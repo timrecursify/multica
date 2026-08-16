@@ -4317,16 +4317,25 @@ func (h *Handler) GetTaskGCCheck(w http.ResponseWriter, r *http.Request) {
 }
 
 // RelayAdvanceRequest is the request body for /api/relay/advance.
-// It routes a task to a specific daemon based on complexity evaluation.
+// Routes a task to a specific daemon based on Scoping-stage complexity evaluation.
+// CONSTRAINT: Only updates routing metadata (daemon_id). Never touches board state (status, column).
 type RelayAdvanceRequest struct {
 	TaskID   string `json:"task_id"`
 	DaemonID string `json:"daemon_id"`
 	Reason   string `json:"reason"`
 }
 
-// RelayAdvance moves a task to a different daemon lane (e.g., junior vs senior).
-// Called by the Scoping stage after evaluating task complexity.
+// RelayAdvance routes a task to a specific daemon lane (junior vs senior models).
+// Called by Scoping stage after evaluating task complexity.
 // Authorization: workspace membership required; task must exist in workspace.
+//
+// Audit logging follows UpdateIssue pattern (issue.go:3103):
+// - h.publish() with event type, workspace, actor info
+// - Previous + new daemon_id values
+// - Routing reason for trace/debug
+//
+// CONSTRAINT: Only updates daemon_id routing metadata. Never updates status/board state.
+// If board-state moves are needed, must use existing board-move code paths.
 func (h *Handler) RelayAdvance(w http.ResponseWriter, r *http.Request) {
 	var req RelayAdvanceRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -4348,6 +4357,8 @@ func (h *Handler) RelayAdvance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	userID := requestUserID(r)
+
 	// Load task and verify workspace access
 	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
 	if err != nil {
@@ -4362,13 +4373,22 @@ func (h *Handler) RelayAdvance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	workspaceID := uuidToString(issue.WorkspaceID)
+
 	// Verify workspace access via the issue
-	member, ok := h.workspaceMember(w, r, uuidToString(issue.WorkspaceID))
-	if !ok {
+	if !h.isWorkspaceEntity(r.Context(), "member", userID, workspaceID) {
+		writeError(w, http.StatusForbidden, "access denied")
 		return
 	}
 
-	// Update task.daemon_id to route to target lane on next claim
+	// Capture previous daemon_id for audit trail (old → new)
+	prevDaemonID := ""
+	if task.DaemonID.Valid {
+		prevDaemonID = task.DaemonID.String
+	}
+
+	// Update task.daemon_id to route to target lane on next claim.
+	// NOTE: Routing metadata update only. Never touches status/board state.
 	updatedTask, err := h.Queries.UpdateAgentTaskDaemonID(r.Context(), db.UpdateAgentTaskDaemonIDParams{
 		ID:       taskUUID,
 		DaemonID: pgtype.Text{String: req.DaemonID, Valid: true},
@@ -4378,12 +4398,25 @@ func (h *Handler) RelayAdvance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Audit logging: follow UpdateIssue pattern (issue.go:3103)
+	// Publish event with actor info + change details
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	h.publish("task_daemon_routed", workspaceID, actorType, actorID, map[string]any{
+		"task_id":        uuidToString(updatedTask.ID),
+		"issue_id":       uuidToString(task.IssueID),
+		"prev_daemon_id": prevDaemonID,
+		"daemon_id":      req.DaemonID,
+		"routing_reason": req.Reason,
+	})
+
 	slog.Info("task routed via relay/advance",
 		"task_id", uuidToString(updatedTask.ID),
-		"workspace_id", uuidToString(issue.WorkspaceID),
+		"workspace_id", workspaceID,
+		"prev_daemon_id", prevDaemonID,
 		"daemon_id", req.DaemonID,
-		"reason", req.Reason,
-		"actor_id", uuidToString(member.UserID),
+		"routing_reason", req.Reason,
+		"actor_type", actorType,
+		"actor_id", actorID,
 	)
 
 	writeJSON(w, http.StatusOK, map[string]any{
