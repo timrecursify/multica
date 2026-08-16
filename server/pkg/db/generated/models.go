@@ -161,6 +161,7 @@ type AgentTaskQueue struct {
 	RetiredSessionID          pgtype.Text `json:"retired_session_id"`
 	QuickActionsDisabled      bool        `json:"quick_actions_disabled"`
 	RegenerateQuickActionsFor pgtype.UUID `json:"regenerate_quick_actions_for"`
+	DaemonID                  pgtype.Text `json:"daemon_id"`
 }
 
 type AgentToLabel struct {

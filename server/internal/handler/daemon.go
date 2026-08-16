@@ -4315,3 +4315,112 @@ func (h *Handler) GetTaskGCCheck(w http.ResponseWriter, r *http.Request) {
 		"completed_at": task.CompletedAt.Time,
 	})
 }
+
+// RelayAdvanceRequest is the request body for /api/relay/advance.
+// Routes a task to a specific daemon based on Scoping-stage complexity evaluation.
+// CONSTRAINT: Only updates routing metadata (daemon_id). Never touches board state (status, column).
+type RelayAdvanceRequest struct {
+	TaskID   string `json:"task_id"`
+	DaemonID string `json:"daemon_id"`
+	Reason   string `json:"reason"`
+}
+
+// RelayAdvance routes a task to a specific daemon lane (junior vs senior models).
+// Called by Scoping stage after evaluating task complexity.
+// Authorization: workspace membership required; task must exist in workspace.
+//
+// Audit logging follows UpdateIssue pattern (issue.go:3103):
+// - h.publish() with event type, workspace, actor info
+// - Previous + new daemon_id values
+// - Routing reason for trace/debug
+//
+// CONSTRAINT: Only updates daemon_id routing metadata. Never updates status/board state.
+// If board-state moves are needed, must use existing board-move code paths.
+func (h *Handler) RelayAdvance(w http.ResponseWriter, r *http.Request) {
+	var req RelayAdvanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.TaskID == "" {
+		writeError(w, http.StatusBadRequest, "task_id is required")
+		return
+	}
+	if req.DaemonID == "" {
+		writeError(w, http.StatusBadRequest, "daemon_id is required")
+		return
+	}
+
+	taskUUID, ok := parseUUIDOrBadRequest(w, req.TaskID, "task_id")
+	if !ok {
+		return
+	}
+
+	userID := requestUserID(r)
+
+	// Load task and verify workspace access
+	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+
+	// Load issue to get workspace_id
+	issue, err := h.Queries.GetIssue(r.Context(), task.IssueID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "issue not found")
+		return
+	}
+
+	workspaceID := uuidToString(issue.WorkspaceID)
+
+	// Verify workspace access via the issue
+	if !h.isWorkspaceEntity(r.Context(), "member", userID, workspaceID) {
+		writeError(w, http.StatusForbidden, "access denied")
+		return
+	}
+
+	// Capture previous daemon_id for audit trail (old → new)
+	prevDaemonID := ""
+	if task.DaemonID.Valid {
+		prevDaemonID = task.DaemonID.String
+	}
+
+	// Update task.daemon_id to route to target lane on next claim.
+	// NOTE: Routing metadata update only. Never touches status/board state.
+	updatedTask, err := h.Queries.UpdateAgentTaskDaemonID(r.Context(), db.UpdateAgentTaskDaemonIDParams{
+		ID:       taskUUID,
+		DaemonID: pgtype.Text{String: req.DaemonID, Valid: true},
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update task routing")
+		return
+	}
+
+	// Audit logging: follow UpdateIssue pattern (issue.go:3103)
+	// Publish event with actor info + change details
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	h.publish("task_daemon_routed", workspaceID, actorType, actorID, map[string]any{
+		"task_id":        uuidToString(updatedTask.ID),
+		"issue_id":       uuidToString(task.IssueID),
+		"prev_daemon_id": prevDaemonID,
+		"daemon_id":      req.DaemonID,
+		"routing_reason": req.Reason,
+	})
+
+	slog.Info("task routed via relay/advance",
+		"task_id", uuidToString(updatedTask.ID),
+		"workspace_id", workspaceID,
+		"prev_daemon_id", prevDaemonID,
+		"daemon_id", req.DaemonID,
+		"routing_reason", req.Reason,
+		"actor_type", actorType,
+		"actor_id", actorID,
+	)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"task_id":   uuidToString(updatedTask.ID),
+		"daemon_id": updatedTask.DaemonID.String,
+	})
+}

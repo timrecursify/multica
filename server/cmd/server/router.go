@@ -1656,6 +1656,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// Tasks (user-facing, with ownership check)
 			r.Post("/api/tasks/{taskId}/cancel", h.CancelTaskByUser)
 
+			// Task routing via Scoping stage complexity evaluation (Phase 2).
+			// Routes a task to a specific daemon lane (junior vs senior).
+			r.Post("/api/relay/advance", h.RelayAdvance)
+
 			// Workspace-wide agent task snapshot for presence derivation:
 			// every active task + each agent's most recent terminal task.
 			r.Get("/api/agent-task-snapshot", h.ListWorkspaceAgentTaskSnapshot)
