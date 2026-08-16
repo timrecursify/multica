@@ -1499,8 +1499,12 @@ RETURNING *;
 -- a sort step (each runtime's slice is index-ordered, but merging several
 -- runtimes' rows into one priority/FIFO order is not). The per-machine
 -- candidate set is small, so this is cheap in practice.
+-- daemon_id filter (MUL-XXXX): tasks with a NULL daemon_id are claimable by any daemon (cloud-compatible).
+-- Tasks with an explicit daemon_id can only be claimed by the matching daemon.
 SELECT * FROM agent_task_queue
-WHERE runtime_id = ANY(@runtime_ids::uuid[]) AND status = 'queued'
+WHERE runtime_id = ANY(@runtime_ids::uuid[])
+  AND status = 'queued'
+  AND (daemon_id IS NULL OR daemon_id = @daemon_id)
 ORDER BY priority DESC, created_at ASC;
 
 -- name: PromoteDueDeferredTasksForRuntimes :many
