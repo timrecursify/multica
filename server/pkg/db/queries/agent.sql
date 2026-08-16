@@ -1788,6 +1788,14 @@ FROM desired
 WHERE a.id = $1 AND a.status IS DISTINCT FROM desired.status
 RETURNING a.*;
 
+-- name: UpdateAgentTaskDaemonID :one
+-- Routes a task to a specific daemon based on Scoping-stage complexity evaluation.
+-- Called by /relay/advance to assign tasks to junior vs senior lanes.
+UPDATE agent_task_queue
+SET daemon_id = sqlc.narg('daemon_id'), updated_at = now()
+WHERE id = $1
+RETURNING *;
+
 -- name: GetAgentBySystemKey :one
 -- Resolves a workspace's built-in agent by its stable system_key. This is the
 -- identity lookup for system agents: their display name is owner-editable, so

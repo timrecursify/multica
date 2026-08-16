@@ -3203,7 +3203,10 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 	}
 
 	// 4. One candidate SELECT across the non-empty set.
-	candidates, err := s.Queries.ListQueuedClaimCandidatesByRuntimes(ctx, nonEmpty, daemonID)
+	candidates, err := s.Queries.ListQueuedClaimCandidatesByRuntimes(ctx, db.ListQueuedClaimCandidatesByRuntimesParams{
+		RuntimeIds: nonEmpty,
+		DaemonID:   pgtype.Text{String: daemonID, Valid: daemonID != ""},
+	})
 	if err != nil {
 		// Steps 2/6 commit reclaimed/claimed tasks in their own transactions,
 		// so `claimed` may already hold tasks dispatched server-side. Dropping
@@ -5642,6 +5645,36 @@ func (s *TaskService) publishQuickCreateInbox(item db.InboxItem, workspaceID, ag
 		ActorID:     agentID,
 		Payload:     map[string]any{"item": resp},
 	})
+}
+
+// EvaluateTaskComplexity scores a task's complexity (Scoping stage logic).
+// Returns "junior" for simple tasks (ppp-free-nvidia), "senior" for complex tasks (codex).
+// Heuristic: content length + priority + context size.
+func EvaluateTaskComplexity(issue db.Issue, contextTokenCount int) string {
+	const (
+		// Thresholds for junior-lane eligibility
+		maxContentLength = 2000   // characters in title+description
+		maxTokens        = 5000   // context token count
+	)
+
+	// P0/critical issues always route to senior
+	if issue.Priority == "critical" || issue.Priority == "p0" {
+		return "senior"
+	}
+
+	// Calculate content complexity
+	descriptionLen := 0
+	if issue.Description.Valid {
+		descriptionLen = utf8.RuneCountInString(issue.Description.String)
+	}
+	contentLen := utf8.RuneCountInString(issue.Title) + descriptionLen
+
+	// Route decision: if both content and context are small, use junior lane
+	if contentLen <= maxContentLength && contextTokenCount <= maxTokens {
+		return "junior"
+	}
+
+	return "senior"
 }
 
 // agentToMap builds a simple map for broadcasting agent status updates.

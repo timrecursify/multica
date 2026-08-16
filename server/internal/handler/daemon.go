@@ -4315,3 +4315,79 @@ func (h *Handler) GetTaskGCCheck(w http.ResponseWriter, r *http.Request) {
 		"completed_at": task.CompletedAt.Time,
 	})
 }
+
+// RelayAdvanceRequest is the request body for /api/relay/advance.
+// It routes a task to a specific daemon based on complexity evaluation.
+type RelayAdvanceRequest struct {
+	TaskID   string `json:"task_id"`
+	DaemonID string `json:"daemon_id"`
+	Reason   string `json:"reason"`
+}
+
+// RelayAdvance moves a task to a different daemon lane (e.g., junior vs senior).
+// Called by the Scoping stage after evaluating task complexity.
+// Authorization: workspace membership required; task must exist in workspace.
+func (h *Handler) RelayAdvance(w http.ResponseWriter, r *http.Request) {
+	var req RelayAdvanceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.TaskID == "" {
+		writeError(w, http.StatusBadRequest, "task_id is required")
+		return
+	}
+	if req.DaemonID == "" {
+		writeError(w, http.StatusBadRequest, "daemon_id is required")
+		return
+	}
+
+	taskUUID, ok := parseUUIDOrBadRequest(w, req.TaskID, "task_id")
+	if !ok {
+		return
+	}
+
+	// Load task and verify workspace access
+	task, err := h.Queries.GetAgentTask(r.Context(), taskUUID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+
+	// Load issue to get workspace_id
+	issue, err := h.Queries.GetIssue(r.Context(), task.IssueID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "issue not found")
+		return
+	}
+
+	// Verify workspace access via the issue
+	member, ok := h.workspaceMember(w, r, uuidToString(issue.WorkspaceID))
+	if !ok {
+		return
+	}
+
+	// Update task.daemon_id to route to target lane on next claim
+	updatedTask, err := h.Queries.UpdateAgentTaskDaemonID(r.Context(), db.UpdateAgentTaskDaemonIDParams{
+		ID:       taskUUID,
+		DaemonID: pgtype.Text{String: req.DaemonID, Valid: true},
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to update task routing")
+		return
+	}
+
+	slog.Info("task routed via relay/advance",
+		"task_id", uuidToString(updatedTask.ID),
+		"workspace_id", uuidToString(issue.WorkspaceID),
+		"daemon_id", req.DaemonID,
+		"reason", req.Reason,
+		"actor_id", uuidToString(member.UserID),
+	)
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"task_id":   uuidToString(updatedTask.ID),
+		"daemon_id": updatedTask.DaemonID.String,
+	})
+}
