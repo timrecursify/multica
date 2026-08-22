@@ -18,10 +18,10 @@ func TestIssueListsTolerateNullCreatorTypeAndNumber(t *testing.T) {
 	ctx := context.Background()
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_type, number)
-		VALUES ($1, 'null scan regression row', 'todo', 'none', NULL, NULL)
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
+		VALUES ($1, 'null scan regression row', 'todo', 'none', NULL, $2, NULL)
 		RETURNING id
-	`, testWorkspaceID).Scan(&issueID); err != nil {
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("insert NULL regression row: %v", err)
 	}
 	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
