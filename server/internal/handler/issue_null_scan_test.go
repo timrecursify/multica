@@ -34,7 +34,7 @@ func TestIssueListsTolerateNullCreatorTypeAndNumber(t *testing.T) {
 
 	table := httptest.NewRecorder()
 	testHandler.ListIssueTableRows(table, newRequest(http.MethodPost, "/api/issues/table/rows?workspace_id="+testWorkspaceID, map[string]any{
-		"query": map[string]any{"scope": map[string]any{"kind": "workspace"}, "filters": map[string]any{}, "sort": map[string]any{"field": "created_at", "direction": "desc"}},
+		"query": map[string]any{"scope": map[string]any{"kind": "workspace"}, "filters": map[string]any{}, "sort": map[string]any{"field": "position", "direction": "asc"}},
 		"group": map[string]any{"kind": "none"}, "hierarchy": map[string]any{"enabled": false}, "page": map[string]any{"limit": 100},
 	}))
 	if table.Code != http.StatusOK || !strings.Contains(table.Body.String(), "null scan regression row") {
