@@ -203,23 +203,18 @@ func (h *Handler) issueTableFacetQuery(w http.ResponseWriter, r *http.Request, r
 	case "label":
 		query = fmt.Sprintf(`SELECT itl.label_id::text, COUNT(DISTINCT i.id)::bigint FROM issue i JOIN issue_to_label itl ON itl.issue_id = i.id WHERE %s GROUP BY itl.label_id`, compiled.where)
 	case "working_agents":
-		// One row per agent currently running issue work inside THIS surface,
-		// with its running-task count. Same predicate as
-		// ListWorkspaceWorkingAgents with type=issue (chat > autopilot > issue
-		// precedence, user-authored non-archived agents only), but the issue set
-		// comes from the surface's own compiled scope + filters instead of a
-		// second, independent workspace-wide definition. That is what keeps the
-		// header chip's count equal to the rows clicking it leaves (MUL-5525).
+		// One row per agent currently assigned In Progress ticket work inside
+		// THIS surface, with its in-flight ticket count. Same predicate as
+		// ListWorkspaceWorkingAgents with type=issue, but the issue set comes
+		// from the surface's own compiled scope + filters instead of a second,
+		// independent workspace-wide definition.
 		query = fmt.Sprintf(`SELECT a.id::text, COUNT(*)::bigint
 FROM issue i
-JOIN agent_task_queue atq ON atq.issue_id = i.id
-JOIN agent a ON a.id = atq.agent_id AND a.workspace_id = i.workspace_id
+JOIN agent a ON a.id = i.assignee_id AND a.workspace_id = i.workspace_id AND i.assignee_type = 'agent'
 WHERE %s
   AND a.kind = 'user'
   AND a.archived_at IS NULL
-  AND atq.status = 'running'
-  AND atq.chat_session_id IS NULL
-  AND atq.autopilot_run_id IS NULL
+  AND lower(i.status) = 'in_progress'
 GROUP BY a.id`, compiled.where)
 	case "property":
 		propertyID, err := util.ParseUUID(facet.PropertyID)

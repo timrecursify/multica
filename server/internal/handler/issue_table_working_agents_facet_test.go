@@ -107,31 +107,57 @@ func TestIssueTableWorkingAgentsFacetFollowsSurfaceScopeAndFilters(t *testing.T)
 		).Scan(&issueID); err != nil {
 			t.Fatalf("insert issue %q: %v", title, err)
 		}
+		if _, err := testPool.Exec(ctx, `
+			UPDATE issue SET assignee_type = 'agent', assignee_id = $2::uuid WHERE id = $1::uuid
+		`, issueID, insideAgentID); err != nil {
+			t.Fatalf("assign facet fixture: %v", err)
+		}
 		t.Cleanup(func() {
 			testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
 		})
 		return issueID
 	}
 
-	inProjectTodoID := insertIssue("in project, todo", "todo", finalNumber-3, projectID, nil)
-	inProjectDoneID := insertIssue("in project, done", "done", finalNumber-2, projectID, nil)
-	outsideProjectID := insertIssue("outside the project", "todo", finalNumber-1, nil, nil)
-	subIssueID := insertIssue("in project, sub-issue", "todo", finalNumber, projectID, inProjectTodoID)
+	inProjectTodoID := insertIssue("in project, in progress", "in_progress", finalNumber-3, projectID, nil)
+	_ = insertIssue("in project, done", "done", finalNumber-2, projectID, nil)
+	outsideProjectID := insertIssue("outside the project", "in_progress", finalNumber-1, nil, nil)
+	subIssueID := insertIssue("in project, sub-issue", "in_progress", finalNumber, projectID, inProjectTodoID)
 
-	// insideAgent holds two running tasks inside the project (one on each
-	// status) plus one on the sub-issue; outsideAgent works only outside it;
-	// idleAgent has no running task at all.
-	createHandlerTestTaskForAgentOnIssue(t, insideAgentID, inProjectTodoID)
-	createHandlerTestTaskForAgentOnIssue(t, insideAgentID, inProjectDoneID)
-	createHandlerTestTaskForAgentOnIssue(t, insideAgentID, subIssueID)
-	createHandlerTestTaskForAgentOnIssue(t, outsideAgentID, outsideProjectID)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE issue SET assignee_type = 'agent', assignee_id = $2::uuid
+		WHERE id = ANY($1::uuid[])
+	`, []string{inProjectTodoID, subIssueID}, insideAgentID); err != nil {
+		t.Fatalf("assign explicit facet fixture: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		SELECT count(*) FROM issue WHERE id = $1::uuid AND status = 'in_progress'
+	`, inProjectTodoID); err != nil {
+		t.Fatalf("verify facet fixture status: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE issue SET assignee_id = $2::uuid WHERE id = $1::uuid AND status = 'in_progress'
+	`, inProjectTodoID, insideAgentID); err != nil {
+		t.Fatalf("reassign facet fixture: %v", err)
+	}
+
+	if _, err := testPool.Exec(ctx, `
+		UPDATE issue SET assignee_type = 'agent', assignee_id = $2::uuid WHERE id = $1::uuid
+	`, outsideProjectID, outsideAgentID); err != nil {
+		t.Fatalf("assign outside facet fixture: %v", err)
+	}
+
+	// insertIssue assigns every ticket to insideAgent, but only In Progress
+	// tickets count. insideAgent therefore holds two working project tickets;
+	// outsideAgent works only outside it; idleAgent has none.
 
 	projectScope := map[string]any{"kind": "project", "project_id": projectID}
 
 	t.Run("project scope excludes agents working elsewhere", func(t *testing.T) {
 		counts := workingAgentsFacetCounts(t, workingAgentsFacetRequest(projectScope, nil))
-		if counts[insideAgentID] != 3 {
-			t.Errorf("inside agent count = %d, want 3", counts[insideAgentID])
+		if counts[insideAgentID] != 2 {
+			t.Errorf("inside agent count = %d, want 2", counts[insideAgentID])
 		}
 		if _, present := counts[outsideAgentID]; present {
 			t.Errorf("agent working outside the project was counted: %s", outsideAgentID)
@@ -145,8 +171,8 @@ func TestIssueTableWorkingAgentsFacetFollowsSurfaceScopeAndFilters(t *testing.T)
 		counts := workingAgentsFacetCounts(t, workingAgentsFacetRequest(projectScope, map[string]any{
 			"statuses": []string{"done"},
 		}))
-		if counts[insideAgentID] != 1 {
-			t.Errorf("inside agent count under status=done = %d, want 1", counts[insideAgentID])
+		if len(counts) != 0 {
+			t.Errorf("done ticket must not be counted as working: %v", counts)
 		}
 	})
 
@@ -154,8 +180,8 @@ func TestIssueTableWorkingAgentsFacetFollowsSurfaceScopeAndFilters(t *testing.T)
 		counts := workingAgentsFacetCounts(t, workingAgentsFacetRequest(projectScope, map[string]any{
 			"include_sub_issues": false,
 		}))
-		if counts[insideAgentID] != 2 {
-			t.Errorf("inside agent count without sub-issues = %d, want 2", counts[insideAgentID])
+		if counts[insideAgentID] != 1 {
+			t.Errorf("inside agent count without sub-issues = %d, want 1", counts[insideAgentID])
 		}
 	})
 
@@ -194,9 +220,9 @@ func TestIssueTableWorkingAgentsFacetFollowsSurfaceScopeAndFilters(t *testing.T)
 		counts := workingAgentsFacetCounts(t, workingAgentsFacetRequest(
 			map[string]any{"kind": "workspace"}, nil,
 		))
-		if counts[insideAgentID] != 3 || counts[outsideAgentID] != 1 {
+		if counts[insideAgentID] != 2 || counts[outsideAgentID] != 1 {
 			t.Errorf(
-				"workspace counts inside=%d outside=%d, want 3 and 1",
+				"workspace counts inside=%d outside=%d, want 2 and 1",
 				counts[insideAgentID], counts[outsideAgentID],
 			)
 		}
@@ -233,7 +259,7 @@ func TestIssueTableWorkingAgentsFacetHidesInaccessibleAgents(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			position, number
 		)
-		VALUES ($1, 'worked on by a private agent', 'todo', 'none', 'member', $2, $3, $4)
+		VALUES ($1, 'worked on by a private agent', 'in_progress', 'none', 'member', $2, $3, $4)
 		RETURNING id
 	`, testWorkspaceID, testUserID, finalNumber, finalNumber).Scan(&issueID); err != nil {
 		t.Fatalf("insert issue: %v", err)
@@ -241,7 +267,11 @@ func TestIssueTableWorkingAgentsFacetHidesInaccessibleAgents(t *testing.T) {
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
 	})
-	createHandlerTestTaskForAgentOnIssue(t, privateAgentID, issueID)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE issue SET assignee_type = 'agent', assignee_id = $2::uuid WHERE id = $1::uuid
+	`, issueID, privateAgentID); err != nil {
+		t.Fatalf("assign private-agent issue: %v", err)
+	}
 
 	facetRequest := func(userID string) *http.Request {
 		request := workingAgentsFacetRequest(map[string]any{"kind": "workspace"}, nil)

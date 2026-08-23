@@ -2175,6 +2175,23 @@ type AgentRunCount struct {
 	RunCount int32  `json:"run_count"`
 }
 
+// WorkspaceThroughput summarizes live status_changed activity over the last
+// 24 hours. It is intentionally event-derived and independent of task queue
+// lifecycle records.
+type WorkspaceThroughput struct {
+	ChangedIssueCount int32  `json:"changed_issue_count"`
+	EventCount        int32  `json:"event_count"`
+	FirstEventAt      string `json:"first_event_at"`
+	LastEventAt       string `json:"last_event_at"`
+}
+
+// WorkspaceStageCount is the current number of tickets in a configured relay
+// stage.
+type WorkspaceStageCount struct {
+	StageName   string `json:"stage_name"`
+	TicketCount int32  `json:"ticket_count"`
+}
+
 // WorkspaceWorkingAgent is the privacy-safe agent summary returned by the
 // workspace working-agents endpoint. It deliberately carries only display
 // information plus the current running-task count and referenced issue ids;
@@ -2388,6 +2405,53 @@ func (h *Handler) GetWorkspaceAgentActivity30d(w http.ResponseWriter, r *http.Re
 		})
 	}
 
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// GetWorkspaceThroughput returns the recent live ticket-transition throughput
+// from activity_log. The window is fixed at 24 hours because it answers "is
+// work moving now", not historical trend analysis.
+func (h *Handler) GetWorkspaceThroughput(w http.ResponseWriter, r *http.Request) {
+	workspaceID := h.resolveWorkspaceID(r)
+	if _, ok := h.workspaceMember(w, r, workspaceID); !ok {
+		return
+	}
+
+	row, err := h.Queries.GetWorkspaceThroughputDaily(r.Context(), parseUUID(workspaceID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to get workspace throughput")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, WorkspaceThroughput{
+		ChangedIssueCount: row.ChangedIssueCount,
+		EventCount:        row.EventCount,
+		FirstEventAt:      timestampToString(row.FirstEventAt),
+		LastEventAt:       timestampToString(row.LastEventAt),
+	})
+}
+
+// ListWorkspaceStageCounts returns current per-stage ticket totals from the
+// configured relay stages joined to issue status.
+func (h *Handler) ListWorkspaceStageCounts(w http.ResponseWriter, r *http.Request) {
+	workspaceID := h.resolveWorkspaceID(r)
+	if _, ok := h.workspaceMember(w, r, workspaceID); !ok {
+		return
+	}
+
+	rows, err := h.Queries.ListWorkspaceStageCounts(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list stage counts")
+		return
+	}
+
+	resp := make([]WorkspaceStageCount, 0, len(rows))
+	for _, row := range rows {
+		resp = append(resp, WorkspaceStageCount{
+			StageName:   row.StageName,
+			TicketCount: row.TicketCount,
+		})
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 

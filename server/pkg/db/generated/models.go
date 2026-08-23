@@ -919,6 +919,12 @@ type QuickAction struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RelayStageConfig struct {
+	ID        int32       `json:"id"`
+	StageName string      `json:"stage_name"`
+	NextStage pgtype.Text `json:"next_stage"`
+}
+
 type RuntimeProfile struct {
 	ID             pgtype.UUID        `json:"id"`
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`

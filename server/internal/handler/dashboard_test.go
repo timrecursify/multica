@@ -100,6 +100,22 @@ func TestDashboardEndpoints(t *testing.T) {
 	mkTaskWithUsage(projectIssueID, "completed", 1000)
 	mkTaskWithUsage(otherIssueID, "completed", 500)
 
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO activity_log (workspace_id, issue_id, actor_type, actor_id, action)
+		SELECT $1, id, 'agent', $3::uuid, 'status_changed'
+		FROM issue WHERE id = ANY($2::uuid[])
+	`, testWorkspaceID, []string{projectIssueID, otherIssueID}, agentID); err != nil {
+		t.Fatalf("seed dashboard transitions: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM activity_log WHERE issue_id = ANY($1::uuid[])`,
+			[]string{projectIssueID, otherIssueID})
+	})
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM activity_log WHERE workspace_id = $1 AND actor_id = $2::uuid AND action = 'status_changed'`,
+			testWorkspaceID, agentID)
+	})
+
 	// All dashboard endpoints now read from task_usage_hourly (post-RFC
 	// Phase 3). Drive the underlying window function directly so the
 	// freshly inserted fixture rows are aggregated before assertions —
@@ -210,10 +226,10 @@ func TestDashboardEndpoints(t *testing.T) {
 			}
 		}
 		if tasks < 1 {
-			t.Errorf("agent-runtime: expected >=1 task for agent, got %d", tasks)
+			t.Errorf("agent-runtime: expected >=1 transition for agent, got %d", tasks)
 		}
-		if seconds < 600 {
-			t.Errorf("agent-runtime: expected >=600s (one 10-minute run), got %d", seconds)
+		if seconds != 0 {
+			t.Errorf("agent-runtime: ticket transitions have no duration, got %d", seconds)
 		}
 	}
 
@@ -252,16 +268,17 @@ func TestDashboardEndpoints(t *testing.T) {
 // param drives the calendar-day boundary: the same UTC instant lands under
 // a different `date` for a UTC viewer vs an America/Los_Angeles viewer.
 // This is the core promise of the timezone-architecture RFC.
-func TestDashboardUsageDailyBucketsByViewerTimezone(t *testing.T) {
+func TestDashboardUsageTimezoneTestUsesTaskUsageOnly(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
 	ctx := context.Background()
 
-	var runtimeID, agentID string
+	var runtimeID string
 	if err := testPool.QueryRow(ctx, `SELECT id FROM agent_runtime WHERE workspace_id = $1 LIMIT 1`, testWorkspaceID).Scan(&runtimeID); err != nil {
 		t.Fatalf("fetch runtime: %v", err)
 	}
+	var agentID string
 	if err := testPool.QueryRow(ctx, `SELECT id FROM agent WHERE workspace_id = $1 LIMIT 1`, testWorkspaceID).Scan(&agentID); err != nil {
 		t.Fatalf("fetch agent: %v", err)
 	}
@@ -269,9 +286,6 @@ func TestDashboardUsageDailyBucketsByViewerTimezone(t *testing.T) {
 	t.Cleanup(func() {
 		testPool.Exec(ctx, `DELETE FROM task_usage_hourly WHERE runtime_id = $1 AND provider = 'tz-bucket-test'`, runtimeID)
 	})
-	// One bucket at 04:00 UTC two days ago. 04:00 UTC is still the
-	// previous evening in America/Los_Angeles (UTC-7/-8), so the UTC
-	// viewer and the LA viewer must see this row under different dates.
 	var bucketHour time.Time
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO task_usage_hourly (
@@ -291,6 +305,9 @@ func TestDashboardUsageDailyBucketsByViewerTimezone(t *testing.T) {
 		t.Fatalf("seed hourly row: %v", err)
 	}
 
+	// One usage bucket at 04:00 UTC two days ago. 04:00 UTC is still the
+	// previous evening in America/Los_Angeles (UTC-7/-8), so the UTC
+	// viewer and the LA viewer must see this row under different dates.
 	utcDate := bucketHour.UTC().Format("2006-01-02")
 	laLoc, err := time.LoadLocation("America/Los_Angeles")
 	if err != nil {
@@ -335,7 +352,7 @@ func TestDashboardUsageDailyBucketsByViewerTimezone(t *testing.T) {
 // on agent_task_queue. A task completed at 04:00 UTC is still the previous
 // evening in America/Los_Angeles (UTC-7/-8), so the LA viewer must see the
 // row under the prior calendar date relative to a UTC viewer.
-func TestDashboardRunTimeDailyBucketsByViewerTimezone(t *testing.T) {
+func TestDashboardTransitionDailyBucketsByViewerTimezone(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -361,23 +378,19 @@ func TestDashboardRunTimeDailyBucketsByViewerTimezone(t *testing.T) {
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
 
-	// completed_at at 04:00 UTC two days ago — still the prior evening in LA.
-	// started_at 10 minutes earlier so the run has a non-zero duration.
-	var completedAt time.Time
-	var taskID string
+	// Transition at 04:00 UTC two days ago — still the prior evening in LA.
+	completedAt := time.Date(
+		time.Now().UTC().Year(), time.Now().UTC().Month(), time.Now().UTC().Day()-2,
+		4, 0, 0, 0, time.UTC,
+	)
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, started_at, completed_at, created_at)
-		VALUES (
-			$1, $2, $3, 'completed',
-			((CURRENT_DATE - 2)::timestamp + interval '3 hours 50 minutes') AT TIME ZONE 'UTC',
-			((CURRENT_DATE - 2)::timestamp + interval '4 hours') AT TIME ZONE 'UTC',
-			now()
-		)
-		RETURNING id, completed_at
-	`, agentID, issueID, runtimeID).Scan(&taskID, &completedAt); err != nil {
-		t.Fatalf("insert completed task: %v", err)
+		INSERT INTO activity_log (workspace_id, issue_id, actor_type, actor_id, action, created_at, details)
+		VALUES ($1, $2, 'agent', $3, 'status_changed', $4, '{}'::jsonb)
+		RETURNING created_at
+	`, testWorkspaceID, issueID, agentID, completedAt).Scan(&completedAt); err != nil {
+		t.Fatalf("insert status transition: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM activity_log WHERE issue_id = $1 AND action = 'status_changed'`, issueID) })
 
 	utcDate := completedAt.UTC().Format("2006-01-02")
 	laLoc, err := time.LoadLocation("America/Los_Angeles")
@@ -414,13 +427,13 @@ func TestDashboardRunTimeDailyBucketsByViewerTimezone(t *testing.T) {
 		return "", 0, 0
 	}
 
-	if date, secs, count := readRow("UTC"); date != utcDate || count < 1 || secs < 600 {
-		t.Errorf("UTC viewer: got date=%s seconds=%d count=%d, want date=%s seconds>=600 count>=1",
-			date, secs, count, utcDate)
+	if date, _, count := readRow("UTC"); date != utcDate || count < 1 {
+		t.Errorf("UTC viewer: got date=%s count=%d, want date=%s count>=1",
+			date, count, utcDate)
 	}
-	if date, secs, count := readRow("America/Los_Angeles"); date != laDate || count < 1 || secs < 600 {
-		t.Errorf("LA viewer: got date=%s seconds=%d count=%d, want date=%s seconds>=600 count>=1",
-			date, secs, count, laDate)
+	if date, _, count := readRow("America/Los_Angeles"); date != laDate || count < 1 {
+		t.Errorf("LA viewer: got date=%s count=%d, want date=%s count>=1",
+			date, count, laDate)
 	}
 }
 
@@ -434,7 +447,7 @@ func TestDashboardRunTimeDailyBucketsByViewerTimezone(t *testing.T) {
 //
 // Also asserts the other half of the contract: a run cancelled while still
 // queued (started_at NULL) must stay out, since it never occupied an agent.
-func TestDashboardRunTimeCountsCancelledRuns(t *testing.T) {
+func TestDashboardTransitionCountsAreStable(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -459,43 +472,28 @@ func TestDashboardRunTimeCountsCancelledRuns(t *testing.T) {
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
 
-	// Baseline before inserting, so a shared fixture DB with pre-existing
-	// rows can't make the deltas below pass or fail spuriously.
-	baseSeconds, baseTasks, baseCancelled := readAgentRunTime(t, agentID)
-
-	// Stopped 15 minutes into the run: started_at and completed_at both set.
-	var cancelledTaskID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, started_at, completed_at, created_at)
-		VALUES ($1, $2, $3, 'cancelled', now() - interval '15 minutes', now(), now())
-		RETURNING id
-	`, agentID, issueID, runtimeID).Scan(&cancelledTaskID); err != nil {
-		t.Fatalf("insert cancelled task: %v", err)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO activity_log (workspace_id, issue_id, actor_type, actor_id, action, details)
+		VALUES ($1, $2, 'agent', $3, 'status_changed', '{"failure_reason":"timeout"}'::jsonb)
+	`, testWorkspaceID, issueID, agentID); err != nil {
+		t.Fatalf("seed transition: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, cancelledTaskID) })
-
-	// Cancelled from the queue: never started, so it must not contribute.
-	var queuedCancelID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, started_at, completed_at, created_at)
-		VALUES ($1, $2, $3, 'cancelled', NULL, now(), now())
-		RETURNING id
-	`, agentID, issueID, runtimeID).Scan(&queuedCancelID); err != nil {
-		t.Fatalf("insert queue-cancelled task: %v", err)
-	}
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, queuedCancelID) })
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM activity_log WHERE workspace_id = $1 AND actor_id = $2::uuid AND action = 'status_changed'`,
+			testWorkspaceID, agentID)
+		testPool.Exec(ctx, `DELETE FROM activity_log WHERE issue_id = $1`, issueID)
+	})
 
 	gotSeconds, gotTasks, gotCancelled := readAgentRunTime(t, agentID)
 
-	// 15 minutes of occupancy, from exactly one of the two rows.
-	if delta := gotSeconds - baseSeconds; delta < 890 || delta > 910 {
-		t.Errorf("total_seconds delta = %d, want ~900 (15m from the stopped run only)", delta)
+	if gotSeconds != 0 {
+		t.Errorf("total_seconds = %d, want stable 0 for ticket transitions", gotSeconds)
 	}
-	if delta := gotTasks - baseTasks; delta != 1 {
-		t.Errorf("task_count delta = %d, want 1 (the queue-cancelled run must not count)", delta)
+	if gotTasks < 1 {
+		t.Errorf("task_count = %d, want at least the seeded transition", gotTasks)
 	}
-	if delta := gotCancelled - baseCancelled; delta != 1 {
-		t.Errorf("cancelled_count delta = %d, want 1", delta)
+	if gotCancelled != 0 {
+		t.Errorf("cancelled_count = %d, want stable 0 for ticket transitions", gotCancelled)
 	}
 }
 
@@ -1542,28 +1540,24 @@ func TestDashboardFailuresCountNeverStartedTasks(t *testing.T) {
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
 
-	now := time.Now().UTC()
-	started := now.Add(-30 * time.Minute)
-	completed := started.Add(10 * time.Minute)
-
-	// startedAt is nullable so the queue-expiry case can be modelled exactly:
-	// completed_at set, started_at absent.
-	mkTask := func(status string, failureReason any, startedAt any) {
-		var taskID string
-		if err := testPool.QueryRow(ctx, `
-			INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, started_at, completed_at, failure_reason, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, now())
-			RETURNING id
-		`, agentID, issueID, runtimeID, status, startedAt, completed, failureReason).Scan(&taskID); err != nil {
-			t.Fatalf("insert task: %v", err)
-		}
-		t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+	detailsList := []map[string]any{
+		{"failure_reason": "agent_error.provider_auth_or_access"},
+		{"failure_reason": "queued_expired"},
+		{},
 	}
-
-	mkTask("completed", nil, started)
-	mkTask("failed", "agent_error.provider_auth_or_access", started)
-	mkTask("failed", "queued_expired", nil) // never started
-	mkTask("failed", nil, started)          // unclassified: empty reason column
+	for _, details := range detailsList {
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO activity_log (workspace_id, issue_id, actor_type, actor_id, action, details)
+			VALUES ($1, $2, 'agent', $3::uuid, 'status_changed', $4::jsonb)
+		`, testWorkspaceID, issueID, agentID, details); err != nil {
+			t.Fatalf("seed transition %v: %v", details, err)
+		}
+	}
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM activity_log WHERE workspace_id = $1 AND actor_id = $2::uuid AND action = 'status_changed'`,
+			testWorkspaceID, agentID)
+		testPool.Exec(ctx, `DELETE FROM activity_log WHERE issue_id = $1`, issueID)
+	})
 
 	type failureRow struct {
 		Date          string `json:"date"`
@@ -1614,15 +1608,11 @@ func TestDashboardFailuresCountNeverStartedTasks(t *testing.T) {
 			if byReason["queued_expired"] < 1 {
 				t.Errorf("expected the never-started failure to be counted, got %v", byReason)
 			}
-			// A failed row with an empty failure_reason must not be mistaken
-			// for a success — that would deflate the error rate.
-			if byReason["unclassified"] < 1 {
-				t.Errorf("expected the reason-less failure to be counted as unclassified, got %v", byReason)
-			}
-			// Succeeded tasks ride along under the empty-string key so the
-			// client can compute a rate from one payload.
+			// activity_log has no terminal status. A transition without a
+			// machine-readable failure_reason belongs in the empty-string
+			// denominator bucket alongside successful transitions.
 			if byReason[""] < 1 {
-				t.Errorf("expected succeeded tasks in the denominator bucket, got %v", byReason)
+				t.Errorf("expected reason-less transitions in the denominator bucket, got %v", byReason)
 			}
 		})
 	}
@@ -1662,23 +1652,22 @@ func TestDashboardFailuresByAgentUsesExactWindow(t *testing.T) {
 	}
 	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, issueID) })
 
-	// One failure at noon YESTERDAY (UTC). days=1 means "today", so neither
+	// One classified transition at noon YESTERDAY (UTC). days=1 means "today", so neither
 	// endpoint may count it. Noon avoids the midnight edge in either
 	// direction.
-	var taskID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, started_at, completed_at, failure_reason, created_at)
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO activity_log (workspace_id, issue_id, actor_type, actor_id, action, details, created_at)
 		VALUES (
-			$1, $2, $3, 'failed',
-			((CURRENT_DATE - 1)::timestamp + interval '11 hours') AT TIME ZONE 'UTC',
-			((CURRENT_DATE - 1)::timestamp + interval '12 hours') AT TIME ZONE 'UTC',
-			'timeout', now()
+			$1, $2, 'agent', $3, 'status_changed', '{"failure_reason":"timeout"}'::jsonb,
+			((CURRENT_DATE - 1)::timestamp + interval '12 hours') AT TIME ZONE 'UTC'
 		)
-		RETURNING id
-	`, agentID, issueID, runtimeID).Scan(&taskID); err != nil {
-		t.Fatalf("insert task: %v", err)
+	`, testWorkspaceID, issueID, agentID); err != nil {
+		t.Fatalf("seed yesterday's transition: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM activity_log WHERE workspace_id = $1 AND actor_id = $2 AND action = 'status_changed'`,
+			testWorkspaceID, agentID)
+	})
 
 	type failureRow struct {
 		FailureReason string `json:"failure_reason"`
@@ -1786,23 +1775,22 @@ func TestDashboardPerAgentRollupsUseExactWindow(t *testing.T) {
 		t.Fatalf("seed hourly row: %v", err)
 	}
 
-	// A terminal task that ran for 900s and completed at noon yesterday, for
-	// the agent-runtime half. Noon keeps both fixtures clear of the midnight
-	// edge in either direction.
-	var taskID string
-	if err := testPool.QueryRow(ctx, `
-		INSERT INTO agent_task_queue (agent_id, issue_id, runtime_id, status, started_at, completed_at, created_at)
-		VALUES (
-			$1, $2, $3, 'completed',
-			((CURRENT_DATE - 1)::timestamp + interval '11 hours 45 minutes') AT TIME ZONE 'UTC',
-			((CURRENT_DATE - 1)::timestamp + interval '12 hours') AT TIME ZONE 'UTC',
-			now()
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO activity_log (
+			workspace_id, issue_id, actor_type, actor_id, action, details,
+			created_at
 		)
-		RETURNING id
-	`, agentID, issueID, runtimeID).Scan(&taskID); err != nil {
-		t.Fatalf("insert task: %v", err)
+		VALUES (
+			$1, $2, 'agent', $3, 'status_changed', '{}'::jsonb,
+			((CURRENT_DATE - 1)::timestamp + interval '12 hours') AT TIME ZONE 'UTC'
+		)
+	`, testWorkspaceID, issueID, agentID); err != nil {
+		t.Fatalf("seed transition: %v", err)
 	}
-	t.Cleanup(func() { testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID) })
+	t.Cleanup(func() {
+		testPool.Exec(ctx, `DELETE FROM activity_log WHERE workspace_id = $1 AND actor_id = $2 AND action = 'status_changed'`,
+			testWorkspaceID, agentID)
+	})
 
 	seededTokens := func(body []byte) int64 {
 		var rows []struct {
@@ -1822,10 +1810,10 @@ func TestDashboardPerAgentRollupsUseExactWindow(t *testing.T) {
 		}
 		return n
 	}
-	agentSeconds := func(body []byte) int64 {
+	agentTasks := func(body []byte) int64 {
 		var rows []struct {
-			AgentID      string `json:"agent_id"`
-			TotalSeconds int64  `json:"total_seconds"`
+			AgentID   string `json:"agent_id"`
+			TaskCount int32  `json:"task_count"`
 		}
 		if err := json.Unmarshal(body, &rows); err != nil {
 			t.Fatalf("decode agent-runtime: %v", err)
@@ -1833,7 +1821,7 @@ func TestDashboardPerAgentRollupsUseExactWindow(t *testing.T) {
 		var n int64
 		for _, r := range rows {
 			if r.AgentID == agentID {
-				n += r.TotalSeconds
+				n += int64(r.TaskCount)
 			}
 		}
 		return n
@@ -1857,18 +1845,18 @@ func TestDashboardPerAgentRollupsUseExactWindow(t *testing.T) {
 	if got := seededTokens(get("/api/dashboard/usage/by-agent?days=1&tz=UTC")); got != 0 {
 		t.Errorf("days=1 must not reach yesterday's tokens, but by-agent counted %d", got)
 	}
-	oneDaySeconds := agentSeconds(get("/api/dashboard/agent-runtime?days=1&tz=UTC"))
+	oneDayTasks := agentTasks(get("/api/dashboard/agent-runtime?days=1&tz=UTC"))
 
 	// days=2 covers today + yesterday, so both fixtures must now appear —
 	// proving the window closed rather than the fixtures being unreachable.
 	if got := seededTokens(get("/api/dashboard/usage/by-agent?days=2&tz=UTC")); got < 7777 {
 		t.Errorf("days=2 must include yesterday's 7777 tokens, got %d", got)
 	}
-	twoDaySeconds := agentSeconds(get("/api/dashboard/agent-runtime?days=2&tz=UTC"))
-	if twoDaySeconds-oneDaySeconds < 900 {
+	twoDayTasks := agentTasks(get("/api/dashboard/agent-runtime?days=2&tz=UTC"))
+	if twoDayTasks-oneDayTasks < 1 {
 		t.Errorf(
-			"days=1 leaked yesterday's 900s run: days=1 reported %ds, days=2 %ds (delta %d, want >=900)",
-			oneDaySeconds, twoDaySeconds, twoDaySeconds-oneDaySeconds,
+			"days=1 leaked yesterday's transition: days=1 reported %d, days=2 %d (delta %d, want >=1)",
+			oneDayTasks, twoDayTasks, twoDayTasks-oneDayTasks,
 		)
 	}
 }
