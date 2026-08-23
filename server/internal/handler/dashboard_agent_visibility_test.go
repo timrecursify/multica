@@ -110,7 +110,25 @@ func TestDashboardPerAgentRollupsFoldRestrictedAgents(t *testing.T) {
 		`, taskID, tokens); err != nil {
 			t.Fatalf("insert task_usage: %v", err)
 		}
+		details := map[string]any{}
+		if failureReason != "" {
+			details["failure_reason"] = failureReason
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO activity_log (
+				workspace_id, issue_id, actor_type, actor_id, action, details
+			)
+			VALUES ($1, $2, 'agent', $3, 'status_changed', $4::jsonb)
+		`, testWorkspaceID, issueID, agentID, details); err != nil {
+			t.Fatalf("seed transition: %v", err)
+		}
 	}
+
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(),
+			`DELETE FROM activity_log WHERE workspace_id = $1 AND action = 'status_changed' AND actor_id IN ($2, $3)`,
+			testWorkspaceID, privateAgentID, publicAgentID)
+	})
 	seedRun(privateAgentID, "completed", "", 1000)
 	seedRun(privateAgentID, "failed", "runtime_offline", 200)
 	seedRun(publicAgentID, "completed", "", 300)
@@ -447,7 +465,24 @@ func TestDashboardPerAgentRollupsFoldSystemAgentCarriers(t *testing.T) {
 		`, taskID, run.tokens); err != nil {
 			t.Fatalf("insert carrier task_usage: %v", err)
 		}
+		details := map[string]any{}
+		if run.failureReason != "" {
+			details["failure_reason"] = run.failureReason
+		}
+		if _, err := testPool.Exec(ctx, `
+			INSERT INTO activity_log (
+				workspace_id, issue_id, actor_type, actor_id, action, details
+			)
+			VALUES ($1, $2, 'agent', $3, 'status_changed', $4::jsonb)
+		`, testWorkspaceID, issueID, carrierID, details); err != nil {
+			t.Fatalf("seed carrier transition: %v", err)
+		}
 	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(),
+			`DELETE FROM activity_log WHERE workspace_id = $1 AND action = 'status_changed' AND actor_id = $2`,
+			testWorkspaceID, carrierID)
+	})
 	t.Cleanup(func() {
 		testPool.Exec(context.Background(),
 			`DELETE FROM task_usage_hourly WHERE model = 'system-carrier-model'`)
@@ -480,14 +515,14 @@ func TestDashboardPerAgentRollupsFoldSystemAgentCarriers(t *testing.T) {
 		if got := after.tokens - viewer.before.tokens; got != 1000 {
 			t.Errorf("%s: usage/by-agent token delta = %d, want 1000 (900 + 100)", viewer.label, got)
 		}
-		if got := after.secs - viewer.before.secs; got != 1200 {
-			t.Errorf("%s: agent-runtime seconds delta = %d, want 1200 (two 600s runs)", viewer.label, got)
+		if got := after.secs - viewer.before.secs; got != 0 {
+			t.Errorf("%s: agent-runtime seconds delta = %d, want stable 0 for ticket transitions", viewer.label, got)
 		}
 		if got := after.tasks - viewer.before.tasks; got != 2 {
 			t.Errorf("%s: agent-runtime task delta = %d, want 2", viewer.label, got)
 		}
-		if got := after.failed - viewer.before.failed; got != 1 {
-			t.Errorf("%s: agent-runtime failed delta = %d, want 1", viewer.label, got)
+		if got := after.failed - viewer.before.failed; got != 0 {
+			t.Errorf("%s: agent-runtime failed delta = %d, want 0 under transition semantics", viewer.label, got)
 		}
 		if got := after.runs - viewer.before.runs; got != 2 {
 			t.Errorf("%s: failures/by-agent run delta = %d, want 2", viewer.label, got)

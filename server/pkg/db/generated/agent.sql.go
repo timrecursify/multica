@@ -3738,6 +3738,41 @@ func (q *Queries) GetWorkspaceAgentRunCounts(ctx context.Context, workspaceID pg
 	return items, nil
 }
 
+const getWorkspaceThroughputDaily = `-- name: GetWorkspaceThroughputDaily :one
+SELECT
+  COUNT(DISTINCT activity.issue_id)::int AS changed_issue_count,
+  COUNT(*)::int AS event_count,
+  COALESCE(MIN(activity.created_at), now())::timestamptz AS first_event_at,
+  COALESCE(MAX(activity.created_at), now())::timestamptz AS last_event_at
+FROM activity_log activity
+WHERE activity.workspace_id = $1
+  AND activity.action = 'status_changed'
+  AND activity.created_at >= now() - interval '24 hours'
+`
+
+type GetWorkspaceThroughputDailyRow struct {
+	ChangedIssueCount int32              `json:"changed_issue_count"`
+	EventCount        int32              `json:"event_count"`
+	FirstEventAt      pgtype.Timestamptz `json:"first_event_at"`
+	LastEventAt       pgtype.Timestamptz `json:"last_event_at"`
+}
+
+// Live throughput from immutable status transitions, bucketed in UTC for the
+// recent operational window. The latest transition per issue determines its
+// current destination stage; event_count includes every transition in the
+// window so bursts remain visible.
+func (q *Queries) GetWorkspaceThroughputDaily(ctx context.Context, workspaceID pgtype.UUID) (GetWorkspaceThroughputDailyRow, error) {
+	row := q.db.QueryRow(ctx, getWorkspaceThroughputDaily, workspaceID)
+	var i GetWorkspaceThroughputDailyRow
+	err := row.Scan(
+		&i.ChangedIssueCount,
+		&i.EventCount,
+		&i.FirstEventAt,
+		&i.LastEventAt,
+	)
+	return i, err
+}
+
 const hasActiveTaskForIssue = `-- name: HasActiveTaskForIssue :one
 SELECT count(*) > 0 AS has_active FROM agent_task_queue
 WHERE issue_id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory')
@@ -4968,55 +5003,82 @@ func (q *Queries) ListWorkspaceAgentTaskSnapshot(ctx context.Context, workspaceI
 	return items, nil
 }
 
+const listWorkspaceStageCounts = `-- name: ListWorkspaceStageCounts :many
+SELECT
+  relay_stage_config.stage_name,
+  COUNT(issue.id)::int AS ticket_count
+FROM relay_stage_config
+LEFT JOIN issue ON issue.status = relay_stage_config.stage_name
+GROUP BY relay_stage_config.id, relay_stage_config.stage_name
+ORDER BY relay_stage_config.id
+`
+
+type ListWorkspaceStageCountsRow struct {
+	StageName   string `json:"stage_name"`
+	TicketCount int32  `json:"ticket_count"`
+}
+
+// Current ticket totals by configured relay stage. Configured stages with no
+// tickets are retained as zero rows.
+func (q *Queries) ListWorkspaceStageCounts(ctx context.Context) ([]ListWorkspaceStageCountsRow, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceStageCounts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWorkspaceStageCountsRow{}
+	for rows.Next() {
+		var i ListWorkspaceStageCountsRow
+		if err := rows.Scan(&i.StageName, &i.TicketCount); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkspaceWorkingAgents = `-- name: ListWorkspaceWorkingAgents :many
 SELECT
   a.id,
   a.name,
   a.avatar_url,
-  COUNT(*)::int AS running_task_count,
+  COUNT(i.id)::int AS running_task_count,
   COALESCE(
-    ARRAY_AGG(DISTINCT atq.issue_id ORDER BY atq.issue_id)
-      FILTER (WHERE atq.issue_id IS NOT NULL),
+    ARRAY_AGG(DISTINCT i.id ORDER BY i.id),
     ARRAY[]::uuid[]
   )::uuid[] AS issue_ids
 FROM agent a
-JOIN agent_task_queue atq ON atq.agent_id = a.id
+JOIN issue i ON
+  i.assignee_type = 'agent'
+  AND i.assignee_id = a.id
+  AND i.workspace_id = a.workspace_id
+  AND lower(i.status) = 'in_progress'
 WHERE a.workspace_id = $1
   AND a.kind = 'user'
   AND a.archived_at IS NULL
-  AND atq.status = 'running'
   AND (
     $2::text = ''
-    OR ($2::text = 'chat' AND atq.chat_session_id IS NOT NULL)
-    OR (
-      $2::text = 'autopilot'
-      AND atq.chat_session_id IS NULL
-      AND atq.autopilot_run_id IS NOT NULL
-    )
-    OR (
-      $2::text = 'issue'
-      AND atq.chat_session_id IS NULL
-      AND atq.autopilot_run_id IS NULL
-      AND atq.issue_id IS NOT NULL
-    )
+    OR $2::text IN ('issue', 'autopilot', 'chat')
   )
   AND (
     $3::text = ''
     OR EXISTS (
       SELECT 1
-      FROM issue i
-      WHERE i.id = atq.issue_id
-        AND i.workspace_id = a.workspace_id
+      FROM issue member_issue
+      WHERE member_issue.id = i.id
         AND (
           (
             $3::text IN ('assigned', 'any')
-            AND i.assignee_type = 'member'
-            AND i.assignee_id = $4::uuid
+            AND member_issue.assignee_type = 'member'
+            AND member_issue.assignee_id = $4::uuid
           )
           OR (
             $3::text IN ('created', 'any')
-            AND i.creator_type = 'member'
-            AND i.creator_id = $4::uuid
+            AND member_issue.creator_type = 'member'
+            AND member_issue.creator_id = $4::uuid
           )
           OR (
             $3::text IN ('involved', 'any')
@@ -5026,7 +5088,7 @@ WHERE a.workspace_id = $1
                 AND EXISTS (
                   SELECT 1
                   FROM agent owned_agent
-                  WHERE owned_agent.id = i.assignee_id
+                  WHERE owned_agent.id = member_issue.assignee_id
                     AND owned_agent.workspace_id = a.workspace_id
                     AND owned_agent.owner_id = $4::uuid
                 )
@@ -5036,7 +5098,7 @@ WHERE a.workspace_id = $1
                 AND EXISTS (
                   SELECT 1
                   FROM squad s
-                  WHERE s.id = i.assignee_id
+                  WHERE s.id = member_issue.assignee_id
                     AND s.workspace_id = a.workspace_id
                     AND (
                       EXISTS (
@@ -5075,7 +5137,7 @@ WHERE a.workspace_id = $1
     OR EXISTS (
       SELECT 1
       FROM issue child
-      WHERE child.id = atq.issue_id
+      WHERE child.id = i.id
         AND child.workspace_id = a.workspace_id
         AND child.parent_issue_id = $5::uuid
     )
@@ -5101,17 +5163,16 @@ type ListWorkspaceWorkingAgentsRow struct {
 }
 
 // Workspace-level source for consumers that show currently working agents.
-// One row per visible, user-authored agent with at least one task that has
-// actually started running. work_type is optional (empty = every source);
-// source-specific reads use the same precedence as computeTaskKind:
-// chat > autopilot > issue. "issue" intentionally groups direct and
-// comment-triggered issue work. Quick-create work is present only in the
-// unfiltered projection because it has no source FK yet. mine_relation is
-// optional (empty = workspace); when set it narrows issue work to the
-// authenticated member's My Issues relation. parent_issue_id is optional
-// (NULL = workspace); when set it narrows issue work to the direct children
-// of that issue, so an issue detail's sub-issue header reads the same
-// projection as the Issues list header instead of deriving its own count.
+// A working agent is a distinct, visible, user-authored agent currently
+// assigned to at least one In Progress ticket. This is the semantically
+// honest live claim surface: assignment represents claimed execution and
+// remains true while the ticket is In Progress even if a transient task row
+// is absent. running_task_count counts assigned In Progress tickets, not
+// concurrent processes. work_type remains accepted for API compatibility;
+// all supported values return this same ticket-backed projection because the
+// retired task queue no longer provides a safe source-specific split.
+// mine_relation optionally narrows to the authenticated member's My Issues
+// relation. parent_issue_id optionally narrows to direct children.
 func (q *Queries) ListWorkspaceWorkingAgents(ctx context.Context, arg ListWorkspaceWorkingAgentsParams) ([]ListWorkspaceWorkingAgentsRow, error) {
 	rows, err := q.db.Query(ctx, listWorkspaceWorkingAgents,
 		arg.WorkspaceID,

@@ -318,25 +318,31 @@ func TestIssueTableWorkingIssueProjectionMatchesTaskIssuesNotAssignees(t *testin
 	}
 
 	assignedOnlyIssueID := insertIssue(
-		"assigned to working agent but not being edited",
+		"assigned in progress to working agent",
 		finalNumber-2,
 		"agent",
 		workingAgentID,
 	)
 	editedIssueID := insertIssue(
-		"being edited by working agent but assigned to member",
+		"in progress assigned to another agent",
 		finalNumber-1,
 		"member",
 		testUserID,
 	)
 	otherAgentIssueID := insertIssue(
-		"being edited by another agent",
+		"second in progress ticket for working agent",
 		finalNumber,
 		"agent",
 		workingAgentID,
 	)
-	createHandlerTestTaskForAgentOnIssue(t, workingAgentID, editedIssueID)
-	createHandlerTestTaskForAgentOnIssue(t, otherAgentID, otherAgentIssueID)
+	if _, err := testPool.Exec(ctx, `
+		UPDATE issue
+		SET status = 'in_progress',
+		    assignee_type = 'agent', assignee_id = $2::uuid
+		WHERE id = ANY($1::uuid[])
+	`, []string{assignedOnlyIssueID, editedIssueID, otherAgentIssueID}, workingAgentID); err != nil {
+		t.Fatalf("mark issues in progress and assign: %v", err)
+	}
 
 	workingRecorder := httptest.NewRecorder()
 	testHandler.ListWorkspaceWorkingAgents(
@@ -396,21 +402,18 @@ func TestIssueTableWorkingIssueProjectionMatchesTaskIssuesNotAssignees(t *testin
 	}
 
 	response := listRows(workingIssueIDs)
-	if response.Total != 2 || len(response.Rows) != 2 {
-		t.Fatalf("working rows total=%d rows=%d, want two", response.Total, len(response.Rows))
+	if response.Total != 3 || len(response.Rows) != 3 {
+		t.Fatalf("working rows total=%d rows=%d, want three", response.Total, len(response.Rows))
 	}
 	gotIssueIDs := make(map[string]struct{}, len(response.Rows))
 	for _, row := range response.Rows {
 		gotIssueIDs[row.Issue.ID] = struct{}{}
 	}
-	if _, ok := gotIssueIDs[editedIssueID]; !ok {
-		t.Errorf("missing issue edited by selected working agent: %s", editedIssueID)
+	if _, ok := gotIssueIDs[assignedOnlyIssueID]; !ok {
+		t.Errorf("missing in-progress issue assigned to selected working agent: %s", assignedOnlyIssueID)
 	}
 	if _, ok := gotIssueIDs[otherAgentIssueID]; !ok {
-		t.Errorf("missing issue edited by other working agent: %s", otherAgentIssueID)
-	}
-	if _, ok := gotIssueIDs[assignedOnlyIssueID]; ok {
-		t.Errorf("included assigned-only issue without a running task: %s", assignedOnlyIssueID)
+		t.Errorf("missing second in-progress issue assigned to working agent: %s", otherAgentIssueID)
 	}
 
 	empty := listRows([]string{})

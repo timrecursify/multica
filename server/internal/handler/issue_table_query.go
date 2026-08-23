@@ -607,7 +607,7 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 	}
 
 	if spec.Filters.WorkingOnly {
-		where = append(where, "EXISTS (SELECT 1 FROM agent_task_queue atq WHERE atq.issue_id = i.id AND atq.status = 'running')")
+		where = append(where, "lower(i.status) = 'in_progress' AND i.assignee_type = 'agent'")
 	}
 	workingIssueIDs, ok := parseIssueTableUUIDList(w, spec.Filters.WorkingIssueIDs, "filters.working_issue_ids")
 	if !ok {
