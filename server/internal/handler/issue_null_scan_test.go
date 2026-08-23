@@ -8,9 +8,11 @@ import (
 	"testing"
 )
 
-// Historical imports may lack creator_type and number. Both list surfaces must
-// return the row rather than failing the whole response during pgx scanning.
-func TestIssueListsTolerateNullCreatorTypeAndNumber(t *testing.T) {
+// Historical imports may lack priority, creator_type, and number. Both list
+// surfaces must return the row rather than failing the whole response during
+// pgx scanning. Description and assignee_type are already nullable pgtype.Text
+// fields in the generated row, so they are exercised by this same fixture.
+func TestIssueListsTolerateNullScalarFields(t *testing.T) {
 	if testHandler == nil {
 		t.Skip("database not available")
 	}
@@ -18,8 +20,8 @@ func TestIssueListsTolerateNullCreatorTypeAndNumber(t *testing.T) {
 	ctx := context.Background()
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
-		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, 'null scan regression row', 'todo', 'none', NULL, $2, NULL)
+		INSERT INTO issue (workspace_id, title, description, status, priority, assignee_type, creator_type, creator_id, number)
+		VALUES ($1, 'null scan regression row', NULL, 'todo', NULL, NULL, NULL, $2, NULL)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("insert NULL regression row: %v", err)

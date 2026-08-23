@@ -372,6 +372,7 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 		var row scannedRow
 		// Keep historical NULL creator_type/number values from aborting the
 		// entire table response while the generated row model remains scalar.
+		var priority pgtype.Text
 		var creatorType pgtype.Text
 		var number pgtype.Int4
 		if err := rows.Scan(
@@ -380,7 +381,7 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 			&row.issue.Title,
 			&row.issue.Description,
 			&row.issue.Status,
-			&row.issue.Priority,
+			&priority,
 			&row.issue.AssigneeType,
 			&row.issue.AssigneeID,
 			&creatorType,
@@ -402,6 +403,9 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 			slog.Warn("ListIssueTableRows scan failed", append(logger.RequestAttrs(r), "error", err)...)
 			writeIssueTableQueryFailure(w, r, "failed to list table rows")
 			return
+		}
+		if priority.Valid {
+			row.issue.Priority = priority.String
 		}
 		if creatorType.Valid {
 			row.issue.CreatorType = creatorType.String

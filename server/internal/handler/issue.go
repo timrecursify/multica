@@ -1238,6 +1238,7 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 		// Legacy/imported rows can contain NULLs here even though the generated
 		// model fields are non-nullable Go values. Scan through nullable pgtype
 		// values so one bad historical row cannot make the entire board 500.
+		var priority pgtype.Text
 		var creatorType pgtype.Text
 		var number pgtype.Int4
 		if err := rows.Scan(
@@ -1246,7 +1247,7 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 			&row.Title,
 			&row.Description,
 			&row.Status,
-			&row.Priority,
+			&priority,
 			&row.AssigneeType,
 			&row.AssigneeID,
 			&creatorType,
@@ -1266,6 +1267,9 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 			slog.Warn("ListIssues scan failed", append(logger.RequestAttrs(r), "error", err)...)
 			writeError(w, http.StatusInternalServerError, "failed to list issues")
 			return
+		}
+		if priority.Valid {
+			row.Priority = priority.String
 		}
 		if creatorType.Valid {
 			row.CreatorType = creatorType.String
