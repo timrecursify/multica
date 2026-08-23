@@ -1235,6 +1235,11 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 	var issues []db.ListIssuesRow
 	for rows.Next() {
 		var row db.ListIssuesRow
+		// Legacy/imported rows can contain NULLs here even though the generated
+		// model fields are non-nullable Go values. Scan through nullable pgtype
+		// values so one bad historical row cannot make the entire board 500.
+		var creatorType pgtype.Text
+		var number pgtype.Int4
 		if err := rows.Scan(
 			&row.ID,
 			&row.WorkspaceID,
@@ -1244,7 +1249,7 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 			&row.Priority,
 			&row.AssigneeType,
 			&row.AssigneeID,
-			&row.CreatorType,
+			&creatorType,
 			&row.CreatorID,
 			&row.ParentIssueID,
 			&row.Position,
@@ -1252,15 +1257,21 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 			&row.DueDate,
 			&row.CreatedAt,
 			&row.UpdatedAt,
-			&row.Number,
+			&number,
 			&row.ProjectID,
 			&row.Metadata,
 			&row.Stage,
 			&row.Properties,
 		); err != nil {
-			slog.Warn("ListIssues scan failed", "error", err)
+			slog.Warn("ListIssues scan failed", append(logger.RequestAttrs(r), "error", err)...)
 			writeError(w, http.StatusInternalServerError, "failed to list issues")
 			return
+		}
+		if creatorType.Valid {
+			row.CreatorType = creatorType.String
+		}
+		if number.Valid {
+			row.Number = number.Int32
 		}
 		issues = append(issues, row)
 	}
