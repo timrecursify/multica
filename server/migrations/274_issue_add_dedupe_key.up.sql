@@ -1,0 +1,11 @@
+-- PPP-20833: add a nullable, strict dedupe key to issue.
+--
+-- Automated creators (sentinels, monitors, relay/daemon re-firing paths)
+-- pass a stable key (e.g. sentinel:<check>:<date>) so a repeated fire resolves
+-- to the existing ticket instead of minting a second one. The column is
+-- additive (nullable, no default) so existing rows and all existing insert
+-- paths are unaffected. The partial UNIQUE index lives in its own single-
+-- statement file because CREATE INDEX CONCURRENTLY cannot run in a transaction
+-- block. Zero-downtime: no table lock beyond the brief ACCESS EXCLUSIVE for the
+-- column add, which is standard for an additive column migration.
+ALTER TABLE issue ADD COLUMN dedupe_key TEXT;

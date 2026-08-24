@@ -651,6 +651,7 @@ type Issue struct {
 	Metadata           []byte             `json:"metadata"`
 	Stage              pgtype.Int4        `json:"stage"`
 	Properties         []byte             `json:"properties"`
+	DedupeKey          pgtype.Text        `json:"dedupe_key"`
 }
 
 type IssueDependency struct {

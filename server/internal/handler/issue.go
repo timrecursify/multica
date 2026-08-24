@@ -2440,6 +2440,16 @@ type CreateIssueRequest struct {
 	OriginType *string `json:"origin_type,omitempty"`
 	OriginID   *string `json:"origin_id,omitempty"`
 
+	// DedupeKey is a stable, caller-supplied idempotency key (PPP-20833).
+	// Automated creators (sentinels, monitors, relay/daemon re-firers) pass a
+	// key such as sentinel:<check>:<date>. When an OPEN issue in the same
+	// workspace already holds it, the create resolves to the existing ticket
+	// (HTTP 200 existing:true) instead of minting a new one.
+	DedupeKey string `json:"dedupe_key,omitempty"`
+	// FuzzyThreshold optionally overrides the default pg_trgm similarity
+	// threshold (0.6) for the fuzzy duplicate gate.
+	FuzzyThreshold *float64 `json:"fuzzy_threshold,omitempty"`
+
 	AllowDuplicate bool `json:"allow_duplicate,omitempty"`
 }
 
@@ -2660,6 +2670,13 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		AttachmentIDs:  attachmentIDs,
 		LabelIDs:       labelIDs,
 		AllowDuplicate: req.AllowDuplicate,
+		DedupeKey:      strings.TrimSpace(req.DedupeKey),
+		FuzzyThreshold: func() float64 {
+			if req.FuzzyThreshold != nil {
+				return *req.FuzzyThreshold
+			}
+			return 0
+		}(),
 	}, service.IssueCreateOpts{
 		ActorID:          actualCreatorID,
 		AnalyticsAgentID: analyticsAgentID,
@@ -2677,6 +2694,39 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 
+	if errors.Is(err, service.ErrFuzzyDuplicate) {
+		prefix := h.getIssuePrefix(r.Context(), wsUUID)
+		matches := make([]map[string]any, 0, len(res.FuzzyMatches))
+		for _, m := range res.FuzzyMatches {
+			existing := issueToResponse(m, prefix)
+			matches = append(matches, map[string]any{
+				"number": existing.Number,
+				"title":  existing.Title,
+				"status": existing.Status,
+				"id":     existing.ID,
+			})
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"code":    "fuzzy_duplicate_issues",
+			"error":   "Near-duplicate tickets already exist for this title. Refile with allow_duplicate=true to override.",
+			"matches": matches,
+		})
+		return
+	}
+	// Strict-key dedupe: the create resolved to an existing OPEN ticket
+	// carrying the same dedupe_key. This is HTTP 200 existing:true — a repeat
+	// fire resolves to the already-open ticket rather than creating a second
+	// one. Not a 409: the caller asked for an idempotent point-in-time snapshot,
+	// and the existing ticket satisfies it.
+	if err == nil && res.DedupeExisting != nil {
+		dup := *res.DedupeExisting
+		existing := issueToResponse(dup, h.getIssuePrefix(r.Context(), dup.WorkspaceID))
+		writeJSON(w, http.StatusOK, map[string]any{
+			"existing": true,
+			"issue":    existing,
+		})
+		return
+	}
 	if errors.Is(err, service.ErrActiveDuplicate) {
 		dup := *res.DuplicateIssue
 		existing := issueToResponse(dup, h.getIssuePrefix(r.Context(), dup.WorkspaceID))
