@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/events"
@@ -408,6 +409,27 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		})
 	}
 	if err != nil {
+		// Concurrent same-key creates: the partial unique index
+		// uq_issue_workspace_dedupe_key_open rejects our INSERT with 23505 when
+		// another writer committed the same dedupe_key between our fast-path
+		// lookup above and this insert. That is not a create failure — the caller
+		// asked for an idempotent key, the existing ticket satisfies it. Resolve
+		// the winning row in a fresh transaction and return HTTP 200 existing:true
+		// rather than leaking the constraint as a 500.
+		if p.DedupeKey != "" && isDedupeKeyUniqueViolation(err) {
+			resolved, rErr := s.resolveDedupeWinner(ctx, p)
+			if rErr != nil {
+				slog.Warn("dedupe_key unique violation but winner unresolvable",
+					"workspace_id", util.UUIDToString(p.WorkspaceID),
+					"dedupe_key", p.DedupeKey,
+					"resolve_error", rErr,
+					"original_error", err)
+				// Fall through: surface the original constraint error rather than
+				// reporting a fabricated failure.
+				return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
+			}
+			return IssueCreateResult{DedupeExisting: resolved}, nil
+		}
 		return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
 	}
 
@@ -793,6 +815,49 @@ func textOrNull(s string) pgtype.Text {
 		return pgtype.Text{}
 	}
 	return pgtype.Text{String: s, Valid: true}
+}
+
+// isDedupeKeyUniqueViolation reports whether err is the 23505 unique-index
+// violation raised by uq_issue_workspace_dedupe_key_open when a concurrent
+// create committed the same dedupe_key first. Only this constraint is a
+// resolve-to-existing outcome; a 23505 from any other index (e.g. the number
+// invariant or a different unique constraint) is a genuine failure and must
+// surface as such. The constraint name is matched exactly so a future rename
+// fails loudly during the rolling deploy rather than silently mis-resolving.
+func isDedupeKeyUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "23505" && pgErr.ConstraintName == "uq_issue_workspace_dedupe_key_open"
+}
+
+// resolveDedupeWinner re-reads the winning OPEN ticket for a dedupe_key after
+// a concurrent same-key create won the unique-index race. The caller's original
+// transaction is aborted (its INSERT raised 23505), so this runs in a fresh
+// transaction and returns the committed row the caller should respond with
+// (HTTP 200 existing:true). Returns an error only if the winner cannot be found
+// — a truly unexpected state that must not be reported as a fabricated success.
+func (s *IssueService) resolveDedupeWinner(ctx context.Context, p IssueCreateParams) (*db.Issue, error) {
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin resolve tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.Queries.WithTx(tx)
+
+	existing, err := qtx.FindIssueByDedupeKey(ctx, db.FindIssueByDedupeKeyParams{
+		WorkspaceID: p.WorkspaceID,
+		DedupeKey:   textOrNull(p.DedupeKey),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dedupe winner lookup: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit resolve tx: %w", err)
+	}
+	dup := existing
+	return &dup, nil
 }
 
 // logDuplicateOverride records that a create proceeded despite the fuzzy
