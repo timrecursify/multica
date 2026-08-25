@@ -2,12 +2,15 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/events"
@@ -75,6 +78,21 @@ type IssueCreateParams struct {
 	// ErrIssueLabelNotFound rather than being silently dropped.
 	LabelIDs       []pgtype.UUID
 	AllowDuplicate bool
+	// DedupeKey is a stable, caller-supplied key (e.g. sentinel:<check>:<date>)
+	// used for strict idempotency (PPP-20833). When non-empty and an OPEN issue
+	// in the same workspace already holds this exact key, Create returns the
+	// existing issue (DedupeExisting) instead of inserting a new one. This is a
+	// "return the existing ticket" outcome, not a rejection — the caller renders
+	// HTTP 200 existing:true. The partial unique index
+	// uq_issue_workspace_dedupe_key_open races any concurrent writer to the same
+	// key and this lookup gives the fast path.
+	DedupeKey string
+	// FuzzyThreshold is the minimum pg_trgm title similarity for the fuzzy
+	// duplicate gate. Zero uses the default (0.6). When fuzzy matches exist and
+	// AllowDuplicate is false the create is rejected with ErrFuzzyDuplicate and
+	// the matches listed; when AllowDuplicate is true the override is recorded in
+	// activity_log and the create proceeds.
+	FuzzyThreshold float64
 	// Stage groups this issue into an ordered barrier group under its parent
 	// (NULL = unstaged). See issue_child_done.go for the staged-barrier wake.
 	Stage pgtype.Int4
@@ -121,12 +139,26 @@ type IssueCreateOpts struct {
 	AssignedAgentRunFireAt time.Time
 }
 
+// defaultFuzzyDuplicateThreshold is the minimum pg_trgm title similarity for
+// the PPP-20833 fuzzy duplicate gate. Tuned so a re-file with a slightly
+// different title (the classic duplicate) is caught (>= 0.6) while distinct
+// tickets stay unaffected.
+const defaultFuzzyDuplicateThreshold = 0.6
+
 // ErrActiveDuplicate signals that the duplicate guard found an active
 // issue with the same (workspace, project, parent, title) tuple and
 // AllowDuplicate was false. The IssueCreateResult.DuplicateIssue field is
 // populated when this error is returned so callers can render the
 // conflict (HTTP 409, Lark card, etc.).
 var ErrActiveDuplicate = errors.New("active duplicate issue exists")
+
+// ErrFuzzyDuplicate signals that the fuzzy gate (PPP-20833) found at least one
+// OPEN issue in the same workspace whose title is a near-match (pg_trgm
+// similarity >= threshold, default 0.6) and AllowDuplicate was false. The
+// IssueCreateResult.FuzzyMatches field lists every match so the caller can
+// render the HTTP 409 with numbers + titles. Unlike ErrActiveDuplicate (a
+// strict normalized-title match), this admits fuzzy near-duplicates.
+var ErrFuzzyDuplicate = errors.New("fuzzy duplicate issues exist")
 
 // ErrParentIssueNotFound signals that the supplied ParentIssueID does
 // not exist in the issue's workspace. The service refuses to create
@@ -166,6 +198,16 @@ type IssueCreateResult struct {
 	// understood label_ids (see the create handler's compatibility contract).
 	Labels         []db.IssueLabel
 	DuplicateIssue *db.Issue
+	// DedupeExisting is populated (with Err==nil) on the PRP-20833 strict-key
+	// path when the caller supplied a dedupe_key already held by an OPEN issue
+	// in the workspace. Callers render this as HTTP 200 existing:true with the
+	// existing ticket — a repeat fire resolves, it does not create.
+	DedupeExisting *db.Issue
+	// FuzzyMatches lists OPEN near-duplicate-titled issues found by the fuzzy
+	// gate. Populated either on ErrFuzzyDuplicate (caller renders HTTP 409 with
+	// the match list) or alongside a successful create when AllowDuplicate
+	// overrode the gate (caller may note the override in logs/telemetry).
+	FuzzyMatches []db.Issue
 }
 
 // Create runs the full issue-creation pipeline atomically end-to-end:
@@ -238,6 +280,61 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 		return IssueCreateResult{}, err
 	}
 
+	// PPP-20833 strict-key dedupe. A stable dedupe_key from an automated
+	// creator (sentinel/monitor/relay) resolves to the existing OPEN issue in
+	// this workspace instead of minting a second ticket. This is an idempotent
+	// "return the existing ticket" outcome (HTTP 200 existing:true), not a 409
+	// rejection. The partial unique index uq_issue_workspace_dedupe_key_open
+	// enforces key uniqueness at insert time against a concurrent writer; this
+	// lookup is the fast path. Terminal rows are excluded so a resolved ticket
+	// never re-blocks the same key firing again later.
+	if p.DedupeKey != "" {
+		existing, dkErr := qtx.FindIssueByDedupeKey(ctx, db.FindIssueByDedupeKeyParams{
+			WorkspaceID: p.WorkspaceID,
+			DedupeKey:   textOrNull(p.DedupeKey),
+		})
+		if dkErr != nil && !errors.Is(dkErr, pgx.ErrNoRows) {
+			return IssueCreateResult{}, fmt.Errorf("dedupe key lookup: %w", dkErr)
+		}
+		if dkErr == nil {
+			slog.Info("issue create resolved to existing dedupe_key",
+				"issue_id", util.UUIDToString(existing.ID),
+				"dedupe_key", p.DedupeKey,
+				"workspace_id", util.UUIDToString(p.WorkspaceID))
+			dup := existing
+			return IssueCreateResult{DedupeExisting: &dup}, nil
+		}
+	}
+
+	// PPP-20833 fuzzy gate. Compares the title against OPEN issues in the same
+	// workspace via pg_trgm similarity (threshold default 0.6). Any match is a
+	// probable duplicate ("slightly different title" re-file). When matches
+	// exist and AllowDuplicate is false the create is rejected with a full match
+	// list (HTTP 409); when AllowDuplicate is true the override is recorded in
+	// activity_log and the create proceeds, carrying the matches for telemetry.
+	threshold := p.FuzzyThreshold
+	if threshold <= 0 {
+		threshold = defaultFuzzyDuplicateThreshold
+	}
+	nearTitle := strings.ToLower(issueguard.NormalizeTitle(p.Title))
+	fuzzyMatches, fErr := qtx.FindFuzzyDuplicateIssues(ctx, db.FindFuzzyDuplicateIssuesParams{
+		WorkspaceID:   p.WorkspaceID,
+		Lower:         nearTitle,
+		MinSimilarity: threshold,
+	})
+	if fErr != nil {
+		return IssueCreateResult{}, fmt.Errorf("fuzzy duplicate gate: %w", fErr)
+	}
+	if len(fuzzyMatches) > 0 {
+		if !p.AllowDuplicate {
+			return IssueCreateResult{FuzzyMatches: fuzzyMatches}, ErrFuzzyDuplicate
+		}
+		// allow_duplicate=true: record the fuzzy override, then proceed.
+		if err := logDuplicateOverride(ctx, qtx, p, fuzzyMatches, threshold); err != nil {
+			return IssueCreateResult{}, fmt.Errorf("log duplicate override: %w", err)
+		}
+	}
+
 	duplicate, found, err := issueguard.LockAndFindActiveDuplicate(ctx, qtx, p.WorkspaceID, projectID, p.ParentIssueID, p.Title, p.AllowDuplicate)
 	if err != nil {
 		return IssueCreateResult{}, fmt.Errorf("duplicate guard: %w", err)
@@ -288,6 +385,7 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			OriginType:    p.OriginType,
 			OriginID:      p.OriginID,
 			Stage:         p.Stage,
+			DedupeKey:     textOrNull(p.DedupeKey),
 		})
 	} else {
 		issue, err = qtx.CreateIssue(ctx, db.CreateIssueParams{
@@ -307,9 +405,31 @@ func (s *IssueService) Create(ctx context.Context, p IssueCreateParams, opts Iss
 			Number:        issueNumber,
 			ProjectID:     projectID,
 			Stage:         p.Stage,
+			DedupeKey:     textOrNull(p.DedupeKey),
 		})
 	}
 	if err != nil {
+		// Concurrent same-key creates: the partial unique index
+		// uq_issue_workspace_dedupe_key_open rejects our INSERT with 23505 when
+		// another writer committed the same dedupe_key between our fast-path
+		// lookup above and this insert. That is not a create failure — the caller
+		// asked for an idempotent key, the existing ticket satisfies it. Resolve
+		// the winning row in a fresh transaction and return HTTP 200 existing:true
+		// rather than leaking the constraint as a 500.
+		if p.DedupeKey != "" && isDedupeKeyUniqueViolation(err) {
+			resolved, rErr := s.resolveDedupeWinner(ctx, p)
+			if rErr != nil {
+				slog.Warn("dedupe_key unique violation but winner unresolvable",
+					"workspace_id", util.UUIDToString(p.WorkspaceID),
+					"dedupe_key", p.DedupeKey,
+					"resolve_error", rErr,
+					"original_error", err)
+				// Fall through: surface the original constraint error rather than
+				// reporting a fabricated failure.
+				return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
+			}
+			return IssueCreateResult{DedupeExisting: resolved}, nil
+		}
 		return IssueCreateResult{}, fmt.Errorf("create issue: %w", err)
 	}
 
@@ -684,4 +804,104 @@ func (s *IssueService) enqueueSquadLeaderTask(ctx context.Context, issue db.Issu
 			"leader_id", util.UUIDToString(squad.LeaderID),
 			"error", err)
 	}
+}
+
+// textOrNull converts a Go string into a pgtype.Text, returning an invalid
+// (NULL) value when s is empty. The dedupe_key column is nullable and only
+// participates in the strict-dedupe index when non-NULL, so an empty key maps
+// to NULL rather than to a real (and index-negated) empty string.
+func textOrNull(s string) pgtype.Text {
+	if s == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: s, Valid: true}
+}
+
+// isDedupeKeyUniqueViolation reports whether err is the 23505 unique-index
+// violation raised by uq_issue_workspace_dedupe_key_open when a concurrent
+// create committed the same dedupe_key first. Only this constraint is a
+// resolve-to-existing outcome; a 23505 from any other index (e.g. the number
+// invariant or a different unique constraint) is a genuine failure and must
+// surface as such. The constraint name is matched exactly so a future rename
+// fails loudly during the rolling deploy rather than silently mis-resolving.
+func isDedupeKeyUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "23505" && pgErr.ConstraintName == "uq_issue_workspace_dedupe_key_open"
+}
+
+// resolveDedupeWinner re-reads the winning OPEN ticket for a dedupe_key after
+// a concurrent same-key create won the unique-index race. The caller's original
+// transaction is aborted (its INSERT raised 23505), so this runs in a fresh
+// transaction and returns the committed row the caller should respond with
+// (HTTP 200 existing:true). Returns an error only if the winner cannot be found
+// — a truly unexpected state that must not be reported as a fabricated success.
+func (s *IssueService) resolveDedupeWinner(ctx context.Context, p IssueCreateParams) (*db.Issue, error) {
+	tx, err := s.TxStarter.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin resolve tx: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	qtx := s.Queries.WithTx(tx)
+
+	existing, err := qtx.FindIssueByDedupeKey(ctx, db.FindIssueByDedupeKeyParams{
+		WorkspaceID: p.WorkspaceID,
+		DedupeKey:   textOrNull(p.DedupeKey),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("dedupe winner lookup: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit resolve tx: %w", err)
+	}
+	dup := existing
+	return &dup, nil
+}
+
+// logDuplicateOverride records that a create proceeded despite the fuzzy
+// gate because allow_duplicate=true (PPP-20833). The audit row names the title
+// deduped on, the similarity threshold, and every matched existing ticket so a
+// reviewer can reconstruct why the duplicate was permitted. Runs inside the
+// create transaction so a failed audit row aborts the create rather than
+// silently allowing an unlogged override.
+func logDuplicateOverride(ctx context.Context, qtx *db.Queries, p IssueCreateParams, matches []db.Issue, threshold float64) error {
+	type match struct {
+		IssueID string `json:"issue_id"`
+		Number  int32  `json:"number"`
+		Status  string `json:"status"`
+		Title   string `json:"title"`
+	}
+	payload := struct {
+		Title     string  `json:"title"`
+		Threshold float64 `json:"threshold"`
+		Matches   []match `json:"matches"`
+	}{
+		Title:     p.Title,
+		Threshold: threshold,
+		Matches:   make([]match, 0, len(matches)),
+	}
+	for _, m := range matches {
+		payload.Matches = append(payload.Matches, match{
+			IssueID: util.UUIDToString(m.ID),
+			Number:  m.Number,
+			Status:  m.Status,
+			Title:   m.Title,
+		})
+	}
+	detailsJSON, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	_, err = qtx.CreateActivity(ctx, db.CreateActivityParams{
+		WorkspaceID: p.WorkspaceID,
+		// issue_id is nullable; the new ticket does not exist yet, so the row is
+		// logged with NULL. The matched existing ticket numbers carry the audit trail.
+		ActorType: pgtype.Text{String: p.CreatorType, Valid: p.CreatorType != ""},
+		ActorID:   p.CreatorID,
+		Action:    "duplicate_fuzzy_override",
+		Details:   detailsJSON,
+	})
+	return err
 }

@@ -129,10 +129,10 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
-    stage
+    stage, dedupe_key
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    sqlc.narg('stage')
+    sqlc.narg('stage'), sqlc.narg('dedupe_key')
 ) RETURNING *;
 
 -- name: GetIssueByNumber :one
@@ -170,10 +170,10 @@ INSERT INTO issue (
     workspace_id, title, description, status, priority,
     assignee_type, assignee_id, creator_type, creator_id,
     parent_issue_id, position, start_date, due_date, number, project_id,
-    origin_type, origin_id, stage
+    origin_type, origin_id, stage, dedupe_key
 ) VALUES (
     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-    sqlc.narg('origin_type'), sqlc.narg('origin_id'), sqlc.narg('stage')
+    sqlc.narg('origin_type'), sqlc.narg('origin_id'), sqlc.narg('stage'), sqlc.narg('dedupe_key')
 ) RETURNING *;
 
 -- name: LockIssueDuplicateKey :exec
@@ -207,6 +207,40 @@ WHERE i.workspace_id = $1
   )
 ORDER BY i.created_at ASC
 LIMIT 1;
+
+-- name: FindIssueByDedupeKey :one
+-- PPP-20833: strict-key dedupe. Returns an OPEN issue in the same workspace
+-- that already holds the exact dedupe_key. Terminal rows (both capital and
+-- lowercase casings, plus Archived) are excluded so a resolved ticket never
+-- re-blocks the same key firing again. The partial unique index
+-- uq_issue_workspace_dedupe_key_open enforces this at insert time; this lookup
+-- gives the create path a cheap fast path to return the existing ticket
+-- (HTTP 200 existing:true) instead of inserting.
+SELECT * FROM issue
+WHERE workspace_id = $1
+  AND dedupe_key = $2
+  AND status NOT IN ('Done', 'done', 'Cancelled', 'cancelled', 'Archived')
+ORDER BY created_at ASC
+LIMIT 1;
+
+-- name: FindFuzzyDuplicateIssues :many
+-- PPP-20833: fuzzy gate. Compares a normalized title against OPEN issues in
+-- the same workspace using pg_trgm similarity. Any row whose similarity is at
+-- or above @min_similarity is returned (ordered strongest first, then oldest)
+-- so the create path can reject with 409 and list every probable duplicate.
+SELECT * FROM issue
+WHERE workspace_id = $1
+  AND status NOT IN ('Done', 'done', 'Cancelled', 'cancelled', 'Archived')
+  AND similarity(
+        lower(btrim(regexp_replace(title, '[[:space:]]+', ' ', 'g'))),
+        lower($2)
+      ) >= @min_similarity
+ORDER BY
+  similarity(
+    lower(btrim(regexp_replace(title, '[[:space:]]+', ' ', 'g'))),
+    lower($2)
+  ) DESC,
+  created_at ASC;
 
 -- name: DeleteIssue :exec
 -- Defense-in-depth: the workspace_id predicate makes the tenant invariant a
