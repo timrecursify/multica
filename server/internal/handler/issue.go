@@ -1146,6 +1146,16 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		}
 		where = append(where, fmt.Sprintf("i.id = ANY(%s::uuid[])", addArg(idsFilter)))
 	}
+	// number resolves a single issue by its human-facing number so clients can
+	// map NUMBER -> UUID with one request instead of paging the whole board.
+	if n := r.URL.Query().Get("number"); n != "" {
+		v, err := strconv.Atoi(n)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid number")
+			return
+		}
+		where = append(where, fmt.Sprintf("i.number = %s::int", addArg(int32(v))))
+	}
 	if r.URL.Query().Get("top_level_only") == "true" {
 		where = append(where, "i.parent_issue_id IS NULL")
 	}
