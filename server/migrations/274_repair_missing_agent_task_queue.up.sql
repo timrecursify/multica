@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS agent_task_queue (
     autopilot_run_id uuid REFERENCES autopilot_run(id) ON DELETE SET NULL,
     attempt integer NOT NULL DEFAULT 1,
     max_attempts integer NOT NULL DEFAULT 2,
-    parent_task_id uuid,
+    parent_task_id uuid REFERENCES agent_task_queue(id) ON DELETE SET NULL,
     failure_reason text,
     trigger_summary text,
     force_fresh_session boolean NOT NULL DEFAULT false,
