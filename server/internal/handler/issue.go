@@ -77,7 +77,13 @@ type IssueResponse struct {
 // the issue table. Write handlers pre-validate these so callers get a clean
 // 400 with the allowed values instead of a database CHECK violation bubbling
 // up as a 500.
-var validIssueStatuses = []string{"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"}
+var validIssueStatuses = []string{
+	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	// PPP fork workflow statuses. issue.status has no CHECK constraint in this
+	// fork; these are the live values the conveyor writes.
+	"Queue", "Spec", "Building", "QC", "In Review", "In Progress",
+	"Human Review", "Done", "Blocked", "Cancelled", "Archived", "dead_letter",
+}
 var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {
