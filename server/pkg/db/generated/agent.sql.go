@@ -2850,6 +2850,158 @@ func (q *Queries) FailAgentTask(ctx context.Context, arg FailAgentTaskParams) (A
 	return i, err
 }
 
+const failOrphanedAgentTask = `-- name: FailOrphanedAgentTask :one
+WITH prev AS (
+    SELECT status FROM agent_task_queue aq WHERE aq.id = $1
+),
+updated AS (
+    UPDATE agent_task_queue
+    SET status = 'failed',
+        completed_at = now(),
+        error = $2::text,
+        failure_reason = $3::text,
+        prepare_lease_expires_at = NULL,
+        wait_reason = NULL
+    WHERE id = $1
+      AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+    RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, daemon_id
+)
+SELECT u.id, u.agent_id, u.issue_id, u.status, u.priority, u.dispatched_at, u.started_at, u.completed_at, u.result, u.error, u.created_at, u.context, u.runtime_id, u.session_id, u.work_dir, u.trigger_comment_id, u.chat_session_id, u.autopilot_run_id, u.attempt, u.max_attempts, u.parent_task_id, u.failure_reason, u.trigger_summary, u.force_fresh_session, u.is_leader_task, u.wait_reason, u.initiator_user_id, u.handoff_note, u.prepare_lease_expires_at, u.squad_id, u.runtime_mcp_overlay, u.escalation_for_task_id, u.fire_at, u.originator_user_id, u.runtime_connected_apps, u.coalesced_comment_ids, u.delivered_comment_ids, u.chat_input_task_id, u.chat_finalize_deferred_at, u.originator_source, u.delegated_from_task_id, u.retry_of_task_id, u.rerun_of_task_id, u.rule_version_id, u.trigger_evidence_kind, u.trigger_evidence_ref_id, u.accountable_user_id, u.session_rollout_missing, u.retired_session_id, u.quick_actions_disabled, u.regenerate_quick_actions_for, u.daemon_id, p.status AS previous_status
+FROM updated u, prev p
+`
+
+type FailOrphanedAgentTaskParams struct {
+	TaskID        pgtype.UUID `json:"task_id"`
+	Error         string      `json:"error"`
+	FailureReason string      `json:"failure_reason"`
+}
+
+type FailOrphanedAgentTaskRow struct {
+	ID                        pgtype.UUID        `json:"id"`
+	AgentID                   pgtype.UUID        `json:"agent_id"`
+	IssueID                   pgtype.UUID        `json:"issue_id"`
+	Status                    string             `json:"status"`
+	Priority                  int32              `json:"priority"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	Result                    []byte             `json:"result"`
+	Error                     pgtype.Text        `json:"error"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	Context                   []byte             `json:"context"`
+	RuntimeID                 pgtype.UUID        `json:"runtime_id"`
+	SessionID                 pgtype.Text        `json:"session_id"`
+	WorkDir                   pgtype.Text        `json:"work_dir"`
+	TriggerCommentID          pgtype.UUID        `json:"trigger_comment_id"`
+	ChatSessionID             pgtype.UUID        `json:"chat_session_id"`
+	AutopilotRunID            pgtype.UUID        `json:"autopilot_run_id"`
+	Attempt                   int32              `json:"attempt"`
+	MaxAttempts               int32              `json:"max_attempts"`
+	ParentTaskID              pgtype.UUID        `json:"parent_task_id"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	TriggerSummary            pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession         bool               `json:"force_fresh_session"`
+	IsLeaderTask              bool               `json:"is_leader_task"`
+	WaitReason                pgtype.Text        `json:"wait_reason"`
+	InitiatorUserID           pgtype.UUID        `json:"initiator_user_id"`
+	HandoffNote               pgtype.Text        `json:"handoff_note"`
+	PrepareLeaseExpiresAt     pgtype.Timestamptz `json:"prepare_lease_expires_at"`
+	SquadID                   pgtype.UUID        `json:"squad_id"`
+	RuntimeMcpOverlay         []byte             `json:"runtime_mcp_overlay"`
+	EscalationForTaskID       pgtype.UUID        `json:"escalation_for_task_id"`
+	FireAt                    pgtype.Timestamptz `json:"fire_at"`
+	OriginatorUserID          pgtype.UUID        `json:"originator_user_id"`
+	RuntimeConnectedApps      []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds       []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds       []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID           pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt    pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	OriginatorSource          pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID       pgtype.UUID        `json:"delegated_from_task_id"`
+	RetryOfTaskID             pgtype.UUID        `json:"retry_of_task_id"`
+	RerunOfTaskID             pgtype.UUID        `json:"rerun_of_task_id"`
+	RuleVersionID             pgtype.UUID        `json:"rule_version_id"`
+	TriggerEvidenceKind       pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID      pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	DaemonID                  pgtype.Text        `json:"daemon_id"`
+	PreviousStatus            string             `json:"previous_status"`
+}
+
+// Manual operator repair (PPP-21291): mark ONE non-terminal task failed
+// WITHOUT the auto-retry / chat-session / issue side effects of FailAgentTask
+// (that path may create a retry child inside the failure transaction). The
+// status predicate is a compare-and-swap: zero rows means the task is already
+// terminal (or gone), and the caller reports a conflict instead of inventing a
+// transition. failure_reason uses the dedicated platform-side value
+// 'operator_orphan_repair' so the row can never be misread as an agent_error.*
+// or retryable reason. The active lease is cleared; runtime provenance is
+// kept for audit.
+func (q *Queries) FailOrphanedAgentTask(ctx context.Context, arg FailOrphanedAgentTaskParams) (FailOrphanedAgentTaskRow, error) {
+	row := q.db.QueryRow(ctx, failOrphanedAgentTask, arg.TaskID, arg.Error, arg.FailureReason)
+	var i FailOrphanedAgentTaskRow
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+		&i.ChatSessionID,
+		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
+		&i.IsLeaderTask,
+		&i.WaitReason,
+		&i.InitiatorUserID,
+		&i.HandoffNote,
+		&i.PrepareLeaseExpiresAt,
+		&i.SquadID,
+		&i.RuntimeMcpOverlay,
+		&i.EscalationForTaskID,
+		&i.FireAt,
+		&i.OriginatorUserID,
+		&i.RuntimeConnectedApps,
+		&i.CoalescedCommentIds,
+		&i.DeliveredCommentIds,
+		&i.ChatInputTaskID,
+		&i.ChatFinalizeDeferredAt,
+		&i.OriginatorSource,
+		&i.DelegatedFromTaskID,
+		&i.RetryOfTaskID,
+		&i.RerunOfTaskID,
+		&i.RuleVersionID,
+		&i.TriggerEvidenceKind,
+		&i.TriggerEvidenceRefID,
+		&i.AccountableUserID,
+		&i.SessionRolloutMissing,
+		&i.RetiredSessionID,
+		&i.QuickActionsDisabled,
+		&i.RegenerateQuickActionsFor,
+		&i.DaemonID,
+		&i.PreviousStatus,
+	)
+	return i, err
+}
+
 const failStaleTasks = `-- name: FailStaleTasks :many
 UPDATE agent_task_queue
 SET status = 'failed', completed_at = now(), error = 'task timed out',
@@ -4745,6 +4897,97 @@ func (q *Queries) ListQueuedClaimCandidatesByRuntimes(ctx context.Context, arg L
 	return items, nil
 }
 
+const listRepairableAgentTasks = `-- name: ListRepairableAgentTasks :many
+SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at,
+       completed_at, error, created_at, runtime_id, attempt, max_attempts,
+       failure_reason, daemon_id
+FROM agent_task_queue
+WHERE ($1::text IS NULL OR status = $1::text)
+  AND ($2::text IS NULL OR daemon_id = $2::text)
+  AND ($3::timestamptz IS NULL
+       OR COALESCE(started_at, dispatched_at, created_at) <= $3::timestamptz)
+ORDER BY COALESCE(started_at, dispatched_at, created_at) ASC, id ASC
+LIMIT $4::integer
+`
+
+type ListRepairableAgentTasksParams struct {
+	Status    pgtype.Text        `json:"status"`
+	DaemonID  pgtype.Text        `json:"daemon_id"`
+	OlderThan pgtype.Timestamptz `json:"older_than"`
+	MaxRows   int32              `json:"max_rows"`
+}
+
+type ListRepairableAgentTasksRow struct {
+	ID            pgtype.UUID        `json:"id"`
+	AgentID       pgtype.UUID        `json:"agent_id"`
+	IssueID       pgtype.UUID        `json:"issue_id"`
+	Status        string             `json:"status"`
+	Priority      int32              `json:"priority"`
+	DispatchedAt  pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	CompletedAt   pgtype.Timestamptz `json:"completed_at"`
+	Error         pgtype.Text        `json:"error"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	RuntimeID     pgtype.UUID        `json:"runtime_id"`
+	Attempt       int32              `json:"attempt"`
+	MaxAttempts   int32              `json:"max_attempts"`
+	FailureReason pgtype.Text        `json:"failure_reason"`
+	DaemonID      pgtype.Text        `json:"daemon_id"`
+}
+
+// Operator repair surface (PPP-21291): incident-scale read over
+// agent_task_queue. Every filter is optional (NULL = no filter):
+//
+//	status      exact status match
+//	daemon_id   exact daemon lane match (migration 273 routing lane)
+//	older_than  server-side cutoff: tasks whose oldest effective activity
+//	            (COALESCE(started_at, dispatched_at, created_at)) is <= cutoff
+//	max_rows    hard cap so a sweep can never dump the whole table
+//
+// Ordered oldest activity first, then task id, so an operator sweep reads a
+// stable, deterministic window. Values are bound parameters, never
+// interpolated into the SQL text.
+func (q *Queries) ListRepairableAgentTasks(ctx context.Context, arg ListRepairableAgentTasksParams) ([]ListRepairableAgentTasksRow, error) {
+	rows, err := q.db.Query(ctx, listRepairableAgentTasks,
+		arg.Status,
+		arg.DaemonID,
+		arg.OlderThan,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRepairableAgentTasksRow{}
+	for rows.Next() {
+		var i ListRepairableAgentTasksRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.AgentID,
+			&i.IssueID,
+			&i.Status,
+			&i.Priority,
+			&i.DispatchedAt,
+			&i.StartedAt,
+			&i.CompletedAt,
+			&i.Error,
+			&i.CreatedAt,
+			&i.RuntimeID,
+			&i.Attempt,
+			&i.MaxAttempts,
+			&i.FailureReason,
+			&i.DaemonID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTasksByIssue = `-- name: ListTasksByIssue :many
 SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, daemon_id FROM agent_task_queue
 WHERE issue_id = $1
@@ -6353,6 +6596,154 @@ func (q *Queries) RequeueAgentTaskAfterClaimFailure(ctx context.Context, arg Req
 		&i.QuickActionsDisabled,
 		&i.RegenerateQuickActionsFor,
 		&i.DaemonID,
+	)
+	return i, err
+}
+
+const requeueOrphanedAgentTask = `-- name: RequeueOrphanedAgentTask :one
+WITH prev AS (
+    SELECT status FROM agent_task_queue aq WHERE aq.id = $1
+),
+updated AS (
+    UPDATE agent_task_queue
+    SET status = 'queued',
+        dispatched_at = NULL,
+        started_at = NULL,
+        prepare_lease_expires_at = NULL,
+        daemon_id = NULL,
+        delivered_comment_ids = '{}'
+    WHERE id = $1
+      AND status IN ('dispatched', 'running', 'waiting_local_directory')
+    RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, daemon_id
+)
+SELECT u.id, u.agent_id, u.issue_id, u.status, u.priority, u.dispatched_at, u.started_at, u.completed_at, u.result, u.error, u.created_at, u.context, u.runtime_id, u.session_id, u.work_dir, u.trigger_comment_id, u.chat_session_id, u.autopilot_run_id, u.attempt, u.max_attempts, u.parent_task_id, u.failure_reason, u.trigger_summary, u.force_fresh_session, u.is_leader_task, u.wait_reason, u.initiator_user_id, u.handoff_note, u.prepare_lease_expires_at, u.squad_id, u.runtime_mcp_overlay, u.escalation_for_task_id, u.fire_at, u.originator_user_id, u.runtime_connected_apps, u.coalesced_comment_ids, u.delivered_comment_ids, u.chat_input_task_id, u.chat_finalize_deferred_at, u.originator_source, u.delegated_from_task_id, u.retry_of_task_id, u.rerun_of_task_id, u.rule_version_id, u.trigger_evidence_kind, u.trigger_evidence_ref_id, u.accountable_user_id, u.session_rollout_missing, u.retired_session_id, u.quick_actions_disabled, u.regenerate_quick_actions_for, u.daemon_id, p.status AS previous_status
+FROM updated u, prev p
+`
+
+type RequeueOrphanedAgentTaskRow struct {
+	ID                        pgtype.UUID        `json:"id"`
+	AgentID                   pgtype.UUID        `json:"agent_id"`
+	IssueID                   pgtype.UUID        `json:"issue_id"`
+	Status                    string             `json:"status"`
+	Priority                  int32              `json:"priority"`
+	DispatchedAt              pgtype.Timestamptz `json:"dispatched_at"`
+	StartedAt                 pgtype.Timestamptz `json:"started_at"`
+	CompletedAt               pgtype.Timestamptz `json:"completed_at"`
+	Result                    []byte             `json:"result"`
+	Error                     pgtype.Text        `json:"error"`
+	CreatedAt                 pgtype.Timestamptz `json:"created_at"`
+	Context                   []byte             `json:"context"`
+	RuntimeID                 pgtype.UUID        `json:"runtime_id"`
+	SessionID                 pgtype.Text        `json:"session_id"`
+	WorkDir                   pgtype.Text        `json:"work_dir"`
+	TriggerCommentID          pgtype.UUID        `json:"trigger_comment_id"`
+	ChatSessionID             pgtype.UUID        `json:"chat_session_id"`
+	AutopilotRunID            pgtype.UUID        `json:"autopilot_run_id"`
+	Attempt                   int32              `json:"attempt"`
+	MaxAttempts               int32              `json:"max_attempts"`
+	ParentTaskID              pgtype.UUID        `json:"parent_task_id"`
+	FailureReason             pgtype.Text        `json:"failure_reason"`
+	TriggerSummary            pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession         bool               `json:"force_fresh_session"`
+	IsLeaderTask              bool               `json:"is_leader_task"`
+	WaitReason                pgtype.Text        `json:"wait_reason"`
+	InitiatorUserID           pgtype.UUID        `json:"initiator_user_id"`
+	HandoffNote               pgtype.Text        `json:"handoff_note"`
+	PrepareLeaseExpiresAt     pgtype.Timestamptz `json:"prepare_lease_expires_at"`
+	SquadID                   pgtype.UUID        `json:"squad_id"`
+	RuntimeMcpOverlay         []byte             `json:"runtime_mcp_overlay"`
+	EscalationForTaskID       pgtype.UUID        `json:"escalation_for_task_id"`
+	FireAt                    pgtype.Timestamptz `json:"fire_at"`
+	OriginatorUserID          pgtype.UUID        `json:"originator_user_id"`
+	RuntimeConnectedApps      []byte             `json:"runtime_connected_apps"`
+	CoalescedCommentIds       []pgtype.UUID      `json:"coalesced_comment_ids"`
+	DeliveredCommentIds       []pgtype.UUID      `json:"delivered_comment_ids"`
+	ChatInputTaskID           pgtype.UUID        `json:"chat_input_task_id"`
+	ChatFinalizeDeferredAt    pgtype.Timestamptz `json:"chat_finalize_deferred_at"`
+	OriginatorSource          pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID       pgtype.UUID        `json:"delegated_from_task_id"`
+	RetryOfTaskID             pgtype.UUID        `json:"retry_of_task_id"`
+	RerunOfTaskID             pgtype.UUID        `json:"rerun_of_task_id"`
+	RuleVersionID             pgtype.UUID        `json:"rule_version_id"`
+	TriggerEvidenceKind       pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID      pgtype.UUID        `json:"trigger_evidence_ref_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	DaemonID                  pgtype.Text        `json:"daemon_id"`
+	PreviousStatus            string             `json:"previous_status"`
+}
+
+// Manual operator repair (PPP-21291): return ONE orphaned in-flight task to
+// the queue, clearing the execution stamps, prepare lease, and daemon lane
+// that made it unrunnable (or that would make it run twice). CAS on the exact
+// active statuses so a concurrently terminalized or re-claimed task is left
+// alone. attempt is preserved -- this is the same unexecuted attempt being
+// re-delivered, not a retry child. Live-task uniqueness
+// (uq_agent_task_queue_live_issue) still applies: a conflicting live row for
+// the same issue makes this UPDATE raise a unique violation, and the caller
+// reports 409 instead of cancelling or replacing the other row. runtime_id is
+// intentionally preserved: agent_task_queue_active_requires_runtime requires
+// an active row to carry one.
+func (q *Queries) RequeueOrphanedAgentTask(ctx context.Context, taskID pgtype.UUID) (RequeueOrphanedAgentTaskRow, error) {
+	row := q.db.QueryRow(ctx, requeueOrphanedAgentTask, taskID)
+	var i RequeueOrphanedAgentTaskRow
+	err := row.Scan(
+		&i.ID,
+		&i.AgentID,
+		&i.IssueID,
+		&i.Status,
+		&i.Priority,
+		&i.DispatchedAt,
+		&i.StartedAt,
+		&i.CompletedAt,
+		&i.Result,
+		&i.Error,
+		&i.CreatedAt,
+		&i.Context,
+		&i.RuntimeID,
+		&i.SessionID,
+		&i.WorkDir,
+		&i.TriggerCommentID,
+		&i.ChatSessionID,
+		&i.AutopilotRunID,
+		&i.Attempt,
+		&i.MaxAttempts,
+		&i.ParentTaskID,
+		&i.FailureReason,
+		&i.TriggerSummary,
+		&i.ForceFreshSession,
+		&i.IsLeaderTask,
+		&i.WaitReason,
+		&i.InitiatorUserID,
+		&i.HandoffNote,
+		&i.PrepareLeaseExpiresAt,
+		&i.SquadID,
+		&i.RuntimeMcpOverlay,
+		&i.EscalationForTaskID,
+		&i.FireAt,
+		&i.OriginatorUserID,
+		&i.RuntimeConnectedApps,
+		&i.CoalescedCommentIds,
+		&i.DeliveredCommentIds,
+		&i.ChatInputTaskID,
+		&i.ChatFinalizeDeferredAt,
+		&i.OriginatorSource,
+		&i.DelegatedFromTaskID,
+		&i.RetryOfTaskID,
+		&i.RerunOfTaskID,
+		&i.RuleVersionID,
+		&i.TriggerEvidenceKind,
+		&i.TriggerEvidenceRefID,
+		&i.AccountableUserID,
+		&i.SessionRolloutMissing,
+		&i.RetiredSessionID,
+		&i.QuickActionsDisabled,
+		&i.RegenerateQuickActionsFor,
+		&i.DaemonID,
+		&i.PreviousStatus,
 	)
 	return i, err
 }
