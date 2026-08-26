@@ -42,18 +42,24 @@ On the machine that will run the service:
 ```bash
 git clone --depth 1 https://github.com/multica-ai/multica.git
 cd multica
+cp .env.example .env
+```
+
+Edit `.env` — at minimum, change `JWT_SECRET` (generate one with
+`openssl rand -hex 32`) and the Postgres password. Then start the stack:
+
+```bash
 make selfhost
 ```
 
-On first run, `make selfhost` will:
+`make selfhost`:
 
-1. Create `.env` from `.env.example`
-2. Generate a random `JWT_SECRET`, PostgreSQL password, and `MULTICA_VCS_SECRET_KEY` (the encryption key for self-hosted Git integrations)
-3. Pull the PostgreSQL, Multica backend, and Multica frontend images
-4. Create persistent volumes and start the three containers
-5. Wait until the backend starts answering health checks
+1. Requires `.env` — a missing or unreadable file fails with an actionable, secret-free message. It never creates or overwrites `.env`
+2. Pulls the PostgreSQL, Multica backend, and Multica frontend images
+3. Creates persistent volumes and starts the three containers
+4. Waits until the backend starts answering health checks
 
-Running `make selfhost` again reuses the existing `.env` and volumes; it does not regenerate secrets.
+Running `make selfhost` again reuses the existing `.env` and volumes. Compose runs through `scripts/selfhost-compose.sh` with `--env-file .env` from a sanitized environment, so inherited shell values and `make selfhost PORT=…` overrides cannot change the rendered stack — edit `.env` instead.
 
 <Callout type="info">
 `make selfhost` pulls published images and does not build the code in your checkout. To test local source, use `make selfhost-build`.
@@ -248,7 +254,7 @@ docker compose -f docker-compose.selfhost.yml up -d
 curl -fsS http://localhost:8080/readyz
 ```
 
-Two ways to upgrade a Docker Compose install. On an existing install they produce the **same result** — the `selfhost` target in the `Makefile` runs the same `docker compose pull` + `up -d`, and additionally creates `.env` when it is missing and waits on `/health` before printing a status summary. Pick whichever you prefer:
+Two ways to upgrade a Docker Compose install. On an existing install they produce the **same result** — the `selfhost` target in the `Makefile` runs the same `docker compose pull` + `up -d` (through `scripts/selfhost-compose.sh`, which requires `.env` and reads configuration only from it) and waits on `/health` before printing a status summary. Pick whichever you prefer:
 
 ```bash
 cd multica
@@ -270,7 +276,7 @@ docker compose -f docker-compose.selfhost.yml up -d
 The version you end up running is resolved by `docker compose pull`, which asks GHCR what the tag points at right now. A checkout that is months out of date will still pull today's `latest` images; conversely, `git pull` alone changes nothing until you pull images and recreate the containers.
 
 <Callout type="warning">
-**If you pinned `MULTICA_IMAGE_TAG`, neither command upgrades anything.** Both images resolve as `${MULTICA_IMAGE_TAG:-latest}` (`docker-compose.selfhost.yml:42`, `:125`), and `.env.example` ships `MULTICA_IMAGE_TAG=latest`. If your `.env` pins an exact release, `pull` just re-fetches that same tag and you stay on the old version — no error, no warning. Check before you upgrade:
+**If you pinned `MULTICA_IMAGE_TAG`, neither command upgrades anything.** Both images resolve as `${MULTICA_IMAGE_TAG:-latest}` (`docker-compose.selfhost.yml:65`, `:172`), and `.env.example` ships `MULTICA_IMAGE_TAG=latest`. If your `.env` pins an exact release, `pull` just re-fetches that same tag and you stay on the old version — no error, no warning. Check before you upgrade:
 
 ```bash
 grep MULTICA_IMAGE_TAG .env
@@ -280,7 +286,7 @@ grep MULTICA_IMAGE_TAG .env
 
 ### Your `.env` is not overwritten
 
-`make selfhost` only generates `.env` when the file is **missing**. Re-running it on an existing install leaves your `JWT_SECRET`, Postgres password, email settings, and `FRONTEND_ORIGIN` exactly as they were.
+`make selfhost` **never creates or overwrites `.env`** — it requires the file to exist and fails with an actionable message when it is missing. Re-running it on an existing install leaves your `JWT_SECRET`, Postgres password, email settings, and `FRONTEND_ORIGIN` exactly as they were.
 
 ### Back up Postgres first
 

@@ -31,8 +31,10 @@ build)
   ;;
 esac
 
-# The Makefile exports COMPOSE; keep the same default when run standalone.
-read -r -a compose_cmd <<<"${COMPOSE:-docker compose}"
+# Every Compose call goes through the self-host wrapper so the port answer
+# comes from the same sanitized .env the `up` used — one configuration source
+# across start and readiness checks.
+compose_cmd=(bash scripts/selfhost-compose.sh)
 
 # Published host port for a service, straight from Compose. Falls back to the
 # same default chain as docker-compose.selfhost.yml when the container is not up

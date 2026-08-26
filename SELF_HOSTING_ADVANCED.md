@@ -145,16 +145,21 @@ If the frontend and backend are served from different hostnames, `COOKIE_DOMAIN`
 | `CORS_ALLOWED_ORIGINS` | Value of `FRONTEND_ORIGIN` | Comma-separated list of allowed origins. Governs **both** the HTTP CORS allowlist **and** the WebSocket `Origin` check. A browser origin that isn't listed here (and isn't `localhost`) has its real-time WebSocket upgrade rejected with `403`, so live updates stop working until a manual refresh. |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
-> **Which source wins depends on the entry point**, and only the alias order above
-> is shared. Docker Compose lets the calling environment outrank `.env`
-> (`PORT=9100 docker compose … up -d` publishes 9100). `make` is the other way
-> round: it `include`s the env file, so a value there outranks the same variable
-> from your environment, and a `make selfhost PORT=…` command-line assignment
-> outranks both. Editing the env file is therefore the one method that behaves
-> the same everywhere. None of this affects whether the reported port is correct:
-> `make selfhost` and both installers read the published port back from
-> `docker compose port`, so the health check and the printed URL always match
-> what Compose actually published.
+> **`.env` is authoritative for the checkout-managed path.** `make selfhost`,
+> `make selfhost-build`, `make selfhost-stop`, and `scripts/selfhost-wait.sh`
+> invoke Compose through `scripts/selfhost-compose.sh`, which requires the
+> repository-root `.env` (missing or unreadable files fail closed with an
+> actionable message) and runs `docker compose --env-file .env` from a
+> sanitized environment that keeps only Docker transport variables (`PATH`,
+> `HOME`, `DOCKER_HOST`, `DOCKER_CONTEXT`, `DOCKER_CONFIG`, `XDG_RUNTIME_DIR`).
+> Inherited shell values (`PORT=9100 make selfhost`) and `make selfhost PORT=…`
+> command-line assignments cannot override the file — edit `.env` to change
+> configuration. Raw `docker compose` commands retain native Compose
+> precedence, where the calling environment outranks `.env`. None of this
+> affects whether the reported port is correct: `make selfhost` and both
+> installers read the published port back from `docker compose port`, so the
+> health check and the printed URL always match what Compose actually
+> published.
 
 The web development server is one intentional exception to the generic `PORT`
 fallback: Next uses `PORT` for its own frontend listener before it evaluates the
