@@ -1119,6 +1119,86 @@ WHERE (
   )
 RETURNING *;
 
+-- name: ListRepairableAgentTasks :many
+-- Operator repair surface (PPP-21291): incident-scale read over
+-- agent_task_queue. Every filter is optional (NULL = no filter):
+--   status      exact status match
+--   daemon_id   exact daemon lane match (migration 273 routing lane)
+--   older_than  server-side cutoff: tasks whose oldest effective activity
+--               (COALESCE(started_at, dispatched_at, created_at)) is <= cutoff
+--   max_rows    hard cap so a sweep can never dump the whole table
+-- Ordered oldest activity first, then task id, so an operator sweep reads a
+-- stable, deterministic window. Values are bound parameters, never
+-- interpolated into the SQL text.
+SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at,
+       completed_at, error, created_at, runtime_id, attempt, max_attempts,
+       failure_reason, daemon_id
+FROM agent_task_queue
+WHERE (sqlc.narg('status')::text IS NULL OR status = sqlc.narg('status')::text)
+  AND (sqlc.narg('daemon_id')::text IS NULL OR daemon_id = sqlc.narg('daemon_id')::text)
+  AND (sqlc.narg('older_than')::timestamptz IS NULL
+       OR COALESCE(started_at, dispatched_at, created_at) <= sqlc.narg('older_than')::timestamptz)
+ORDER BY COALESCE(started_at, dispatched_at, created_at) ASC, id ASC
+LIMIT sqlc.arg('max_rows')::integer;
+
+-- name: FailOrphanedAgentTask :one
+-- Manual operator repair (PPP-21291): mark ONE non-terminal task failed
+-- WITHOUT the auto-retry / chat-session / issue side effects of FailAgentTask
+-- (that path may create a retry child inside the failure transaction). The
+-- status predicate is a compare-and-swap: zero rows means the task is already
+-- terminal (or gone), and the caller reports a conflict instead of inventing a
+-- transition. failure_reason uses the dedicated platform-side value
+-- 'operator_orphan_repair' so the row can never be misread as an agent_error.*
+-- or retryable reason. The active lease is cleared; runtime provenance is
+-- kept for audit.
+WITH prev AS (
+    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id')
+),
+updated AS (
+    UPDATE agent_task_queue
+    SET status = 'failed',
+        completed_at = now(),
+        error = sqlc.arg('error')::text,
+        failure_reason = sqlc.arg('failure_reason')::text,
+        prepare_lease_expires_at = NULL,
+        wait_reason = NULL
+    WHERE id = sqlc.arg('task_id')
+      AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+    RETURNING *
+)
+SELECT u.*, p.status AS previous_status
+FROM updated u, prev p;
+
+-- name: RequeueOrphanedAgentTask :one
+-- Manual operator repair (PPP-21291): return ONE orphaned in-flight task to
+-- the queue, clearing the execution stamps, prepare lease, and daemon lane
+-- that made it unrunnable (or that would make it run twice). CAS on the exact
+-- active statuses so a concurrently terminalized or re-claimed task is left
+-- alone. attempt is preserved -- this is the same unexecuted attempt being
+-- re-delivered, not a retry child. Live-task uniqueness
+-- (uq_agent_task_queue_live_issue) still applies: a conflicting live row for
+-- the same issue makes this UPDATE raise a unique violation, and the caller
+-- reports 409 instead of cancelling or replacing the other row. runtime_id is
+-- intentionally preserved: agent_task_queue_active_requires_runtime requires
+-- an active row to carry one.
+WITH prev AS (
+    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id')
+),
+updated AS (
+    UPDATE agent_task_queue
+    SET status = 'queued',
+        dispatched_at = NULL,
+        started_at = NULL,
+        prepare_lease_expires_at = NULL,
+        daemon_id = NULL,
+        delivered_comment_ids = '{}'
+    WHERE id = sqlc.arg('task_id')
+      AND status IN ('dispatched', 'running', 'waiting_local_directory')
+    RETURNING *
+)
+SELECT u.*, p.status AS previous_status
+FROM updated u, prev p;
+
 -- name: ExpireStaleQueuedTasks :many
 -- Fails tasks that have been sitting in 'queued' for longer than the TTL.
 -- This is the cleanup arm of the MUL-1899 "queued backlog" fix: even with the

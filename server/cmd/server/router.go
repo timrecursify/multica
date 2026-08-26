@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -166,6 +167,35 @@ func normalizeServerVersion(v string) string {
 // path Redis client, not the realtime relay's blocking read client. A nil rdb
 // keeps the default in-memory stores which are fine for single-node dev and
 // tests.
+
+// operatorAuth guards the operator repair API (PPP-21291) with a shared
+// bearer secret that the PPP MCP gateway holds under the same
+// MULTICA_OPERATOR_SECRET value. Fail-closed: when the env var is unset the
+// middleware rejects every request with 503 so an unconfigured deployment
+// can never silently expose the repair surface, and a wrong/missing bearer
+// is a plain 401.
+func operatorAuth(next http.Handler) http.Handler {
+	secret := os.Getenv("MULTICA_OPERATOR_SECRET")
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if secret == "" {
+			http.Error(w, "operator API not configured", http.StatusServiceUnavailable)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(auth, prefix) {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		got := strings.TrimPrefix(auth, prefix)
+		if len(got) != len(secret) || subtle.ConstantTimeCompare([]byte(got), []byte(secret)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func NewRouter(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus, analyticsClient analytics.Client, rdb *redis.Client) chi.Router {
 	r, _ := NewRouterWithOptions(pool, hub, bus, analyticsClient, rdb, RouterOptions{})
 	return r
@@ -1068,6 +1098,18 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 		r.Post("/runtimes/{runtimeId}/recover-orphans", h.RecoverOrphanedTasks)
 		r.Post("/tasks/{taskId}/session", h.PinTaskSession)
+	})
+
+	// Operator repair API (PPP-21291). Service-authenticated surface for the
+	// shared desk: list / fail / requeue agent_task_queue rows without raw
+	// SQL. Guarded by the MULTICA_OPERATOR_SECRET shared bearer — the PPP MCP
+	// gateway holds the same value — and deliberately NOT mounted inside the
+	// daemon or user auth groups.
+	r.Route("/api/operator/task-queue", func(r chi.Router) {
+		r.Use(operatorAuth)
+		r.Get("/", h.ListRepairableTasks)
+		r.Post("/{taskId}/fail", h.FailOrphanedTask)
+		r.Post("/{taskId}/requeue", h.RequeueOrphanedTask)
 	})
 
 	// Protected API routes
