@@ -68,10 +68,17 @@ If you prefer to run each step manually:
 ```bash
 git clone https://github.com/multica-ai/multica.git
 cd multica
+cp .env.example .env
+# Edit .env — at minimum change JWT_SECRET and the Postgres password
 make selfhost
 ```
 
-`make selfhost` automatically creates `.env` from the example, generates a random `JWT_SECRET`, and starts all services via Docker Compose.
+`make selfhost` requires `.env` to exist — a missing or unreadable file fails
+with an actionable, secret-free message. It never generates or overwrites the
+file. Compose is invoked through `scripts/selfhost-compose.sh`, which reads
+configuration only from `.env` (with `--env-file .env` from a sanitized
+environment), so inherited shell variables and `make selfhost PORT=…`
+command-line assignments are ignored — edit `.env` to change configuration.
 
 By default it pulls the latest stable release images from GHCR. To build the backend/web from your current checkout instead, run `make selfhost-build`.
 If the selected GHCR tag has not been published yet, `make selfhost` now tells you to fall back to `make selfhost-build`.

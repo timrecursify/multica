@@ -69,11 +69,12 @@ If the default ports (8080/3000) are in use:
 2. Run `make selfhost`
 3. Run `multica setup self-host --port <PORT> --frontend-port <FRONTEND_PORT>`
 
-Edit the file rather than relying on environment variables: `make` `include`s
-`.env`, so a value in the file outranks the same variable from your shell
-(`PORT=9100 make selfhost` is ignored when `.env` sets `PORT`). A command-line
-assignment does take effect (`make selfhost PORT=9100`), and Docker Compose
-invoked directly is the reverse again — there the environment outranks `.env`.
+Edit the file rather than relying on environment variables: `make selfhost*`
+runs Compose through `scripts/selfhost-compose.sh`, which reads configuration
+only from `.env`. Inherited shell values (`PORT=9100 make selfhost`) and
+command-line assignments (`make selfhost PORT=9100`) are intentionally ignored,
+so the rendered stack always matches `.env`. Raw `docker compose` commands are
+the reverse again — there the calling environment outranks `.env`.
 
 `BACKEND_PORT` is an optional alias that overrides `PORT` for the backend;
 `API_PORT` and `SERVER_PORT` follow in that order. Whichever route you use, the

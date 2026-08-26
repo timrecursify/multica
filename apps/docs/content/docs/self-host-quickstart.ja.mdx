@@ -42,18 +42,23 @@ Multica は Compose v2（`docker compose`）を使います。旧版の `docker-
 ```bash
 git clone --depth 1 https://github.com/multica-ai/multica.git
 cd multica
+cp .env.example .env
+```
+
+`.env` を編集します。最低でも `JWT_SECRET`（`openssl rand -hex 32` で生成）と PostgreSQL パスワードを変更してください。その後、スタックを起動します。
+
+```bash
 make selfhost
 ```
 
-初回実行時、`make selfhost` は次を行います。
+`make selfhost` は次を行います。
 
-1. `.env.example` から `.env` を作成する
-2. `JWT_SECRET`、PostgreSQL パスワード、`MULTICA_VCS_SECRET_KEY`（セルフホストの Git 連携用の暗号化キー）をランダム生成する
-3. PostgreSQL、Multica backend、Multica frontend のイメージを取得する
-4. 永続化ボリュームを作成し、3 つのコンテナを起動する
-5. backend がヘルスチェックに応答し始めるまで待機する
+1. `.env` を必須とする（ファイルがない、または読めない場合は、秘密情報を含まない対処方法を示すメッセージで失敗する。`.env` を自動作成・上書きしない）
+2. PostgreSQL、Multica backend、Multica frontend のイメージを取得する
+3. 永続化ボリュームを作成し、3 つのコンテナを起動する
+4. backend がヘルスチェックに応答し始めるまで待機する
 
-2 回目以降の `make selfhost` は既存の `.env` とボリュームをそのまま使い、シークレットを再生成しません。
+2 回目以降の `make selfhost` は既存の `.env` とボリュームをそのまま使います。Compose は `scripts/selfhost-compose.sh` を通じて `--env-file .env` でサニタイズされた環境から実行されるため、シェルの環境変数や `make selfhost PORT=…` による上書きは反映されません。設定を変更するには `.env` を編集してください。
 
 <Callout type="info">
 `make selfhost` は公開済みのイメージを取得し、checkout 中のコードをビルドしません。ローカルのソースを試すには `make selfhost-build` を使ってください。
@@ -270,7 +275,7 @@ docker compose -f docker-compose.selfhost.yml up -d
 実際に動くバージョンを決めるのは `docker compose pull` で、そのタグが今どのイメージを指しているかを GHCR に問い合わせます。したがって数か月更新していない checkout でも今日の `latest` イメージを取得できますし、逆に `git pull` だけではイメージを取得してコンテナを作り直すまで何も変わりません。
 
 <Callout type="warning">
-**`MULTICA_IMAGE_TAG` を固定している場合、どちらのコマンドでもアップグレードされません。** 両方のイメージが `${MULTICA_IMAGE_TAG:-latest}` として解決され（`docker-compose.selfhost.yml:42`、`:125`）、`.env.example` は `MULTICA_IMAGE_TAG=latest` を同梱しています。`.env` で特定のリリースに固定していると、`pull` は同じタグを取り直すだけで、古いバージョンのままです — エラーも警告も出ません。アップグレード前に確認してください。
+**`MULTICA_IMAGE_TAG` を固定している場合、どちらのコマンドでもアップグレードされません。** 両方のイメージが `${MULTICA_IMAGE_TAG:-latest}` として解決され（`docker-compose.selfhost.yml:65`、`:172`）、`.env.example` は `MULTICA_IMAGE_TAG=latest` を同梱しています。`.env` で特定のリリースに固定していると、`pull` は同じタグを取り直すだけで、古いバージョンのままです — エラーも警告も出ません。アップグレード前に確認してください。
 
 ```bash
 grep MULTICA_IMAGE_TAG .env
