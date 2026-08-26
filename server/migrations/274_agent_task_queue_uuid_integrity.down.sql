@@ -1,0 +1,2 @@
+-- 274 only performs an installation-time integrity assertion.  It creates no
+-- persistent object, and rollback intentionally never rewrites IDs or history.
