@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1882,6 +1883,36 @@ func TestCommentCRUD(t *testing.T) {
 	req = newRequest("DELETE", "/api/issues/"+issueID, nil)
 	req = withURLParam(req, "id", issueID)
 	testHandler.DeleteIssue(w, req)
+}
+
+func TestCreateCommentByBareNumberAllowsNullCreator(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("requires DB")
+	}
+
+	ctx := context.Background()
+	const issueNumber = 921094
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, number)
+		VALUES ($1, $2, $3)
+		RETURNING id
+	`, testWorkspaceID, "reconstructed issue with no creator", issueNumber).Scan(&issueID); err != nil {
+		t.Fatalf("create null-creator issue fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", fmt.Sprintf("/api/issues/%d/comments", issueNumber), map[string]any{
+		"content": "comment on reconstructed issue",
+	})
+	req = withURLParam(req, "id", strconv.Itoa(issueNumber))
+	testHandler.CreateComment(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateComment by bare number: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
 }
 
 func TestCommentWritePathsPreserveIssueIdentifiers(t *testing.T) {
