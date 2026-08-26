@@ -30,6 +30,12 @@ export
 
 MULTICA_ARGS ?= $(ARGS)
 
+# Self-host Compose invocations go through scripts/selfhost-compose.sh so the
+# repository-root .env is the single authoritative configuration source and
+# inherited shell values cannot override it (see that script). Developer
+# Compose targets below (db-up/db-down/db-reset) intentionally keep plain
+# `docker compose` with ordinary shell precedence.
+SELFHOST_COMPOSE := bash scripts/selfhost-compose.sh
 COMPOSE := docker compose
 
 define REQUIRE_ENV
@@ -47,7 +53,13 @@ endef
 # (e.g. "unknown shorthand flag: 'f' in -f") when the plugin is missing or v1.
 # Keep the message short and OS-agnostic: per-OS install steps belong in docs.
 define REQUIRE_COMPOSE
-	@if ! compose_version=$$($(COMPOSE) version --short 2>/dev/null); then \
+	@if [ ! -f .env ] || [ ! -r .env ]; then \
+		echo "Missing or unreadable self-host configuration file: .env"; \
+		echo "Create it from the example and edit it for your setup, then use 'make selfhost' (or 'make selfhost-build'):"; \
+		echo "  cp .env.example .env"; \
+		exit 1; \
+	fi
+	@if ! compose_version=$$($(SELFHOST_COMPOSE) version --short 2>/dev/null); then \
 		echo "Docker Compose ('docker compose') was not found."; \
 		echo "Self-hosting requires the Compose CLI plugin; legacy 'docker-compose' v1 is not supported."; \
 		echo "Install Docker Compose from https://docs.docker.com/compose/install/ and verify with: docker compose version"; \
@@ -55,7 +67,7 @@ define REQUIRE_COMPOSE
 	fi; \
 	case "$$compose_version" in \
 		1.*|v1.*) \
-			echo "'$(COMPOSE)' is legacy Docker Compose v1 ($$compose_version)."; \
+			echo "'docker compose' is legacy Docker Compose v1 ($$compose_version)."; \
 			echo "Self-hosting requires the Compose CLI plugin; legacy 'docker-compose' v1 is not supported."; \
 			echo "Install Docker Compose from https://docs.docker.com/compose/install/ and verify with: docker compose version"; \
 			exit 1; \
@@ -79,29 +91,10 @@ makehelp: help ## Alias for `make help`
 # ---------- Self-hosting (Docker Compose) ----------
 ##@ Self-hosting
 
-selfhost: ## Create .env if needed, then pull and start the official self-hosted images
+selfhost: ## Pull and start the official self-hosted images (requires .env)
 	$(REQUIRE_COMPOSE)
-	@if [ ! -f .env ]; then \
-		echo "==> Creating .env from .env.example..."; \
-		cp .env.example .env; \
-		JWT=$$(openssl rand -hex 32); \
-		PGPASS=$$(openssl rand -hex 24); \
-		VCSKEY=$$(openssl rand -base64 32); \
-		if [ "$$(uname)" = "Darwin" ]; then \
-			sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
-			sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
-			sed -i '' -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
-			sed -i '' "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
-		else \
-			sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
-			sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
-			sed -i -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
-			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
-		fi; \
-		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
-	fi
 	@echo "==> Pulling official Multica images..."
-	@if ! $(COMPOSE) -f docker-compose.selfhost.yml pull; then \
+	@if ! $(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml pull; then \
 		echo ""; \
 		echo "Official images for tag '$${MULTICA_IMAGE_TAG:-latest}' are not published yet."; \
 		echo "If this is before the first GHCR release, build from the current checkout:"; \
@@ -109,38 +102,19 @@ selfhost: ## Create .env if needed, then pull and start the official self-hosted
 		exit 1; \
 	fi
 	@echo "==> Starting Multica via Docker Compose..."
-	$(COMPOSE) -f docker-compose.selfhost.yml up -d
+	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml up -d
 	@bash scripts/selfhost-wait.sh official
 
-selfhost-build: ## Build backend/web from the current checkout and start the self-hosted stack
+selfhost-build: ## Build backend/web from the current checkout and start the self-hosted stack (requires .env)
 	$(REQUIRE_COMPOSE)
-	@if [ ! -f .env ]; then \
-		echo "==> Creating .env from .env.example..."; \
-		cp .env.example .env; \
-		JWT=$$(openssl rand -hex 32); \
-		PGPASS=$$(openssl rand -hex 24); \
-		VCSKEY=$$(openssl rand -base64 32); \
-		if [ "$$(uname)" = "Darwin" ]; then \
-			sed -i '' "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
-			sed -i '' "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
-			sed -i '' -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
-			sed -i '' "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
-		else \
-			sed -i "s/^JWT_SECRET=.*/JWT_SECRET=$$JWT/" .env; \
-			sed -i "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$PGPASS/" .env; \
-			sed -i -E "s#^(DATABASE_URL=postgres://[^:]+:)[^@]*(@.*)#\1$$PGPASS\2#" .env; \
-			sed -i "s#^MULTICA_VCS_SECRET_KEY=.*#MULTICA_VCS_SECRET_KEY=$$VCSKEY#" .env; \
-		fi; \
-		echo "==> Generated random JWT_SECRET, POSTGRES_PASSWORD, and MULTICA_VCS_SECRET_KEY"; \
-	fi
 	@echo "==> Building Multica from the current checkout..."
-	$(COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
+	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml -f docker-compose.selfhost.build.yml up -d --build
 	@bash scripts/selfhost-wait.sh build
 
 selfhost-stop: ## Stop the self-hosted Docker Compose stack
 	$(REQUIRE_COMPOSE)
 	@echo "==> Stopping Multica services..."
-	$(COMPOSE) -f docker-compose.selfhost.yml down
+	$(SELFHOST_COMPOSE) -f docker-compose.selfhost.yml down
 	@echo "✓ All services stopped."
 
 # ---------- One-click commands ----------

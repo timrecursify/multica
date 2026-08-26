@@ -31,4 +31,15 @@ make_preview="$(make -s -C "$root" -n db-up)"
 grep -Fq 'docker compose up -d dev-postgres' <<<"$make_preview"
 grep -Fq 'docker compose exec -T dev-postgres' "$root/scripts/ensure-postgres.sh"
 
+# Developer Compose targets must not route through the self-host wrapper: the
+# wrapper requires the repository-root .env and sanitizes the environment,
+# which would break shared dev-postgres management for worktrees.
+for target in db-up db-down db-reset; do
+  preview="$(make -s -C "$root" -n "$target")"
+  if grep -Fq 'selfhost-compose' <<<"$preview"; then
+    echo "developer target $target must not use the self-host wrapper" >&2
+    exit 1
+  fi
+done
+
 printf 'PASS: normal dev Compose reconciliation cannot replace production postgres resources\n'

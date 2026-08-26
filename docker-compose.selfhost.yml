@@ -11,7 +11,18 @@
 # Usage:
 #   cp .env.example .env
 #   # Edit .env — change JWT_SECRET at minimum
-#   docker compose -f docker-compose.selfhost.yml up -d
+#   make selfhost            # or: make selfhost-build
+#
+# The checkout-managed path (`make selfhost`, `make selfhost-build`, `make
+# selfhost-stop`, and scripts/selfhost-wait.sh) invokes Compose through
+# scripts/selfhost-compose.sh: the repository-root .env is required (missing or
+# unreadable files fail closed with an actionable message) and Compose runs
+# with `--env-file .env` from a sanitized environment that keeps only Docker
+# transport variables (PATH, HOME, DOCKER_HOST, DOCKER_CONTEXT, DOCKER_CONFIG,
+# XDG_RUNTIME_DIR). Inherited shell values and `make selfhost PORT=…`
+# command-line assignments cannot override the env file — edit .env instead.
+# Raw `docker compose` commands (e.g. the installers) retain native Compose
+# precedence, where the calling environment outranks the env file.
 #
 # Frontend: http://localhost:${FRONTEND_PORT:-3000}
 # Backend:  http://localhost:${BACKEND_PORT:-${API_PORT:-${SERVER_PORT:-${PORT:-8080}}}}
@@ -23,12 +34,10 @@
 # and scripts/local-env.sh. The web dev fallback intentionally omits PORT
 # because Next uses that variable for its own frontend listener.
 #
-# Note that *which source* wins differs per entry point — Compose lets the
-# calling environment outrank this file, while make lets the included env file
-# outrank the environment. Nothing re-derives the published port from the inputs
-# any more: `make selfhost` (via scripts/selfhost-wait.sh) and both installers
-# read it back with `docker compose port`, so the health check and the printed
-# URL always match what was actually published.
+# Nothing re-derives the published port from the inputs any more: `make
+# selfhost` (via scripts/selfhost-wait.sh) and both installers read it back
+# with `docker compose port`, so the health check and the printed URL always
+# match what was actually published.
 
 name: multica
 
