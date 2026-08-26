@@ -49,6 +49,8 @@ func TestFormatAdmissionReason(t *testing.T) {
 		{"agent no runtime", db.Autopilot{AssigneeType: "agent"}, "agent has no runtime bound", "assignee agent has no runtime bound"},
 		{"squad no runtime", db.Autopilot{AssigneeType: "squad"}, "agent has no runtime bound", "squad leader agent has no runtime bound"},
 		{"runtime offline retains MUL-1899 suffix", db.Autopilot{AssigneeType: "agent"}, "agent runtime is offline", "agent runtime is offline at dispatch time"},
+		{"rate-limited lane keeps its window verbatim", db.Autopilot{AssigneeType: "agent"}, "agent lane rate-limited (429): 2 provider rate-limit failures in the last 15m0s, paused until 2026-08-26T17:13:00Z", "agent lane rate-limited (429): 2 provider rate-limit failures in the last 15m0s, paused until 2026-08-26T17:13:00Z"},
+		{"rate-limited squad leader keeps its window verbatim", db.Autopilot{AssigneeType: "squad"}, "agent lane rate-limited (429): 2 provider rate-limit failures in the last 15m0s, paused until 2026-08-26T17:13:00Z", "agent lane rate-limited (429): 2 provider rate-limit failures in the last 15m0s, paused until 2026-08-26T17:13:00Z"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

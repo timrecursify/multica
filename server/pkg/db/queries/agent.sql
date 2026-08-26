@@ -1923,3 +1923,18 @@ INSERT INTO agent (
     @owner_id, '', '{}'::jsonb, '[]'::jsonb, 'user', @system_key
 )
 RETURNING *;
+
+-- name: GetAgentRecentRateLimitFailures :one
+-- Counts provider rate-limit/capacity task failures for an agent since the
+-- given timestamp and reports the most recent one. Consumed by the dispatch
+-- admission lane-health gate (PPP-21346): a lane with a burst of 429 failures
+-- is paused for new assignments until the cooldown elapses, instead of
+-- enqueueing tasks that fail instantly with "exceeded retry limit, 429".
+SELECT
+    count(*)::int AS failure_count,
+    max(completed_at)::timestamptz AS last_failure_at
+FROM agent_task_queue
+WHERE agent_id = $1
+  AND status = 'failed'
+  AND failure_reason = 'agent_error.provider_capacity_or_rate_limit'
+  AND completed_at >= $2;

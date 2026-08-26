@@ -41,15 +41,21 @@ func TestAgentReadinessReasonCode(t *testing.T) {
 	archivedAt := pgtype.Timestamptz{Valid: true}
 
 	// No runtime bound — the state an agent lands in when its runtime is deleted.
-	if got := agentReadinessReasonCode(db.Agent{}); got != dispatch.ReasonAgentRuntimeRequired {
+	if got := agentReadinessReasonCode(db.Agent{}, ""); got != dispatch.ReasonAgentRuntimeRequired {
 		t.Errorf("no runtime bound: got %q, want agent_runtime_required", got)
 	}
 	// Bound runtime that is offline at dispatch time.
-	if got := agentReadinessReasonCode(db.Agent{RuntimeID: validRuntime}); got != dispatch.ReasonRuntimeOffline {
+	if got := agentReadinessReasonCode(db.Agent{RuntimeID: validRuntime}, "agent runtime is offline"); got != dispatch.ReasonRuntimeOffline {
 		t.Errorf("bound offline runtime: got %q, want runtime_offline", got)
 	}
 	// Archived agent cannot run at all.
-	if got := agentReadinessReasonCode(db.Agent{ArchivedAt: archivedAt, RuntimeID: validRuntime}); got != dispatch.ReasonTargetUnavailable {
+	if got := agentReadinessReasonCode(db.Agent{ArchivedAt: archivedAt, RuntimeID: validRuntime}, ""); got != dispatch.ReasonTargetUnavailable {
 		t.Errorf("archived agent: got %q, want target_unavailable", got)
+	}
+	// Lane paused by the rate-limit health gate is a provider-capacity problem
+	// (PPP-21346), distinct from runtime availability.
+	rateLimitedReason := "agent lane rate-limited (429): 3 provider rate-limit failures in the last 15m0s, paused until 2026-08-26T17:13:00Z"
+	if got := agentReadinessReasonCode(db.Agent{RuntimeID: validRuntime}, rateLimitedReason); got != dispatch.ReasonLaneRateLimited {
+		t.Errorf("rate-limited lane: got %q, want lane_rate_limited", got)
 	}
 }
