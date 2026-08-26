@@ -1032,6 +1032,9 @@ func TestCreateIssueAllowsDuplicateAfterCancelled(t *testing.T) {
 		t.Fatalf("decode cancelled: %v", err)
 	}
 	firstID = first.ID
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'Cancelled' WHERE id = $1`, firstID); err != nil {
+		t.Fatalf("store canonical Cancelled status: %v", err)
+	}
 
 	w = httptest.NewRecorder()
 	req = newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
