@@ -1021,7 +1021,7 @@ func TestCreateIssueAllowsDuplicateAfterCancelled(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  title,
-		"status": "cancelled",
+		"status": "Cancelled",
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1066,7 +1066,7 @@ func TestCreateIssueAllowsDuplicateAfterDone(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  title,
-		"status": "done",
+		"status": "Done",
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -1093,6 +1093,51 @@ func TestCreateIssueAllowsDuplicateAfterDone(t *testing.T) {
 	secondID = second.ID
 	if secondID == firstID {
 		t.Fatalf("new issue reused done issue id %s", secondID)
+	}
+}
+
+func TestCreateIssueAllowsDuplicateAfterArchived(t *testing.T) {
+	ctx := context.Background()
+	title := fmt.Sprintf("Archived duplicate guard %d", time.Now().UnixNano())
+	var firstID, secondID string
+	defer func() {
+		for _, id := range []string{secondID, firstID} {
+			if id != "" {
+				testPool.Exec(ctx, `DELETE FROM issue WHERE id = $1`, id)
+			}
+		}
+	}()
+
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title":  title,
+		"status": "Archived",
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue archived: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var first IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&first); err != nil {
+		t.Fatalf("decode archived: %v", err)
+	}
+	firstID = first.ID
+
+	w = httptest.NewRecorder()
+	req = newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
+		"title": title,
+	})
+	testHandler.CreateIssue(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue after archived: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var second IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&second); err != nil {
+		t.Fatalf("decode second: %v", err)
+	}
+	secondID = second.ID
+	if secondID == firstID {
+		t.Fatalf("new issue reused archived issue id %s", secondID)
 	}
 }
 
