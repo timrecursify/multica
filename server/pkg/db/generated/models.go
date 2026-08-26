@@ -651,6 +651,7 @@ type Issue struct {
 	Metadata           []byte             `json:"metadata"`
 	Stage              pgtype.Int4        `json:"stage"`
 	Properties         []byte             `json:"properties"`
+	QcFailCount        pgtype.Int4        `json:"qc_fail_count"`
 }
 
 type IssueDependency struct {
