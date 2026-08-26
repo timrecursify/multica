@@ -10,6 +10,8 @@ selfhost_config="$(docker compose -f "$root/docker-compose.selfhost.yml" config 
 [[ "$(jq -r '.name' <<<"$default_config")" == multica-dev ]]
 [[ "$(jq -r '.services | keys | join(",")' <<<"$default_config")" == dev-postgres ]]
 [[ "$(jq -r '.volumes | keys | join(",")' <<<"$default_config")" == dev_pgdata ]]
+[[ "$(jq -r '.volumes.dev_pgdata.name' <<<"$default_config")" == multica_dev_pgdata ]]
+[[ "$(jq -r '.networks.default.name' <<<"$default_config")" == multica_dev_default ]]
 
 # COMPOSE_PROJECT_NAME has higher precedence than top-level name. Even under
 # that hostile/ambient override, the dev service and volume keys must remain
@@ -18,10 +20,12 @@ selfhost_config="$(docker compose -f "$root/docker-compose.selfhost.yml" config 
 [[ "$(jq -r '.services | keys | join(",")' <<<"$override_config")" == dev-postgres ]]
 [[ "$(jq -r '.volumes | keys | join(",")' <<<"$override_config")" == dev_pgdata ]]
 [[ "$(jq -r '.volumes.dev_pgdata.name' <<<"$override_config")" == multica_dev_pgdata ]]
+[[ "$(jq -r '.networks.default.name' <<<"$override_config")" == multica_dev_default ]]
 
 [[ "$(jq -r '.name' <<<"$selfhost_config")" == multica ]]
 [[ "$(jq -r '.services | has("postgres")' <<<"$selfhost_config")" == true ]]
 [[ "$(jq -r '.volumes | has("pgdata")' <<<"$selfhost_config")" == true ]]
+[[ "$(jq -r '.networks.default.name' <<<"$selfhost_config")" == multica_default ]]
 
 make_preview="$(make -s -C "$root" -n db-up)"
 grep -Fq 'docker compose up -d dev-postgres' <<<"$make_preview"

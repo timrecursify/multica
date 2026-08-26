@@ -18,3 +18,10 @@ services:
 
 volumes:
   dev_pgdata:
+    name: multica_dev_pgdata
+
+networks:
+  default:
+    # Keep the developer network disjoint even when an ambient
+    # COMPOSE_PROJECT_NAME overrides the top-level project name.
+    name: multica_dev_default
