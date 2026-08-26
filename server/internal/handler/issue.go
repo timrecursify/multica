@@ -83,6 +83,8 @@ var validIssueStatuses = []string{
 	// fork; these are the live values the conveyor writes.
 	"Queue", "Spec", "Building", "QC", "In Review", "In Progress",
 	"Human Review", "Done", "Blocked", "Cancelled", "Archived", "dead_letter",
+	// sk CLI posts new tickets with this status.
+	"Registered",
 }
 var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
 
