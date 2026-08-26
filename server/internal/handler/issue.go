@@ -2716,6 +2716,13 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	issue := res.Issue
+	// Autopilot event triggers (PPP-21289): an issue CREATED in a watched
+	// status fires its event triggers now — the poll-based cron dispatcher
+	// would have picked it up on its next tick, so create must fire too.
+	// Best-effort: a fire failure must not fail the create.
+	if err := h.AutopilotService.FireIssueStatusEventTriggers(r.Context(), issue); err != nil {
+		slog.Warn("autopilot event trigger fire failed", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "workspace_id", workspaceID, "error", err)...)
+	}
 	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 
 	resp := issueToResponse(issue, prefix)
@@ -3170,6 +3177,17 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		h.issueTriggerWriteProbe(r, actorType, issue),
 	); ok && !req.SuppressRun {
 		h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.HandoffNote)
+	}
+
+	// Autopilot event triggers (PPP-21289): an issue ENTERING a watched status
+	// fires its event triggers now — native intake without the 10-minute cron
+	// dispatcher. WillEnqueueRun-style hook at the issue_trigger layer, gated
+	// by the same SuppressRun flag the assignee enqueue respects. Best-effort:
+	// a fire failure must not fail the status write.
+	if statusChanged && !req.SuppressRun {
+		if err := h.AutopilotService.FireIssueStatusEventTriggers(r.Context(), issue); err != nil {
+			slog.Warn("autopilot event trigger fire failed", append(logger.RequestAttrs(r), "issue_id", id, "workspace_id", workspaceID, "error", err)...)
+		}
 	}
 
 	// Platform-driven parent notification: when this issue transitions into
@@ -3711,6 +3729,15 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			h.issueTriggerWriteProbe(r, actorType, issue),
 		); ok && !req.Updates.SuppressRun {
 			h.dispatchIssueRun(r.Context(), issue, trigger, actorType, actorID, req.Updates.HandoffNote)
+		}
+
+		// Autopilot event triggers (PPP-21289) — mirrors UpdateIssue: fire when
+		// this batch write lands the issue in a watched status, unless the batch
+		// suppresses runs. Best-effort; a fire failure does not fail the batch.
+		if statusChanged && !req.Updates.SuppressRun {
+			if err := h.AutopilotService.FireIssueStatusEventTriggers(r.Context(), issue); err != nil {
+				slog.Warn("autopilot event trigger fire failed", append(logger.RequestAttrs(r), "issue_id", issueID, "workspace_id", workspaceID, "error", err)...)
+			}
 		}
 
 		// No status change — not even → cancelled — cancels active tasks here,

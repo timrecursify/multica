@@ -92,6 +92,33 @@ func (q *Queries) ArchiveAutopilot(ctx context.Context, id pgtype.UUID) error {
 	return err
 }
 
+const autopilotEventRunExistsForIssue = `-- name: AutopilotEventRunExistsForIssue :one
+SELECT EXISTS (
+    SELECT 1
+    FROM autopilot_run
+    WHERE trigger_id = $1
+      AND trigger_payload @> $2::jsonb
+      AND created_at >= $3
+) AS exists
+`
+
+type AutopilotEventRunExistsForIssueParams struct {
+	TriggerID     pgtype.UUID        `json:"trigger_id"`
+	DedupePayload []byte             `json:"dedupe_payload"`
+	Since         pgtype.Timestamptz `json:"since"`
+}
+
+// Idempotency guard for event-trigger dispatch: an issue status transition
+// retried inside the dedupe window (HTTP retry / double write) must not fan
+// out a second autopilot run. The payload carries the triggering issue_id and
+// status; a genuine later re-entry after the window fires again.
+func (q *Queries) AutopilotEventRunExistsForIssue(ctx context.Context, arg AutopilotEventRunExistsForIssueParams) (bool, error) {
+	row := q.db.QueryRow(ctx, autopilotEventRunExistsForIssue, arg.TriggerID, arg.DedupePayload, arg.Since)
+	var exists bool
+	err := row.Scan(&exists)
+	return exists, err
+}
+
 const createAutopilot = `-- name: CreateAutopilot :one
 INSERT INTO autopilot (
     workspace_id, title, description, assignee_type, assignee_id,
@@ -955,6 +982,92 @@ func (q *Queries) ListAutopilotCollaborators(ctx context.Context, autopilotID pg
 			&i.UserID,
 			&i.GrantedBy,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAutopilotEventTriggersForStatus = `-- name: ListAutopilotEventTriggersForStatus :many
+SELECT
+    t.id, t.autopilot_id, t.kind, t.enabled, t.cron_expression, t.timezone, t.next_run_at, t.webhook_token, t.label, t.last_fired_at, t.created_at, t.updated_at, t.provider, t.signing_secret, t.event_filters, t.published_by_type, t.published_by_id,
+    a.id, a.workspace_id, a.title, a.description, a.assignee_id, a.status, a.execution_mode, a.issue_title_template, a.created_by_type, a.created_by_id, a.last_run_at, a.created_at, a.updated_at, a.assignee_type, a.project_id, a.pause_reason
+FROM autopilot_trigger t
+JOIN autopilot a ON a.id = t.autopilot_id
+WHERE t.kind = 'event'
+  AND t.enabled = true
+  AND a.status = 'active'
+  AND a.workspace_id = $1
+  AND t.event_filters @> $2::jsonb
+ORDER BY t.created_at ASC
+`
+
+type ListAutopilotEventTriggersForStatusParams struct {
+	WorkspaceID  pgtype.UUID `json:"workspace_id"`
+	StatusFilter []byte      `json:"status_filter"`
+}
+
+type ListAutopilotEventTriggersForStatusRow struct {
+	AutopilotTrigger AutopilotTrigger `json:"autopilot_trigger"`
+	Autopilot        Autopilot        `json:"autopilot"`
+}
+
+// Enabled event triggers in a workspace whose event_filters declare the given
+// issue status, joined to their active autopilot so dispatch needs no second
+// lookup (PPP-21289). event_filters JSONB shape:
+//
+//	[{"event": "issue_status", "actions": ["Queue", "in_review"]}]
+//
+// actions are issue statuses; a trigger fires when an issue ENTERS one of
+// them (create in that status or transition into it).
+func (q *Queries) ListAutopilotEventTriggersForStatus(ctx context.Context, arg ListAutopilotEventTriggersForStatusParams) ([]ListAutopilotEventTriggersForStatusRow, error) {
+	rows, err := q.db.Query(ctx, listAutopilotEventTriggersForStatus, arg.WorkspaceID, arg.StatusFilter)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAutopilotEventTriggersForStatusRow{}
+	for rows.Next() {
+		var i ListAutopilotEventTriggersForStatusRow
+		if err := rows.Scan(
+			&i.AutopilotTrigger.ID,
+			&i.AutopilotTrigger.AutopilotID,
+			&i.AutopilotTrigger.Kind,
+			&i.AutopilotTrigger.Enabled,
+			&i.AutopilotTrigger.CronExpression,
+			&i.AutopilotTrigger.Timezone,
+			&i.AutopilotTrigger.NextRunAt,
+			&i.AutopilotTrigger.WebhookToken,
+			&i.AutopilotTrigger.Label,
+			&i.AutopilotTrigger.LastFiredAt,
+			&i.AutopilotTrigger.CreatedAt,
+			&i.AutopilotTrigger.UpdatedAt,
+			&i.AutopilotTrigger.Provider,
+			&i.AutopilotTrigger.SigningSecret,
+			&i.AutopilotTrigger.EventFilters,
+			&i.AutopilotTrigger.PublishedByType,
+			&i.AutopilotTrigger.PublishedByID,
+			&i.Autopilot.ID,
+			&i.Autopilot.WorkspaceID,
+			&i.Autopilot.Title,
+			&i.Autopilot.Description,
+			&i.Autopilot.AssigneeID,
+			&i.Autopilot.Status,
+			&i.Autopilot.ExecutionMode,
+			&i.Autopilot.IssueTitleTemplate,
+			&i.Autopilot.CreatedByType,
+			&i.Autopilot.CreatedByID,
+			&i.Autopilot.LastRunAt,
+			&i.Autopilot.CreatedAt,
+			&i.Autopilot.UpdatedAt,
+			&i.Autopilot.AssigneeType,
+			&i.Autopilot.ProjectID,
+			&i.Autopilot.PauseReason,
 		); err != nil {
 			return nil, err
 		}
