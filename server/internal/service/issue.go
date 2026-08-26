@@ -628,6 +628,13 @@ func isAgentAssigneeReadyWithQueries(ctx context.Context, q *db.Queries, issue d
 	if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
 		return false
 	}
+	// Lane health gate (PPP-21346): an assignee lane paused for provider
+	// rate-limit backoff must not be enqueued — the task would fail
+	// instantly with 429.
+	paused, _, err := AgentRateLimitPaused(ctx, q, agent.ID)
+	if err != nil || paused {
+		return false
+	}
 	return true
 }
 

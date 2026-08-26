@@ -3365,6 +3365,39 @@ func (q *Queries) GetAgentInWorkspace(ctx context.Context, arg GetAgentInWorkspa
 	return i, err
 }
 
+const getAgentRecentRateLimitFailures = `-- name: GetAgentRecentRateLimitFailures :one
+SELECT
+    count(*)::int AS failure_count,
+    max(completed_at)::timestamptz AS last_failure_at
+FROM agent_task_queue
+WHERE agent_id = $1
+  AND status = 'failed'
+  AND failure_reason = 'agent_error.provider_capacity_or_rate_limit'
+  AND completed_at >= $2
+`
+
+type GetAgentRecentRateLimitFailuresParams struct {
+	AgentID     pgtype.UUID        `json:"agent_id"`
+	CompletedAt pgtype.Timestamptz `json:"completed_at"`
+}
+
+type GetAgentRecentRateLimitFailuresRow struct {
+	FailureCount  int32              `json:"failure_count"`
+	LastFailureAt pgtype.Timestamptz `json:"last_failure_at"`
+}
+
+// Counts provider rate-limit/capacity task failures for an agent since the
+// given timestamp and reports the most recent one. Consumed by the dispatch
+// admission lane-health gate (PPP-21346): a lane with a burst of 429 failures
+// is paused for new assignments until the cooldown elapses, instead of
+// enqueueing tasks that fail instantly with "exceeded retry limit, 429".
+func (q *Queries) GetAgentRecentRateLimitFailures(ctx context.Context, arg GetAgentRecentRateLimitFailuresParams) (GetAgentRecentRateLimitFailuresRow, error) {
+	row := q.db.QueryRow(ctx, getAgentRecentRateLimitFailures, arg.AgentID, arg.CompletedAt)
+	var i GetAgentRecentRateLimitFailuresRow
+	err := row.Scan(&i.FailureCount, &i.LastFailureAt)
+	return i, err
+}
+
 const getAgentTask = `-- name: GetAgentTask :one
 SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, daemon_id FROM agent_task_queue
 WHERE id = $1
