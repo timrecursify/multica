@@ -45,6 +45,20 @@ const DefaultAutopilotTriggerTimezone = "UTC"
 
 const autopilotRecentDuplicateWindow = 60 * time.Second
 
+// EventTriggerIssueStatusEvent is the event name event triggers use to match
+// issue status transitions (PPP-21289). event_filters for kind='event' triggers
+// declare [{event: <this>, actions: [status, ...]}] and fire when an issue
+// enters one of the listed statuses — the native, no-cron replacement for
+// poll-based dispatcher autopilots.
+const EventTriggerIssueStatusEvent = "issue_status"
+
+// autopilotEventDedupeWindow is how long an issue-status event trigger skips
+// re-dispatching for the same (trigger, issue, status) triple. A retried or
+// double-written status transition inside this window cannot fan out duplicate
+// runs; a genuine later re-entry (issue leaves and re-enters the status) fires
+// again.
+const autopilotEventDedupeWindow = 60 * time.Second
+
 func NewAutopilotService(q *db.Queries, tx TxStarter, bus *events.Bus, taskSvc *TaskService) *AutopilotService {
 	return &AutopilotService{Queries: q, TxStarter: tx, Bus: bus, TaskSvc: taskSvc}
 }
@@ -411,6 +425,81 @@ func (s *AutopilotService) DispatchAutopilotForPlan(
 	// delivery on the scheduled-plan path.
 	run, _, err := s.dispatchAutopilot(ctx, autopilot, triggerID, source, payload, plannedTS, pgtype.UUID{}, pgtype.UUID{})
 	return run, err
+}
+
+// FireIssueStatusEventTriggers dispatches every enabled event trigger in the
+// issue's workspace whose event_filters watch the issue's current status
+// (PPP-21289). It is the native, no-cron replacement for poll-based dispatcher
+// autopilots: an issue entering Queue fires the build-agent autopilot, an
+// issue entering in_review fires the QC autopilot.
+//
+// Fires are best-effort per trigger: a lookup/dispatch failure on one trigger
+// is logged and does not block the others, and a failed fire never fails the
+// issue write that triggered it. Duplicate transitions inside
+// autopilotEventDedupeWindow are skipped via the (trigger_id, payload) guard;
+// each fire bumps last_fired_at regardless of dispatch outcome (matching the
+// webhook trigger contract — a fire is a fire even if admission skips it).
+func (s *AutopilotService) FireIssueStatusEventTriggers(ctx context.Context, issue db.Issue) error {
+	rows, err := s.Queries.ListAutopilotEventTriggersForStatus(ctx, db.ListAutopilotEventTriggersForStatusParams{
+		WorkspaceID:  issue.WorkspaceID,
+		StatusFilter: issueStatusEventFilterJSON(issue.Status),
+	})
+	if err != nil {
+		return fmt.Errorf("list event triggers for status %q: %w", issue.Status, err)
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	payload := issueStatusEventPayloadJSON(issue)
+	since := pgtype.Timestamptz{Time: time.Now().UTC().Add(-autopilotEventDedupeWindow), Valid: true}
+	for _, row := range rows {
+		trigger := row.AutopilotTrigger
+		exists, err := s.Queries.AutopilotEventRunExistsForIssue(ctx, db.AutopilotEventRunExistsForIssueParams{
+			TriggerID:     trigger.ID,
+			DedupePayload: payload,
+			Since:         since,
+		})
+		if err != nil {
+			slog.Warn("autopilot event trigger: dedupe lookup failed",
+				"trigger_id", util.UUIDToString(trigger.ID),
+				"issue_id", util.UUIDToString(issue.ID),
+				"status", issue.Status,
+				"error", err)
+			continue
+		}
+		if exists {
+			slog.Debug("autopilot event trigger: skipping duplicate fire",
+				"trigger_id", util.UUIDToString(trigger.ID),
+				"issue_id", util.UUIDToString(issue.ID),
+				"status", issue.Status)
+			continue
+		}
+		if _, err := s.DispatchAutopilot(ctx, row.Autopilot, trigger.ID, "event", payload); err != nil {
+			slog.Warn("autopilot event trigger dispatch failed",
+				"trigger_id", util.UUIDToString(trigger.ID),
+				"autopilot_id", util.UUIDToString(row.Autopilot.ID),
+				"issue_id", util.UUIDToString(issue.ID),
+				"status", issue.Status,
+				"error", err)
+		}
+		_ = s.Queries.TouchAutopilotTriggerFiredAt(ctx, trigger.ID)
+	}
+	return nil
+}
+
+// issueStatusEventFilterJSON builds the event_filters containment probe for one
+// status: the trigger's event_filters column must contain
+// [{"event":"issue_status","actions":["<status>"]}] to fire on this entry.
+func issueStatusEventFilterJSON(status string) []byte {
+	return []byte(fmt.Sprintf(`[{"event": %q, "actions": [%q]}]`, EventTriggerIssueStatusEvent, status))
+}
+
+// issueStatusEventPayloadJSON is the trigger_payload written on an event-trigger
+// run. It carries the triggering issue and status so the run history shows what
+// fired, and doubles as the dedupe key for AutopilotEventRunExistsForIssue.
+func issueStatusEventPayloadJSON(issue db.Issue) []byte {
+	return []byte(fmt.Sprintf(`{"issue_id": %q, "status": %q}`, util.UUIDToString(issue.ID), issue.Status))
 }
 
 // isAutopilotRunComplete decides whether an existing autopilot_run row

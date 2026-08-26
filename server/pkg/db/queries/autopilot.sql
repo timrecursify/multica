@@ -591,3 +591,35 @@ SELECT EXISTS (
 -- Powers the per-row can_write flag on the list endpoint without an N+1.
 SELECT autopilot_id FROM autopilot_collaborator
 WHERE user_type = 'member' AND user_id = $1;
+
+-- name: ListAutopilotEventTriggersForStatus :many
+-- Enabled event triggers in a workspace whose event_filters declare the given
+-- issue status, joined to their active autopilot so dispatch needs no second
+-- lookup (PPP-21289). event_filters JSONB shape:
+--   [{"event": "issue_status", "actions": ["Queue", "in_review"]}]
+-- actions are issue statuses; a trigger fires when an issue ENTERS one of
+-- them (create in that status or transition into it).
+SELECT
+    sqlc.embed(t),
+    sqlc.embed(a)
+FROM autopilot_trigger t
+JOIN autopilot a ON a.id = t.autopilot_id
+WHERE t.kind = 'event'
+  AND t.enabled = true
+  AND a.status = 'active'
+  AND a.workspace_id = sqlc.arg('workspace_id')
+  AND t.event_filters @> sqlc.arg('status_filter')::jsonb
+ORDER BY t.created_at ASC;
+
+-- name: AutopilotEventRunExistsForIssue :one
+-- Idempotency guard for event-trigger dispatch: an issue status transition
+-- retried inside the dedupe window (HTTP retry / double write) must not fan
+-- out a second autopilot run. The payload carries the triggering issue_id and
+-- status; a genuine later re-entry after the window fires again.
+SELECT EXISTS (
+    SELECT 1
+    FROM autopilot_run
+    WHERE trigger_id = sqlc.arg('trigger_id')
+      AND trigger_payload @> sqlc.arg('dedupe_payload')::jsonb
+      AND created_at >= sqlc.arg('since')
+) AS exists;

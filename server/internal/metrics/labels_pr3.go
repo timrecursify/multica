@@ -86,6 +86,7 @@ var (
 	knownAutopilotTriggers = map[string]string{
 		"schedule": "schedule",
 		"webhook":  "webhook",
+		"event":    "event",
 		"manual":   "manual",
 		"unknown":  "unknown",
 	}

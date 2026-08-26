@@ -24,6 +24,7 @@ import (
 
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
 	"github.com/multica-ai/multica/server/internal/middleware"
+	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -634,6 +635,32 @@ func validateWebhookEventFilters(filters []WebhookEventFilter) error {
 	for i, f := range filters {
 		if strings.TrimSpace(f.Event) == "" {
 			return fmt.Errorf("event_filters[%d].event must not be empty", i)
+		}
+		for j, a := range f.Actions {
+			if strings.TrimSpace(a) == "" {
+				return fmt.Errorf("event_filters[%d].actions[%d] must not be empty", i, j)
+			}
+		}
+	}
+	return nil
+}
+
+// validateEventTriggerEventFilters enforces the closed event value space for
+// event triggers (PPP-21289). Only issue status transitions are supported:
+// filters must declare event "issue_status" with non-empty status actions
+// (the statuses whose ENTRY fires the trigger). Rejecting unknown events and
+// empty filter sets early keeps a misconfigured event trigger from silently
+// never firing.
+func validateEventTriggerEventFilters(filters []WebhookEventFilter) error {
+	if len(filters) == 0 {
+		return errors.New("event_filters is required for event triggers")
+	}
+	for i, f := range filters {
+		if f.Event != service.EventTriggerIssueStatusEvent {
+			return fmt.Errorf("event_filters[%d].event must be %q for event triggers", i, service.EventTriggerIssueStatusEvent)
+		}
+		if len(f.Actions) == 0 {
+			return fmt.Errorf("event_filters[%d].actions must not be empty for event triggers", i)
 		}
 		for j, a := range f.Actions {
 			if strings.TrimSpace(a) == "" {

@@ -8,7 +8,7 @@ export type AutopilotExecutionMode = "create_issue" | "run_only";
 // Path A). Older servers omit this field — callers should default to "agent".
 export type AutopilotAssigneeType = "agent" | "squad";
 
-export type AutopilotTriggerKind = "schedule" | "webhook" | "api";
+export type AutopilotTriggerKind = "schedule" | "webhook" | "api" | "event";
 
 // `skipped` is emitted by the backend pre-flight admission check
 // (assignee runtime offline at dispatch time, MUL-1899). The frontend MUST
@@ -21,7 +21,7 @@ export type AutopilotRunStatus =
   | "failed"
   | "skipped";
 
-export type AutopilotRunSource = "schedule" | "manual" | "webhook" | "api";
+export type AutopilotRunSource = "schedule" | "manual" | "webhook" | "api" | "event";
 
 export interface Autopilot {
   id: string;
@@ -106,8 +106,9 @@ export interface AutopilotTrigger {
   // webhook_path when this is missing.
   webhook_url?: string | null;
   label: string | null;
-  // event_filters is only present for webhook triggers. Null/empty means
-  // "accept all events".
+  // event_filters is only present for webhook and event triggers. For webhook,
+  // null/empty means "accept all events"; for event, it lists the issue statuses
+  // whose entry fires the trigger.
   event_filters?: WebhookEventFilter[] | null;
   last_fired_at: string | null;
   created_at: string;
