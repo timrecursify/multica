@@ -840,10 +840,7 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 			writeError(w, http.StatusBadRequest, "invalid workspace_id")
 			return db.Issue{}, false
 		}
-		issue, err := h.Queries.GetIssueByNumber(r.Context(), db.GetIssueByNumberParams{
-			WorkspaceID: wsUUID,
-			Number:      int32(number),
-		})
+		issue, err := h.loadIssueByNumber(r.Context(), wsUUID, int32(number))
 		if err == nil {
 			return issue, true
 		}
@@ -870,6 +867,39 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 		return db.Issue{}, false
 	}
 	return issue, true
+}
+
+// loadIssueByNumber keeps the generated Issue model compatible with historical
+// rows whose creator_type is absent. The database schema deliberately permits
+// that absence after migration 273, while sqlc still models CreatorType as a
+// string for the wider application surface.
+func (h *Handler) loadIssueByNumber(ctx context.Context, workspaceID pgtype.UUID, number int32) (db.Issue, error) {
+	row := h.DB.QueryRow(ctx, `
+		SELECT id, workspace_id, title, description, status, priority,
+		       assignee_type, assignee_id, creator_type, creator_id,
+		       parent_issue_id, acceptance_criteria, context_refs, position,
+		       due_date, created_at, updated_at, number, project_id,
+		       origin_type, origin_id, first_executed_at, start_date, metadata,
+		       stage, properties
+		FROM issue
+		WHERE workspace_id = $1 AND number = $2
+	`, workspaceID, number)
+	var issue db.Issue
+	var creatorType pgtype.Text
+	err := row.Scan(
+		&issue.ID, &issue.WorkspaceID, &issue.Title, &issue.Description,
+		&issue.Status, &issue.Priority, &issue.AssigneeType, &issue.AssigneeID,
+		&creatorType, &issue.CreatorID, &issue.ParentIssueID,
+		&issue.AcceptanceCriteria, &issue.ContextRefs, &issue.Position,
+		&issue.DueDate, &issue.CreatedAt, &issue.UpdatedAt, &issue.Number,
+		&issue.ProjectID, &issue.OriginType, &issue.OriginID,
+		&issue.FirstExecutedAt, &issue.StartDate, &issue.Metadata, &issue.Stage,
+		&issue.Properties,
+	)
+	if err == nil && creatorType.Valid {
+		issue.CreatorType = creatorType.String
+	}
+	return issue, err
 }
 
 // resolveIssueByIdentifier tries to look up an issue by "PREFIX-NUMBER" format.
