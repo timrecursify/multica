@@ -1,7 +1,11 @@
-name: multica
+# Developer-only database. All worktrees intentionally share this one local
+# PostgreSQL container while using separate database names. Keep this project
+# name distinct from the production/self-host project ("multica") so a dev
+# checkout's normal reconciliation cannot replace production resources.
+name: multica-dev
 
 services:
-  postgres:
+  dev-postgres:
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_DB: multica
@@ -10,7 +14,14 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - dev_pgdata:/var/lib/postgresql/data
 
 volumes:
-  pgdata:
+  dev_pgdata:
+    name: multica_dev_pgdata
+
+networks:
+  default:
+    # Keep the developer network disjoint even when an ambient
+    # COMPOSE_PROJECT_NAME overrides the top-level project name.
+    name: multica_dev_default

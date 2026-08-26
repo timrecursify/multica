@@ -69,19 +69,19 @@ is_local() {
 if is_local; then
   # ---------- Local: use Docker ----------
   echo "==> Ensuring shared PostgreSQL container is running on localhost:5432..."
-  docker compose up -d postgres
+  docker compose up -d dev-postgres
 
   echo "==> Waiting for PostgreSQL to be ready..."
-  until docker compose exec -T postgres pg_isready -U "$POSTGRES_USER" -d postgres > /dev/null 2>&1; do
+  until docker compose exec -T dev-postgres pg_isready -U "$POSTGRES_USER" -d postgres > /dev/null 2>&1; do
     sleep 1
   done
 
   echo "==> Ensuring database '$POSTGRES_DB' exists..."
-  db_exists="$(docker compose exec -T postgres \
+  db_exists="$(docker compose exec -T dev-postgres \
     psql -U "$POSTGRES_USER" -d postgres -Atqc "SELECT 1 FROM pg_database WHERE datname = '$POSTGRES_DB'")"
 
   if [ "$db_exists" != "1" ]; then
-    docker compose exec -T postgres \
+    docker compose exec -T dev-postgres \
       psql -U "$POSTGRES_USER" -d postgres -v ON_ERROR_STOP=1 \
       -c "CREATE DATABASE \"$POSTGRES_DB\"" \
       > /dev/null
