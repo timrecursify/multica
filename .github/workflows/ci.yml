@@ -51,7 +51,9 @@ jobs:
               - 'scripts/generate-reserved-slugs.mjs'
               - 'server/internal/handler/reserved_slugs.json'
               - 'scripts/selfhost-config.test.sh'
+              - 'scripts/selfhost-compose.sh'
               - 'scripts/selfhost-wait.sh'
+              - 'scripts/dev-compose-isolation.test.sh'
               # selfhost-config.test.sh asserts on the installers' side of
               # the port contract, so a change to either must run it.
               - 'scripts/install.sh'
@@ -148,6 +150,10 @@ jobs:
       - name: Test self-host env derivation
         if: ${{ needs.changes.outputs.frontend == 'true' }}
         run: bash scripts/selfhost-config.test.sh
+
+      - name: Test development Compose isolation
+        if: ${{ needs.changes.outputs.frontend == 'true' }}
+        run: bash scripts/dev-compose-isolation.test.sh
 
       - name: Verify reserved-slugs.ts is up to date
         if: ${{ needs.changes.outputs.frontend == 'true' }}
