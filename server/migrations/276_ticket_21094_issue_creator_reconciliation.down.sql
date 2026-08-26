@@ -1,0 +1,2 @@
+-- Reversing this migration would reintroduce rows that cannot be scanned by
+-- the API. The original nullable migration remains the historical rollback.
