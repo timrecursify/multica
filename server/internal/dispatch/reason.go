@@ -54,4 +54,10 @@ const (
 	ReasonSelfTriggerSuppressed ReasonCode = "self_trigger_suppressed"
 	// ReasonInternalError: an unexpected server error prevented a clean decision.
 	ReasonInternalError ReasonCode = "internal_error"
+	// ReasonLaneRateLimited: the target agent's lane is paused by the
+	// rate-limit health gate (PPP-21346) — its recent tasks failed with
+	// provider rate-limit / capacity errors (429), so new work is refused
+	// until the lane's cooldown elapses. Not a permission problem and not a
+	// dead lane: the fix is time, or moving the work to a healthy lane.
+	ReasonLaneRateLimited ReasonCode = "lane_rate_limited"
 )

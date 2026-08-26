@@ -3371,6 +3371,14 @@ func (h *Handler) isAgentAssigneeReady(ctx context.Context, issue db.Issue) bool
 		return false
 	}
 
+	// Lane health gate (PPP-21346): an assignee lane paused for provider
+	// rate-limit backoff must not be enqueued — the task would fail
+	// instantly with 429.
+	paused, _, err := service.AgentRateLimitPaused(ctx, h.Queries, agent.ID)
+	if err != nil || paused {
+		return false
+	}
+
 	return true
 }
 

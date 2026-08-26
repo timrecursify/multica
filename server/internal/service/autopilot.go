@@ -962,7 +962,7 @@ func (s *AutopilotService) dispatchRunOnly(ctx context.Context, ap db.Autopilot,
 		return fmt.Errorf("check agent readiness: %w", err)
 	}
 	if !ready {
-		return &errDispatchSkipped{reason: formatAdmissionReason(ap, reason), code: agentReadinessReasonCode(agent)}
+		return &errDispatchSkipped{reason: formatAdmissionReason(ap, reason), code: agentReadinessReasonCode(agent, reason)}
 	}
 
 	// Fail-closed invocation gate for squad autopilots (admission principal =
@@ -1327,7 +1327,7 @@ func (s *AutopilotService) shouldSkipDispatch(ctx context.Context, ap db.Autopil
 				"reason", reason,
 			)
 		} else {
-			return formatAdmissionReason(ap, reason), agentReadinessReasonCode(agent), true
+			return formatAdmissionReason(ap, reason), agentReadinessReasonCode(agent, reason), true
 		}
 	}
 	// Invocation gate at the autopilot layer (MUL-3963 / MUL-4525). The
@@ -1350,11 +1350,17 @@ func (s *AutopilotService) shouldSkipDispatch(ctx context.Context, ap db.Autopil
 
 // agentReadinessReasonCode types the reason an AgentReadiness check failed from
 // the agent's own state rather than the human-readable reason string (MUL-4525).
-// An archived agent cannot run at all; anything else (no runtime bound, or a
-// bound runtime that is not online) is a runtime-availability problem.
-func agentReadinessReasonCode(agent db.Agent) dispatch.ReasonCode {
+// An archived agent cannot run at all; a bound runtime that is not online is a
+// runtime-availability problem; a lane paused by the rate-limit health gate is
+// a provider-capacity problem (PPP-21346).
+func agentReadinessReasonCode(agent db.Agent, reason string) dispatch.ReasonCode {
 	if agent.ArchivedAt.Valid {
 		return dispatch.ReasonTargetUnavailable
+	}
+	// The rate-limit health gate pauses a lane whose recent tasks failed with
+	// provider 429s; the fix is time, not re-binding a runtime.
+	if strings.HasPrefix(reason, "agent lane rate-limited") {
+		return dispatch.ReasonLaneRateLimited
 	}
 	// No runtime bound at all is a different user story from a runtime that is
 	// merely offline: nothing will ever pick the work up, and the fix is to bind
@@ -1383,12 +1389,17 @@ func formatAdmissionReason(ap db.Autopilot, raw string) string {
 		return prefix + "agent is archived"
 	case "agent has no runtime bound":
 		return prefix + "agent has no runtime bound"
-	default:
-		// raw is "agent runtime is X" — surface the runtime status while
-		// preserving the legacy "at dispatch time" suffix from MUL-1899
-		// so alert queries do not need to change.
-		return raw + " at dispatch time"
 	}
+	// Lane health gate (PPP-21346): the reason already names the pause window,
+	// so keep it verbatim and never append the legacy "at dispatch time"
+	// suffix that is tuned for the runtime-status phrasing.
+	if strings.HasPrefix(raw, "agent lane rate-limited") {
+		return raw
+	}
+	// raw is "agent runtime is X" — surface the runtime status while
+	// preserving the legacy "at dispatch time" suffix from MUL-1899
+	// so alert queries do not need to change.
+	return raw + " at dispatch time"
 }
 
 // errSquadArchived signals that an autopilot's squad assignee has been

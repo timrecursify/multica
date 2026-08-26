@@ -2,8 +2,10 @@ package service
 
 import (
 	"context"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -118,6 +120,18 @@ func (s *IssueService) WillEnqueueRun(ctx context.Context, in IssueTriggerInput,
 	case "agent":
 		agent, err := s.Queries.GetAgent(ctx, issue.AssigneeID)
 		if err != nil || !agent.RuntimeID.Valid || agent.ArchivedAt.Valid {
+			return IssueRunTrigger{}, false
+		}
+		// Lane health gate (PPP-21346): a lane paused for provider
+		// rate-limit backoff must not receive a new run — the task would
+		// fail instantly with 429 and churn the board.
+		if paused, reason, err := AgentRateLimitPaused(ctx, s.Queries, agent.ID); err != nil || paused {
+			if paused {
+				slog.Warn("issue enqueue skipped: assignee lane rate-limited",
+					"issue_id", util.UUIDToString(issue.ID),
+					"agent_id", util.UUIDToString(agent.ID),
+					"reason", reason)
+			}
 			return IssueRunTrigger{}, false
 		}
 		if !canAccess(agent) {
