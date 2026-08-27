@@ -139,7 +139,7 @@ END, ''))`,
 		}
 		seenSecondaryValues := make(map[string]struct{}, len(group.SecondaryValues))
 		for _, value := range group.SecondaryValues {
-			if !issueTableContainsString(validIssueStatuses, value) {
+			if strings.TrimSpace(value) == "" {
 				writeError(w, http.StatusBadRequest, "invalid group.secondary_values")
 				return resolvedIssueTableGroup{}, false
 			}
@@ -325,7 +325,7 @@ func (group resolvedIssueTableGroup) descriptor(raw string, count int64, context
 	descriptor := issueTableGroupDescriptorResponse{Count: count}
 	switch group.kind {
 	case "status":
-		if !issueTableContainsString(validIssueStatuses, raw) {
+		if strings.TrimSpace(raw) == "" {
 			return descriptor, fmt.Errorf("unexpected status group value %q", raw)
 		}
 		descriptor.Key = "status:" + raw
@@ -422,7 +422,7 @@ func (group resolvedIssueTableGroup) predicate(w http.ResponseWriter, key string
 		}
 		encodedAndStatus := strings.TrimPrefix(key, prefix)
 		encoded, status, ok := strings.Cut(encodedAndStatus, ":status:")
-		if !ok || !issueTableContainsString(validIssueStatuses, status) {
+		if !ok || strings.TrimSpace(status) == "" {
 			writeError(w, http.StatusBadRequest, "invalid group_key")
 			return "", false
 		}
@@ -446,7 +446,7 @@ func (group resolvedIssueTableGroup) predicate(w http.ResponseWriter, key string
 		return "TRUE", true
 	case "status":
 		const prefix = "status:"
-		if !strings.HasPrefix(key, prefix) || !issueTableContainsString(validIssueStatuses, strings.TrimPrefix(key, prefix)) {
+		if !strings.HasPrefix(key, prefix) || strings.TrimSpace(strings.TrimPrefix(key, prefix)) == "" {
 			writeError(w, http.StatusBadRequest, "invalid group_key")
 			return "", false
 		}
