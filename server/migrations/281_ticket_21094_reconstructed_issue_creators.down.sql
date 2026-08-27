@@ -1,0 +1,2 @@
+-- Attribution backfill is intentionally irreversible: restoring NULL values
+-- would reintroduce the reconstruction lookup failure.

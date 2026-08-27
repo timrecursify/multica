@@ -176,6 +176,42 @@ func TestListComments_DefaultPreservesChronologicalOrder(t *testing.T) {
 	eqIDs(t, ids(rows), want, "default order")
 }
 
+// Reconstructed issues can have a missing creator type. The comment lookup
+// must still resolve the workspace-scoped issue instead of hiding it.
+func TestListComments_AllowsNullCreatorType(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+
+	ctx := context.Background()
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
+		VALUES ($1, 'RECONSTRUCTED comment lookup regression', 'todo', 'none', NULL, $2, 987656)
+		RETURNING id
+	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+		t.Fatalf("insert reconstructed issue: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
+
+	var commentID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+		VALUES ($1, $2, 'member', $3, 'reconstructed issue comment', 'comment')
+		RETURNING id
+	`, issueID, testWorkspaceID, testUserID).Scan(&commentID); err != nil {
+		t.Fatalf("insert comment: %v", err)
+	}
+
+	rec, comments := listComments(t, issueID, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListComments = %d: %s", rec.Code, rec.Body.String())
+	}
+	if len(comments) != 1 || comments[0].ID != commentID {
+		t.Fatalf("ListComments returned %+v, want %s", comments, commentID)
+	}
+}
+
 // TestListComments_RootsOnlyReturnsTopLevelComments pins the #3164 contract:
 // issue-level orientation should fetch only root comments, leaving replies for
 // a later thread-scoped read if the caller needs detail.
