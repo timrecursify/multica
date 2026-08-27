@@ -831,6 +831,23 @@ func (h *Handler) loadIssueForUser(w http.ResponseWriter, r *http.Request, issue
 		return issue, true
 	}
 
+	// Accept a bare issue number as well as a UUID or canonical identifier. The
+	// query remains scoped to the caller's selected workspace.
+	if number, err := strconv.ParseInt(issueID, 10, 32); err == nil && number > 0 {
+		wsUUID, err := util.ParseUUID(workspaceID)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid workspace_id")
+			return db.Issue{}, false
+		}
+		issue, err := h.Queries.GetIssueByNumber(r.Context(), db.GetIssueByNumberParams{
+			WorkspaceID: wsUUID,
+			Number:      int32(number),
+		})
+		if err == nil {
+			return issue, true
+		}
+	}
+
 	issueUUID, err := util.ParseUUID(issueID)
 	if err != nil {
 		// Not a valid UUID and didn't match identifier format → 404 (consistent

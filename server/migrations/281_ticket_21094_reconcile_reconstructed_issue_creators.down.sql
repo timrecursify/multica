@@ -1,0 +1,2 @@
+-- The creator backfill is intentionally irreversible: restoring NULL values
+-- would make reconstructed issues unreadable by the API's generated model.
