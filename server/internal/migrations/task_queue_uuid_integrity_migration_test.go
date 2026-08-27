@@ -72,7 +72,7 @@ func TestTaskQueueUUIDIntegrityMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("holds shared lock through integrity check", func(t *testing.T) {
+	t.Run("shared lock blocks concurrent child writer", func(t *testing.T) {
 		holder, cleanup := uuidIntegritySchema(t, ctx, dbURL, "uuid", "uuid", "uuid")
 		defer cleanup()
 		seedUUIDHistory(t, ctx, holder, false)
@@ -91,18 +91,24 @@ func TestTaskQueueUUIDIntegrityMigration(t *testing.T) {
 		if _, err := worker.Exec(ctx, "SET search_path TO "+schema); err != nil {
 			t.Fatal(err)
 		}
-		done := make(chan error, 1)
-		go func() { done <- applyUUIDIntegrity(context.Background(), worker) }()
+		writerDone := make(chan error, 1)
+		go func() {
+			_, err := worker.Exec(context.Background(), `INSERT INTO task_message VALUES ('00000000-0000-0000-0000-000000000099', '00000000-0000-0000-0000-000000000001')`)
+			writerDone <- err
+		}()
 		select {
-		case err := <-done:
-			t.Fatalf("migration did not wait for conflicting writer lock: %v", err)
+		case err := <-writerDone:
+			t.Fatalf("child writer was not blocked by integrity lock: %v", err)
 		case <-time.After(150 * time.Millisecond):
 		}
 		if _, err := holder.Exec(ctx, "ROLLBACK"); err != nil {
 			t.Fatal(err)
 		}
-		if err := <-done; err != nil {
-			t.Fatalf("migration after lock release: %v", err)
+		if err := <-writerDone; err != nil {
+			t.Fatalf("child writer after lock release: %v", err)
+		}
+		if err := applyUUIDIntegrity(ctx, holder); err != nil {
+			t.Fatalf("migration after concurrent writer: %v", err)
 		}
 	})
 }

@@ -72,9 +72,13 @@ func TestRepairTaskHistory_RealPostgresDryRunCommitAndIdempotency(t *testing.T) 
 	if err := run(ctx, csv, dbURL, false, &out); err != nil {
 		t.Fatalf("idempotent repair: %v", err)
 	}
-	var messages, usage, orphans int
-	if err := pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM task_message), (SELECT count(*) FROM task_usage), (SELECT count(*) FROM task_message m LEFT JOIN agent_task_queue q ON q.id=m.task_id WHERE q.id IS NULL)`).Scan(&messages, &usage, &orphans); err != nil || messages != 1 || usage != 1 || orphans != 0 {
-		t.Fatalf("post-repair rows messages=%d usage=%d orphans=%d err=%v", messages, usage, orphans, err)
+	var messages, usage, messageOrphans, usageOrphans int
+	if err := pool.QueryRow(ctx, `SELECT
+        (SELECT count(*) FROM task_message),
+        (SELECT count(*) FROM task_usage),
+        (SELECT count(*) FROM task_message m LEFT JOIN agent_task_queue q ON q.id=m.task_id WHERE m.task_id IS NOT NULL AND q.id IS NULL),
+        (SELECT count(*) FROM task_usage u LEFT JOIN agent_task_queue q ON q.id=u.task_id WHERE u.task_id IS NOT NULL AND q.id IS NULL)`).Scan(&messages, &usage, &messageOrphans, &usageOrphans); err != nil || messages != 1 || usage != 1 || messageOrphans != 0 || usageOrphans != 0 {
+		t.Fatalf("post-repair rows messages=%d usage=%d message_orphans=%d usage_orphans=%d err=%v", messages, usage, messageOrphans, usageOrphans, err)
 	}
 }
 
