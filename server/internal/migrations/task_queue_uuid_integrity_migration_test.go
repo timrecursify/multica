@@ -72,43 +72,50 @@ func TestTaskQueueUUIDIntegrityMigration(t *testing.T) {
 		}
 	})
 
-	t.Run("shared lock blocks concurrent child writer", func(t *testing.T) {
+	t.Run("race before table lock is rejected by orphan postcondition", func(t *testing.T) {
 		holder, cleanup := uuidIntegritySchema(t, ctx, dbURL, "uuid", "uuid", "uuid")
 		defer cleanup()
 		seedUUIDHistory(t, ctx, holder, false)
-		if _, err := holder.Exec(ctx, "BEGIN; LOCK TABLE agent_task_queue, task_message, task_usage IN SHARE ROW EXCLUSIVE MODE"); err != nil {
+		if _, err := holder.Exec(ctx, "BEGIN; SELECT pg_advisory_xact_lock(hashtextextended('agent_task_queue_uuid_integrity', 0))"); err != nil {
 			t.Fatal(err)
 		}
-		worker, err := pgx.Connect(ctx, dbURL)
+		migration, err := pgx.Connect(ctx, dbURL)
 		if err != nil {
 			t.Fatal(err)
 		}
-		defer worker.Close(ctx)
+		defer migration.Close(ctx)
 		var schema string
 		if err := holder.QueryRow(ctx, "SELECT current_schema()").Scan(&schema); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := worker.Exec(ctx, "SET search_path TO "+schema); err != nil {
+		if _, err := migration.Exec(ctx, "SET search_path TO "+schema); err != nil {
 			t.Fatal(err)
 		}
-		writerDone := make(chan error, 1)
+		migrationDone := make(chan error, 1)
 		go func() {
-			_, err := worker.Exec(context.Background(), `INSERT INTO task_message VALUES ('00000000-0000-0000-0000-000000000099', '00000000-0000-0000-0000-000000000001')`)
-			writerDone <- err
+			migrationDone <- applyUUIDIntegrity(context.Background(), migration)
 		}()
 		select {
-		case err := <-writerDone:
-			t.Fatalf("child writer was not blocked by integrity lock: %v", err)
+		case err := <-migrationDone:
+			t.Fatalf("migration ignored the shared advisory lock: %v", err)
 		case <-time.After(150 * time.Millisecond):
+		}
+		writer, err := pgx.Connect(ctx, dbURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer writer.Close(ctx)
+		if _, err := writer.Exec(ctx, "SET search_path TO "+schema); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Exec(ctx, `INSERT INTO task_message VALUES ('00000000-0000-0000-0000-000000000099', '00000000-0000-0000-0000-000000000777')`); err != nil {
+			t.Fatalf("write before migration table lock: %v", err)
 		}
 		if _, err := holder.Exec(ctx, "ROLLBACK"); err != nil {
 			t.Fatal(err)
 		}
-		if err := <-writerDone; err != nil {
-			t.Fatalf("child writer after lock release: %v", err)
-		}
-		if err := applyUUIDIntegrity(ctx, holder); err != nil {
-			t.Fatalf("migration after concurrent writer: %v", err)
+		if err := <-migrationDone; err == nil || !strings.Contains(err.Error(), "task_message_orphans=1, task_usage_orphans=0") {
+			t.Fatalf("migration did not reject raced orphan: %v", err)
 		}
 	})
 }
