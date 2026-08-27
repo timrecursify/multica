@@ -45,12 +45,6 @@ var legacyDuplicateMigrationStems = map[string][]string{
 	"124": {"124_autopilot_run_planned_at", "124_channel_generalization", "124_task_prepare_lease"},
 	"127": {"127_issue_pull_request_reference_only", "127_task_squad_id", "127_user_composio_connection"},
 	"128": {"128_agent_task_queue_runtime_mcp_overlay", "128_autopilot_collaborator", "128_comment_routing_escalation"},
-	// PPP fork: 273_* files were added in the fork's early relay/dashboard
-	// commits with a shared prefix. They are already applied in deployed
-	// databases (schema_migrations records the full stem, so they cannot be
-	// renamed without re-running them), so the prefix is allowlisted exactly
-	// like the upstream historical duplicates above.
-	"273": {"273_add_daemon_id_to_task_queue", "273_issue_creator_type_nullable", "273_relay_stage_config"},
 }
 
 var migrationPrefixPattern = regexp.MustCompile(`^(\d+)_`)
