@@ -76,6 +76,12 @@ const (
 	// RecoverOrphanedTasksForRuntime at daemon startup.
 	ReasonRuntimeRecovery Reason = "runtime_recovery"
 
+	// ReasonOrphaned: an in-flight task's owning daemon detected that its
+	// child process died/was reaped before any terminal result was
+	// delivered. Written by the daemon's terminal-result path so a crash
+	// cannot strand the row running (PPP-21532).
+	ReasonOrphaned Reason = "orphaned"
+
 	// ReasonTimeout: server-side or runtime-side hard timeout.
 	// Written by FailStaleTasks (server) and the daemon's per-task
 	// agent timeout path.
@@ -200,6 +206,7 @@ var allReasons = []Reason{
 	ReasonQueuedExpired,
 	ReasonRuntimeOffline,
 	ReasonRuntimeRecovery,
+	ReasonOrphaned,
 	ReasonTimeout,
 	ReasonIterationLimit,
 	ReasonAgentBlocked,

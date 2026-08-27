@@ -356,6 +356,16 @@ var legacyOpencodeStreamEndedReasons = map[string]bool{
 	"agent_error":                     true,
 }
 
+// legacyOrphanedReasons are reasons an older daemon can put on a process-exit
+// terminal result. These use catchall/error labels because they predate the
+// orphaned taxonomy entry.
+var legacyOrphanedReasons = map[string]bool{
+	string(ReasonAgentProcessFailure): true,
+	string(ReasonAgentUnknown):        true,
+}
+
+const errCodexProcessExitedWitness = "codex process exited"
+
 // NormalizeDaemonReason upgrades a failure_reason reported by an older daemon
 // onto the taxonomy this server understands, using the raw error text as the
 // witness. It returns the reason unchanged when nothing applies.
@@ -399,6 +409,14 @@ func NormalizeDaemonReason(reason, rawError string) Reason {
 	if legacyOpencodeStreamEndedReasons[reason] &&
 		strings.HasPrefix(strings.ToLower(strings.TrimSpace(rawError)), opencodeStreamEndedPrefix) {
 		return ReasonAgentProviderNetwork
+	}
+	// PPP-21532: older daemons have no structured process-exit label, but
+	// their terminal failure carries the Codex backend's unambiguous witness.
+	// Mapping it here makes the recovery path work as soon as this server is
+	// deployed, instead of waiting for every daemon host to update.
+	if legacyOrphanedReasons[reason] &&
+		strings.Contains(strings.ToLower(rawError), errCodexProcessExitedWitness) {
+		return ReasonOrphaned
 	}
 	return Reason(reason)
 }

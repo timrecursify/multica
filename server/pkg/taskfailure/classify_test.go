@@ -441,3 +441,17 @@ func TestNormalizeDaemonReason_UpgradedReasonIsPlatformSide(t *testing.T) {
 		t.Errorf("%q must be platform-side: the agent process never started", got)
 	}
 }
+
+func TestNormalizeDaemonReasonCodexProcessExitedIsOrphaned(t *testing.T) {
+	t.Parallel()
+
+	raw := "codex process exited before delivering a terminal result"
+	for _, reason := range []string{string(ReasonAgentProcessFailure), string(ReasonAgentUnknown)} {
+		if got := NormalizeDaemonReason(reason, raw); got != ReasonOrphaned {
+			t.Errorf("NormalizeDaemonReason(%q, %q) = %q, want %q", reason, raw, got, ReasonOrphaned)
+		}
+	}
+	if got := NormalizeDaemonReason(string(ReasonAgentProcessFailure), "codex exited cleanly with an ordinary failure"); got != ReasonAgentProcessFailure {
+		t.Errorf("NormalizeDaemonReason upgraded text without the full process-exit witness: got %q", got)
+	}
+}

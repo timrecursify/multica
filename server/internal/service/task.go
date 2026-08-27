@@ -4140,6 +4140,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 var retryableReasons = map[string]bool{
 	"runtime_offline":           true,
 	"runtime_recovery":          true,
+	"orphaned":                  true,
 	"timeout":                   true,
 	"codex_semantic_inactivity": true,
 	string(taskfailure.ReasonAgentProviderNetwork):   true,

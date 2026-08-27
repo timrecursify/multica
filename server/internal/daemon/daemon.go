@@ -56,6 +56,15 @@ var ErrNoRuntimesToRegister = errors.New("no agent runtimes could be registered"
 // recover the task on a fresh attempt.
 var errTaskPrepareTimeout = errors.New("task preparation timed out")
 
+// errTaskChildProcessExited marks a reaped child process that never produced
+// its own terminal result. runTask converts it into a synthetic terminal task
+// failure so the server row cannot remain running (PPP-21532).
+var errTaskChildProcessExited = errors.New("agent child process exited")
+
+// errOrphanedTerminal becomes handleTask's error text, while the deferred
+// mapping in runTask ensures the failure reason is platform-side orphaned.
+var errOrphanedTerminal = errors.New(string(taskfailure.ReasonOrphaned))
+
 // errSkillBundleUnavailable marks a task that died in preparation because the
 // daemon could not download one of the agent's skill bundles. Carrying it as a
 // sentinel — rather than leaving handleTask to pattern-match the wrapped
@@ -5607,6 +5616,17 @@ func skillRefFromBundle(bundle SkillData) SkillRefData {
 }
 
 func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot int, taskLog *slog.Logger) (taskResult TaskResult, returnErr error) {
+	// A child process that is reaped without delivering a terminal result must
+	// never leave the task row running. This deferred guard labels the synthetic
+	// error before handleTask reports it; a real TaskResult overwrites it on
+	// every normal terminal path. See PPP-21532.
+	defer func() {
+		if !errors.Is(returnErr, errTaskChildProcessExited) {
+			return
+		}
+		taskResult = TaskResult{}
+		returnErr = errOrphanedTerminal
+	}()
 	// Refuse to spawn an agent without a workspace. An empty workspace_id
 	// here would make MULTICA_WORKSPACE_ID empty in the agent env, and the
 	// CLI would otherwise silently fall back to the user-global config — a
@@ -6332,6 +6352,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// keep ascending seq values for the same task.
 	var msgSeq atomic.Int32
 	result, tools, err := d.executeAndDrain(ctx, backend, prompt, execOpts, taskLog, task.ID, env.CodexHome, &msgSeq)
+	if err == nil && result.Status == "failed" &&
+		strings.Contains(strings.ToLower(result.Error), "codex process exited") {
+		return TaskResult{}, fmt.Errorf("%w: %s", errTaskChildProcessExited, result.Error)
+	}
 	if err != nil {
 		return TaskResult{}, err
 	}

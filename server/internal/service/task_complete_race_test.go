@@ -234,6 +234,8 @@ func TestProviderNetworkRetrySchedule(t *testing.T) {
 		{"provider_network with retry disabled (max_attempts=1) never retries", provNet, 1, 1, false},
 		{"timeout keeps single immediate retry", "timeout", 1, 2, true},
 		{"timeout exhausts at attempt 2", "timeout", 2, 2, false},
+		{"orphaned dead-child failure retries", "orphaned", 1, 2, true},
+		{"orphaned exhausts at attempt 2", "orphaned", 2, 2, false},
 		{"non-retryable reason never retries", "agent_error.unknown", 1, 2, false},
 	}
 	for _, tc := range eligCases {
