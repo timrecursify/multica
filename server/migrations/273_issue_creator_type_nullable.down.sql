@@ -1,3 +1,0 @@
-ALTER TABLE issue
-    ALTER COLUMN creator_type SET NOT NULL,
-    ALTER COLUMN number SET NOT NULL;
