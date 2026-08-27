@@ -29,7 +29,7 @@ func TestRerunIssueBlockedBeforeMutationWhenInvokeDenied(t *testing.T) {
 		ID:           util.MustParseUUID(issueID),
 		AssigneeID:   util.MustParseUUID(agentID),
 		Priority:     "medium",
-		CreatorType:  "member",
+		CreatorType:  pgtype.Text{String: "member", Valid: true},
 		CreatorID:    util.MustParseUUID(creatorID),
 		WorkspaceID:  util.MustParseUUID(workspaceID),
 		AssigneeType: pgtype.Text{String: "agent", Valid: true},

@@ -135,7 +135,7 @@ func fullyPopulatedIssue(t *testing.T) db.Issue {
 		Priority:      "high",
 		AssigneeType:  pgtype.Text{String: "agent", Valid: true},
 		AssigneeID:    parseUUID("33333333-3333-3333-3333-333333333333"),
-		CreatorType:   "member",
+		CreatorType:   pgtype.Text{String: "member", Valid: true},
 		CreatorID:     parseUUID("44444444-4444-4444-4444-444444444444"),
 		ParentIssueID: parseUUID("55555555-5555-5555-5555-555555555555"),
 		ProjectID:     parseUUID("66666666-6666-6666-6666-666666666666"),

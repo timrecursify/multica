@@ -718,7 +718,7 @@ func (s *AutopilotService) dispatchCreateIssue(ctx context.Context, ap db.Autopi
 		// is captured separately via origin_type=autopilot + origin_id. For
 		// squad-assigned autopilots, the creator is the resolved leader —
 		// the same agent the issue listener will end up enqueueing.
-		CreatorType:   "agent",
+		CreatorType:   pgtype.Text{String: "agent", Valid: true},
 		CreatorID:     leader.ID,
 		ParentIssueID: pgtype.UUID{},
 		Position:      newPosition,

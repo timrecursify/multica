@@ -3128,7 +3128,7 @@ func (h *Handler) emitIssueExecutedOnFirstCompletion(r *http.Request, task *db.A
 	// workspace_created land). Agent-created issues keep the agent id with a
 	// prefix so PostHog doesn't merge them into a user by accident.
 	distinct := uuidToString(marked.CreatorID)
-	if marked.CreatorType == "agent" {
+	if marked.CreatorType.String == "agent" {
 		distinct = "agent:" + distinct
 	}
 	obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.IssueExecuted(

@@ -77,7 +77,7 @@ func (h *Handler) AddIssueReaction(w http.ResponseWriter, r *http.Request) {
 		"issue_id":     uuidToString(issue.ID),
 		"issue_title":  issue.Title,
 		"issue_status": issue.Status,
-		"creator_type": issue.CreatorType,
+		"creator_type": issue.CreatorType.String,
 		"creator_id":   uuidToString(issue.CreatorID),
 	})
 	writeJSON(w, http.StatusCreated, resp)

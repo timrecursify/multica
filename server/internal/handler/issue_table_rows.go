@@ -370,9 +370,8 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 	scanned := make([]scannedRow, 0, limit+1)
 	for rows.Next() {
 		var row scannedRow
-		// Keep historical NULL creator_type/number values from aborting the
-		// entire table response while the generated row model remains scalar.
-		var creatorType pgtype.Text
+		// Keep a historical NULL number from aborting the entire table
+		// response while the generated row model remains scalar.
 		var number pgtype.Int4
 		if err := rows.Scan(
 			&row.issue.ID,
@@ -383,7 +382,7 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 			&row.issue.Priority,
 			&row.issue.AssigneeType,
 			&row.issue.AssigneeID,
-			&creatorType,
+			&row.issue.CreatorType,
 			&row.issue.CreatorID,
 			&row.issue.ParentIssueID,
 			&row.issue.Position,
@@ -402,9 +401,6 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 			slog.Warn("ListIssueTableRows scan failed", append(logger.RequestAttrs(r), "error", err)...)
 			writeIssueTableQueryFailure(w, r, "failed to list table rows")
 			return
-		}
-		if creatorType.Valid {
-			row.issue.CreatorType = creatorType.String
 		}
 		if number.Valid {
 			row.issue.Number = number.Int32
