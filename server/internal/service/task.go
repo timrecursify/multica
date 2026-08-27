@@ -486,7 +486,7 @@ func (s *TaskService) attributionForIssueTask(ctx context.Context, issue db.Issu
 	}
 	facts := attribution.DirectFacts{
 		IssueID:     issue.ID,
-		CreatorType: issue.CreatorType,
+		CreatorType: issue.CreatorType.String,
 		CreatorID:   issue.CreatorID,
 	}
 	// Member-created issues resolve without a DB read. Only origin-linked
@@ -495,7 +495,7 @@ func (s *TaskService) attributionForIssueTask(ctx context.Context, issue db.Issu
 	// unit-test setups safe and yields unattributed). Both origin types stamp
 	// origin_id with the agent_task_queue row that created the issue, so the
 	// top-of-chain human is that task's originator_user_id (MUL-4305).
-	if !(issue.CreatorType == "member" && issue.CreatorID.Valid) &&
+	if !(issue.CreatorType.String == "member" && issue.CreatorID.Valid) &&
 		s != nil && s.Queries != nil && issue.OriginType.Valid && issue.OriginID.Valid &&
 		(issue.OriginType.String == "quick_create" || issue.OriginType.String == "agent_create") {
 		facts.OriginType = issue.OriginType.String
@@ -858,7 +858,7 @@ func (s *TaskService) taskAnalyticsContext(ctx context.Context, task db.AgentTas
 	if task.IssueID.Valid {
 		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
 			tc.WorkspaceID = util.UUIDToString(issue.WorkspaceID)
-			if issue.CreatorType == "member" {
+			if issue.CreatorType.String == "member" {
 				tc.UserID = util.UUIDToString(issue.CreatorID)
 			}
 			if issue.OriginType.Valid {
@@ -5319,7 +5319,7 @@ func IssueToMap(issue db.Issue, issuePrefix string) map[string]any {
 		"priority":        issue.Priority,
 		"assignee_type":   util.TextToPtr(issue.AssigneeType),
 		"assignee_id":     util.UUIDToPtr(issue.AssigneeID),
-		"creator_type":    issue.CreatorType,
+		"creator_type":    issue.CreatorType.String,
 		"creator_id":      util.UUIDToString(issue.CreatorID),
 		"parent_issue_id": util.UUIDToPtr(issue.ParentIssueID),
 		"project_id":      util.UUIDToPtr(issue.ProjectID),

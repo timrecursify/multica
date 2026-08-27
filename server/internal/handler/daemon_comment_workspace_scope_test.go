@@ -40,7 +40,7 @@ func enqueueIssueTaskWithTrigger(t *testing.T, ctx context.Context, agentID, iss
 		WorkspaceID:  parseUUID(testWorkspaceID),
 		AssigneeType: pgtype.Text{String: "agent", Valid: true},
 		AssigneeID:   parseUUID(agentID),
-		CreatorType:  "member",
+		CreatorType:  pgtype.Text{String: "member", Valid: true},
 		CreatorID:    parseUUID(testUserID),
 		Priority:     "none",
 	}, parseUUID(triggerCommentID))

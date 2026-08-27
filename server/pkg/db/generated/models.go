@@ -633,7 +633,7 @@ type Issue struct {
 	Priority           string             `json:"priority"`
 	AssigneeType       pgtype.Text        `json:"assignee_type"`
 	AssigneeID         pgtype.UUID        `json:"assignee_id"`
-	CreatorType        string             `json:"creator_type"`
+	CreatorType        pgtype.Text        `json:"creator_type"`
 	CreatorID          pgtype.UUID        `json:"creator_id"`
 	ParentIssueID      pgtype.UUID        `json:"parent_issue_id"`
 	AcceptanceCriteria []byte             `json:"acceptance_criteria"`

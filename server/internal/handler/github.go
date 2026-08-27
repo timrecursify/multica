@@ -1739,7 +1739,7 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 		"issue":          resp,
 		"status_changed": true,
 		"prev_status":    issue.Status,
-		"creator_type":   issue.CreatorType,
+		"creator_type":   issue.CreatorType.String,
 		"creator_id":     uuidToString(issue.CreatorID),
 		"source":         "github_pr_merged",
 	})

@@ -190,7 +190,7 @@ type CreateIssueParams struct {
 	Priority      string      `json:"priority"`
 	AssigneeType  pgtype.Text `json:"assignee_type"`
 	AssigneeID    pgtype.UUID `json:"assignee_id"`
-	CreatorType   string      `json:"creator_type"`
+	CreatorType   pgtype.Text `json:"creator_type"`
 	CreatorID     pgtype.UUID `json:"creator_id"`
 	ParentIssueID pgtype.UUID `json:"parent_issue_id"`
 	Position      float64     `json:"position"`
@@ -273,7 +273,7 @@ type CreateIssueWithOriginParams struct {
 	Priority      string      `json:"priority"`
 	AssigneeType  pgtype.Text `json:"assignee_type"`
 	AssigneeID    pgtype.UUID `json:"assignee_id"`
-	CreatorType   string      `json:"creator_type"`
+	CreatorType   pgtype.Text `json:"creator_type"`
 	CreatorID     pgtype.UUID `json:"creator_id"`
 	ParentIssueID pgtype.UUID `json:"parent_issue_id"`
 	Position      float64     `json:"position"`
@@ -1004,7 +1004,7 @@ type ListIssuesRow struct {
 	Priority      string             `json:"priority"`
 	AssigneeType  pgtype.Text        `json:"assignee_type"`
 	AssigneeID    pgtype.UUID        `json:"assignee_id"`
-	CreatorType   string             `json:"creator_type"`
+	CreatorType   pgtype.Text        `json:"creator_type"`
 	CreatorID     pgtype.UUID        `json:"creator_id"`
 	ParentIssueID pgtype.UUID        `json:"parent_issue_id"`
 	Position      float64            `json:"position"`
@@ -1166,7 +1166,7 @@ type ListOpenIssuesRow struct {
 	Priority      string             `json:"priority"`
 	AssigneeType  pgtype.Text        `json:"assignee_type"`
 	AssigneeID    pgtype.UUID        `json:"assignee_id"`
-	CreatorType   string             `json:"creator_type"`
+	CreatorType   pgtype.Text        `json:"creator_type"`
 	CreatorID     pgtype.UUID        `json:"creator_id"`
 	ParentIssueID pgtype.UUID        `json:"parent_issue_id"`
 	Position      float64            `json:"position"`
@@ -1346,7 +1346,7 @@ RETURNING id, workspace_id, creator_type, creator_id, first_executed_at
 type MarkIssueFirstExecutedRow struct {
 	ID              pgtype.UUID        `json:"id"`
 	WorkspaceID     pgtype.UUID        `json:"workspace_id"`
-	CreatorType     string             `json:"creator_type"`
+	CreatorType     pgtype.Text        `json:"creator_type"`
 	CreatorID       pgtype.UUID        `json:"creator_id"`
 	FirstExecutedAt pgtype.Timestamptz `json:"first_executed_at"`
 }

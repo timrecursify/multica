@@ -272,7 +272,7 @@ func TestHydrateDeferredChannelIssueTaskOverlayDoesNotOverwriteMergedCommentPlan
 		WorkspaceID:  util.MustParseUUID(workspaceID),
 		AssigneeType: pgtype.Text{String: "agent", Valid: true},
 		AssigneeID:   util.MustParseUUID(agentID),
-		CreatorType:  "member",
+		CreatorType:  pgtype.Text{String: "member", Valid: true},
 		CreatorID:    userUUID,
 		Priority:     "medium",
 	}, time.Now().Add(time.Minute))

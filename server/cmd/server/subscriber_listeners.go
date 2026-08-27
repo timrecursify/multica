@@ -165,7 +165,7 @@ func subscribeDelegatedHuman(bus *events.Bus, pool *pgxpool.Pool, queries *db.Qu
 		slog.Error("delegated subscribe: load issue failed", "issue_id", issueID, "error", err)
 		return
 	}
-	if issue.CreatorType != "agent" || !issue.OriginType.Valid || !issue.OriginID.Valid {
+	if issue.CreatorType.String != "agent" || !issue.OriginType.Valid || !issue.OriginID.Valid {
 		return
 	}
 
@@ -184,7 +184,7 @@ func subscribeDelegatedHuman(bus *events.Bus, pool *pgxpool.Pool, queries *db.Qu
 	}
 
 	human, reason, ok := attribution.DelegatedSubscriber(attribution.SubscriptionFacts{
-		CreatorType:      issue.CreatorType,
+		CreatorType:      issue.CreatorType.String,
 		OriginType:       issue.OriginType.String,
 		OriginOriginator: originTask.OriginatorUserID,
 	})
