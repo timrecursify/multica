@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/service"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -27,7 +28,7 @@ func TestRouter_IssueCommand_BroadcastPayloadCarriesIdentityFields(t *testing.T)
 		WorkspaceID: workspaceID,
 		Number:      42,
 		Title:       "Fix login",
-		CreatorType: "member",
+		CreatorType: pgtype.Text{String: "member", Valid: true},
 		CreatorID:   creatorID,
 	}
 	h.issues.result = service.IssueCreateResult{Issue: created}

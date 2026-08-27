@@ -265,7 +265,7 @@ func TestDeferredChannelIssueTaskPromotesAfterMediaSettlement(t *testing.T) {
 		WorkspaceID:  util.MustParseUUID(workspaceID),
 		AssigneeType: pgtype.Text{String: "agent", Valid: true},
 		AssigneeID:   util.MustParseUUID(agentID),
-		CreatorType:  "member",
+		CreatorType:  pgtype.Text{String: "member", Valid: true},
 		CreatorID:    util.MustParseUUID(userID),
 		Priority:     "none",
 	}, deadline)
@@ -362,7 +362,7 @@ func TestDeferredChannelIssueTaskConflictsWithQueuedSiblingAtDatabase(t *testing
 		WorkspaceID:  util.MustParseUUID(workspaceID),
 		AssigneeType: pgtype.Text{String: "agent", Valid: true},
 		AssigneeID:   util.MustParseUUID(agentID),
-		CreatorType:  "member",
+		CreatorType:  pgtype.Text{String: "member", Valid: true},
 		CreatorID:    util.MustParseUUID(userID),
 		Priority:     "none",
 	}, time.Now().Add(time.Minute))

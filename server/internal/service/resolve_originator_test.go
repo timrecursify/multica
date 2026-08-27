@@ -310,7 +310,7 @@ func TestAttributionForIssueTask_SystemCommentFallsThroughToIssueProvenance(t *t
 	// finds the system comment and classifies it (author_type=system) before the
 	// fall-through to issue provenance.
 	issue := db.Issue{
-		CreatorType: "agent",
+		CreatorType: pgtype.Text{String: "agent", Valid: true},
 		OriginType:  pgtype.Text{String: "agent_create", Valid: true},
 		OriginID:    parentTaskID,
 		WorkspaceID: util.MustParseUUID(workspaceIDStr),
@@ -332,7 +332,7 @@ func TestAttributionForIssueTask_SystemCommentFallsThroughToIssueProvenance(t *t
 func TestResolveOriginatorForIssueTask_MemberCreatedNoComment(t *testing.T) {
 	userID := util.MustParseUUID("11111111-1111-1111-1111-111111111111")
 	svc := &TaskService{}
-	issue := db.Issue{CreatorType: "member", CreatorID: userID}
+	issue := db.Issue{CreatorType: pgtype.Text{String: "member", Valid: true}, CreatorID: userID}
 
 	got := svc.resolveOriginatorForIssueTask(context.Background(), issue, pgtype.UUID{})
 	if !got.Valid {
@@ -352,7 +352,7 @@ func TestResolveOriginatorForIssueTask_QuickCreateIssueInheritsParentTask(t *tes
 	_, _, parentTaskID, userID, _ := seedOriginatorFanout(t, pool)
 	svc := &TaskService{Queries: db.New(pool)}
 	issue := db.Issue{
-		CreatorType: "agent",
+		CreatorType: pgtype.Text{String: "agent", Valid: true},
 		OriginType:  pgtype.Text{String: "quick_create", Valid: true},
 		OriginID:    parentTaskID,
 	}
@@ -377,7 +377,7 @@ func TestResolveOriginatorForIssueTask_AgentCreateIssueInheritsParentTask(t *tes
 	_, _, parentTaskID, userID, _ := seedOriginatorFanout(t, pool)
 	svc := &TaskService{Queries: db.New(pool)}
 	issue := db.Issue{
-		CreatorType: "agent",
+		CreatorType: pgtype.Text{String: "agent", Valid: true},
 		OriginType:  pgtype.Text{String: "agent_create", Valid: true},
 		OriginID:    parentTaskID,
 	}
@@ -402,7 +402,7 @@ func TestOriginatorForIssueTask_MatchesResolverForAgentCreate(t *testing.T) {
 	_, _, parentTaskID, userID, _ := seedOriginatorFanout(t, pool)
 	svc := &TaskService{Queries: db.New(pool)}
 	issue := db.Issue{
-		CreatorType: "agent",
+		CreatorType: pgtype.Text{String: "agent", Valid: true},
 		OriginType:  pgtype.Text{String: "agent_create", Valid: true},
 		OriginID:    parentTaskID,
 	}
@@ -504,7 +504,7 @@ func TestEnqueueTaskForIssueStoresRuntimeMCPOverlayInQueuedRow(t *testing.T) {
 		ID:           util.MustParseUUID(issueIDStr),
 		AssigneeID:   util.MustParseUUID(agentIDStr),
 		Priority:     "medium",
-		CreatorType:  "member",
+		CreatorType:  pgtype.Text{String: "member", Valid: true},
 		CreatorID:    userID,
 		WorkspaceID:  util.MustParseUUID(workspaceIDStr),
 		AssigneeType: pgtype.Text{String: "agent", Valid: true},

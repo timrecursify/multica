@@ -103,7 +103,7 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
-		CreatorType:   i.CreatorType,
+		CreatorType:   i.CreatorType.String,
 		CreatorID:     uuidToString(i.CreatorID),
 		ParentIssueID: uuidToPtr(i.ParentIssueID),
 		ProjectID:     uuidToPtr(i.ProjectID),
@@ -132,7 +132,7 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueRespons
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
-		CreatorType:   i.CreatorType,
+		CreatorType:   i.CreatorType.String,
 		CreatorID:     uuidToString(i.CreatorID),
 		ParentIssueID: uuidToPtr(i.ParentIssueID),
 		ProjectID:     uuidToPtr(i.ProjectID),
@@ -193,7 +193,7 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
-		CreatorType:   i.CreatorType,
+		CreatorType:   i.CreatorType.String,
 		CreatorID:     uuidToString(i.CreatorID),
 		ParentIssueID: uuidToPtr(i.ParentIssueID),
 		ProjectID:     uuidToPtr(i.ProjectID),
@@ -1245,10 +1245,10 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 	var issues []db.ListIssuesRow
 	for rows.Next() {
 		var row db.ListIssuesRow
-		// Legacy/imported rows can contain NULLs here even though the generated
-		// model fields are non-nullable Go values. Scan through nullable pgtype
-		// values so one bad historical row cannot make the entire board 500.
-		var creatorType pgtype.Text
+		// Legacy/imported rows can contain a NULL number even though the
+		// generated model field is a non-nullable Go value. Scan through a
+		// nullable pgtype value so one bad historical row cannot make the
+		// entire board 500.
 		var number pgtype.Int4
 		if err := rows.Scan(
 			&row.ID,
@@ -1259,7 +1259,7 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 			&row.Priority,
 			&row.AssigneeType,
 			&row.AssigneeID,
-			&creatorType,
+			&row.CreatorType,
 			&row.CreatorID,
 			&row.ParentIssueID,
 			&row.Position,
@@ -1276,9 +1276,6 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 			slog.Warn("ListIssues scan failed", append(logger.RequestAttrs(r), "error", err)...)
 			writeError(w, http.StatusInternalServerError, "failed to list issues")
 			return
-		}
-		if creatorType.Valid {
-			row.CreatorType = creatorType.String
 		}
 		if number.Valid {
 			row.Number = number.Int32
@@ -3146,7 +3143,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		"prev_start_date":     prevStartDate,
 		"prev_due_date":       prevDueDate,
 		"prev_description":    textToPtr(prevIssue.Description),
-		"creator_type":        prevIssue.CreatorType,
+		"creator_type":        prevIssue.CreatorType.String,
 		"creator_id":          uuidToString(prevIssue.CreatorID),
 	})
 
