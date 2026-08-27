@@ -1,0 +1,2 @@
+-- Migration 281 creates no persistent database objects. UUID task history is
+-- intentionally never converted back to integer IDs or deleted on rollback.
