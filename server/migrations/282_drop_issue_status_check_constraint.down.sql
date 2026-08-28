@@ -1,9 +1,14 @@
--- PPP 282: restore the legacy-only issue.status CHECK constraint that this
--- migration removed. Only safe to apply when every writer submits the legacy
--- lowercase vocabulary; re-adding it after canonical spellings have entered
--- the column would fail. Mirrors the original 001_init definition.
-ALTER TABLE public.issue
-    ADD CONSTRAINT issue_status_check
-    CHECK (status IN ('backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled'));
+-- PPP-22989 rollback: restore the exact rows changed by the up migration.
+-- This deliberately fails if canonical-only writes occurred after migration;
+-- it never silently discards newer status data to satisfy the old constraint.
+ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
-COMMENT ON COLUMN public.issue.status IS NULL;
+UPDATE issue i
+SET status = r.previous_status
+FROM issue_status_282_rollback r
+WHERE i.id = r.issue_id;
+
+ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
+    ('backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled'));
+
+DROP TABLE issue_status_282_rollback;
