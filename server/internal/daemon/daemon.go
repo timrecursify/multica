@@ -6244,10 +6244,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		idleWatchdogTimeout = d.cfg.OpenCodeIdleWatchdog
 	}
 	execOpts := agent.ExecOptions{
-		Cwd:                       env.WorkDir,
-		Model:                     model,
-		ThreadName:                deriveTaskThreadName(task),
-		Timeout:                   d.cfg.AgentTimeout,
+		Cwd:        env.WorkDir,
+		Model:      model,
+		ThreadName: deriveTaskThreadName(task),
+		Timeout:    d.cfg.AgentTimeout,
+		// Input-token ceiling enforced by the codex backend (PROD-22899).
+		MaxInputTokens:            d.cfg.MaxInputTokens,
 		SemanticInactivityTimeout: d.cfg.CodexSemanticInactivityTimeout,
 		IdleWatchdogTimeout:       idleWatchdogTimeout,
 		HandshakeTimeout:          d.cfg.CodexHandshakeTimeout,
@@ -6431,6 +6433,11 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			CacheReadTokens:  u.CacheReadTokens,
 			CacheWriteTokens: u.CacheWriteTokens,
 			CostUSDTicks:     u.CostUSDTicks,
+			// The codex backend derives these counters from the provider's own
+			// usage envelope (or from provider-written token_count events in the
+			// session JSONL), never from a local tokenizer — so it is always
+			// provider-reported here.
+			UsageSource: "provider",
 		})
 	}
 

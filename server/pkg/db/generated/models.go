@@ -1054,6 +1054,9 @@ type TaskUsage struct {
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
 	// Provider-reported cost in 1e-10 USD. NULL when the provider reports none; those rows are priced client-side from the static rate table.
 	CostUsdTicks pgtype.Int8 `json:"cost_usd_ticks"`
+	AttemptNo    int32       `json:"attempt_no"`
+	RuntimeID    pgtype.UUID `json:"runtime_id"`
+	UsageSource  string      `json:"usage_source"`
 }
 
 type TaskUsageHourly struct {

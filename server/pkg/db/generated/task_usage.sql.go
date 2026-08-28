@@ -60,7 +60,7 @@ func (q *Queries) GetIssueUsageSummary(ctx context.Context, issueID pgtype.UUID)
 }
 
 const getTaskUsage = `-- name: GetTaskUsage :many
-SELECT id, task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at, updated_at, cost_usd_ticks FROM task_usage
+SELECT id, task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at, updated_at, cost_usd_ticks, attempt_no, runtime_id, usage_source FROM task_usage
 WHERE task_id = $1
 ORDER BY model
 `
@@ -86,6 +86,9 @@ func (q *Queries) GetTaskUsage(ctx context.Context, taskID pgtype.UUID) ([]TaskU
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.CostUsdTicks,
+			&i.AttemptNo,
+			&i.RuntimeID,
+			&i.UsageSource,
 		); err != nil {
 			return nil, err
 		}
@@ -359,11 +362,71 @@ func (q *Queries) ListIssueTaskUsage(ctx context.Context, issueID pgtype.UUID) (
 	return items, nil
 }
 
+const listTaskUsageByAttempt = `-- name: ListTaskUsageByAttempt :many
+SELECT task_id, attempt_no, runtime_id, usage_source, provider, model,
+       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks
+FROM task_usage
+WHERE task_id = $1
+ORDER BY attempt_no, model
+`
+
+type ListTaskUsageByAttemptRow struct {
+	TaskID           pgtype.UUID `json:"task_id"`
+	AttemptNo        int32       `json:"attempt_no"`
+	RuntimeID        pgtype.UUID `json:"runtime_id"`
+	UsageSource      string      `json:"usage_source"`
+	Provider         string      `json:"provider"`
+	Model            string      `json:"model"`
+	InputTokens      int64       `json:"input_tokens"`
+	OutputTokens     int64       `json:"output_tokens"`
+	CacheReadTokens  int64       `json:"cache_read_tokens"`
+	CacheWriteTokens int64       `json:"cache_write_tokens"`
+	CostUsdTicks     pgtype.Int8 `json:"cost_usd_ticks"`
+}
+
+// Per-(task, provider, model, attempt_no) usage for one task — the per-attempt
+// half of per-task cost accounting. A retried task therefore yields one row
+// per attempt (rows share task_id but differ by attempt_no and usually by the
+// runtime that ran them), so per-attempt spend is attributable after the fact.
+func (q *Queries) ListTaskUsageByAttempt(ctx context.Context, taskID pgtype.UUID) ([]ListTaskUsageByAttemptRow, error) {
+	rows, err := q.db.Query(ctx, listTaskUsageByAttempt, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListTaskUsageByAttemptRow{}
+	for rows.Next() {
+		var i ListTaskUsageByAttemptRow
+		if err := rows.Scan(
+			&i.TaskID,
+			&i.AttemptNo,
+			&i.RuntimeID,
+			&i.UsageSource,
+			&i.Provider,
+			&i.Model,
+			&i.InputTokens,
+			&i.OutputTokens,
+			&i.CacheReadTokens,
+			&i.CacheWriteTokens,
+			&i.CostUsdTicks,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const upsertTaskUsage = `-- name: UpsertTaskUsage :exec
-INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now())
-ON CONFLICT (task_id, provider, model)
+INSERT INTO task_usage (task_id, provider, model, attempt_no, runtime_id, usage_source, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+ON CONFLICT (task_id, provider, model, attempt_no)
 DO UPDATE SET
+    runtime_id = EXCLUDED.runtime_id,
+    usage_source = EXCLUDED.usage_source,
     input_tokens = EXCLUDED.input_tokens,
     output_tokens = EXCLUDED.output_tokens,
     cache_read_tokens = EXCLUDED.cache_read_tokens,
@@ -376,6 +439,9 @@ type UpsertTaskUsageParams struct {
 	TaskID           pgtype.UUID `json:"task_id"`
 	Provider         string      `json:"provider"`
 	Model            string      `json:"model"`
+	AttemptNo        int32       `json:"attempt_no"`
+	RuntimeID        pgtype.UUID `json:"runtime_id"`
+	UsageSource      string      `json:"usage_source"`
 	InputTokens      int64       `json:"input_tokens"`
 	OutputTokens     int64       `json:"output_tokens"`
 	CacheReadTokens  int64       `json:"cache_read_tokens"`
@@ -383,6 +449,14 @@ type UpsertTaskUsageParams struct {
 	CostUsdTicks     pgtype.Int8 `json:"cost_usd_ticks"`
 }
 
+// Each provider/model usage row is keyed by (task_id, provider, model,
+// attempt_no) so a task retried across attempts records every attempt as its
+// own attributable row instead of overwriting the previous attempt's counters
+// (PROD-22899). runtime_id and usage_source are recorded so it is clear which
+// worker ran the attempt and whether the numbers are provider-reported or
+// locally estimated. When a newer report for the same (task, provider, model,
+// attempt) arrives (e.g. a corrected token count), it replaces that attempt's
+// row rather than accumulating.
 // Bumps `updated_at` on INSERT and on conflict so the hourly-rollup worker
 // detects the row as dirty and re-aggregates its bucket.
 // Without the conflict-side bump, a correction to historical token counts
@@ -395,6 +469,9 @@ func (q *Queries) UpsertTaskUsage(ctx context.Context, arg UpsertTaskUsageParams
 		arg.TaskID,
 		arg.Provider,
 		arg.Model,
+		arg.AttemptNo,
+		arg.RuntimeID,
+		arg.UsageSource,
 		arg.InputTokens,
 		arg.OutputTokens,
 		arg.CacheReadTokens,

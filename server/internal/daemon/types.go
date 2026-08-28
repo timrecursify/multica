@@ -250,6 +250,11 @@ type TaskUsageEntry struct {
 	// server then leaves the column NULL and the client estimates from the
 	// pricing table instead. See agent.TokenUsage.CostUSDTicks.
 	CostUSDTicks int64 `json:"cost_usd_ticks,omitempty"`
+	// UsageSource is "provider" when the numbers come from the provider's own
+	// usage envelope and "estimated" when the agent derived them locally.
+	// Empty means the daemon did not distinguish; the server defaults to
+	// "provider". See TaskUsageEntryUsageSource.
+	UsageSource string `json:"usage_source,omitempty"`
 }
 
 // TaskResult is the outcome of executing a task.

@@ -38,6 +38,13 @@ type ExecOptions struct {
 	MaxTurns                  int
 	Timeout                   time.Duration
 	SemanticInactivityTimeout time.Duration
+	// MaxInputTokens is the ceiling on this task's cumulative input-side
+	// tokens (uncached input + cached reads + cache writes) enforced by the
+	// backends that support it (currently codex). 0 means no ceiling. When a
+	// run would exceed it, the backend aborts with an actionable failure
+	// reason instead of continuing to burn provider tokens. Set from the
+	// daemon's MULTICA_MAX_INPUT_TOKENS config.
+	MaxInputTokens int64
 	// IdleWatchdogTimeout optionally narrows the daemon's generic no-message
 	// watchdog for this execution. Zero keeps the daemon-wide window, and a
 	// value above that window cannot extend the global safety bound. The

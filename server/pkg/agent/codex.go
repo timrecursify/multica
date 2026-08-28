@@ -1072,6 +1072,7 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		attempt:              attempt,
 		activeLaunches:       activeLaunches,
 		notificationProtocol: "unknown",
+		maxInputTokens:       opts.MaxInputTokens,
 		acceptNotification:   turnNotificationGate.accept,
 		onDiscardedNotification: func(string, map[string]any) {
 			// Any app-server notification proves the process made semantic
@@ -2100,6 +2101,14 @@ type codexClient struct {
 
 	usageMu sync.Mutex
 	usage   TokenUsage // accumulated from turn events
+
+	// maxInputTokens is the task-level ceiling on cumulative input-side tokens
+	// (uncached input + cached reads + cache writes). 0 disables the ceiling.
+	// Consumed in extractUsageFromMap so a run aborts with an actionable
+	// failure reason rather than continuing to burn provider tokens once the
+	// task's context budget is exceeded (PROD-22899). Mirrors
+	// ExecOptions.MaxInputTokens set by the daemon from MULTICA_MAX_INPUT_TOKENS.
+	maxInputTokens int64
 
 	turnErrorMu sync.Mutex
 	turnError   string // captured from turn/completed status=failed or terminal error notifications
@@ -3203,6 +3212,36 @@ func (c *codexClient) extractUsageFromMap(data map[string]any) {
 	c.usage.OutputTokens += codexInt64(usageMap, "output_tokens", "output", "completion_tokens")
 	c.usage.CacheReadTokens += cacheReadTokens
 	c.usage.CacheWriteTokens += codexInt64(usageMap, "cache_write_tokens", "cache_creation_input_tokens")
+
+	c.checkInputCeiling()
+}
+
+// checkInputCeiling aborts the run once the task's cumulative input-side
+// tokens exceed the configured ceiling. Called holding usageMu, so it must
+// not take usageMu itself. It records an actionable turn error; the turn
+// handler surfaces it as a failed result, so the task fails loudly before
+// burning more provider tokens instead of silently "completing" from an
+// unbounded runaway context (PROD-22899).
+func (c *codexClient) checkInputCeiling() {
+	if c.maxInputTokens <= 0 {
+		return
+	}
+	total := cumulativeInputTokens(c.usage)
+	if total <= c.maxInputTokens {
+		return
+	}
+	c.setTurnError(fmt.Sprintf(
+		"context input-token ceiling exceeded: cumulative task input %d tokens exceeds configured ceiling %d (MULTICA_MAX_INPUT_TOKENS); aborting before further provider spend — split the task or reduce its scope",
+		total, c.maxInputTokens,
+	))
+}
+
+// cumulativeInputTokens is the input-side token total the provider must
+// account for on this task: uncached input plus cached reads plus cache
+// writes. Cached reads/writes are counted because they still consume provider
+// accounting on a long-lived context and are part of the per-task input dial.
+func cumulativeInputTokens(u TokenUsage) int64 {
+	return u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens
 }
 
 func codexUncachedInputTokens(inputTokens, cachedInputTokens int64) int64 {

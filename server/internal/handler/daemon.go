@@ -3583,6 +3583,10 @@ type TaskUsagePayload struct {
 	// every provider except Grok today) — stored as NULL so the reader knows
 	// to fall back to rate-table estimation rather than reading a real $0.
 	CostUSDTicks int64 `json:"cost_usd_ticks"`
+	// UsageSource distinguishes provider-reported usage from a local estimate.
+	// "" and "provider" mean the numbers came from the provider's own usage
+	// envelope; "estimated" means a local tokenizer/estimate was used.
+	UsageSource string `json:"usage_source,omitempty"`
 }
 
 // authoritativeCostTicks converts a reported cost into the nullable column.
@@ -3633,8 +3637,19 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 			}
 			provider = runtimeProvider
 		}
+		// Bound the usage row to this task attempt so a retried task records
+		// each attempt as its own row rather than overwriting the aggregate
+		// (PROD-22899). usage_source defaults to "provider"; a daemon that
+		// knows it derived the numbers locally reports "estimated".
+		usageSource := u.UsageSource
+		if usageSource == "" {
+			usageSource = "provider"
+		}
 		if err := h.Queries.UpsertTaskUsage(r.Context(), db.UpsertTaskUsageParams{
 			TaskID:           parseUUID(taskID),
+			AttemptNo:        task.Attempt,
+			RuntimeID:        task.RuntimeID,
+			UsageSource:      usageSource,
 			Provider:         provider,
 			Model:            u.Model,
 			InputTokens:      u.InputTokens,

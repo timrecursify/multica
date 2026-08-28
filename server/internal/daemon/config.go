@@ -57,7 +57,16 @@ const (
 	// matching tool_result would otherwise run forever. This is the backstop for
 	// that stuck-tool case (MUL-3064). Set MULTICA_AGENT_TOOL_WATCHDOG=0 to
 	// disable, in which case an in-flight tool never force-stops the run.
-	DefaultAgentToolWatchdog              = 2 * time.Hour
+	DefaultAgentToolWatchdog = 2 * time.Hour
+	// DefaultMaxInputTokens is the task-level ceiling on cumulative input-side
+	// tokens (uncached input + cached reads + cache writes) enforced by the
+	// codex backend before it continues a run (PROD-22899). 2,000,000 prevents
+	// the ~2M-token runaway contexts seen in PROD-22899 while leaving large
+	// legitimate multi-turn builds headroom (the two recorded 2M outliers both
+	// completed on a single attempt; a healthy bounded build stays well under
+	// this). Operators may raise it with MULTICA_MAX_INPUT_TOKENS to permit
+	// bigger single tasks, or set it to 0 to disable the ceiling.
+	DefaultMaxInputTokens                 = int(2_000_000)
 	DefaultRuntimeName                    = "Local Agent"
 	DefaultWorkspaceBootstrapSyncInterval = 30 * time.Second
 	DefaultWorkspaceLegacySyncInterval    = 5 * time.Minute
@@ -118,11 +127,15 @@ type Config struct {
 	OpenCodeIdleWatchdog           time.Duration // OpenCode-specific no-message window; 0 falls back to AgentIdleWatchdog and values above it cannot extend the global bound
 	AgentIdleWatchdog              time.Duration // force-stop a run when the backend goes silent this long with an empty queue (0 = disabled)
 	AgentToolWatchdog              time.Duration // force-stop a run when a single tool call stays in flight (silent) this long (0 = disabled); backstop for hung tools now that there is no wall-clock cap
-	ClaudeArgs                     []string
-	CodexArgs                      []string
-	CodebuddyArgs                  []string
-	QwenArgs                       []string
-	QwenpawArgs                    []string
+	// MaxInputTokens is the ceiling on cumulative input-side tokens a single
+	// task run may spend before the codex backend aborts it with an actionable
+	// failure reason (PROD-22899). 0 disables the ceiling. Env: MULTICA_MAX_INPUT_TOKENS.
+	MaxInputTokens int64
+	ClaudeArgs     []string
+	CodexArgs      []string
+	CodebuddyArgs  []string
+	QwenArgs       []string
+	QwenpawArgs    []string
 
 	// ProfileCommandOverrides maps a custom runtime profile_id -> the absolute
 	// executable path to use for that profile on THIS machine (MUL-3284).
@@ -334,6 +347,11 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		maxConcurrentTasks = overrides.MaxConcurrentTasks
 	}
 
+	maxInputTokens, err := intFromEnv("MULTICA_MAX_INPUT_TOKENS", DefaultMaxInputTokens)
+	if err != nil {
+		return Config{}, err
+	}
+
 	// Profile
 	profile := overrides.Profile
 
@@ -496,6 +514,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		OpenCodeIdleWatchdog:           openCodeIdleWatchdog,
 		AgentIdleWatchdog:              agentIdleWatchdog,
 		AgentToolWatchdog:              agentToolWatchdog,
+		MaxInputTokens:                 int64(maxInputTokens),
 		ClaudeArgs:                     claudeArgs,
 		CodexArgs:                      codexArgs,
 		CodebuddyArgs:                  codebuddyArgs,

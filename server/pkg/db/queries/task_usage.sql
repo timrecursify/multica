@@ -1,4 +1,12 @@
 -- name: UpsertTaskUsage :exec
+-- Each provider/model usage row is keyed by (task_id, provider, model,
+-- attempt_no) so a task retried across attempts records every attempt as its
+-- own attributable row instead of overwriting the previous attempt's counters
+-- (PROD-22899). runtime_id and usage_source are recorded so it is clear which
+-- worker ran the attempt and whether the numbers are provider-reported or
+-- locally estimated. When a newer report for the same (task, provider, model,
+-- attempt) arrives (e.g. a corrected token count), it replaces that attempt's
+-- row rather than accumulating.
 -- Bumps `updated_at` on INSERT and on conflict so the hourly-rollup worker
 -- detects the row as dirty and re-aggregates its bucket.
 -- Without the conflict-side bump, a correction to historical token counts
@@ -6,16 +14,29 @@
 -- cost_usd_ticks is the provider's own price for this usage (1e-10 USD), NULL
 -- when it reports none. It is overwritten like the token counters so a
 -- corrected report replaces the previous figure rather than accumulating.
-INSERT INTO task_usage (task_id, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, sqlc.narg('cost_usd_ticks'), now())
-ON CONFLICT (task_id, provider, model)
+INSERT INTO task_usage (task_id, provider, model, attempt_no, runtime_id, usage_source, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, sqlc.narg('cost_usd_ticks'), now())
+ON CONFLICT (task_id, provider, model, attempt_no)
 DO UPDATE SET
+    runtime_id = EXCLUDED.runtime_id,
+    usage_source = EXCLUDED.usage_source,
     input_tokens = EXCLUDED.input_tokens,
     output_tokens = EXCLUDED.output_tokens,
     cache_read_tokens = EXCLUDED.cache_read_tokens,
     cache_write_tokens = EXCLUDED.cache_write_tokens,
     cost_usd_ticks = EXCLUDED.cost_usd_ticks,
     updated_at = now();
+
+-- name: ListTaskUsageByAttempt :many
+-- Per-(task, provider, model, attempt_no) usage for one task — the per-attempt
+-- half of per-task cost accounting. A retried task therefore yields one row
+-- per attempt (rows share task_id but differ by attempt_no and usually by the
+-- runtime that ran them), so per-attempt spend is attributable after the fact.
+SELECT task_id, attempt_no, runtime_id, usage_source, provider, model,
+       input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks
+FROM task_usage
+WHERE task_id = $1
+ORDER BY attempt_no, model;
 
 -- name: GetTaskUsage :many
 SELECT * FROM task_usage
