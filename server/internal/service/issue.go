@@ -614,7 +614,7 @@ func (s *IssueService) shouldEnqueueAgentTask(ctx context.Context, issue db.Issu
 }
 
 func (s *IssueService) shouldEnqueueAgentTaskWithQueries(ctx context.Context, q *db.Queries, issue db.Issue) bool {
-	if issue.Status == "backlog" {
+	if issue.Status == "Spec" {
 		return false
 	}
 	return isAgentAssigneeReadyWithQueries(ctx, q, issue)
@@ -639,7 +639,7 @@ func isAgentAssigneeReadyWithQueries(ctx context.Context, q *db.Queries, issue d
 }
 
 func (s *IssueService) shouldEnqueueSquadLeaderOnAssign(ctx context.Context, issue db.Issue) bool {
-	if issue.Status == "backlog" {
+	if issue.Status == "Spec" {
 		return false
 	}
 	return s.isSquadLeaderReady(ctx, issue)

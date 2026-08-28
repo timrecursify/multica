@@ -36,3 +36,6 @@ WHERE status NOT IN
 
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived'));
+
+-- New rows that omit status must also enter the canonical vocabulary.
+ALTER TABLE issue ALTER COLUMN status SET DEFAULT 'Spec';

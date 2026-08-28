@@ -70,6 +70,7 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 	}
 
 	applyMigrationFile(t, ctx, conn.Conn(), "282_drop_issue_status_check_constraint.up.sql")
+	assertIssueStatusDefault(t, ctx, conn.Conn(), "'Spec'::text")
 	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
 		"00000000-0000-0000-0000-000000000001": "Spec",
 		"00000000-0000-0000-0000-000000000002": "Queue",
@@ -97,6 +98,7 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 	}
 
 	applyMigrationFile(t, ctx, conn.Conn(), "282_drop_issue_status_check_constraint.down.sql")
+	assertIssueStatusDefault(t, ctx, conn.Conn(), "'todo'::text")
 	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
 		"00000000-0000-0000-0000-000000000001": "Spec",
 		"00000000-0000-0000-0000-000000000002": "Queue",
@@ -141,6 +143,21 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 		"00000000-0000-0000-0000-000000000016": "Cancelled",
 		"00000000-0000-0000-0000-000000000017": "in_review",
 	})
+}
+
+func assertIssueStatusDefault(t *testing.T, ctx context.Context, conn *pgx.Conn, want string) {
+	t.Helper()
+	var got string
+	if err := conn.QueryRow(ctx, `
+		SELECT column_default
+		FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'issue' AND column_name = 'status'
+	`).Scan(&got); err != nil {
+		t.Fatalf("read issue.status default: %v", err)
+	}
+	if got != want {
+		t.Fatalf("issue.status default = %q, want %q", got, want)
+	}
 }
 
 func assertIssueStatuses(t *testing.T, ctx context.Context, conn *pgx.Conn, want map[string]string) {

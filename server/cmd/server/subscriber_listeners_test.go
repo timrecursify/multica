@@ -24,7 +24,7 @@ func createTestIssue(t *testing.T, workspaceID, creatorID string) string {
 	var issueID string
 	err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, number)
-		VALUES ($1, 'subscriber test issue', 'todo', 'medium', 'member', $2, 0,
+		VALUES ($1, 'subscriber test issue', 'Spec', 'medium', 'member', $2, 0,
 		        (SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1))
 		RETURNING id
 	`, workspaceID, creatorID).Scan(&issueID)
@@ -101,7 +101,7 @@ func TestSubscriberIssueCreated_CreatorSubscribed(t *testing.T) {
 				ID:          issueID,
 				WorkspaceID: testWorkspaceID,
 				Title:       "test issue",
-				Status:      "todo",
+				Status:      "Spec",
 				Priority:    "medium",
 				CreatorType: "member",
 				CreatorID:   testUserID,
@@ -140,7 +140,7 @@ func TestSubscriberIssueCreated_CreatorAndAssignee(t *testing.T) {
 				ID:           issueID,
 				WorkspaceID:  testWorkspaceID,
 				Title:        "test issue",
-				Status:       "todo",
+				Status:       "Spec",
 				Priority:     "medium",
 				CreatorType:  "member",
 				CreatorID:    testUserID,
@@ -182,7 +182,7 @@ func TestSubscriberIssueCreated_SelfAssign(t *testing.T) {
 				ID:           issueID,
 				WorkspaceID:  testWorkspaceID,
 				Title:        "test issue",
-				Status:       "todo",
+				Status:       "Spec",
 				Priority:     "medium",
 				CreatorType:  "member",
 				CreatorID:    testUserID,
@@ -224,7 +224,7 @@ func TestSubscriberIssueUpdated_AssigneeChanged(t *testing.T) {
 				ID:           issueID,
 				WorkspaceID:  testWorkspaceID,
 				Title:        "test issue",
-				Status:       "todo",
+				Status:       "Spec",
 				Priority:     "medium",
 				CreatorType:  "member",
 				CreatorID:    testUserID,
@@ -332,7 +332,7 @@ func TestSubscriberAddedEventPublished(t *testing.T) {
 				ID:          issueID,
 				WorkspaceID: testWorkspaceID,
 				Title:       "test issue",
-				Status:      "todo",
+				Status:      "Spec",
 				Priority:    "medium",
 				CreatorType: "member",
 				CreatorID:   testUserID,
@@ -379,7 +379,7 @@ func TestSubscriberIssueCreated_AutopilotMapPayload(t *testing.T) {
 				"id":           issueID,
 				"workspace_id": testWorkspaceID,
 				"title":        "autopilot test issue",
-				"status":       "todo",
+				"status":       "Spec",
 				"priority":     "medium",
 				"creator_type": "member",
 				"creator_id":   testUserID,

@@ -238,7 +238,7 @@ func TestDescriptionUpdateLockSerializesLaterChannelMediaAppend(t *testing.T) {
 		INSERT INTO issue (
 			workspace_id, title, description, status, priority,
 			creator_type, creator_id, number
-		) VALUES ($1, 'Description/media lock race', 'Original', 'todo', 'none', 'member', $2,
+		) VALUES ($1, 'Description/media lock race', 'Original', 'Spec', 'none', 'member', $2,
 			(SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1))
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {

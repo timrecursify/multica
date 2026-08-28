@@ -58,7 +58,13 @@ func TestMain(m *testing.M) {
 	go hub.Run()
 	bus := events.New()
 	emailSvc := service.NewEmailService()
-	testHandler = New(queries, pool, hub, bus, emailSvc, nil, nil, analytics.NoopClient{}, Config{AllowSignup: true})
+	// Fixtures persist canonical post-282 values. Keep the legacy response
+	// profile here so long-lived handler API compatibility assertions remain
+	// explicit; PPP-specific tests opt into canonical emission themselves.
+	testHandler = New(queries, pool, hub, bus, emailSvc, nil, nil, analytics.NoopClient{}, Config{
+		AllowSignup:         true,
+		IssueStatusContract: mustTestStatusContract(IssueStatusProfileLinear),
+	})
 	// httptest.NewRequest defaults RemoteAddr to 192.0.2.1, so every webhook
 	// test in the suite shares one IP bucket. With the production default
 	// (30/min) the budget runs out partway through the suite and unrelated
@@ -651,7 +657,7 @@ func TestCreateIssueRejectsCrossWorkspaceParent(t *testing.T) {
 	var foreignParentID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, $2, 'todo', 'none', 'member', $3, 1)
+		VALUES ($1, $2, 'Spec', 'none', 'member', $3, 1)
 		RETURNING id
 	`, otherWorkspaceID, "Foreign parent", testUserID).Scan(&foreignParentID); err != nil {
 		t.Fatalf("insert foreign parent: %v", err)
@@ -2991,7 +2997,7 @@ func TestResolveActor(t *testing.T) {
 	var issueID string
 	err = testPool.QueryRow(ctx,
 		`INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number, position)
-		 VALUES ($1, 'resolveActor test', 'todo', 'none', 'member', $2, 9999, 0)
+		 VALUES ($1, 'resolveActor test', 'Spec', 'none', 'member', $2, 9999, 0)
 		 RETURNING id`, testWorkspaceID, testUserID,
 	).Scan(&issueID)
 	if err != nil {

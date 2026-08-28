@@ -232,7 +232,7 @@ func seedIssueForAvatarTest(t *testing.T, workspaceID string) string {
 	var id string
 	if err := testPool.QueryRow(context.Background(), `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, 'avatar authorization fixture', 'todo', 'medium', 'member', $2,
+		VALUES ($1, 'avatar authorization fixture', 'Spec', 'medium', 'member', $2,
 		        (SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1))
 		RETURNING id::text
 	`, workspaceID, testUserID).Scan(&id); err != nil {

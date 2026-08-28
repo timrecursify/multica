@@ -99,7 +99,7 @@ func TestActivityIssueUpdated_StatusChanged(t *testing.T) {
 				CreatorID:   testUserID,
 			},
 			"status_changed": true,
-			"prev_status":    "todo",
+			"prev_status":    "Spec",
 		},
 	})
 
@@ -115,7 +115,7 @@ func TestActivityIssueUpdated_StatusChanged(t *testing.T) {
 	if err := json.Unmarshal(activities[0].Details, &details); err != nil {
 		t.Fatalf("failed to unmarshal details: %v", err)
 	}
-	if details["from"] != "todo" {
+	if details["from"] != "Spec" {
 		t.Fatalf("expected from 'todo', got %q", details["from"])
 	}
 	if details["to"] != "in_progress" {

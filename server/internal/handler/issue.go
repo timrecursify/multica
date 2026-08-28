@@ -88,7 +88,7 @@ var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
 // it — they canonicalize against h.IssueStatusContract so the configured
 // profile's vocabulary is authoritative. The CLI keeps its own union list.
 var validIssueStatuses = []string{
-	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	"Spec", "Queue", "in_progress", "in_review", "Human Review", "Done", "Cancelled", "Archived",
 	"Queue", "Spec", "Building", "QC", "In Review", "In Progress",
 	"Human Review", "Done", "Blocked", "Cancelled", "Archived", "dead_letter", "Registered",
 }
@@ -498,7 +498,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	whereClause := "(" + strings.Join(whereParts, " OR ") + ")"
 
 	if !includeClosed {
-		whereClause += " AND i.status NOT IN ('done', 'cancelled')"
+		whereClause += " AND i.status NOT IN ('Done', 'Cancelled', 'Archived')"
 	}
 
 	// --- ORDER BY clause ---
@@ -584,7 +584,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 		directHitParts = append(directHitParts, fmt.Sprintf("i.number = %s", numParam))
 	}
 	cancelledRank := fmt.Sprintf(
-		"CASE WHEN i.status = 'cancelled' AND NOT (%s) THEN 1 ELSE 0 END",
+		"CASE WHEN i.status = 'Cancelled' AND NOT (%s) THEN 1 ELSE 0 END",
 		strings.Join(directHitParts, " OR "),
 	)
 
@@ -3304,7 +3304,7 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 // triggering execution. Moving out of backlog is handled separately in
 // UpdateIssue.
 func (h *Handler) shouldEnqueueAgentTask(ctx context.Context, issue db.Issue) bool {
-	if issue.Status == "backlog" {
+	if issue.Status == "Spec" {
 		return false
 	}
 	return h.isAgentAssigneeReady(ctx, issue)

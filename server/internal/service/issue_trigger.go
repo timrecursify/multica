@@ -102,12 +102,12 @@ func (s *IssueService) WillEnqueueRun(ctx context.Context, in IssueTriggerInput,
 	switch {
 	case in.IsCreate || in.AssigneeChanged:
 		// Backlog is the parking lot: assigning into backlog never starts a run.
-		if issue.Status == "backlog" {
+		if issue.Status == "Spec" {
 			return IssueRunTrigger{}, false
 		}
 		source = RunSourceAssign
-	case in.StatusChanged && in.PrevStatus == "backlog" &&
-		issue.Status != "done" && issue.Status != "cancelled":
+	case in.StatusChanged && in.PrevStatus == "Spec" &&
+		issue.Status != "Done" && issue.Status != "Cancelled" && issue.Status != "Archived":
 		if probe.IsSelfLoop != nil && probe.IsSelfLoop() {
 			return IssueRunTrigger{}, false
 		}

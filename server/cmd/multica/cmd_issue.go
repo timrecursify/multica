@@ -961,7 +961,7 @@ func runIssueChildren(cmd *cobra.Command, args []string) error {
 		}
 		stages[gi].Issues = append(stages[gi].Issues, c)
 		stages[gi].Total++
-		if st := strVal(c, "status"); st == "done" || st == "cancelled" {
+		if st := strVal(c, "status"); st == "Done" || st == "Cancelled" || st == "Archived" {
 			stages[gi].Done++
 		}
 	}

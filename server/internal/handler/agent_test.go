@@ -317,7 +317,7 @@ func TestListWorkspaceWorkingAgents(t *testing.T) {
 				workspace_id, number, title, status, priority,
 				assignee_type, assignee_id, creator_type, creator_id
 			)
-			SELECT $1, COALESCE(MIN(number), 0) - 1, $2, 'todo', 'none',
+			SELECT $1, COALESCE(MIN(number), 0) - 1, $2, 'Spec', 'none',
 			       $3, $4, $5, $6
 			FROM issue
 			WHERE workspace_id = $1
@@ -637,7 +637,7 @@ func TestListWorkspaceWorkingAgentsParentScope(t *testing.T) {
 				workspace_id, number, title, status, priority,
 				creator_type, creator_id, parent_issue_id
 			)
-			SELECT $1, COALESCE(MIN(number), 0) - 1, $2, CASE WHEN $4::uuid IS NULL THEN 'todo' ELSE 'in_progress' END, 'none',
+			SELECT $1, COALESCE(MIN(number), 0) - 1, $2, CASE WHEN $4::uuid IS NULL THEN 'Spec' ELSE 'in_progress' END, 'none',
 			       'member', $3, $4
 			FROM issue
 			WHERE workspace_id = $1

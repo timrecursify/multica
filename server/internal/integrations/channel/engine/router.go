@@ -774,7 +774,7 @@ func (r *Router) createIssue(ctx context.Context, inst ResolvedInstallation, ori
 		WorkspaceID:  inst.WorkspaceID,
 		Title:        cmd.Title,
 		Description:  pgtype.Text{String: cmd.Description, Valid: cmd.Description != ""},
-		Status:       "todo",
+		Status:       "Spec",
 		Priority:     "none",
 		AssigneeType: pgtype.Text{String: "agent", Valid: true},
 		AssigneeID:   inst.AgentID,

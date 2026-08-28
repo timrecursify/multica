@@ -298,7 +298,7 @@ func TestIssueTableWorkingIssueProjectionMatchesTaskIssuesNotAssignees(t *testin
 				workspace_id, title, status, priority, creator_type, creator_id,
 				assignee_type, assignee_id, position, number
 			)
-			VALUES ($1, $2, 'todo', 'none', 'member', $3, $4, $5, $6, $7)
+			VALUES ($1, $2, 'Spec', 'none', 'member', $3, $4, $5, $6, $7)
 			RETURNING id
 		`,
 			testWorkspaceID,
@@ -536,7 +536,7 @@ func TestIssueTableRowsCommitsBeforeBestEffortEnrichment(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			position, number, project_id
 		)
-		VALUES ($1, 'table-enrichment', 'todo', 'none', 'member', $2, 1, $3, $4)
+		VALUES ($1, 'table-enrichment', 'Spec', 'none', 'member', $2, 1, $3, $4)
 	`, testWorkspaceID, testUserID, issueNumber, projectID); err != nil {
 		t.Fatalf("seed issue: %v", err)
 	}
@@ -623,7 +623,7 @@ func TestIssueTableStatusGroupingOverOneThousandRows(t *testing.T) {
 			position, number, project_id
 		)
 		SELECT $1, 'server-table-' || n::text,
-		       CASE WHEN n <= 501 THEN 'todo' ELSE 'done' END,
+		       CASE WHEN n <= 501 THEN 'Spec' ELSE 'Done' END,
 		       'none', 'member', $2, n::double precision,
 		       $3 + n - 1, $4
 		FROM generate_series(1, 1001) AS n
@@ -1003,8 +1003,8 @@ func TestIssueTableAssigneeNamesResolveAfterGrouping(t *testing.T) {
 			creator_type, creator_id, position, number, project_id
 		)
 		VALUES
-			($1, 'Assigned row', 'todo', 'none', 'member', $2, 'member', $2, 1, $3, $4),
-			($1, 'Unassigned row', 'todo', 'none', NULL, NULL, 'member', $2, 2, $3 + 1, $4)
+			($1, 'Assigned row', 'Spec', 'none', 'member', $2, 'member', $2, 1, $3, $4),
+			($1, 'Unassigned row', 'Spec', 'none', NULL, NULL, 'member', $2, 2, $3 + 1, $4)
 	`, testWorkspaceID, testUserID, finalNumber-1, projectID); err != nil {
 		t.Fatalf("seed issues: %v", err)
 	}
@@ -1083,7 +1083,7 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			position, number, project_id
 		)
-		VALUES ($1, 'Parent context', 'done', 'none', 'member', $2, 1, $3, $4)
+		VALUES ($1, 'Parent context', 'Done', 'none', 'member', $2, 1, $3, $4)
 		RETURNING id
 	`, testWorkspaceID, testUserID, finalNumber-3, projectID).Scan(&parentID); err != nil {
 		t.Fatalf("create parent: %v", err)
@@ -1094,9 +1094,9 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 			parent_issue_id, position, number, project_id
 		)
 		VALUES
-			($1, 'Child todo', 'todo', 'none', 'member', $2, $3, 2, $4, $5),
+			($1, 'Child todo', 'Spec', 'none', 'member', $2, $3, 2, $4, $5),
 			($1, 'Child review', 'in_review', 'none', 'member', $2, $3, 3, $4 + 1, $5),
-			($1, 'No parent', 'todo', 'none', 'member', $2, NULL, 4, $4 + 2, $5)
+			($1, 'No parent', 'Spec', 'none', 'member', $2, NULL, 4, $4 + 2, $5)
 	`, testWorkspaceID, testUserID, parentID, finalNumber-2, projectID); err != nil {
 		t.Fatalf("seed grouped issues: %v", err)
 	}
@@ -1164,7 +1164,7 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			position, number, project_id
 		)
-		VALUES ($1, 'Visible parent card', 'todo', 'none', 'member', $2, 5, $3, $4)
+		VALUES ($1, 'Visible parent card', 'Spec', 'none', 'member', $2, 5, $3, $4)
 		RETURNING id
 	`, testWorkspaceID, testUserID, hiddenParentNumber-1, projectID).Scan(&hiddenParentID); err != nil {
 		t.Fatalf("create hidden-only parent: %v", err)
@@ -1174,7 +1174,7 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			parent_issue_id, position, number, project_id
 		)
-		VALUES ($1, 'Hidden child', 'done', 'none', 'member', $2, $3, 6, $4, $5)
+		VALUES ($1, 'Hidden child', 'Done', 'none', 'member', $2, $3, 6, $4, $5)
 	`, testWorkspaceID, testUserID, hiddenParentID, hiddenParentNumber, projectID); err != nil {
 		t.Fatalf("create hidden child: %v", err)
 	}
@@ -1299,7 +1299,7 @@ func TestIssueTableHierarchyDoesNotCrossGroups(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			position, number, project_id
 		)
-		VALUES ($1, 'Todo parent', 'todo', 'none', 'member', $2, 1, $3, $4)
+		VALUES ($1, 'Todo parent', 'Spec', 'none', 'member', $2, 1, $3, $4)
 		RETURNING id
 	`, testWorkspaceID, testUserID, finalNumber-1, projectID).Scan(&parentID); err != nil {
 		t.Fatalf("create parent: %v", err)
@@ -1310,7 +1310,7 @@ func TestIssueTableHierarchyDoesNotCrossGroups(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			parent_issue_id, position, number, project_id
 		)
-		VALUES ($1, 'Done child', 'done', 'none', 'member', $2, $3, 2, $4, $5)
+		VALUES ($1, 'Done child', 'Done', 'none', 'member', $2, $3, 2, $4, $5)
 		RETURNING id
 	`, testWorkspaceID, testUserID, parentID, finalNumber, projectID).Scan(&childID); err != nil {
 		t.Fatalf("create child: %v", err)
@@ -1399,7 +1399,7 @@ func TestIssueTableHierarchyRootKeysetPagination(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			position, number, project_id
 		)
-		SELECT $1, 'Hierarchy root ' || n::text, 'todo', 'none', 'member', $2,
+		SELECT $1, 'Hierarchy root ' || n::text, 'Spec', 'none', 'member', $2,
 		       n::double precision, $3 + n - 1, $4
 		FROM generate_series(1, 3) AS n
 		ORDER BY n

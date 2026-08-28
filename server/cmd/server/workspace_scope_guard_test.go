@@ -98,13 +98,13 @@ func TestWorkspaceScopeGuard(t *testing.T) {
 			t.Fatalf("cross-workspace UpdateIssueStatus: expected pgx.ErrNoRows, got %v", err)
 		}
 
-		// Status must still be the original 'todo'.
+		// Status must still be the original 'Spec'.
 		var status string
 		if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, util.UUIDToString(id)).Scan(&status); err != nil {
 			t.Fatalf("re-read issue: %v", err)
 		}
-		if status != "todo" {
-			t.Fatalf("issue status changed across workspace boundary: got %q, want 'todo'", status)
+		if status != "Spec" {
+			t.Fatalf("issue status changed across workspace boundary: got %q, want 'Spec'", status)
 		}
 	})
 
@@ -138,7 +138,7 @@ func seedIssue(t *testing.T, ctx context.Context) pgtype.UUID {
 	n := 1_000_000 + rand.IntN(1_000_000)
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, number)
-		VALUES ($1, 'scope-guard test issue', 'todo', 'none', 'member', $2, 0, $3)
+		VALUES ($1, 'scope-guard test issue', 'Spec', 'none', 'member', $2, 0, $3)
 		RETURNING id
 	`, testWorkspaceID, testUserID, n).Scan(&s); err != nil {
 		t.Fatalf("seed issue: %v", err)

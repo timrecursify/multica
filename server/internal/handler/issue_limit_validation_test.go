@@ -52,7 +52,7 @@ func TestListIssues_LimitValidation(t *testing.T) {
 		var id string
 		if err := testPool.QueryRow(ctx, `
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, number, project_id)
-			VALUES ($1, $2, 'todo', 'none', 'member', $3, 0, $4, $5) RETURNING id
+			VALUES ($1, $2, 'Spec', 'none', 'member', $3, 0, $4, $5) RETURNING id
 		`, testWorkspaceID, title, testUserID, number, projectID).Scan(&id); err != nil {
 			t.Fatalf("create issue %q: %v", title, err)
 		}
@@ -177,7 +177,7 @@ func TestListIssues_LimitClamp(t *testing.T) {
 		}
 		if _, err := testPool.Exec(ctx, `
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, number, project_id)
-			VALUES ($1, $2, 'todo', 'none', 'member', $3, 0, $4, $5)
+			VALUES ($1, $2, 'Spec', 'none', 'member', $3, 0, $4, $5)
 		`, testWorkspaceID, title, testUserID, number, projectID); err != nil {
 			t.Fatalf("create issue #%d: %v", idx, err)
 		}

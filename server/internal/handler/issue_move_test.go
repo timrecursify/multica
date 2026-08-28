@@ -60,7 +60,7 @@ func TestMoveIssueRejectsUnsafeInputs(t *testing.T) {
 			number, position
 		)
 		VALUES (
-			$1, $2, 'todo', 'none', 'member', $3,
+			$1, $2, 'Spec', 'none', 'member', $3,
 			(SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1),
 			100
 		)
@@ -90,7 +90,7 @@ func TestMoveIssueRejectsUnsafeInputs(t *testing.T) {
 			workspace_id, title, status, priority, creator_type, creator_id,
 			number, position
 		)
-		VALUES ($1, $2, 'todo', 'none', 'member', $3, 1, 200)
+		VALUES ($1, $2, 'Spec', 'none', 'member', $3, 1, 200)
 		RETURNING id
 	`, foreignWorkspaceID, "Foreign move anchor "+suffix, testUserID).Scan(&foreignAnchorID); err != nil {
 		t.Fatalf("insert foreign anchor: %v", err)

@@ -220,7 +220,7 @@ func createChildIssue(t *testing.T, workspaceID, creatorID string, parent pgtype
 	err := testPool.QueryRow(context.Background(), `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id,
 		                   position, number, parent_issue_id)
-		VALUES ($1, 'child issue', 'todo', 'medium', 'member', $2, 0,
+		VALUES ($1, 'child issue', 'Spec', 'medium', 'member', $2, 0,
 		        (SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1), $3)
 		RETURNING id
 	`, workspaceID, creatorID, parent).Scan(&issueID)

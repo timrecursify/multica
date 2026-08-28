@@ -1,6 +1,9 @@
 -- PPP-22989 rollback: restore exact pre-up values from the migration sidecar.
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
+-- Restore the pre-282 implicit write vocabulary alongside the data snapshot.
+ALTER TABLE issue ALTER COLUMN status SET DEFAULT 'todo';
+
 UPDATE issue i
 SET status = r.previous_status
 FROM issue_status_282_rollback r

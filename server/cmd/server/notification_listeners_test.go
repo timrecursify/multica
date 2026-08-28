@@ -57,7 +57,7 @@ func createTestSubIssue(t *testing.T, workspaceID, creatorID, parentIssueID stri
 	var issueID string
 	err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, parent_issue_id, number)
-		VALUES ($1, 'sub-issue test', 'todo', 'medium', 'member', $2, 0, $3,
+		VALUES ($1, 'sub-issue test', 'Spec', 'medium', 'member', $2, 0, $3,
 		        (SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1))
 		RETURNING id
 	`, workspaceID, creatorID, parentIssueID).Scan(&issueID)
@@ -110,7 +110,7 @@ func TestNotification_IssueCreated_AssigneeNotified(t *testing.T) {
 				ID:           issueID,
 				WorkspaceID:  testWorkspaceID,
 				Title:        "notif test issue",
-				Status:       "todo",
+				Status:       "Spec",
 				Priority:     "medium",
 				CreatorType:  "member",
 				CreatorID:    testUserID,
@@ -173,7 +173,7 @@ func TestNotification_IssueCreated_SelfAssign(t *testing.T) {
 				ID:           issueID,
 				WorkspaceID:  testWorkspaceID,
 				Title:        "self-assign issue",
-				Status:       "todo",
+				Status:       "Spec",
 				Priority:     "medium",
 				CreatorType:  "member",
 				CreatorID:    testUserID,
@@ -219,7 +219,7 @@ func TestNotification_IssueCreated_NoAssignee(t *testing.T) {
 				ID:          issueID,
 				WorkspaceID: testWorkspaceID,
 				Title:       "no assignee issue",
-				Status:      "todo",
+				Status:      "Spec",
 				Priority:    "medium",
 				CreatorType: "member",
 				CreatorID:   testUserID,
@@ -279,7 +279,7 @@ func TestNotification_StatusChanged(t *testing.T) {
 			},
 			"assignee_changed": false,
 			"status_changed":   true,
-			"prev_status":      "todo",
+			"prev_status":      "Spec",
 		},
 	})
 
@@ -363,7 +363,7 @@ func TestNotification_StatusChanged_Muted(t *testing.T) {
 			},
 			"assignee_changed": false,
 			"status_changed":   true,
-			"prev_status":      "todo",
+			"prev_status":      "Spec",
 		},
 	})
 
@@ -415,7 +415,7 @@ func TestNotification_CommentCreated(t *testing.T) {
 				Type:       "comment",
 			},
 			"issue_title":  "comment test issue",
-			"issue_status": "todo",
+			"issue_status": "Spec",
 		},
 	})
 
@@ -590,7 +590,7 @@ func TestNotification_AssigneeChanged(t *testing.T) {
 				ID:           issueID,
 				WorkspaceID:  testWorkspaceID,
 				Title:        "assignee change issue",
-				Status:       "todo",
+				Status:       "Spec",
 				Priority:     "medium",
 				CreatorType:  "member",
 				CreatorID:    testUserID,
@@ -757,7 +757,7 @@ func TestNotification_PriorityChanged(t *testing.T) {
 				ID:          issueID,
 				WorkspaceID: testWorkspaceID,
 				Title:       "priority test issue",
-				Status:      "todo",
+				Status:      "Spec",
 				Priority:    "high",
 				CreatorType: "member",
 				CreatorID:   testUserID,
@@ -823,7 +823,7 @@ func TestNotification_DueDateChanged(t *testing.T) {
 				ID:          issueID,
 				WorkspaceID: testWorkspaceID,
 				Title:       "due date test issue",
-				Status:      "todo",
+				Status:      "Spec",
 				Priority:    "medium",
 				CreatorType: "member",
 				CreatorID:   testUserID,
@@ -949,7 +949,7 @@ func TestNotification_ParentBubble_StatusChanged(t *testing.T) {
 				ID:          subID,
 				WorkspaceID: testWorkspaceID,
 				Title:       "sub-issue status bubble",
-				Status:      "done",
+				Status:      "Done",
 				Priority:    "medium",
 				CreatorType: "member",
 				CreatorID:   testUserID,
@@ -1018,7 +1018,7 @@ func TestNotification_ParentBubble_NewCommentSuppressed(t *testing.T) {
 				Type:       "comment",
 			},
 			"issue_title":  "sub-issue comment bubble",
-			"issue_status": "todo",
+			"issue_status": "Spec",
 		},
 	})
 
@@ -1061,7 +1061,7 @@ func TestNotification_ParentBubble_PriorityChangeSuppressed(t *testing.T) {
 				ID:          subID,
 				WorkspaceID: testWorkspaceID,
 				Title:       "sub-issue priority bubble",
-				Status:      "todo",
+				Status:      "Spec",
 				Priority:    "high",
 				CreatorType: "member",
 				CreatorID:   testUserID,
@@ -1271,7 +1271,7 @@ func TestNotification_StatusChange_NonTerminalKeepsTaskFailed(t *testing.T) {
 		t.Fatalf("precondition: expected 1 active task_failed row, got %d", active)
 	}
 
-	publishStatusChange(bus, issueID, "in_progress", "todo")
+	publishStatusChange(bus, issueID, "in_progress", "Spec")
 
 	// task_failed row stays active because in_progress is not terminal.
 	active, archived := countInboxByTypeForRecipient(t, testUserID, "task_failed")

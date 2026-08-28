@@ -175,7 +175,7 @@ func (h *Handler) PreviewIssueTrigger(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "invalid workspace")
 			return
 		}
-		status := "todo"
+		status := "Spec"
 		if req.Status != nil && *req.Status != "" {
 			status = *req.Status
 		}

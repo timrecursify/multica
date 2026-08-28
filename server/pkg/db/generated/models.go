@@ -706,6 +706,11 @@ type IssueReaction struct {
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
+type IssueStatus282Rollback struct {
+	IssueID        pgtype.UUID `json:"issue_id"`
+	PreviousStatus string      `json:"previous_status"`
+}
+
 type IssueSubscriber struct {
 	IssueID        pgtype.UUID        `json:"issue_id"`
 	UserType       string             `json:"user_type"`

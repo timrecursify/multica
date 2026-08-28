@@ -59,7 +59,7 @@ func createAgentOriginIssue(t *testing.T, agentID, originType string, originTask
 	err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id,
 		                   position, number, origin_type, origin_id, parent_issue_id)
-		VALUES ($1, 'delegated subscriber test issue', 'todo', 'medium', 'agent', $2, 0,
+		VALUES ($1, 'delegated subscriber test issue', 'Spec', 'medium', 'agent', $2, 0,
 		        (SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1),
 		        $3, $4, $5)
 		RETURNING id
@@ -84,7 +84,7 @@ func publishAgentIssueCreated(bus *events.Bus, issueID, agentID string) {
 				ID:          issueID,
 				WorkspaceID: testWorkspaceID,
 				Title:       "delegated subscriber test issue",
-				Status:      "todo",
+				Status:      "Spec",
 				Priority:    "medium",
 				CreatorType: "agent",
 				CreatorID:   agentID,
@@ -275,19 +275,19 @@ func TestDeliverToSubscriber_DelegatedTier(t *testing.T) {
 		want        bool
 	}{
 		{"direct subscriber keeps every event", "creator", "status_changed", "in_progress", true},
-		{"direct subscriber keeps comments", "assignee", "new_comment", "todo", true},
+		{"direct subscriber keeps comments", "assignee", "new_comment", "Spec", true},
 
 		{"delegated skips routine progress", "delegated", "status_changed", "in_progress", false},
-		{"delegated skips backlog parking", "delegated", "status_changed", "backlog", false},
-		{"delegated skips todo", "delegated", "status_changed", "todo", false},
+		{"delegated skips backlog parking", "delegated", "status_changed", "Queue", false},
+		{"delegated skips todo", "delegated", "status_changed", "Spec", false},
 		{"delegated skips comment churn", "delegated", "new_comment", "in_progress", false},
 		{"delegated skips assignee churn", "delegated", "assignee_changed", "in_progress", false},
 		{"delegated skips date churn", "delegated", "due_date_changed", "in_progress", false},
 
 		{"delegated gets the review handoff", "delegated", "status_changed", "in_review", true},
-		{"delegated gets completion", "delegated", "status_changed", "done", true},
-		{"delegated gets cancellation", "delegated", "status_changed", "cancelled", true},
-		{"delegated gets blocked", "delegated", "status_changed", "blocked", true},
+		{"delegated gets completion", "delegated", "status_changed", "Done", true},
+		{"delegated gets cancellation", "delegated", "status_changed", "Cancelled", true},
+		{"delegated gets blocked", "delegated", "status_changed", "Human Review", true},
 
 		{"delegated always gets direct mentions", "delegated", "mentioned", "in_progress", true},
 		{"delegated always gets failures", "delegated", "task_failed", "in_progress", true},
