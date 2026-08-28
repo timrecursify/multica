@@ -5,9 +5,9 @@ import "github.com/multica-ai/multica/server/pkg/taskfailure"
 type buildFailureClass string
 
 const (
-	buildFailureProvider buildFailureClass = "provider"
-	buildFailureDefect   buildFailureClass = "defect"
-	buildFailureSpec     buildFailureClass = "spec"
+	buildFailureInfra  buildFailureClass = "infrastructure"
+	buildFailureDefect buildFailureClass = "defect"
+	buildFailureSpec   buildFailureClass = "spec"
 )
 
 type buildRetryKind string
@@ -23,7 +23,7 @@ type buildFailureDecision struct {
 	RunState          string
 	TerminalReason    string
 	IncrementAttempts bool
-	Retry              buildRetryKind
+	Retry             buildRetryKind
 	HumanReview       bool
 }
 
@@ -31,9 +31,9 @@ const buildDefectMaxAttempts int32 = 3
 
 // decideBuildFailure is the executable WP-4 escalation table. Provider-side
 // failures park without charging the ticket, missing-input failures go to human
-// review without a model retry, and implementation defects get one clean retry
-// followed by one explicit stronger-runtime escalation.
-func decideBuildFailure(reason string, attempt int32) buildFailureDecision {
+// review without a model retry, and implementation defects with useful progress
+// get one clean retry followed by one explicit stronger-runtime escalation.
+func decideBuildFailure(reason string, attempt int32, usefulProgress bool) buildFailureDecision {
 	switch reason {
 	case string(taskfailure.ReasonAgentProviderAuthOrAccess),
 		string(taskfailure.ReasonAgentProviderQuotaLimit),
@@ -41,9 +41,11 @@ func decideBuildFailure(reason string, attempt int32) buildFailureDecision {
 		string(taskfailure.ReasonAgentProviderServerError),
 		string(taskfailure.ReasonAgentProviderNetwork),
 		string(taskfailure.ReasonAgentMissingConfig),
-		string(taskfailure.ReasonAgentModelNotFoundOrUnavailable):
+		string(taskfailure.ReasonAgentModelNotFoundOrUnavailable),
+		string(taskfailure.ReasonAgentRuntimeMissingExecutable),
+		string(taskfailure.ReasonAgentRuntimeVersionUnsupported):
 		return buildFailureDecision{
-			Class:          buildFailureProvider,
+			Class:          buildFailureInfra,
 			RunState:       "parked",
 			TerminalReason: "blocked_provider",
 		}
@@ -61,11 +63,13 @@ func decideBuildFailure(reason string, attempt int32) buildFailureDecision {
 			TerminalReason:    "defect",
 			IncrementAttempts: true,
 		}
-		switch attempt {
-		case 1:
-			decision.Retry = buildRetryFresh
-		case 2:
-			decision.Retry = buildRetryStronger
+		if usefulProgress && attempt < buildDefectMaxAttempts {
+			switch attempt {
+			case 1:
+				decision.Retry = buildRetryFresh
+			case 2:
+				decision.Retry = buildRetryStronger
+			}
 		}
 		return decision
 	}
