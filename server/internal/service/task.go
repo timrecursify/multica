@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,10 @@ type TaskService struct {
 	// FeatureFlags is the server-side toggle router. Nil is valid and returns
 	// each call site's default.
 	FeatureFlags *featureflag.Service
+	// SupervisorEnabled gates the WP-4 reasonix run/fence integration.  It is
+	// deliberately captured once at process start so rollback is a config flip
+	// plus restart, matching WP10A-DESIGN section 6.
+	SupervisorEnabled bool
 	// EmptyClaim caches "this runtime has no queued task" so the daemon
 	// poll path can skip a Postgres scan on the steady-state empty case.
 	// Optional — a nil cache disables the fast path and every claim
@@ -166,6 +171,8 @@ const (
 	// stretching this global crash-recovery window.
 	claimResponseRecoveryWindow = 90 * time.Second
 	prepareLeaseDuration        = 45 * time.Second
+	buildRunLeaseDuration       = 120 * time.Second
+	buildRunDeadline            = 30 * time.Minute
 )
 
 // buildCommentTriggerSummary fetches the comment content and truncates
@@ -255,7 +262,14 @@ func NewTaskService(q *db.Queries, tx TxStarter, hub *realtime.Hub, bus *events.
 	if len(wakeups) > 0 {
 		wakeup = wakeups[0]
 	}
-	return &TaskService{Queries: q, TxStarter: tx, Hub: hub, Bus: bus, Wakeup: wakeup}
+	return &TaskService{
+		Queries:           q,
+		TxStarter:         tx,
+		Hub:               hub,
+		Bus:               bus,
+		Wakeup:            wakeup,
+		SupervisorEnabled: strings.EqualFold(strings.TrimSpace(os.Getenv("MULTICA_SUPERVISOR")), "on"),
+	}
 }
 
 var trivialDoneMarkers = []string{
@@ -2815,6 +2829,9 @@ func (s *TaskService) broadcastChatCancelFinalized(ctx context.Context, task db.
 // ClaimTask atomically claims the next queued task for an agent,
 // respecting max_concurrent_tasks.
 func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	if !agentID.Valid {
+		return nil, errors.New("claim task: registered agent identity is required")
+	}
 	start := time.Now()
 	outcome := "unknown"
 	var getAgentMs, countRunningMs, claimAgentMs, reanchorMs, updateStatusMs, dispatchMs int64
@@ -2859,6 +2876,84 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 			}
 			outcome = "error_claim"
 			return fmt.Errorf("claim task: %w", err)
+		}
+
+		// WP-4 applies only to issue-backed work on the reasonix runtime. Chat,
+		// autopilot-run-only, and every other provider retain their established
+		// lifecycle. The flag is the rollback boundary described by WP10A.
+		if s.SupervisorEnabled && task.IssueID.Valid {
+			runtime, runtimeErr := qtx.GetAgentRuntime(ctx, task.RuntimeID)
+			if runtimeErr != nil {
+				outcome = "error_supervisor_runtime"
+				return fmt.Errorf("supervisor claim runtime: %w", runtimeErr)
+			}
+			if strings.EqualFold(runtime.Provider, "reasonix") {
+				leaseHolder := util.UUIDToString(task.RuntimeID) + ":" + task.DaemonID.String
+				run, runErr := qtx.ClaimBuildRunForTask(ctx, db.ClaimBuildRunForTaskParams{
+					LeaseHolder:  leaseHolder,
+					LeaseTtlSecs: buildRunLeaseDuration.Seconds(),
+					DeadlineSecs: buildRunDeadline.Seconds(),
+					RuntimeID:    task.RuntimeID,
+					TaskID:       task.ID,
+					AgentID:      agentID,
+				})
+				if runErr != nil {
+					outcome = "error_supervisor_claim"
+					if errors.Is(runErr, pgx.ErrNoRows) {
+						return errors.New("supervisor claim refused: registered identity and open issue budget are required")
+					}
+					return fmt.Errorf("supervisor claim run: %w", runErr)
+				}
+				bound, bindErr := qtx.BindAgentTaskBuildRun(ctx, db.BindAgentTaskBuildRunParams{
+					BuildRunID: run.ID,
+					TaskID:     task.ID,
+					AgentID:    agentID,
+				})
+				if bindErr != nil {
+					outcome = "error_supervisor_bind"
+					return fmt.Errorf("bind build run: %w", bindErr)
+				}
+				task = bound
+
+				prState, prErr := qtx.GetIssueBuildPRState(ctx, task.IssueID)
+				if prErr != nil {
+					outcome = "error_pr_reconciliation"
+					return fmt.Errorf("inspect linked pull requests: %w", prErr)
+				}
+				status, reconcile := issueStatusForExistingPR(prState.OpenCount, prState.MergedCount)
+				if reconcile {
+					if _, reconcileErr := qtx.ReconcileIssueForExistingPR(ctx, db.ReconcileIssueForExistingPRParams{
+						Merged:  status == "done",
+						IssueID: task.IssueID,
+					}); reconcileErr != nil {
+						outcome = "error_pr_reconciliation"
+						return fmt.Errorf("reconcile issue pull request state: %w", reconcileErr)
+					}
+					detail, _ := json.Marshal(map[string]any{
+						"reconciled_pull_requests": true,
+						"open_count":              prState.OpenCount,
+						"merged_count":            prState.MergedCount,
+						"model_calls":             0,
+					})
+					result, _ := json.Marshal(map[string]any{
+						"reconciled":  true,
+						"issue_status": status,
+						"model_calls": 0,
+					})
+					if _, completeErr := qtx.CompleteReconciledBuildRunAndTask(ctx, db.CompleteReconciledBuildRunAndTaskParams{
+						Result:     result,
+						TaskID:     task.ID,
+						RunDetail:  detail,
+						BuildRunID: run.ID,
+						Fence:      run.Fence,
+					}); completeErr != nil {
+						outcome = "error_pr_reconciliation"
+						return fmt.Errorf("complete pull request reconciliation: %w", completeErr)
+					}
+					outcome = "reconciled_existing_pr"
+					return nil
+				}
+			}
 		}
 
 		// An idle task-owned direct-chat row may already be visible as the

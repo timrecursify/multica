@@ -162,6 +162,7 @@ type AgentTaskQueue struct {
 	QuickActionsDisabled      bool        `json:"quick_actions_disabled"`
 	RegenerateQuickActionsFor pgtype.UUID `json:"regenerate_quick_actions_for"`
 	DaemonID                  pgtype.Text `json:"daemon_id"`
+	BuildRunID                pgtype.UUID `json:"build_run_id"`
 }
 
 type AgentToLabel struct {
@@ -271,6 +272,40 @@ type AutopilotTrigger struct {
 	PublishedByType pgtype.Text `json:"published_by_type"`
 	// The member/agent currently responsible for this trigger's effective config (creator, then last substantive editor). For a member this is the accountable human of runs the trigger fires (source=trigger_owner). No FK, app-layer integrity. NULL on pre-migration triggers, which degrade to rule_owner (MUL-4302).
 	PublishedByID pgtype.UUID `json:"published_by_id"`
+}
+
+type BuildBudget struct {
+	ID            pgtype.UUID        `json:"id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	Scope         string             `json:"scope"`
+	ScopeRef      string             `json:"scope_ref"`
+	LimitTicks    int64              `json:"limit_ticks"`
+	ReservedTicks int64              `json:"reserved_ticks"`
+	SpentTicks    int64              `json:"spent_ticks"`
+	State         string             `json:"state"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+type BuildRun struct {
+	ID             pgtype.UUID        `json:"id"`
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	IssueID        pgtype.UUID        `json:"issue_id"`
+	TaskID         pgtype.UUID        `json:"task_id"`
+	AgentID        pgtype.UUID        `json:"agent_id"`
+	Lane           string             `json:"lane"`
+	RunNumber      int32              `json:"run_number"`
+	Fence          int64              `json:"fence"`
+	LeaseHolder    string             `json:"lease_holder"`
+	LeaseExpiresAt pgtype.Timestamptz `json:"lease_expires_at"`
+	HeartbeatAt    pgtype.Timestamptz `json:"heartbeat_at"`
+	State          string             `json:"state"`
+	BudgetID       pgtype.UUID        `json:"budget_id"`
+	DeadlineAt     pgtype.Timestamptz `json:"deadline_at"`
+	ClaimedAt      pgtype.Timestamptz `json:"claimed_at"`
+	EndedAt        pgtype.Timestamptz `json:"ended_at"`
+	TerminalReason pgtype.Text        `json:"terminal_reason"`
+	Detail         []byte             `json:"detail"`
 }
 
 type ChannelBindingToken struct {

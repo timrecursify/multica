@@ -1636,6 +1636,17 @@ type claimBuildFailure struct {
 func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQueue, runtime db.AgentRuntime, runtimeID, runtimeWorkspaceID string) (resp AgentTaskResponse, deliveredCommentIDs []pgtype.UUID, agentSkillCount, builtinSkillCount int, failure *claimBuildFailure) {
 	// Build response with fresh agent data (name + skills + custom_env + custom_args).
 	resp = taskToResponse(*task, runtimeWorkspaceID)
+	if task.BuildRunID.Valid {
+		run, err := h.Queries.GetBuildRunForTask(r.Context(), task.ID)
+		if err != nil || run.ID != task.BuildRunID || run.State != "running" {
+			return AgentTaskResponse{}, nil, 0, 0, &claimBuildFailure{
+				outcome: "build_run_missing",
+				status:  http.StatusConflict,
+				message: "supervised task has no active build run",
+			}
+		}
+		resp.BuildFence = strconv.FormatInt(run.Fence, 10)
+	}
 	// Claim-only capability: this server resolves the squad-leader role on the
 	// wire (is_leader_task / squad_id), so the daemon must not re-derive it
 	// from the briefing text. Set unconditionally — on every claim, leader or

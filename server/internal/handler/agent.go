@@ -299,6 +299,10 @@ type AgentTaskResponse struct {
 	RuntimeID   string `json:"runtime_id"`
 	IssueID     string `json:"issue_id"`
 	WorkspaceID string `json:"workspace_id"`
+	BuildRunID  string `json:"build_run_id,omitempty"`
+	// BuildFence is encoded as a decimal string so installed JavaScript clients
+	// never lose precision when the global bigint sequence exceeds 2^53.
+	BuildFence string `json:"build_fence,omitempty"`
 	// WorkspaceContext is the workspace-level system prompt set in workspace
 	// settings (`workspace.context` DB column). Injected into the agent brief
 	// as `## Workspace Context` so every agent running in this workspace —
@@ -673,6 +677,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		RuntimeID:           uuidToString(t.RuntimeID),
 		IssueID:             uuidToString(t.IssueID),
 		WorkspaceID:         workspaceID,
+		BuildRunID:          uuidToString(t.BuildRunID),
 		Status:              t.Status,
 		Priority:            t.Priority,
 		DispatchedAt:        timestampToPtr(t.DispatchedAt),
