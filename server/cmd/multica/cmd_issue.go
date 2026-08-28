@@ -371,6 +371,11 @@ var issueSearchCmd = &cobra.Command{
 
 var validIssueStatuses = []string{
 	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	// PPP boards persist and expose canonical workflow statuses. Keep the
+	// client-side guard aligned with the server so a status returned by a board
+	// can be supplied to an update without being rejected before the request.
+	"Registered", "Spec", "Queue", "In Progress", "In Review", "Human Review",
+	"CI/CD & Deploy", "Done",
 }
 
 var validIssuePriorities = []string{

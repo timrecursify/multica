@@ -2687,13 +2687,21 @@ func TestRunIssueCommentList_DoesNotPrintShowingPreamble(t *testing.T) {
 
 func TestValidIssueStatuses(t *testing.T) {
 	expected := map[string]bool{
-		"backlog":     true,
-		"todo":        true,
-		"in_progress": true,
-		"in_review":   true,
-		"done":        true,
-		"blocked":     true,
-		"cancelled":   true,
+		"backlog":        true,
+		"todo":           true,
+		"in_progress":    true,
+		"in_review":      true,
+		"done":           true,
+		"blocked":        true,
+		"cancelled":      true,
+		"Registered":     true,
+		"Spec":           true,
+		"Queue":          true,
+		"In Progress":    true,
+		"In Review":      true,
+		"Human Review":   true,
+		"CI/CD & Deploy": true,
+		"Done":           true,
 	}
 	for _, s := range validIssueStatuses {
 		if !expected[s] {
