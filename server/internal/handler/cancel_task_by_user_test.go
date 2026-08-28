@@ -591,7 +591,7 @@ func TestCancelTaskByUser_IssueTask_Succeeds(t *testing.T) {
 	var issueID, taskID string
 	if err := testPool.QueryRow(context.Background(), `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'cancel-byid-issue', 'todo', 'medium', $2, 'member', 92001, 0)
+		VALUES ($1, 'cancel-byid-issue', 'Spec', 'medium', $2, 'member', 92001, 0)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)

@@ -29,7 +29,7 @@ func TestListTasksByIssueHydratesUsage(t *testing.T) {
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'usage-list-issue', 'todo', 'medium', $2, 'member', 92778, 0)
+		VALUES ($1, 'usage-list-issue', 'Spec', 'medium', $2, 'member', 92778, 0)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)

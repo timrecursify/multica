@@ -369,8 +369,17 @@ var issueSearchCmd = &cobra.Command{
 	RunE: runIssueSearch,
 }
 
+// validIssueStatuses is the union of every status spelling accepted by the
+// configured profiles. The two historical boards ran mutually exclusive
+// vocabularies (the legacy lowercase set vs the canonical board set); the CLI
+// therefore accepts the full union and the server — which canonicalizes onto
+// its own configured profile — remains authoritative. This is what lets the
+// CLI keep working across a mixed-version rollout: it tries the canonical
+// vocabulary first and, once both backends accept it, the fallback silently
+// stops being needed.
 var validIssueStatuses = []string{
 	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	"Spec", "Queue", "In Progress", "In Review", "Human Review", "Done", "Cancelled", "Archived",
 }
 
 var validIssuePriorities = []string{
@@ -952,7 +961,7 @@ func runIssueChildren(cmd *cobra.Command, args []string) error {
 		}
 		stages[gi].Issues = append(stages[gi].Issues, c)
 		stages[gi].Total++
-		if st := strVal(c, "status"); st == "done" || st == "cancelled" {
+		if st := strVal(c, "status"); st == "Done" || st == "Cancelled" || st == "Archived" {
 			stages[gi].Done++
 		}
 	}

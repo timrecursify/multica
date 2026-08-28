@@ -220,7 +220,7 @@ func createMentionFixtureIssue(t *testing.T, ctx context.Context, title string) 
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, number, title, description, status, creator_type, creator_id)
 		VALUES ($1, (SELECT COALESCE(MAX(number), 0) + 1 FROM issue WHERE workspace_id = $1),
-		        $2, '', 'todo', 'member', $3)
+		        $2, '', 'Spec', 'member', $3)
 		RETURNING id
 	`, testWorkspaceID, title, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("insert fixture issue: %v", err)

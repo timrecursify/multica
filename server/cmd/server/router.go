@@ -247,6 +247,20 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	cfSigner := auth.NewCloudFrontSignerFromEnv()
 	origins := allowedOrigins()
 
+	// Issue-status vocabulary is a deployment-wide invariant: parse the
+	// profile once and fail startup on an unknown value so a misconfigured
+	// deployment cannot silently drift to a different vocabulary.
+	statusProfile, err := handler.ParseIssueStatusProfile(os.Getenv("MULTICA_ISSUE_STATUS_PROFILE"))
+	if err != nil {
+		slog.Error("invalid issue status profile", "error", err)
+		os.Exit(1)
+	}
+	statusContract, err := handler.NewIssueStatusContract(statusProfile)
+	if err != nil {
+		slog.Error("build issue status contract", "error", err)
+		os.Exit(1)
+	}
+
 	signupConfig := handler.Config{
 		AllowSignup:              os.Getenv("ALLOW_SIGNUP") != "false",
 		AllowedEmails:            splitAndTrim(os.Getenv("ALLOWED_EMAILS")),
@@ -264,6 +278,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		LLMBaseURL:               strings.TrimSpace(os.Getenv("MULTICA_LLM_BASE_URL")),
 		LLMDefaultModel:          strings.TrimSpace(os.Getenv("MULTICA_LLM_DEFAULT_MODEL")),
 		ServerVersion:            normalizeServerVersion(version),
+		IssueStatusContract:      statusContract,
 	}
 	h := handler.New(queries, pool, hub, bus, emailSvc, store, cfSigner, analyticsClient, signupConfig, daemonHub)
 	h.Metrics = opts.BusinessMetrics

@@ -187,7 +187,7 @@ func TestListComments_AllowsNullCreatorType(t *testing.T) {
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, 'RECONSTRUCTED comment lookup regression', 'todo', 'none', NULL, $2, 987656)
+		VALUES ($1, 'RECONSTRUCTED comment lookup regression', 'Spec', 'none', NULL, $2, 987656)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("insert reconstructed issue: %v", err)

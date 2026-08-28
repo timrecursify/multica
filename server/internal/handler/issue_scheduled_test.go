@@ -40,7 +40,7 @@ func TestListIssues_ScheduledFilter(t *testing.T) {
 		var id string
 		if err := testPool.QueryRow(ctx, `
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, number, project_id, start_date, due_date)
-			VALUES ($1, $2, 'todo', 'none', 'member', $3, 0, $4, $5, $6, $7) RETURNING id
+			VALUES ($1, $2, 'Spec', 'none', 'member', $3, 0, $4, $5, $6, $7) RETURNING id
 		`, testWorkspaceID, title, testUserID, number, projectID, startDate, dueDate).Scan(&id); err != nil {
 			t.Fatalf("create issue %q: %v", title, err)
 		}
@@ -127,7 +127,7 @@ func TestListIssuesReturnsStage(t *testing.T) {
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, position, number, project_id, stage)
-		VALUES ($1, $2, 'todo', 'none', 'member', $3, 0, $4, $5, 2)
+		VALUES ($1, $2, 'Spec', 'none', 'member', $3, 0, $4, $5, 2)
 		RETURNING id
 	`, testWorkspaceID, fmt.Sprintf("stage-list-%d", suffix), testUserID, number, projectID).Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)

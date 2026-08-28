@@ -70,7 +70,7 @@ func TestListGroupedIssuesAssigneePaginatesPerGroup(t *testing.T) {
 				assignee_type, assignee_id, creator_type, creator_id,
 				position, number, start_date, stage
 			)
-			VALUES ($1, $2, NULL, 'todo', 'none', $3, $4, 'member', $5, $6, $7, $8, $9)
+			VALUES ($1, $2, NULL, 'Spec', 'none', $3, $4, 'member', $5, $6, $7, $8, $9)
 			RETURNING id
 		`, testWorkspaceID, title, assigneeType, assigneeID, testUserID, position, number, startDate, stage).Scan(&id); err != nil {
 			t.Fatalf("create issue %q: %v", title, err)

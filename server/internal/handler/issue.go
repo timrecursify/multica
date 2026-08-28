@@ -73,20 +73,25 @@ type IssueResponse struct {
 	Labels *[]LabelResponse `json:"labels,omitempty"`
 }
 
-// validIssueStatuses / validIssuePriorities mirror the CHECK constraints on
-// the issue table. Write handlers pre-validate these so callers get a clean
-// 400 with the allowed values instead of a database CHECK violation bubbling
-// up as a 500.
-var validIssueStatuses = []string{
-	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
-	// PPP fork workflow statuses. issue.status has no CHECK constraint in this
-	// fork; these are the live values the conveyor writes.
-	"Queue", "Spec", "Building", "QC", "In Review", "In Progress",
-	"Human Review", "Done", "Blocked", "Cancelled", "Archived", "dead_letter",
-	// sk CLI posts new tickets with this status.
-	"Registered",
-}
+// validIssuePriorities mirrors the CHECK constraint on the issue table. The
+// status vocabulary is handled by h.IssueStatusContract (a per-deployment
+// immutable contract chosen at startup) rather than a package-level list:
+// the two historical Multica boards ran mutually exclusive status sets, and
+// the create/update/batch handlers canonicalize against the configured
+// contract instead of a hard-coded global list.
 var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
+
+// validIssueStatuses is the union of every status spelling either board has
+// historically accepted, kept solely for backward compatibility with the
+// pre-existing issue_validation_test.go unit tests that reference the
+// package-level symbol. Production create/update/batch write paths do NOT use
+// it — they canonicalize against h.IssueStatusContract so the configured
+// profile's vocabulary is authoritative. The CLI keeps its own union list.
+var validIssueStatuses = []string{
+	"Spec", "Queue", "in_progress", "in_review", "Human Review", "Done", "Cancelled", "Archived",
+	"Queue", "Spec", "Building", "QC", "In Review", "In Progress",
+	"Human Review", "Done", "Blocked", "Cancelled", "Archived", "dead_letter", "Registered",
+}
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {
 	for _, a := range allowed {
@@ -98,8 +103,9 @@ func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []str
 	return false
 }
 
-func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
+func issueToResponse(i db.Issue, issuePrefix string, contract *IssueStatusContract) IssueResponse {
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	status := issueStatusForResponse(i.Status, contract)
 	return IssueResponse{
 		ID:            uuidToString(i.ID),
 		WorkspaceID:   uuidToString(i.WorkspaceID),
@@ -107,7 +113,7 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 		Identifier:    identifier,
 		Title:         i.Title,
 		Description:   textToPtr(i.Description),
-		Status:        i.Status,
+		Status:        status,
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
@@ -127,8 +133,9 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 }
 
 // issueListRowToResponse converts a list-query row (no description) to an IssueResponse.
-func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueResponse {
+func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string, contract *IssueStatusContract) IssueResponse {
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	status := issueStatusForResponse(i.Status, contract)
 	return IssueResponse{
 		ID:            uuidToString(i.ID),
 		WorkspaceID:   uuidToString(i.WorkspaceID),
@@ -136,7 +143,7 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueRespons
 		Identifier:    identifier,
 		Title:         i.Title,
 		Description:   textToPtr(i.Description),
-		Status:        i.Status,
+		Status:        status,
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
@@ -188,8 +195,9 @@ func (h *Handler) labelsByIssue(ctx context.Context, wsUUID pgtype.UUID, issueID
 	return out
 }
 
-func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueResponse {
+func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string, contract *IssueStatusContract) IssueResponse {
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	status := issueStatusForResponse(i.Status, contract)
 	return IssueResponse{
 		ID:            uuidToString(i.ID),
 		WorkspaceID:   uuidToString(i.WorkspaceID),
@@ -197,7 +205,7 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 		Identifier:    identifier,
 		Title:         i.Title,
 		Description:   textToPtr(i.Description),
-		Status:        i.Status,
+		Status:        status,
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
@@ -214,6 +222,13 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 		Metadata:      parseIssueMetadata(i.Metadata),
 		Properties:    parseIssueProperties(i.Properties),
 	}
+}
+
+func issueStatusForResponse(stored string, contract *IssueStatusContract) string {
+	if contract == nil {
+		return stored
+	}
+	return contract.DisplayStatus(stored)
 }
 
 type IssueAssigneeGroupResponse struct {
@@ -401,7 +416,7 @@ type searchResult struct {
 // It uses LOWER(column) LIKE for case-insensitive matching compatible with pg_bigm 1.2 GIN indexes.
 // Search patterns are lowercased in Go to avoid redundant LOWER() on the pattern side in SQL.
 // LIKE patterns are pre-built in Go (e.g. "%html%") so pg_bigm can extract bigrams from a single parameter value.
-func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, includeClosed bool) (string, []any) {
+func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []string, queryNum int, hasNum bool, includeClosed bool) (string, []any) {
 	// Lowercase in Go so SQL only needs LOWER() on the column side.
 	phrase = strings.ToLower(phrase)
 	for i, t := range terms {
@@ -483,7 +498,7 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 	whereClause := "(" + strings.Join(whereParts, " OR ") + ")"
 
 	if !includeClosed {
-		whereClause += " AND i.status NOT IN ('done', 'cancelled')"
+		whereClause += " AND i.status NOT IN ('Done', 'Cancelled', 'Archived')"
 	}
 
 	// --- ORDER BY clause ---
@@ -540,17 +555,12 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 
 	rankExpr := "CASE " + strings.Join(rankCases, " ") + " ELSE 9 END"
 
-	// Status priority: active issues first
-	statusRank := `CASE i.status
-		WHEN 'in_progress' THEN 0
-		WHEN 'in_review' THEN 1
-		WHEN 'todo' THEN 2
-		WHEN 'blocked' THEN 3
-		WHEN 'backlog' THEN 4
-		WHEN 'done' THEN 5
-		WHEN 'cancelled' THEN 6
-		ELSE 7
-	END`
+	// Status priority: active issues first. The rank is derived from the
+	// configured status contract so the canonical board vocabulary (Spec /
+	// Queue / in_progress / ... / Archived) is ranked the same way as the
+	// legacy lowercase set — a canonical status must never collapse into the
+	// fallback rank because the contract does not know its spelling.
+	statusRank := contract.activityRankCASE("i.status")
 
 	// Cancelled issues are abandoned work. statusRank alone cannot keep them
 	// down because it is only a tie-breaker within one relevance tier: a
@@ -574,7 +584,7 @@ func buildSearchQuery(phrase string, terms []string, queryNum int, hasNum bool, 
 		directHitParts = append(directHitParts, fmt.Sprintf("i.number = %s", numParam))
 	}
 	cancelledRank := fmt.Sprintf(
-		"CASE WHEN i.status = 'cancelled' AND NOT (%s) THEN 1 ELSE 0 END",
+		"CASE WHEN i.status = 'Cancelled' AND NOT (%s) THEN 1 ELSE 0 END",
 		strings.Join(directHitParts, " OR "),
 	)
 
@@ -694,7 +704,7 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	terms := splitSearchTerms(q)
 	queryNum, hasNum := parseQueryNumber(q)
 
-	sqlQuery, args := buildSearchQuery(q, terms, queryNum, hasNum, includeClosed)
+	sqlQuery, args := buildSearchQuery(h.IssueStatusContract, q, terms, queryNum, hasNum, includeClosed)
 	// Fill placeholder args: $4 = workspace_id, last two = limit, offset
 	args[3] = wsUUID
 	args[len(args)-2] = limit
@@ -763,7 +773,7 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	resp := make([]SearchIssueResponse, len(results))
 	for i, sr := range results {
 		sir := SearchIssueResponse{
-			IssueResponse: issueToResponse(sr.issue, prefix),
+			IssueResponse: issueToResponse(sr.issue, prefix, h.IssueStatusContract),
 			MatchSource:   sr.matchSource,
 		}
 		// Always populate comment snippet when a matching comment exists
@@ -928,7 +938,7 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		labelsMap := h.labelsByIssue(ctx, wsUUID, ids)
 		resp := make([]IssueResponse, len(issues))
 		for i, issue := range issues {
-			resp[i] = openIssueRowToResponse(issue, prefix)
+			resp[i] = openIssueRowToResponse(issue, prefix, h.IssueStatusContract)
 			labels := labelsMap[resp[i].ID]
 			if labels == nil {
 				labels = []LabelResponse{}
@@ -1000,7 +1010,7 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		case "position", "title", "created_at", "updated_at", "start_date", "due_date":
 			sortCol = s
 		case "status":
-			sortCol = "CASE i.status WHEN 'backlog' THEN 0 WHEN 'todo' THEN 1 WHEN 'in_progress' THEN 2 WHEN 'in_review' THEN 3 WHEN 'done' THEN 4 WHEN 'blocked' THEN 5 WHEN 'cancelled' THEN 6 ELSE 7 END"
+			sortCol = h.IssueStatusContract.orderCASE("i.status")
 			sortIsExpr = true
 		case "priority":
 			sortCol = "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END"
@@ -1313,7 +1323,7 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 	labelsMap := h.labelsByIssue(ctx, wsUUID, ids)
 	resp := make([]IssueResponse, len(issues))
 	for i, issue := range issues {
-		resp[i] = issueListRowToResponse(issue, prefix)
+		resp[i] = issueListRowToResponse(issue, prefix, h.IssueStatusContract)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -1741,7 +1751,7 @@ func (h *Handler) ListGroupedIssues(w http.ResponseWriter, r *http.Request) {
 		case "position", "title", "created_at", "updated_at", "start_date", "due_date":
 			sortCol = s
 		case "status":
-			sortCol = "CASE i.status WHEN 'backlog' THEN 0 WHEN 'todo' THEN 1 WHEN 'in_progress' THEN 2 WHEN 'in_review' THEN 3 WHEN 'done' THEN 4 WHEN 'blocked' THEN 5 WHEN 'cancelled' THEN 6 ELSE 7 END"
+			sortCol = h.IssueStatusContract.orderCASE("i.status")
 			sortIsExpr = true
 		case "priority":
 			sortCol = "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END"
@@ -1904,7 +1914,7 @@ ORDER BY
 			})
 		}
 
-		issue := issueListRowToResponse(row.ListIssuesRow, prefix)
+		issue := issueListRowToResponse(row.ListIssuesRow, prefix, h.IssueStatusContract)
 		labels := labelsMap[issue.ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -1923,7 +1933,7 @@ func (h *Handler) GetIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-	resp := issueToResponse(issue, prefix)
+	resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 	detailLabels := h.labelsByIssue(r.Context(), issue.WorkspaceID, []pgtype.UUID{issue.ID})[uuidToString(issue.ID)]
 	if detailLabels == nil {
 		detailLabels = []LabelResponse{}
@@ -1974,7 +1984,7 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 	labelsMap := h.labelsByIssue(r.Context(), issue.WorkspaceID, ids)
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
-		resp[i] = issueToResponse(child, prefix)
+		resp[i] = issueToResponse(child, prefix, h.IssueStatusContract)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2053,7 +2063,7 @@ func (h *Handler) ListChildrenByParents(w http.ResponseWriter, r *http.Request) 
 	labelsMap := h.labelsByIssue(r.Context(), wsUUID, ids)
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
-		resp[i] = issueToResponse(child, prefix)
+		resp[i] = issueToResponse(child, prefix, h.IssueStatusContract)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2488,13 +2498,19 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 
 	status := req.Status
 	if status == "" {
-		status = "todo"
+		status = h.IssueStatusContract.DefaultStatus()
 	}
 	priority := req.Priority
 	if priority == "" {
 		priority = "none"
 	}
-	if !validateIssueEnum(w, "status", status, validIssueStatuses) {
+	// Canonicalize the create status once, before duplicate checks, position
+	// selection, the DB insert, the response, and events all read it. An
+	// unknown / wrong-case / whitespace-padded value is a 400 with no write.
+	if canonicalStatus, ok := h.IssueStatusContract.Canonicalize(status); ok {
+		status = canonicalStatus
+	} else {
+		h.IssueStatusContract.writeInvalidStatusError(w, status)
 		return
 	}
 	if !validateIssueEnum(w, "priority", priority, validIssuePriorities) {
@@ -2680,7 +2696,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		AnalyticsAgentID: analyticsAgentID,
 		Platform:         func() string { p, _, _ := middleware.ClientMetadataFromContext(r.Context()); return p }(),
 		BroadcastPayload: func(issue db.Issue, atts []db.Attachment, labels []db.IssueLabel) map[string]any {
-			payload := issueToResponse(issue, prefix)
+			payload := issueToResponse(issue, prefix, h.IssueStatusContract)
 			payload.Attachments = buildAttachmentResponses(atts)
 			// Carry the authoritative label snapshot so every online client
 			// renders the new issue already labeled. Non-nil (even empty)
@@ -2694,7 +2710,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 
 	if errors.Is(err, service.ErrActiveDuplicate) {
 		dup := *res.DuplicateIssue
-		existing := issueToResponse(dup, h.getIssuePrefix(r.Context(), dup.WorkspaceID))
+		existing := issueToResponse(dup, h.getIssuePrefix(r.Context(), dup.WorkspaceID), h.IssueStatusContract)
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"code":  "active_duplicate_issue",
 			"error": duplicateIssueMessage(existing),
@@ -2730,7 +2746,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 
-	resp := issueToResponse(issue, prefix)
+	resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 	resp.Attachments = buildAttachmentResponses(res.Attachments)
 	// Echo the authoritative labels attached in the create transaction. Always
 	// non-nil (empty slice when none) so a newer client can tell the backend
@@ -2950,10 +2966,12 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		params.Description = pgtype.Text{String: *req.Description, Valid: true}
 	}
 	if req.Status != nil {
-		if !validateIssueEnum(w, "status", *req.Status, validIssueStatuses) {
+		canonicalStatus, ok := h.IssueStatusContract.Canonicalize(*req.Status)
+		if !ok {
+			h.IssueStatusContract.writeInvalidStatusError(w, *req.Status)
 			return
 		}
-		params.Status = pgtype.Text{String: *req.Status, Valid: true}
+		params.Status = pgtype.Text{String: canonicalStatus, Valid: true}
 	}
 	if req.Priority != nil {
 		if !validateIssueEnum(w, "priority", *req.Priority, validIssuePriorities) {
@@ -3109,7 +3127,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-	resp := issueToResponse(issue, prefix)
+	resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 	slog.Info("issue updated", append(logger.RequestAttrs(r), "issue_id", id, "workspace_id", workspaceID)...)
 
 	assigneeChanged := (req.AssigneeType != nil || req.AssigneeID != nil) &&
@@ -3286,7 +3304,7 @@ func (h *Handler) validateAssigneePair(ctx context.Context, r *http.Request, wor
 // triggering execution. Moving out of backlog is handled separately in
 // UpdateIssue.
 func (h *Handler) shouldEnqueueAgentTask(ctx context.Context, issue db.Issue) bool {
-	if issue.Status == "backlog" {
+	if issue.Status == "Spec" {
 		return false
 	}
 	return h.isAgentAssigneeReady(ctx, issue)
@@ -3516,10 +3534,17 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"updated": 0})
 		return
 	}
+	// Validate and canonicalize the batch status exactly once, before the item
+	// loop, so every affected issue is written with the same canonical value
+	// and an invalid status is a 400 with no mutation anywhere in the batch.
+	batchCanonicalStatus := ""
 	if req.Updates.Status != nil {
-		if !validateIssueEnum(w, "status", *req.Updates.Status, validIssueStatuses) {
+		canonicalStatus, ok := h.IssueStatusContract.Canonicalize(*req.Updates.Status)
+		if !ok {
+			h.IssueStatusContract.writeInvalidStatusError(w, *req.Updates.Status)
 			return
 		}
+		batchCanonicalStatus = canonicalStatus
 	}
 	if req.Updates.Priority != nil {
 		if !validateIssueEnum(w, "priority", *req.Updates.Priority, validIssuePriorities) {
@@ -3568,7 +3593,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			params.Description = pgtype.Text{String: *req.Updates.Description, Valid: true}
 		}
 		if req.Updates.Status != nil {
-			params.Status = pgtype.Text{String: *req.Updates.Status, Valid: true}
+			params.Status = pgtype.Text{String: batchCanonicalStatus, Valid: true}
 		}
 		if req.Updates.Priority != nil {
 			params.Priority = pgtype.Text{String: *req.Updates.Priority, Valid: true}
@@ -3709,7 +3734,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		}
 
 		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-		resp := issueToResponse(issue, prefix)
+		resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 		actorType, actorID := h.resolveActor(r, userID, workspaceID)
 
 		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&

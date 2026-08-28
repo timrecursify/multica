@@ -60,7 +60,7 @@ func createPropertyTestIssue(t *testing.T, title string) string {
 	var issueID string
 	if err := testPool.QueryRow(context.Background(), `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, $2, 'todo', 'none', 'member', $3,
+		VALUES ($1, $2, 'Spec', 'none', 'member', $3,
 		        COALESCE((SELECT MAX(number) FROM issue WHERE workspace_id = $1), 0) + 1)
 		RETURNING id
 	`, testWorkspaceID, title, testUserID).Scan(&issueID); err != nil {

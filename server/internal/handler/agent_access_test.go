@@ -447,7 +447,7 @@ func TestMentionAgent_RejectsCrossWorkspaceAgentUUID(t *testing.T) {
 	var issueID, commentID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, 'cross-ws mention test', 'todo', 'medium', 'member', $2,
+		VALUES ($1, 'cross-ws mention test', 'Spec', 'medium', 'member', $2,
 		        COALESCE((SELECT MAX(number) FROM issue WHERE workspace_id = $1), 0) + 1)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
@@ -532,7 +532,7 @@ func TestShouldEnqueueOnComment_PrivateAgentGate(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id,
 		                   assignee_type, assignee_id, number)
-		VALUES ($1, 'on_comment private-agent gate test', 'todo', 'medium', 'member', $2,
+		VALUES ($1, 'on_comment private-agent gate test', 'Spec', 'medium', 'member', $2,
 		        'agent', $3,
 		        COALESCE((SELECT MAX(number) FROM issue WHERE workspace_id = $1), 0) + 1)
 		RETURNING id

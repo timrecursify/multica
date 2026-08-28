@@ -28,7 +28,7 @@ func TestIssueToMap_KeysMatchIssueResponse(t *testing.T) {
 	const prefix = "MUL"
 	issue := fullyPopulatedIssue(t)
 
-	responseKeys := jsonKeys(t, issueToResponse(issue, prefix))
+	responseKeys := jsonKeys(t, issueToResponse(issue, prefix, mustTestStatusContract(IssueStatusProfilePPP)))
 	mapKeys := jsonKeys(t, service.IssueToMap(issue, prefix))
 
 	for _, k := range responseKeys {
@@ -52,7 +52,7 @@ func TestIssueToMap_ValuesMatchIssueResponse(t *testing.T) {
 	const prefix = "MUL"
 	issue := fullyPopulatedIssue(t)
 
-	response, err := json.Marshal(issueToResponse(issue, prefix))
+	response, err := json.Marshal(issueToResponse(issue, prefix, mustTestStatusContract(IssueStatusProfilePPP)))
 	if err != nil {
 		t.Fatalf("marshal IssueResponse: %v", err)
 	}

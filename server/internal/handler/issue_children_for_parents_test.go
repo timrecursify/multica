@@ -191,14 +191,14 @@ func TestListChildrenByParents_IgnoresForeignWorkspaceParents(t *testing.T) {
 	var foreignParentID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, number, title, status, position, creator_type, creator_id)
-		VALUES ($1, 1, 'foreign parent', 'todo', 1, 'member', $2)
+		VALUES ($1, 1, 'foreign parent', 'Spec', 1, 'member', $2)
 		RETURNING id
 	`, foreignWorkspaceID, testUserID).Scan(&foreignParentID); err != nil {
 		t.Fatalf("setup: insert foreign parent: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `
 		INSERT INTO issue (workspace_id, number, title, status, position, parent_issue_id, creator_type, creator_id)
-		VALUES ($1, 2, 'foreign child', 'todo', 2, $2, 'member', $3)
+		VALUES ($1, 2, 'foreign child', 'Spec', 2, $2, 'member', $3)
 	`, foreignWorkspaceID, foreignParentID, testUserID); err != nil {
 		t.Fatalf("setup: insert foreign child: %v", err)
 	}

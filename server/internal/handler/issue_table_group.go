@@ -67,6 +67,10 @@ type resolvedIssueTableGroup struct {
 	primary           *resolvedIssueTableGroup
 	secondaryValues   []string
 	secondaryFiltered bool
+	// statusContract is the immutable status vocabulary this group was
+	// resolved against. Status grouping, compound secondary statuses, and
+	// group-key validation all consult it instead of a package-level list.
+	statusContract *IssueStatusContract
 }
 
 func issueTableGroupIdentity(group issueTableGroupSpec) string {
@@ -94,13 +98,14 @@ func (h *Handler) resolveIssueTableGroup(w http.ResponseWriter, r *http.Request,
 			writeError(w, http.StatusBadRequest, "group.kind=none is not valid for group headers")
 			return resolvedIssueTableGroup{}, false
 		}
-		return resolvedIssueTableGroup{kind: "none"}, true
+		return resolvedIssueTableGroup{kind: "none", statusContract: h.IssueStatusContract}, true
 	case "status":
-		return resolvedIssueTableGroup{kind: "status", groupExpr: "i.status"}, true
+		return resolvedIssueTableGroup{kind: "status", groupExpr: "i.status", statusContract: h.IssueStatusContract}, true
 	case "assignee":
 		return resolvedIssueTableGroup{
-			kind:      "assignee",
-			groupExpr: "CASE WHEN i.assignee_type IS NULL OR i.assignee_id IS NULL THEN '__unassigned__' ELSE i.assignee_type || ':' || i.assignee_id::text END",
+			kind:           "assignee",
+			statusContract: h.IssueStatusContract,
+			groupExpr:      "CASE WHEN i.assignee_type IS NULL OR i.assignee_id IS NULL THEN '__unassigned__' ELSE i.assignee_type || ':' || i.assignee_id::text END",
 			// groupSortExpr runs after issues have been reduced to one row per
 			// actor. Resolving display names before GROUP BY executes one lookup
 			// per issue and turns large assignee groups into an N+1 query plan.
@@ -112,8 +117,9 @@ END, ''))`,
 		}, true
 	case "project":
 		return resolvedIssueTableGroup{
-			kind:      "project",
-			groupExpr: "COALESCE(i.project_id::text, '__no_project__')",
+			kind:           "project",
+			statusContract: h.IssueStatusContract,
+			groupExpr:      "COALESCE(i.project_id::text, '__no_project__')",
 			groupSortExpr: `CASE WHEN group_value = '__no_project__' THEN '' ELSE LOWER(COALESCE(
   (SELECT p.title FROM project p WHERE p.workspace_id = $1 AND p.id = group_value::uuid),
   ''
@@ -121,8 +127,9 @@ END, ''))`,
 		}, true
 	case "parent":
 		return resolvedIssueTableGroup{
-			kind:      "parent",
-			groupExpr: "COALESCE(i.parent_issue_id::text, '__no_parent__')",
+			kind:           "parent",
+			statusContract: h.IssueStatusContract,
+			groupExpr:      "COALESCE(i.parent_issue_id::text, '__no_parent__')",
 			groupSortExpr: `CASE WHEN group_value = '__no_parent__' THEN '' ELSE LOWER(COALESCE(
   (SELECT p.title FROM issue p WHERE p.workspace_id = $1 AND p.id = group_value::uuid),
   ''
@@ -153,11 +160,13 @@ END, ''))`,
 		if !ok {
 			return resolvedIssueTableGroup{}, false
 		}
+		primary.statusContract = h.IssueStatusContract
 		return resolvedIssueTableGroup{
 			kind:              "compound",
 			primary:           &primary,
 			secondaryValues:   append([]string(nil), group.SecondaryValues...),
 			secondaryFiltered: group.SecondaryValues != nil,
+			statusContract:    h.IssueStatusContract,
 		}, true
 	case "property":
 		propertyUUID, err := util.ParseUUID(group.PropertyID)
@@ -185,10 +194,11 @@ END, ''))`,
 		propertyID := util.UUIDToString(property.ID)
 		quotedKey := "'" + propertyID + "'"
 		resolved := resolvedIssueTableGroup{
-			kind:          "property",
-			propertyID:    propertyID,
-			propertyType:  property.Type,
-			activeOptions: map[string]struct{}{},
+			kind:           "property",
+			propertyID:     propertyID,
+			propertyType:   property.Type,
+			statusContract: h.IssueStatusContract,
+			activeOptions:  map[string]struct{}{},
 		}
 		switch property.Type {
 		case "select":
@@ -259,7 +269,7 @@ func (group resolvedIssueTableGroup) orderExpression(addArg func(any) string) st
 	}
 	switch group.kind {
 	case "status":
-		return "CASE group_value WHEN 'backlog' THEN 0 WHEN 'todo' THEN 1 WHEN 'in_progress' THEN 2 WHEN 'in_review' THEN 3 WHEN 'done' THEN 4 WHEN 'blocked' THEN 5 WHEN 'cancelled' THEN 6 ELSE 7 END"
+		return group.statusContract.statusOrderThroughArg(addArg)
 	case "assignee":
 		return "CASE split_part(group_value, ':', 1) WHEN 'member' THEN 0 WHEN 'agent' THEN 1 WHEN 'squad' THEN 2 ELSE 3 END"
 	case "project":
@@ -309,13 +319,13 @@ func (group resolvedIssueTableGroup) descriptor(raw string, count int64, context
 			return descriptor, err
 		}
 		descriptor.SecondaryGroups = make([]issueTableGroupDescriptorResponse, 0, len(secondaryCounts))
-		for _, status := range validIssueStatuses {
+		for _, status := range group.statusContract.CanonicalStatuses() {
 			statusCount := secondaryCounts[status]
 			descriptor.SecondaryGroups = append(descriptor.SecondaryGroups, issueTableGroupDescriptorResponse{
 				Key: compoundCellGroupKey(descriptor.Key, status),
 				Value: issueTableGroupValueResponse{
 					Kind:   "status",
-					Status: status,
+					Status: group.statusContract.DisplayStatus(status),
 				},
 				Count: statusCount,
 			})
@@ -329,7 +339,7 @@ func (group resolvedIssueTableGroup) descriptor(raw string, count int64, context
 			return descriptor, fmt.Errorf("unexpected status group value %q", raw)
 		}
 		descriptor.Key = "status:" + raw
-		descriptor.Value = issueTableGroupValueResponse{Kind: "status", Status: raw}
+		descriptor.Value = issueTableGroupValueResponse{Kind: "status", Status: group.statusContract.DisplayStatus(raw)}
 	case "assignee":
 		descriptor.Value.Kind = "assignee"
 		if raw == "__unassigned__" {
