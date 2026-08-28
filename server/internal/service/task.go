@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,10 @@ type TaskService struct {
 	// FeatureFlags is the server-side toggle router. Nil is valid and returns
 	// each call site's default.
 	FeatureFlags *featureflag.Service
+	// SupervisorEnabled gates the WP-4 reasonix run/fence integration.  It is
+	// deliberately captured once at process start so rollback is a config flip
+	// plus restart, matching WP10A-DESIGN section 6.
+	SupervisorEnabled bool
 	// EmptyClaim caches "this runtime has no queued task" so the daemon
 	// poll path can skip a Postgres scan on the steady-state empty case.
 	// Optional — a nil cache disables the fast path and every claim
@@ -166,6 +171,8 @@ const (
 	// stretching this global crash-recovery window.
 	claimResponseRecoveryWindow = 90 * time.Second
 	prepareLeaseDuration        = 45 * time.Second
+	buildRunLeaseDuration       = 120 * time.Second
+	buildRunDeadline            = 30 * time.Minute
 )
 
 // buildCommentTriggerSummary fetches the comment content and truncates
@@ -255,7 +262,14 @@ func NewTaskService(q *db.Queries, tx TxStarter, hub *realtime.Hub, bus *events.
 	if len(wakeups) > 0 {
 		wakeup = wakeups[0]
 	}
-	return &TaskService{Queries: q, TxStarter: tx, Hub: hub, Bus: bus, Wakeup: wakeup}
+	return &TaskService{
+		Queries:           q,
+		TxStarter:         tx,
+		Hub:               hub,
+		Bus:               bus,
+		Wakeup:            wakeup,
+		SupervisorEnabled: strings.EqualFold(strings.TrimSpace(os.Getenv("MULTICA_SUPERVISOR")), "on"),
+	}
 }
 
 var trivialDoneMarkers = []string{
@@ -2815,6 +2829,9 @@ func (s *TaskService) broadcastChatCancelFinalized(ctx context.Context, task db.
 // ClaimTask atomically claims the next queued task for an agent,
 // respecting max_concurrent_tasks.
 func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.AgentTaskQueue, error) {
+	if !agentID.Valid {
+		return nil, errors.New("claim task: registered agent identity is required")
+	}
 	start := time.Now()
 	outcome := "unknown"
 	var getAgentMs, countRunningMs, claimAgentMs, reanchorMs, updateStatusMs, dispatchMs int64
@@ -2859,6 +2876,84 @@ func (s *TaskService) ClaimTask(ctx context.Context, agentID pgtype.UUID) (*db.A
 			}
 			outcome = "error_claim"
 			return fmt.Errorf("claim task: %w", err)
+		}
+
+		// WP-4 applies only to issue-backed work on the reasonix runtime. Chat,
+		// autopilot-run-only, and every other provider retain their established
+		// lifecycle. The flag is the rollback boundary described by WP10A.
+		if s.SupervisorEnabled && task.IssueID.Valid {
+			runtime, runtimeErr := qtx.GetAgentRuntime(ctx, task.RuntimeID)
+			if runtimeErr != nil {
+				outcome = "error_supervisor_runtime"
+				return fmt.Errorf("supervisor claim runtime: %w", runtimeErr)
+			}
+			if strings.EqualFold(runtime.Provider, "reasonix") {
+				leaseHolder := util.UUIDToString(task.RuntimeID) + ":" + task.DaemonID.String
+				run, runErr := qtx.ClaimBuildRunForTask(ctx, db.ClaimBuildRunForTaskParams{
+					LeaseHolder:  leaseHolder,
+					LeaseTtlSecs: buildRunLeaseDuration.Seconds(),
+					DeadlineSecs: buildRunDeadline.Seconds(),
+					RuntimeID:    task.RuntimeID,
+					TaskID:       task.ID,
+					AgentID:      agentID,
+				})
+				if runErr != nil {
+					outcome = "error_supervisor_claim"
+					if errors.Is(runErr, pgx.ErrNoRows) {
+						return errors.New("supervisor claim refused: registered identity and open issue budget are required")
+					}
+					return fmt.Errorf("supervisor claim run: %w", runErr)
+				}
+				bound, bindErr := qtx.BindAgentTaskBuildRun(ctx, db.BindAgentTaskBuildRunParams{
+					BuildRunID: run.ID,
+					TaskID:     task.ID,
+					AgentID:    agentID,
+				})
+				if bindErr != nil {
+					outcome = "error_supervisor_bind"
+					return fmt.Errorf("bind build run: %w", bindErr)
+				}
+				task = bound
+
+				prState, prErr := qtx.GetIssueBuildPRState(ctx, task.IssueID)
+				if prErr != nil {
+					outcome = "error_pr_reconciliation"
+					return fmt.Errorf("inspect linked pull requests: %w", prErr)
+				}
+				status, reconcile := issueStatusForExistingPR(prState.OpenCount, prState.MergedCount)
+				if reconcile {
+					if _, reconcileErr := qtx.ReconcileIssueForExistingPR(ctx, db.ReconcileIssueForExistingPRParams{
+						Merged:  status == "done",
+						IssueID: task.IssueID,
+					}); reconcileErr != nil {
+						outcome = "error_pr_reconciliation"
+						return fmt.Errorf("reconcile issue pull request state: %w", reconcileErr)
+					}
+					detail, _ := json.Marshal(map[string]any{
+						"reconciled_pull_requests": true,
+						"open_count":               prState.OpenCount,
+						"merged_count":             prState.MergedCount,
+						"model_calls":              0,
+					})
+					result, _ := json.Marshal(map[string]any{
+						"reconciled":   true,
+						"issue_status": status,
+						"model_calls":  0,
+					})
+					if _, completeErr := qtx.CompleteReconciledBuildRunAndTask(ctx, db.CompleteReconciledBuildRunAndTaskParams{
+						Result:     result,
+						TaskID:     task.ID,
+						RunDetail:  detail,
+						BuildRunID: run.ID,
+						Fence:      run.Fence,
+					}); completeErr != nil {
+						outcome = "error_pr_reconciliation"
+						return fmt.Errorf("complete pull request reconciliation: %w", completeErr)
+					}
+					outcome = "reconciled_existing_pr"
+					return nil
+				}
+			}
 		}
 
 		// An idle task-owned direct-chat row may already be visible as the
@@ -3390,7 +3485,25 @@ func (s *TaskService) CancelDeferredEscalationsForIssueAgent(ctx context.Context
 
 // ExtendTaskPrepareLease keeps a claimed-but-not-started task protected while
 // the daemon resolves cached inputs and prepares the execution environment.
-func (s *TaskService) ExtendTaskPrepareLease(ctx context.Context, taskID, runtimeID pgtype.UUID) (*db.AgentTaskQueue, error) {
+// RunIdentity is the capability returned with a supervised claim.  It is
+// deliberately required at every lifecycle write: task ids alone are not a
+// lease and must never let a stale daemon mutate a successor run.
+type RunIdentity struct {
+	BuildRunID pgtype.UUID
+	Fence      int64
+}
+
+func (s *TaskService) ExtendTaskPrepareLease(ctx context.Context, taskID, runtimeID pgtype.UUID, run *RunIdentity) (*db.AgentTaskQueue, error) {
+	if run != nil {
+		task, err := s.Queries.ExtendFencedAgentTaskLease(ctx, db.ExtendFencedAgentTaskLeaseParams{
+			LeaseSecs: buildRunLeaseDuration.Seconds(), TaskID: taskID, RuntimeID: runtimeID,
+			BuildRunID: run.BuildRunID, Fence: run.Fence,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("extend fenced task lease: %w", err)
+		}
+		return &task, nil
+	}
 	task, err := s.Queries.ExtendAgentTaskPrepareLease(ctx, db.ExtendAgentTaskPrepareLeaseParams{
 		ID:        taskID,
 		RuntimeID: runtimeID,
@@ -3441,7 +3554,11 @@ func (s *TaskService) MarkTaskWaitingLocalDirectory(ctx context.Context, taskID 
 // queued chat message could be claimed in the window between the task
 // flipping to 'completed' and chat_session.session_id being refreshed,
 // causing the new task to resume against a stale (or NULL) session.
-func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID string) (*db.AgentTaskQueue, error) {
+func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, result []byte, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID string, identities ...*RunIdentity) (*db.AgentTaskQueue, error) {
+	var run *RunIdentity
+	if len(identities) > 0 {
+		run = identities[0]
+	}
 	var task db.AgentTaskQueue
 	// chatAssistantMsg is the single assistant outcome row written for a chat
 	// task inside the completion transaction below. It is broadcast (chat:done)
@@ -3451,14 +3568,18 @@ func (s *TaskService) CompleteTask(ctx context.Context, taskID pgtype.UUID, resu
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
-		t, err := qtx.CompleteAgentTask(ctx, db.CompleteAgentTaskParams{
-			ID:                    taskID,
-			Result:                result,
-			SessionID:             pgtype.Text{String: sessionID, Valid: sessionID != ""},
-			WorkDir:               pgtype.Text{String: workDir, Valid: workDir != ""},
-			SessionRolloutMissing: sessionRolloutMissing,
-			RetiredSessionID:      pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
-		})
+		var t db.AgentTaskQueue
+		var err error
+		if run != nil {
+			detail, _ := json.Marshal(map[string]any{"terminal": "complete"})
+			t, err = qtx.CompleteFencedAgentTask(ctx, db.CompleteFencedAgentTaskParams{
+				TaskID: taskID, Result: result, SessionID: pgtype.Text{String: sessionID, Valid: sessionID != ""}, WorkDir: pgtype.Text{String: workDir, Valid: workDir != ""}, SessionRolloutMissing: sessionRolloutMissing, RetiredSessionID: pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""}, RunDetail: detail, BuildRunID: run.BuildRunID, Fence: run.Fence,
+			})
+		} else {
+			t, err = qtx.CompleteAgentTask(ctx, db.CompleteAgentTaskParams{
+				ID: taskID, Result: result, SessionID: pgtype.Text{String: sessionID, Valid: sessionID != ""}, WorkDir: pgtype.Text{String: workDir, Valid: workDir != ""}, SessionRolloutMissing: sessionRolloutMissing, RetiredSessionID: pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
+			})
+		}
 		if err != nil {
 			return err
 		}
@@ -3845,7 +3966,11 @@ func (s *TaskService) observeChatOutputLocalPath(task db.AgentTaskQueue, body st
 // coarse bucket. Daemon callers that already produced a refined reason
 // (via classifyPoisonedError, the timeout / runtime classifier, etc.)
 // will have their value preserved untouched.
-func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, failureReason string, sessionRolloutMissing bool, retiredSessionID string) (*db.AgentTaskQueue, error) {
+func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, sessionID, workDir, failureReason string, sessionRolloutMissing bool, retiredSessionID string, identities ...*RunIdentity) (*db.AgentTaskQueue, error) {
+	var run *RunIdentity
+	if len(identities) > 0 {
+		run = identities[0]
+	}
 	// MUL-2946: synthesise a refined reason from the error text whenever the
 	// caller didn't supply one. This is the last write-path guard against
 	// "agent_error" coarse rows ending up in agent_task_queue.failure_reason
@@ -3879,7 +4004,7 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		retryFireAt      pgtype.Timestamptz
 		retryMaxAttempts pgtype.Int4
 	)
-	if retryableReasons[failureReason] {
+	if run == nil && retryableReasons[failureReason] {
 		if parent, perr := s.Queries.GetAgentTask(ctx, taskID); perr != nil {
 			slog.Warn("fail task auto-retry: load parent failed",
 				"task_id", util.UUIDToString(taskID), "error", perr)
@@ -3913,15 +4038,43 @@ func (s *TaskService) FailTask(ctx context.Context, taskID pgtype.UUID, errMsg, 
 		if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 			return err
 		}
-		t, err := qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
-			ID:                    taskID,
-			Error:                 pgtype.Text{String: errMsg, Valid: true},
-			FailureReason:         pgtype.Text{String: failureReason, Valid: failureReason != ""},
-			SessionID:             pgtype.Text{String: sessionID, Valid: sessionID != ""},
-			WorkDir:               pgtype.Text{String: workDir, Valid: workDir != ""},
-			SessionRolloutMissing: sessionRolloutMissing,
-			RetiredSessionID:      pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
-		})
+		var t db.AgentTaskQueue
+		var err error
+		if run != nil {
+			parent, loadErr := qtx.GetAgentTask(ctx, taskID)
+			if loadErr != nil {
+				return loadErr
+			}
+			decision := decideBuildFailure(failureReason, parent.Attempt, sessionID != "" || workDir != "")
+			detail, _ := json.Marshal(map[string]any{"failure_class": decision.Class, "retry": decision.Retry})
+			t, err = qtx.FailFencedAgentTask(ctx, db.FailFencedAgentTaskParams{
+				TaskID: taskID, Error: pgtype.Text{String: errMsg, Valid: true}, FailureReason: pgtype.Text{String: failureReason, Valid: failureReason != ""}, SessionID: pgtype.Text{String: sessionID, Valid: sessionID != ""}, WorkDir: pgtype.Text{String: workDir, Valid: workDir != ""}, SessionRolloutMissing: sessionRolloutMissing, RetiredSessionID: pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""}, RunState: decision.RunState, TerminalReason: pgtype.Text{String: decision.TerminalReason, Valid: true}, RunDetail: detail, BuildRunID: run.BuildRunID, Fence: run.Fence,
+			})
+			if err == nil && decision.IncrementAttempts && t.IssueID.Valid {
+				if _, err = qtx.IncrementIssueBuildAttempts(ctx, t.IssueID); err != nil {
+					return err
+				}
+			}
+			if err == nil && decision.HumanReview && t.IssueID.Valid {
+				if _, err = qtx.MoveIssueToHumanReviewUnlessInReview(ctx, t.IssueID); err != nil {
+					return err
+				}
+			}
+			if err == nil && decision.Retry != buildRetryNone {
+				child, cerr := qtx.CreateRetryTask(ctx, db.CreateRetryTaskParams{ID: taskID, MaxAttempts: pgtype.Int4{Int32: buildDefectMaxAttempts, Valid: true}})
+				if cerr != nil {
+					return fmt.Errorf("create supervised retry: %w", cerr)
+				}
+				if _, cerr = qtx.MarkBuildRetryPolicy(ctx, db.MarkBuildRetryPolicyParams{TaskID: child.ID, ParentTaskID: taskID, StrongerRuntime: decision.Retry == buildRetryStronger}); cerr != nil {
+					return fmt.Errorf("mark supervised retry: %w", cerr)
+				}
+				retried = &child
+			}
+		} else {
+			t, err = qtx.FailAgentTask(ctx, db.FailAgentTaskParams{
+				ID: taskID, Error: pgtype.Text{String: errMsg, Valid: true}, FailureReason: pgtype.Text{String: failureReason, Valid: failureReason != ""}, SessionID: pgtype.Text{String: sessionID, Valid: sessionID != ""}, WorkDir: pgtype.Text{String: workDir, Valid: workDir != ""}, SessionRolloutMissing: sessionRolloutMissing, RetiredSessionID: pgtype.Text{String: retiredSessionID, Valid: retiredSessionID != ""},
+			})
+		}
 		if err != nil {
 			return err
 		}
@@ -5653,8 +5806,8 @@ func (s *TaskService) publishQuickCreateInbox(item db.InboxItem, workspaceID, ag
 func EvaluateTaskComplexity(issue db.Issue, contextTokenCount int) string {
 	const (
 		// Thresholds for junior-lane eligibility
-		maxContentLength = 2000   // characters in title+description
-		maxTokens        = 5000   // context token count
+		maxContentLength = 2000 // characters in title+description
+		maxTokens        = 5000 // context token count
 	)
 
 	// P0/critical issues always route to senior
