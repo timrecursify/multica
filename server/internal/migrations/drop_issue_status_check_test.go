@@ -1,32 +1,157 @@
 package migrations
 
 import (
-	"strings"
+	"context"
+	"fmt"
+	"os"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// TestDropIssueStatusCheck_MigrationContent pins the forward/rollback
-// contract of migration 282 (PPP-22989): forward records and converts legacy
-// spellings before constraining storage to canonical values; rollback restores
-// the recorded source spellings before re-adding the legacy constraint.
-func TestDropIssueStatusCheck_MigrationContent(t *testing.T) {
-	up := readMigrationFile(t, "282_drop_issue_status_check_constraint.up.sql")
-	down := readMigrationFile(t, "282_drop_issue_status_check_constraint.down.sql")
+func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
+	dbURL := os.Getenv("DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("integration test requires Postgres at DATABASE_URL")
+	}
 
-	for _, want := range []string{"issue_status_282_rollback", "WHEN 'todo' THEN 'Spec'", "WHEN 'Building' THEN 'in_progress'", "WHEN 'done' THEN 'Done'", "WHEN 'cancelled' THEN 'Cancelled'", "ADD CONSTRAINT issue_status_check"} {
-		if !strings.Contains(up, want) {
-			t.Errorf("up migration missing %q", want)
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect to Postgres: %v", err)
+	}
+	defer pool.Close()
+
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire Postgres connection: %v", err)
+	}
+	defer conn.Release()
+
+	schema := fmt.Sprintf("issue_status_282_%d", time.Now().UnixNano())
+	if _, err := conn.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
+		t.Fatalf("create scratch schema: %v", err)
+	}
+	defer func() {
+		if _, err := conn.Exec(ctx, "DROP SCHEMA "+schema+" CASCADE"); err != nil {
+			t.Errorf("drop scratch schema: %v", err)
 		}
+	}()
+	if _, err := conn.Exec(ctx, "SET search_path TO "+schema); err != nil {
+		t.Fatalf("select scratch schema: %v", err)
 	}
-	for _, want := range []string{"UPDATE issue i", "SET status = r.previous_status", "DROP TABLE issue_status_282_rollback", "ADD CONSTRAINT issue_status_check"} {
-		if !strings.Contains(down, want) {
-			t.Errorf("down migration missing %q", want)
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE issue (
+			id UUID PRIMARY KEY,
+			status TEXT NOT NULL
+		);
+		INSERT INTO issue (id, status) VALUES
+			('00000000-0000-0000-0000-000000000001', 'Spec'),
+			('00000000-0000-0000-0000-000000000002', 'Queue'),
+			('00000000-0000-0000-0000-000000000003', 'in_progress'),
+			('00000000-0000-0000-0000-000000000004', 'in_review'),
+			('00000000-0000-0000-0000-000000000005', 'Human Review'),
+			('00000000-0000-0000-0000-000000000006', 'Done'),
+			('00000000-0000-0000-0000-000000000007', 'Cancelled'),
+			('00000000-0000-0000-0000-000000000008', 'Archived'),
+			('00000000-0000-0000-0000-000000000009', 'backlog'),
+			('00000000-0000-0000-0000-000000000010', 'Building'),
+			('00000000-0000-0000-0000-000000000011', 'done'),
+			('00000000-0000-0000-0000-000000000012', 'CI/CD & Deploy'),
+			('00000000-0000-0000-0000-000000000013', 'unknown legacy value');
+		ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (
+			status IN ('backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled')
+		) NOT VALID;
+	`); err != nil {
+		t.Fatalf("seed scratch issue table: %v", err)
+	}
+
+	applyMigrationFile(t, ctx, conn.Conn(), "282_drop_issue_status_check_constraint.up.sql")
+	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
+		"00000000-0000-0000-0000-000000000001": "Spec",
+		"00000000-0000-0000-0000-000000000002": "Queue",
+		"00000000-0000-0000-0000-000000000003": "in_progress",
+		"00000000-0000-0000-0000-000000000004": "in_review",
+		"00000000-0000-0000-0000-000000000005": "Human Review",
+		"00000000-0000-0000-0000-000000000006": "Done",
+		"00000000-0000-0000-0000-000000000007": "Cancelled",
+		"00000000-0000-0000-0000-000000000008": "Archived",
+		"00000000-0000-0000-0000-000000000009": "Spec",
+		"00000000-0000-0000-0000-000000000010": "in_progress",
+		"00000000-0000-0000-0000-000000000011": "Done",
+		"00000000-0000-0000-0000-000000000012": "Spec",
+		"00000000-0000-0000-0000-000000000013": "Spec",
+	})
+
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO issue (id, status) VALUES
+			('00000000-0000-0000-0000-000000000014', 'Queue'),
+			('00000000-0000-0000-0000-000000000015', 'Human Review'),
+			('00000000-0000-0000-0000-000000000016', 'Archived'),
+			('00000000-0000-0000-0000-000000000017', 'in_review')
+	`); err != nil {
+		t.Fatalf("write canonical rows after up: %v", err)
+	}
+
+	applyMigrationFile(t, ctx, conn.Conn(), "282_drop_issue_status_check_constraint.down.sql")
+	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
+		"00000000-0000-0000-0000-000000000001": "backlog",
+		"00000000-0000-0000-0000-000000000002": "todo",
+		"00000000-0000-0000-0000-000000000003": "in_progress",
+		"00000000-0000-0000-0000-000000000004": "in_review",
+		"00000000-0000-0000-0000-000000000005": "blocked",
+		"00000000-0000-0000-0000-000000000006": "done",
+		"00000000-0000-0000-0000-000000000007": "cancelled",
+		"00000000-0000-0000-0000-000000000008": "cancelled",
+		"00000000-0000-0000-0000-000000000009": "backlog",
+		"00000000-0000-0000-0000-000000000010": "Building",
+		"00000000-0000-0000-0000-000000000011": "done",
+		"00000000-0000-0000-0000-000000000012": "CI/CD & Deploy",
+		"00000000-0000-0000-0000-000000000013": "unknown legacy value",
+		"00000000-0000-0000-0000-000000000014": "todo",
+		"00000000-0000-0000-0000-000000000015": "blocked",
+		"00000000-0000-0000-0000-000000000016": "cancelled",
+		"00000000-0000-0000-0000-000000000017": "in_review",
+	})
+
+	var sidecarExists bool
+	if err := conn.QueryRow(ctx, `SELECT to_regclass('issue_status_282_rollback') IS NOT NULL`).Scan(&sidecarExists); err != nil {
+		t.Fatalf("read rollback sidecar: %v", err)
+	}
+	if sidecarExists {
+		t.Fatal("rollback sidecar remains after down")
+	}
+
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO issue (id, status)
+		VALUES ('00000000-0000-0000-0000-000000000018', 'new unrecorded value')
+	`); !isCheckViolation(err) {
+		t.Fatalf("restored legacy constraint: got %v, want check violation", err)
+	}
+
+	applyMigrationFile(t, ctx, conn.Conn(), "282_drop_issue_status_check_constraint.up.sql")
+	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
+		"00000000-0000-0000-0000-000000000012": "Spec",
+		"00000000-0000-0000-0000-000000000013": "Spec",
+		"00000000-0000-0000-0000-000000000014": "Spec",
+		"00000000-0000-0000-0000-000000000015": "Human Review",
+		"00000000-0000-0000-0000-000000000016": "Cancelled",
+		"00000000-0000-0000-0000-000000000017": "in_review",
+	})
+}
+
+func assertIssueStatuses(t *testing.T, ctx context.Context, conn *pgx.Conn, want map[string]string) {
+	t.Helper()
+	for id, expected := range want {
+		var actual string
+		if err := conn.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, id).Scan(&actual); err != nil {
+			t.Fatalf("read issue %s: %v", id, err)
 		}
-	}
-	if !strings.Contains(down, "'backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled'") {
-		t.Errorf("rollback must restore the legacy lowercase vocabulary")
-	}
-	if !strings.Contains(up, "'Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived'") {
-		t.Errorf("up migration must constrain canonical vocabulary")
+		if actual != expected {
+			t.Errorf("issue %s status = %q, want %q", id, actual, expected)
+		}
 	}
 }

@@ -1,5 +1,9 @@
 -- PPP-22989: converge issue.status storage on the production board vocabulary.
--- The rollback table records each changed row's exact previous spelling.
+-- Snapshot every non-canonical value before rewriting it so down can restore
+-- the exact value, including legacy values not known when this migration was
+-- written. The sidecar is migration-local state and is dropped by down.
+ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
+
 CREATE TABLE issue_status_282_rollback (
     issue_id UUID PRIMARY KEY,
     previous_status TEXT NOT NULL
@@ -7,8 +11,8 @@ CREATE TABLE issue_status_282_rollback (
 
 INSERT INTO issue_status_282_rollback (issue_id, previous_status)
 SELECT id, status FROM issue
-WHERE status IN ('backlog', 'todo', 'Registered', 'Building', 'In Progress', 'QC',
-    'In Review', 'blocked', 'Blocked', 'done', 'cancelled', 'dead_letter');
+WHERE status NOT IN
+    ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived');
 
 UPDATE issue
 SET status = CASE status
@@ -24,19 +28,12 @@ SET status = CASE status
     WHEN 'done' THEN 'Done'
     WHEN 'cancelled' THEN 'Cancelled'
     WHEN 'dead_letter' THEN 'Cancelled'
-    ELSE status
-END;
+    -- Unknown pre-up values are intentionally canonicalized to Spec. Their
+    -- exact original value is retained in issue_status_282_rollback for down.
+    ELSE 'Spec'
+END
+WHERE status NOT IN
+    ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived');
 
--- Fail closed: every stored status must be readable and writable by the
--- canonical handler after this migration.
-DO $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM issue WHERE status NOT IN
-        ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived')) THEN
-        RAISE EXCEPTION 'PPP-22989: issue.status contains an unknown value after canonicalization';
-    END IF;
-END $$;
-
-ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived'));
