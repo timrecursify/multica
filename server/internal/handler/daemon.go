@@ -2886,6 +2886,34 @@ func (h *Handler) ListPendingTasksByRuntime(w http.ResponseWriter, r *http.Reque
 // Task Lifecycle (called by daemon)
 // ---------------------------------------------------------------------------
 
+// requireFencedRunIdentity makes supervised callbacks fail closed.  Legacy
+// daemons may still operate non-supervised tasks, but a task that was claimed
+// with a build_run can only be advanced by the exact immutable run/fence pair
+// returned by that claim.
+func requireFencedRunIdentity(w http.ResponseWriter, task db.AgentTaskQueue, buildRunID, buildFence string) (*service.RunIdentity, bool) {
+	if !task.BuildRunID.Valid {
+		return nil, true
+	}
+	if buildRunID == "" || buildFence == "" {
+		writeError(w, http.StatusConflict, "supervised task requires build_run_id and build_fence")
+		return nil, false
+	}
+	runID, ok := parseUUIDOrBadRequest(w, buildRunID, "build_run_id")
+	if !ok {
+		return nil, false
+	}
+	if runID != task.BuildRunID {
+		writeError(w, http.StatusConflict, "build run does not own task")
+		return nil, false
+	}
+	fence, err := strconv.ParseInt(buildFence, 10, 64)
+	if err != nil || fence < 1 {
+		writeError(w, http.StatusBadRequest, "invalid build_fence")
+		return nil, false
+	}
+	return &service.RunIdentity{BuildRunID: runID, Fence: fence}, true
+}
+
 // ExtendTaskPrepareLease keeps a dispatched task protected while the daemon is
 // resolving startup inputs and preparing the execution environment.
 func (h *Handler) ExtendTaskPrepareLease(w http.ResponseWriter, r *http.Request) {
@@ -2905,7 +2933,19 @@ func (h *Handler) ExtendTaskPrepareLease(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	updated, err := h.TaskService.ExtendTaskPrepareLease(r.Context(), parseUUID(taskID), parseUUID(runtimeID))
+	var req struct {
+		BuildRunID string `json:"build_run_id,omitempty"`
+		BuildFence string `json:"build_fence,omitempty"`
+	}
+	if r.ContentLength != 0 && json.NewDecoder(r.Body).Decode(&req) != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	run, ok := requireFencedRunIdentity(w, task, req.BuildRunID, req.BuildFence)
+	if !ok {
+		return
+	}
+	updated, err := h.TaskService.ExtendTaskPrepareLease(r.Context(), parseUUID(taskID), parseUUID(runtimeID), run)
 	if err != nil {
 		slog.Warn("extend task prepare lease failed", "task_id", taskID, "runtime_id", runtimeID, "error", err)
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -2920,11 +2960,22 @@ func (h *Handler) StartTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
-	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	claimed, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
 		return
 	}
 
+	var req struct {
+		BuildRunID string `json:"build_run_id,omitempty"`
+		BuildFence string `json:"build_fence,omitempty"`
+	}
+	if r.ContentLength != 0 && json.NewDecoder(r.Body).Decode(&req) != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if _, ok := requireFencedRunIdentity(w, claimed, req.BuildRunID, req.BuildFence); !ok {
+		return
+	}
 	task, err := h.TaskService.StartTask(r.Context(), parseUUID(taskID))
 	if err != nil {
 		slog.Warn("start task failed", "task_id", taskID, "error", err)
@@ -3011,10 +3062,12 @@ func (h *Handler) ReportTaskProgress(w http.ResponseWriter, r *http.Request) {
 
 // CompleteTask marks a running task as completed.
 type TaskCompleteRequest struct {
-	PRURL     string `json:"pr_url"`
-	Output    string `json:"output"`
-	SessionID string `json:"session_id"` // Claude session ID for future resumption
-	WorkDir   string `json:"work_dir"`   // working directory used during execution
+	BuildRunID string `json:"build_run_id,omitempty"`
+	BuildFence string `json:"build_fence,omitempty"`
+	PRURL      string `json:"pr_url"`
+	Output     string `json:"output"`
+	SessionID  string `json:"session_id"` // Claude session ID for future resumption
+	WorkDir    string `json:"work_dir"`   // working directory used during execution
 	// SessionRolloutMissing: the daemon withheld this task's Codex session
 	// because its rollout was missing (MUL-5305). Clear the resume pointer and
 	// flag the continuity gap for the next claim.
@@ -3030,7 +3083,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
-	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	claimed, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
 		return
 	}
@@ -3038,6 +3091,10 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	var req TaskCompleteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	run, ok := requireFencedRunIdentity(w, claimed, req.BuildRunID, req.BuildFence)
+	if !ok {
 		return
 	}
 
@@ -3058,6 +3115,8 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 			"failure_reason", taskfailure.ReasonAgentContextOverflow,
 		)
 		h.failTask(w, r, taskID, workspaceID, TaskFailRequest{
+			BuildRunID:            req.BuildRunID,
+			BuildFence:            req.BuildFence,
 			Error:                 req.Output,
 			FailureReason:         string(taskfailure.ReasonAgentContextOverflow),
 			SessionID:             req.SessionID,
@@ -3073,7 +3132,7 @@ func (h *Handler) CompleteTask(w http.ResponseWriter, r *http.Request) {
 	// transaction (force session_id NULL + flag the row), so an auto-retry the
 	// same commit creates and wakes can never observe the withheld pointer or a
 	// missing continuity-gap flag.
-	task, err := h.TaskService.CompleteTask(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.SessionRolloutMissing, req.RetiredSessionID)
+	task, err := h.TaskService.CompleteTask(r.Context(), parseUUID(taskID), result, req.SessionID, req.WorkDir, req.SessionRolloutMissing, req.RetiredSessionID, run)
 	if err != nil {
 		// A CompleteTask error is an infrastructure failure (transaction /
 		// assistant-outcome write), not a bad request: an already-finalized
@@ -3698,6 +3757,8 @@ func (h *Handler) GetTaskStatus(w http.ResponseWriter, r *http.Request) {
 
 // FailTask marks a running task as failed.
 type TaskFailRequest struct {
+	BuildRunID    string `json:"build_run_id,omitempty"`
+	BuildFence    string `json:"build_fence,omitempty"`
 	Error         string `json:"error"`
 	SessionID     string `json:"session_id,omitempty"`
 	WorkDir       string `json:"work_dir,omitempty"`
@@ -3717,7 +3778,7 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	taskID := chi.URLParam(r, "taskId")
 
 	// Verify the caller owns this task's workspace.
-	_, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
+	claimed, workspaceID, ok := h.requireDaemonTaskAccessWithWorkspace(w, r, taskID)
 	if !ok {
 		return
 	}
@@ -3725,6 +3786,9 @@ func (h *Handler) FailTask(w http.ResponseWriter, r *http.Request) {
 	var req TaskFailRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if _, ok := requireFencedRunIdentity(w, claimed, req.BuildRunID, req.BuildFence); !ok {
 		return
 	}
 
@@ -3742,7 +3806,16 @@ func (h *Handler) failTask(w http.ResponseWriter, r *http.Request, taskID, works
 	// keep a stale mid-flight pin) and flagging the row in the same commit that
 	// creates and wakes the auto-retry, so the retry can never claim the withheld
 	// pointer or miss the continuity gap.
-	task, err := h.TaskService.FailTask(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID)
+	current, err := h.Queries.GetAgentTask(r.Context(), parseUUID(taskID))
+	if err != nil {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	run, ok := requireFencedRunIdentity(w, current, req.BuildRunID, req.BuildFence)
+	if !ok {
+		return
+	}
+	task, err := h.TaskService.FailTask(r.Context(), parseUUID(taskID), req.Error, req.SessionID, req.WorkDir, req.FailureReason, req.SessionRolloutMissing, req.RetiredSessionID, run)
 	if err != nil {
 		// A FailTask error is an infrastructure failure (the terminal
 		// transaction that also clears the withheld session, writes the

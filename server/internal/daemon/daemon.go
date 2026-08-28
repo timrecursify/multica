@@ -202,6 +202,8 @@ type terminalTaskReport struct {
 	// run on the issue or chat can select it again, however many clean rows
 	// still reference it.
 	retiredSessionID string
+	buildRunID       string
+	buildFence       string
 }
 
 type executionEnvironmentCommand func() ([]string, error)
@@ -4785,7 +4787,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		return
 	}
 
-	d.reportTaskResult(ctx, task.ID, result, taskLog)
+	d.reportTaskResultWithTask(ctx, task, result, taskLog)
 
 	// Write GC metadata after the task finishes so the periodic GC loop
 	// can look up the parent record (issue / chat session / autopilot run /
@@ -4987,6 +4989,11 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 // the next chat turn to resume there rather than start over and "forget"
 // the conversation.
 func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result TaskResult, taskLog *slog.Logger) {
+	d.reportTaskResultWithTask(ctx, Task{ID: taskID}, result, taskLog)
+}
+
+func (d *Daemon) reportTaskResultWithTask(ctx context.Context, task Task, result TaskResult, taskLog *slog.Logger) {
+	taskID := task.ID
 	switch result.Status {
 	case "completed":
 		taskLog.Info("task completed", "status", result.Status)
@@ -4999,6 +5006,8 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			workDir:               result.WorkDir,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
+			buildRunID:            task.BuildRunID,
+			buildFence:            task.BuildFence,
 		})
 		if err == nil {
 			return
@@ -5037,6 +5046,8 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			failureReason:         taskfailure.Classify(fallbackErrMsg).String(),
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
+			buildRunID:            task.BuildRunID,
+			buildFence:            task.BuildFence,
 		}); failErr != nil {
 			taskLog.Error("fail task fallback also failed", "error", failErr)
 		}
@@ -5069,6 +5080,8 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			failureReason:         failureReason,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
+			buildRunID:            task.BuildRunID,
+			buildFence:            task.BuildFence,
 		}); err != nil {
 			taskLog.Error("report failed task failed", "error", err)
 		}
@@ -5086,9 +5099,9 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
+		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.buildRunID, report.buildFence)
 	case terminalTaskReportFail:
-		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID)
+		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID, report.buildRunID, report.buildFence)
 	default:
 		return fmt.Errorf("unsupported terminal task report kind %d", report.kind)
 	}
@@ -5526,7 +5539,7 @@ func (d *Daemon) startTaskPrepareLeaseExtender(ctx context.Context, task Task, t
 				return
 			case <-ticker.C:
 				reqCtx, reqCancel := context.WithTimeout(leaseCtx, taskPrepareLeaseTimeout)
-				err := d.client.ExtendTaskPrepareLease(reqCtx, task.RuntimeID, task.ID)
+				err := d.client.ExtendTaskPrepareLease(reqCtx, task.RuntimeID, task.ID, task.BuildRunID, task.BuildFence)
 				reqCancel()
 				if err != nil {
 					taskLog.Warn("extend task prepare lease failed", "error", err)
@@ -5962,7 +5975,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// taskfailure.Classify path records the failure with the same
 	// "start task failed: <…>" string and the same failure_reason
 	// taxonomy as before — see MUL-2946 for the classifier contract.
-	if err := d.client.StartTask(prepareCtx, task.ID); err != nil {
+	if err := d.client.StartTask(prepareCtx, task.ID, task.BuildRunID, task.BuildFence); err != nil {
 		stopPrepareLease()
 		return TaskResult{}, fmt.Errorf("start task failed: %w", err)
 	}
