@@ -7,37 +7,29 @@ import (
 	"strings"
 )
 
-// IssueStatusProfile selects which issue-status vocabulary a deployment
-// validates against, persists, and emits.
-//
-// Multica has historically shipped two mutually exclusive vocabularies: a
-// lowercase legacy set and the canonical board set the production boards
-// display. The two boards diverged because the legacy starded acceptance
-// validation in the API while the storage layer (and the relay) normalized
-// onto the canonical set; a value accepted by one board was a hard HTTP 400
-// on the other. This ticket converges them by parameterizing the whole status
-// layer behind one immutable contract, chosen once at startup, that every
-// read and write path shares.
+// IssueStatusProfile selects the emitted/display vocabulary for a deployment.
+// Every profile accepts both historic vocabularies, but all writes normalize
+// to the single canonical board vocabulary.
 type IssueStatusProfile string
 
 const (
-	// IssueStatusProfileLinear is the default (and self-hosted / GSP) profile:
-	// it backs the historic lowercase lifecycle statuses. New deployments get
-	// this profile unless they opt in to the canonical board vocabulary.
+	// IssueStatusProfileLinear emits the historic lowercase display spellings
+	// for compatibility. It never changes persisted values.
 	IssueStatusProfileLinear IssueStatusProfile = "linear"
-	// IssueStatusProfilePPP is the production profile that stores and emits
-	// the canonical board statuses (Spec, Queue, in_progress, in_review,
-	// Human Review, Done, Cancelled, Archived).
+	// IssueStatusProfilePPP emits the canonical board statuses (Spec, Queue,
+	// in_progress, in_review, Human Review, Done, Cancelled, Archived).
 	IssueStatusProfilePPP IssueStatusProfile = "ppp"
 )
 
 // ParseIssueStatusProfile parses the MULTICA_ISSUE_STATUS_PROFILE environment
-// value ("linear" or "ppp", defaulting to "linear"). Unknown values fail
+// value ("linear" or "ppp", defaulting to canonical "ppp"). Unknown values fail
 // startup instead of silently falling back, so a deployment cannot drift to a
 // different vocabulary than the one its operators believe they configured.
 func ParseIssueStatusProfile(raw string) (IssueStatusProfile, error) {
 	switch strings.TrimSpace(strings.ToLower(raw)) {
-	case "", "linear":
+	case "":
+		return IssueStatusProfilePPP, nil
+	case "linear":
 		return IssueStatusProfileLinear, nil
 	case "ppp":
 		return IssueStatusProfilePPP, nil
@@ -46,66 +38,50 @@ func ParseIssueStatusProfile(raw string) (IssueStatusProfile, error) {
 	}
 }
 
-// IssueStatusContract is an immutable, per-profile description of the status
-// layer: the ordered canonical spellings that are stored and emitted, the
-// accepted aliases that normalize onto them, and the terminal predicates.
-// Every validation, canonicalization, grouping, filtering, and sorting path
-// in the handler shares the one contract that was selected at startup; nothing
-// reads the environment or a hard-coded global list.
+// IssueStatusContract is an immutable description of the status layer. Its
+// canonical values are always persisted; the profile only selects how those
+// values are emitted for display compatibility.
 type IssueStatusContract struct {
 	profile   IssueStatusProfile
-	canonical []string          // ordered: display + persistence order
+	canonical []string          // ordered persistence + display order
 	order     map[string]int    // canonical spelling -> display order
 	aliases   map[string]string // accepted non-canonical input -> canonical
 	accepted  map[string]string // every accepted input (canonical + alias) -> canonical
 	terminal  map[string]bool   // canonical spellings that are terminal
+	display   map[string]string // canonical spelling -> emitted spelling
 }
 
 // NewIssueStatusContract builds the immutable contract for a profile. The
 // profile is fixed for the process lifetime; callers must never switch it per
 // request.
 func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, error) {
-	var canonical []string
-	var aliases map[string]string
-	var terminal []string
+	canonical := []string{"Spec", "Queue", "in_progress", "in_review", "Human Review", "Done", "Cancelled", "Archived"}
+	aliases := map[string]string{
+		"todo":        "Spec",
+		"backlog":     "Spec",
+		"Registered":  "Spec",
+		"In Progress": "in_progress",
+		"Building":    "in_progress",
+		"In Review":   "in_review",
+		"QC":          "in_review",
+		"blocked":     "Human Review",
+		"Blocked":     "Human Review",
+		"done":        "Done",
+		"cancelled":   "Cancelled",
+		"dead_letter": "Cancelled",
+	}
+	terminal := []string{"Done", "Cancelled", "Archived"}
+	display := map[string]string{}
 	switch profile {
 	case IssueStatusProfileLinear:
-		canonical = []string{"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"}
-		// Cross-vocabulary aliases normalize the canonical board spellings onto
-		// the lowercase legacy set. This is what lets a mixed-version fleet
-		// (one backend still canonical, one already past the rollout) accept
-		// every writer without changing which spelling this deployment stores.
-		aliases = map[string]string{
-			"Spec":         "todo",
-			"Queue":        "backlog",
-			"In Progress":  "in_progress",
-			"In Review":    "in_review",
-			"Human Review": "blocked",
-			"Done":         "done",
-			"Cancelled":    "cancelled",
+		display = map[string]string{
+			"Spec": "todo", "Queue": "backlog", "in_progress": "in_progress", "in_review": "in_review",
+			"Human Review": "blocked", "Done": "done", "Cancelled": "cancelled", "Archived": "cancelled",
 		}
-		terminal = []string{"done", "cancelled"}
 	case IssueStatusProfilePPP:
-		canonical = []string{"Spec", "Queue", "in_progress", "in_review", "Human Review", "Done", "Cancelled", "Archived"}
-		// Every other spelling the fork conveyor and sk have been known to
-		// write (previously accepted verbatim by commit #33) normalizes onto
-		// one of these canonical values, so post-convergence PPP responses are
-		// consistent and no writer that worked before starts getting 400s.
-		aliases = map[string]string{
-			"todo":        "Spec",
-			"backlog":     "Spec",
-			"Registered":  "Spec",
-			"In Progress": "in_progress",
-			"Building":    "in_progress",
-			"In Review":   "in_review",
-			"QC":          "in_review",
-			"blocked":     "Human Review",
-			"Blocked":     "Human Review",
-			"done":        "Done",
-			"cancelled":   "Cancelled",
-			"dead_letter": "Cancelled",
+		for _, status := range canonical {
+			display[status] = status
 		}
-		terminal = []string{"Done", "Cancelled", "Archived"}
 	default:
 		return nil, fmt.Errorf("invalid issue status profile %q", profile)
 	}
@@ -117,6 +93,7 @@ func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, e
 		aliases:   make(map[string]string, len(aliases)),
 		accepted:  make(map[string]string, len(canonical)+len(aliases)),
 		terminal:  make(map[string]bool, len(terminal)),
+		display:   make(map[string]string, len(display)),
 	}
 	for i, status := range canonical {
 		contract.order[status] = i
@@ -129,6 +106,9 @@ func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, e
 	for _, status := range terminal {
 		contract.terminal[status] = true
 	}
+	for canonicalStatus, emittedStatus := range display {
+		contract.display[canonicalStatus] = emittedStatus
+	}
 	return contract, nil
 }
 
@@ -137,15 +117,11 @@ func (c *IssueStatusContract) Profile() IssueStatusProfile {
 	return c.profile
 }
 
-// DefaultStatus returns the canonical status a new issue without an explicit
-// status should be created with. Kept distinct per profile so the canonical
-// vocabulary's intake row ("Spec") is what new PPP-prod issues land in rather
-// than a legacy spelling the workers would not poll.
+// DefaultStatus returns the canonical stored status for a new issue without an
+// explicit status. It is profile-independent to prevent a display setting from
+// changing persisted data.
 func (c *IssueStatusContract) DefaultStatus() string {
-	if c.profile == IssueStatusProfilePPP {
-		return "Spec"
-	}
-	return "todo"
+	return "Spec"
 }
 
 // CanonicalStatuses returns the ordered canonical spellings (display and
@@ -174,6 +150,16 @@ func (c *IssueStatusContract) ContainsCanonical(status string) bool {
 func (c *IssueStatusContract) Canonicalize(input string) (string, bool) {
 	canonical, ok := c.accepted[input]
 	return canonical, ok
+}
+
+// DisplayStatus returns the profile-selected emitted spelling for a canonical
+// stored status. Unknown values remain unchanged so legacy rows can still be
+// inspected during a partial migration rather than being mislabeled.
+func (c *IssueStatusContract) DisplayStatus(canonicalStatus string) string {
+	if emitted, ok := c.display[canonicalStatus]; ok {
+		return emitted
+	}
+	return canonicalStatus
 }
 
 // AllAcceptedInputs returns every accepted spelling for the profile (the
@@ -233,15 +219,7 @@ func (c *IssueStatusContract) orderCASE(statusExpr string) string {
 // float to the top of a search. It maps every canonical status to a rank so a
 // canonical spelling never collapses into the fallback.
 func (c *IssueStatusContract) activityRankCASE(statusExpr string) string {
-	var rank []string
-	switch c.profile {
-	case IssueStatusProfileLinear:
-		rank = []string{"in_progress", "in_review", "todo", "blocked", "backlog", "done", "cancelled"}
-	case IssueStatusProfilePPP:
-		rank = []string{"in_progress", "in_review", "Spec", "Queue", "Human Review", "Done", "Cancelled", "Archived"}
-	default:
-		rank = c.canonical
-	}
+	rank := []string{"in_progress", "in_review", "Spec", "Queue", "Human Review", "Done", "Cancelled", "Archived"}
 	var b strings.Builder
 	b.WriteString("CASE ")
 	b.WriteString(statusExpr)

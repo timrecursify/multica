@@ -313,7 +313,7 @@ func (h *Handler) BootstrapOnboardingRuntime(w http.ResponseWriter, r *http.Requ
 	}
 	if issueCreated {
 		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-		resp := issueToResponse(issue, prefix)
+		resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 		h.publish(protocol.EventIssueCreated, req.WorkspaceID, "member", userID, map[string]any{"issue": resp})
 		platform, _, _ := middleware.ClientMetadataFromContext(r.Context())
 		obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.IssueCreated(
@@ -453,7 +453,7 @@ func (h *Handler) BootstrapOnboardingNoRuntime(w http.ResponseWriter, r *http.Re
 
 	if issueCreated {
 		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-		resp := issueToResponse(issue, prefix)
+		resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 		h.publish(protocol.EventIssueCreated, req.WorkspaceID, "member", userID, map[string]any{"issue": resp})
 		platform2, _, _ := middleware.ClientMetadataFromContext(r.Context())
 		obsmetrics.RecordEvent(h.Analytics, h.Metrics, analytics.IssueCreated(

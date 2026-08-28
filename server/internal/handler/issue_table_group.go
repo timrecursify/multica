@@ -325,7 +325,7 @@ func (group resolvedIssueTableGroup) descriptor(raw string, count int64, context
 				Key: compoundCellGroupKey(descriptor.Key, status),
 				Value: issueTableGroupValueResponse{
 					Kind:   "status",
-					Status: status,
+					Status: group.statusContract.DisplayStatus(status),
 				},
 				Count: statusCount,
 			})
@@ -339,7 +339,7 @@ func (group resolvedIssueTableGroup) descriptor(raw string, count int64, context
 			return descriptor, fmt.Errorf("unexpected status group value %q", raw)
 		}
 		descriptor.Key = "status:" + raw
-		descriptor.Value = issueTableGroupValueResponse{Kind: "status", Status: raw}
+		descriptor.Value = issueTableGroupValueResponse{Kind: "status", Status: group.statusContract.DisplayStatus(raw)}
 	case "assignee":
 		descriptor.Value.Kind = "assignee"
 		if raw == "__unassigned__" {

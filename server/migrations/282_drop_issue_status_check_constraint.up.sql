@@ -1,7 +1,8 @@
 -- PPP-22989: converge issue.status storage on the production board vocabulary.
--- Snapshot every non-canonical value before rewriting it so down can restore
--- the exact value, including legacy values not known when this migration was
--- written. The sidecar is migration-local state and is dropped by down.
+-- Snapshot every pre-up value before rewriting it so down can restore the
+-- exact value, including canonical and legacy values not known when this
+-- migration was written. The sidecar is migration-local state and is dropped
+-- by down.
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
 CREATE TABLE issue_status_282_rollback (
@@ -10,9 +11,7 @@ CREATE TABLE issue_status_282_rollback (
 );
 
 INSERT INTO issue_status_282_rollback (issue_id, previous_status)
-SELECT id, status FROM issue
-WHERE status NOT IN
-    ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived');
+SELECT id, status FROM issue;
 
 UPDATE issue
 SET status = CASE status

@@ -1734,7 +1734,7 @@ func (h *Handler) advanceIssueToDone(ctx context.Context, issue db.Issue, worksp
 	h.notifyParentOfChildDone(ctx, issue, updated)
 
 	prefix := h.getIssuePrefix(ctx, issue.WorkspaceID)
-	resp := issueToResponse(updated, prefix)
+	resp := issueToResponse(updated, prefix, h.IssueStatusContract)
 	h.publish(protocol.EventIssueUpdated, workspaceID, "system", "", map[string]any{
 		"issue":          resp,
 		"status_changed": true,

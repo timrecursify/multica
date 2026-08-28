@@ -467,7 +467,7 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 	labelsByIssue := baseHandler.labelsByIssue(r.Context(), compiled.workspaceID, issueIDs)
 	responseRows := make([]issueTableRowResponse, len(scanned))
 	for index, row := range scanned {
-		issue := issueListRowToResponse(row.issue, prefix)
+		issue := issueListRowToResponse(row.issue, prefix, baseHandler.IssueStatusContract)
 		labels := labelsByIssue[issue.ID]
 		if labels == nil {
 			labels = []LabelResponse{}

@@ -10,7 +10,7 @@ func TestParseIssueStatusProfile(t *testing.T) {
 		raw  string
 		want IssueStatusProfile
 	}{
-		{"", IssueStatusProfileLinear},
+		{"", IssueStatusProfilePPP},
 		{"linear", IssueStatusProfileLinear},
 		{"ppp", IssueStatusProfilePPP},
 		{" PPP ", IssueStatusProfilePPP},
@@ -31,42 +31,29 @@ func TestParseIssueStatusProfile(t *testing.T) {
 	}
 }
 
-func TestIssueStatusContractProfilesAreMutuallyExclusive(t *testing.T) {
+func TestIssueStatusContractProfilesShareCanonicalStorage(t *testing.T) {
 	linear := mustTestStatusContract(IssueStatusProfileLinear)
 	ppp := mustTestStatusContract(IssueStatusProfilePPP)
 
-	// Each profile canonicalizes its own vocabulary.
-	for _, s := range []string{"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"} {
-		if _, ok := linear.Canonicalize(s); !ok {
-			t.Errorf("linear: canonicalize %q failed", s)
-		}
-		if s == "backlog" || s == "todo" {
-			if got, ok := ppp.Canonicalize(s); !ok || got != "Spec" {
-				t.Errorf("ppp: canonicalize %q = %q, %v; want Spec,true", s, got, ok)
+	for _, tc := range []struct{ input, want string }{
+		{"todo", "Spec"}, {"backlog", "Spec"}, {"Spec", "Spec"},
+		{"Queue", "Queue"}, {"In Progress", "in_progress"}, {"Building", "in_progress"},
+		{"In Review", "in_review"}, {"QC", "in_review"}, {"Human Review", "Human Review"},
+		{"blocked", "Human Review"}, {"Done", "Done"}, {"done", "Done"},
+		{"Cancelled", "Cancelled"}, {"cancelled", "Cancelled"}, {"Archived", "Archived"},
+	} {
+		for _, contract := range []*IssueStatusContract{linear, ppp} {
+			got, ok := contract.Canonicalize(tc.input)
+			if !ok || got != tc.want {
+				t.Errorf("%s: canonicalize %q = %q,%v; want %q,true", contract.Profile(), tc.input, got, ok, tc.want)
 			}
 		}
 	}
-	for _, s := range []string{"Spec", "Queue", "In Progress", "In Review", "Human Review", "Done", "Cancelled", "Archived"} {
-		if _, ok := ppp.Canonicalize(s); !ok {
-			t.Errorf("ppp: canonicalize %q failed", s)
-		}
+	if got := linear.DisplayStatus("Spec"); got != "todo" {
+		t.Errorf("linear display Spec = %q, want todo", got)
 	}
-	// The linear profile maps the overlapping board spellings onto its own
-	// lowercase canonical set so a canonical-word writer keeps working when
-	// pointed at a linear backend during the convergence rollout. "Archived"
-	// has no legacy counterpart and is therefore rejected on linear.
-	for _, tc := range []struct{ input, want string }{
-		{"Spec", "todo"}, {"Queue", "backlog"}, {"In Progress", "in_progress"},
-		{"In Review", "in_review"}, {"Human Review", "blocked"},
-		{"Done", "done"}, {"Cancelled", "cancelled"},
-	} {
-		got, ok := linear.Canonicalize(tc.input)
-		if !ok || got != tc.want {
-			t.Errorf("linear: canonicalize %q = %q,%v; want %q,true", tc.input, got, ok, tc.want)
-		}
-	}
-	if _, ok := linear.Canonicalize("Archived"); ok {
-		t.Errorf("linear: canonicalize Archived unexpectedly succeeded")
+	if got := ppp.DisplayStatus("Spec"); got != "Spec" {
+		t.Errorf("ppp display Spec = %q, want Spec", got)
 	}
 }
 
@@ -98,37 +85,32 @@ func TestIssueStatusContractCanonicalizeIsIdempotent(t *testing.T) {
 func TestIssueStatusContractDefaultAndTerminal(t *testing.T) {
 	linear := mustTestStatusContract(IssueStatusProfileLinear)
 	ppp := mustTestStatusContract(IssueStatusProfilePPP)
-	if linear.DefaultStatus() != "todo" {
-		t.Errorf("linear default = %q, want todo", linear.DefaultStatus())
+	if linear.DefaultStatus() != "Spec" {
+		t.Errorf("linear default = %q, want Spec", linear.DefaultStatus())
 	}
 	if ppp.DefaultStatus() != "Spec" {
 		t.Errorf("ppp default = %q, want Spec", ppp.DefaultStatus())
 	}
-	if !ppp.IsTerminal("Done") || !ppp.IsTerminal("Cancelled") || !ppp.IsTerminal("Archived") {
-		t.Errorf("ppp terminals not recognized")
-	}
-	if linear.IsTerminal("todo") || linear.IsTerminal("in_progress") {
-		t.Errorf("linear non-terminal statuses reported terminal")
-	}
-	if !linear.IsTerminal("done") || !linear.IsTerminal("cancelled") {
-		t.Errorf("linear terminal statuses not recognized")
+	for _, contract := range []*IssueStatusContract{linear, ppp} {
+		if !contract.IsTerminal("Done") || !contract.IsTerminal("Cancelled") || !contract.IsTerminal("Archived") {
+			t.Errorf("%s terminals not recognized", contract.Profile())
+		}
+		if contract.IsTerminal("Spec") || contract.IsTerminal("in_progress") {
+			t.Errorf("%s non-terminal statuses reported terminal", contract.Profile())
+		}
 	}
 }
 
 func TestIssueStatusContractOrderCASE(t *testing.T) {
-	ppp := mustTestStatusContract(IssueStatusProfilePPP)
-	expr := ppp.orderCASE("i.status")
-	if !strings.Contains(expr, "WHEN 'Spec' THEN 0") {
-		t.Errorf("orderCASE missing ppp first status: %s", expr)
-	}
-	if !strings.Contains(expr, "WHEN 'Archived' THEN 7") {
-		t.Errorf("orderCASE missing ppp last status: %s", expr)
-	}
-	if specOrder, ok := ppp.Order("Spec"); !ok || specOrder != 0 {
-		t.Fatalf("Order(Spec) = %d, %v; want 0,true", specOrder, ok)
-	}
-	if archivedOrder, ok := ppp.Order("Archived"); !ok || archivedOrder != 7 {
-		t.Fatalf("Order(Archived) = %d, %v; want 7,true", archivedOrder, ok)
+	for _, profile := range []IssueStatusProfile{IssueStatusProfileLinear, IssueStatusProfilePPP} {
+		contract := mustTestStatusContract(profile)
+		expr := contract.orderCASE("i.status")
+		if !strings.Contains(expr, "WHEN 'Spec' THEN 0") {
+			t.Errorf("%s orderCASE missing canonical first status: %s", profile, expr)
+		}
+		if !strings.Contains(expr, "WHEN 'Archived' THEN 7") {
+			t.Errorf("%s orderCASE missing canonical last status: %s", profile, expr)
+		}
 	}
 }
 

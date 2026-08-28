@@ -339,12 +339,11 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		cfg.AttachmentDownloadURLTTL = defaultAttachmentDownloadURLTTL
 	}
 
-	// Default the issue-status contract to the linear profile when the
-	// operator did not configure one, so handlers and tests always have a
-	// valid contract to canonicalize against. Router.go overrides this with
-	// the MULTICA_ISSUE_STATUS_PROFILE-selected profile at startup.
+	// Default the issue-status contract to the converged canonical profile when
+	// the operator did not configure one. Router.go can select a display profile
+	// with MULTICA_ISSUE_STATUS_PROFILE without changing persisted values.
 	if cfg.IssueStatusContract == nil {
-		cfg.IssueStatusContract, _ = NewIssueStatusContract(IssueStatusProfileLinear)
+		cfg.IssueStatusContract, _ = NewIssueStatusContract(IssueStatusProfilePPP)
 	}
 
 	var daemonHub *daemonws.Hub

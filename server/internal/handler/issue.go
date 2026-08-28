@@ -103,8 +103,9 @@ func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []str
 	return false
 }
 
-func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
+func issueToResponse(i db.Issue, issuePrefix string, contract *IssueStatusContract) IssueResponse {
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	status := issueStatusForResponse(i.Status, contract)
 	return IssueResponse{
 		ID:            uuidToString(i.ID),
 		WorkspaceID:   uuidToString(i.WorkspaceID),
@@ -112,7 +113,7 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 		Identifier:    identifier,
 		Title:         i.Title,
 		Description:   textToPtr(i.Description),
-		Status:        i.Status,
+		Status:        status,
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
@@ -132,8 +133,9 @@ func issueToResponse(i db.Issue, issuePrefix string) IssueResponse {
 }
 
 // issueListRowToResponse converts a list-query row (no description) to an IssueResponse.
-func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueResponse {
+func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string, contract *IssueStatusContract) IssueResponse {
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	status := issueStatusForResponse(i.Status, contract)
 	return IssueResponse{
 		ID:            uuidToString(i.ID),
 		WorkspaceID:   uuidToString(i.WorkspaceID),
@@ -141,7 +143,7 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string) IssueRespons
 		Identifier:    identifier,
 		Title:         i.Title,
 		Description:   textToPtr(i.Description),
-		Status:        i.Status,
+		Status:        status,
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
@@ -193,8 +195,9 @@ func (h *Handler) labelsByIssue(ctx context.Context, wsUUID pgtype.UUID, issueID
 	return out
 }
 
-func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueResponse {
+func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string, contract *IssueStatusContract) IssueResponse {
 	identifier := issuePrefix + "-" + strconv.Itoa(int(i.Number))
+	status := issueStatusForResponse(i.Status, contract)
 	return IssueResponse{
 		ID:            uuidToString(i.ID),
 		WorkspaceID:   uuidToString(i.WorkspaceID),
@@ -202,7 +205,7 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 		Identifier:    identifier,
 		Title:         i.Title,
 		Description:   textToPtr(i.Description),
-		Status:        i.Status,
+		Status:        status,
 		Priority:      i.Priority,
 		AssigneeType:  textToPtr(i.AssigneeType),
 		AssigneeID:    uuidToPtr(i.AssigneeID),
@@ -219,6 +222,13 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string) IssueRes
 		Metadata:      parseIssueMetadata(i.Metadata),
 		Properties:    parseIssueProperties(i.Properties),
 	}
+}
+
+func issueStatusForResponse(stored string, contract *IssueStatusContract) string {
+	if contract == nil {
+		return stored
+	}
+	return contract.DisplayStatus(stored)
 }
 
 type IssueAssigneeGroupResponse struct {
@@ -763,7 +773,7 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 	resp := make([]SearchIssueResponse, len(results))
 	for i, sr := range results {
 		sir := SearchIssueResponse{
-			IssueResponse: issueToResponse(sr.issue, prefix),
+			IssueResponse: issueToResponse(sr.issue, prefix, h.IssueStatusContract),
 			MatchSource:   sr.matchSource,
 		}
 		// Always populate comment snippet when a matching comment exists
@@ -928,7 +938,7 @@ func (h *Handler) ListIssues(w http.ResponseWriter, r *http.Request) {
 		labelsMap := h.labelsByIssue(ctx, wsUUID, ids)
 		resp := make([]IssueResponse, len(issues))
 		for i, issue := range issues {
-			resp[i] = openIssueRowToResponse(issue, prefix)
+			resp[i] = openIssueRowToResponse(issue, prefix, h.IssueStatusContract)
 			labels := labelsMap[resp[i].ID]
 			if labels == nil {
 				labels = []LabelResponse{}
@@ -1313,7 +1323,7 @@ LIMIT %s OFFSET %s`, whereSql, orderBy, limitRef, offsetRef)
 	labelsMap := h.labelsByIssue(ctx, wsUUID, ids)
 	resp := make([]IssueResponse, len(issues))
 	for i, issue := range issues {
-		resp[i] = issueListRowToResponse(issue, prefix)
+		resp[i] = issueListRowToResponse(issue, prefix, h.IssueStatusContract)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -1904,7 +1914,7 @@ ORDER BY
 			})
 		}
 
-		issue := issueListRowToResponse(row.ListIssuesRow, prefix)
+		issue := issueListRowToResponse(row.ListIssuesRow, prefix, h.IssueStatusContract)
 		labels := labelsMap[issue.ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -1923,7 +1933,7 @@ func (h *Handler) GetIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-	resp := issueToResponse(issue, prefix)
+	resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 	detailLabels := h.labelsByIssue(r.Context(), issue.WorkspaceID, []pgtype.UUID{issue.ID})[uuidToString(issue.ID)]
 	if detailLabels == nil {
 		detailLabels = []LabelResponse{}
@@ -1974,7 +1984,7 @@ func (h *Handler) ListChildIssues(w http.ResponseWriter, r *http.Request) {
 	labelsMap := h.labelsByIssue(r.Context(), issue.WorkspaceID, ids)
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
-		resp[i] = issueToResponse(child, prefix)
+		resp[i] = issueToResponse(child, prefix, h.IssueStatusContract)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2053,7 +2063,7 @@ func (h *Handler) ListChildrenByParents(w http.ResponseWriter, r *http.Request) 
 	labelsMap := h.labelsByIssue(r.Context(), wsUUID, ids)
 	resp := make([]IssueResponse, len(children))
 	for i, child := range children {
-		resp[i] = issueToResponse(child, prefix)
+		resp[i] = issueToResponse(child, prefix, h.IssueStatusContract)
 		labels := labelsMap[resp[i].ID]
 		if labels == nil {
 			labels = []LabelResponse{}
@@ -2686,7 +2696,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		AnalyticsAgentID: analyticsAgentID,
 		Platform:         func() string { p, _, _ := middleware.ClientMetadataFromContext(r.Context()); return p }(),
 		BroadcastPayload: func(issue db.Issue, atts []db.Attachment, labels []db.IssueLabel) map[string]any {
-			payload := issueToResponse(issue, prefix)
+			payload := issueToResponse(issue, prefix, h.IssueStatusContract)
 			payload.Attachments = buildAttachmentResponses(atts)
 			// Carry the authoritative label snapshot so every online client
 			// renders the new issue already labeled. Non-nil (even empty)
@@ -2700,7 +2710,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 
 	if errors.Is(err, service.ErrActiveDuplicate) {
 		dup := *res.DuplicateIssue
-		existing := issueToResponse(dup, h.getIssuePrefix(r.Context(), dup.WorkspaceID))
+		existing := issueToResponse(dup, h.getIssuePrefix(r.Context(), dup.WorkspaceID), h.IssueStatusContract)
 		writeJSON(w, http.StatusConflict, map[string]any{
 			"code":  "active_duplicate_issue",
 			"error": duplicateIssueMessage(existing),
@@ -2736,7 +2746,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("issue created", append(logger.RequestAttrs(r), "issue_id", uuidToString(issue.ID), "title", issue.Title, "status", issue.Status, "workspace_id", workspaceID)...)
 
-	resp := issueToResponse(issue, prefix)
+	resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 	resp.Attachments = buildAttachmentResponses(res.Attachments)
 	// Echo the authoritative labels attached in the create transaction. Always
 	// non-nil (empty slice when none) so a newer client can tell the backend
@@ -3117,7 +3127,7 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-	resp := issueToResponse(issue, prefix)
+	resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 	slog.Info("issue updated", append(logger.RequestAttrs(r), "issue_id", id, "workspace_id", workspaceID)...)
 
 	assigneeChanged := (req.AssigneeType != nil || req.AssigneeID != nil) &&
@@ -3724,7 +3734,7 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 		}
 
 		prefix := h.getIssuePrefix(r.Context(), issue.WorkspaceID)
-		resp := issueToResponse(issue, prefix)
+		resp := issueToResponse(issue, prefix, h.IssueStatusContract)
 		actorType, actorID := h.resolveActor(r, userID, workspaceID)
 
 		assigneeChanged := (req.Updates.AssigneeType != nil || req.Updates.AssigneeID != nil) &&
