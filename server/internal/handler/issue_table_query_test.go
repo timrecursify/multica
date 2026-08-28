@@ -478,8 +478,8 @@ func TestIssueTableGroupIdentityBindsIncludeEmpty(t *testing.T) {
 }
 
 func TestIssueTableCompoundCellKeyResolvesPrimaryAndStatus(t *testing.T) {
-	primary := resolvedIssueTableGroup{kind: "parent"}
-	compound := resolvedIssueTableGroup{kind: "compound", primary: &primary}
+	primary := resolvedIssueTableGroup{kind: "parent", statusContract: linearTestContract}
+	compound := resolvedIssueTableGroup{kind: "compound", primary: &primary, statusContract: linearTestContract}
 	key := compoundCellGroupKey(
 		"parent:00000000-0000-4000-8000-000000000001",
 		"todo",
