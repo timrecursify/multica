@@ -1,3 +1,2 @@
-CREATE INDEX CONCURRENTLY idx_activity_log_funnel_workspace_created
-    ON activity_log (workspace_id, created_at DESC)
-    WHERE action IN ('status_changed', 'assignee_changed');
+CREATE INDEX CONCURRENTLY idx_issue_funnel_transition_workspace_occurred
+    ON issue_funnel_transition (workspace_id, occurred_at DESC);

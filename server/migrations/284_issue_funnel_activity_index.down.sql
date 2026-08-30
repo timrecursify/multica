@@ -1,1 +1,1 @@
-DROP INDEX CONCURRENTLY IF EXISTS idx_activity_log_funnel_workspace_created;
+DROP INDEX CONCURRENTLY IF EXISTS idx_issue_funnel_transition_workspace_occurred;

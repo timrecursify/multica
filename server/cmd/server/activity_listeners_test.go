@@ -72,8 +72,10 @@ func TestActivityIssueCreated(t *testing.T) {
 	}
 }
 
-func TestIssueFunnelTriggerRecordsStatusChanged(t *testing.T) {
+func TestActivityIssueUpdated_StatusChanged(t *testing.T) {
 	queries := db.New(testPool)
+	bus := events.New()
+	registerActivityListeners(bus, queries)
 
 	issueID := createTestIssue(t, testWorkspaceID, testUserID)
 	t.Cleanup(func() {
@@ -81,10 +83,25 @@ func TestIssueFunnelTriggerRecordsStatusChanged(t *testing.T) {
 		cleanupTestIssue(t, issueID)
 	})
 
-	if _, err := testPool.Exec(context.Background(),
-		`UPDATE issue SET status = 'in_progress' WHERE id = $1`, issueID); err != nil {
-		t.Fatalf("update issue status: %v", err)
-	}
+	bus.Publish(events.Event{
+		Type:        protocol.EventIssueUpdated,
+		WorkspaceID: testWorkspaceID,
+		ActorType:   "member",
+		ActorID:     testUserID,
+		Payload: map[string]any{
+			"issue": handler.IssueResponse{
+				ID:          issueID,
+				WorkspaceID: testWorkspaceID,
+				Title:       "activity test issue",
+				Status:      "in_progress",
+				Priority:    "medium",
+				CreatorType: "member",
+				CreatorID:   testUserID,
+			},
+			"status_changed": true,
+			"prev_status":    "Spec",
+		},
+	})
 
 	activities := listActivitiesForIssue(t, queries, issueID)
 	if len(activities) != 1 {
@@ -98,7 +115,7 @@ func TestIssueFunnelTriggerRecordsStatusChanged(t *testing.T) {
 	if err := json.Unmarshal(activities[0].Details, &details); err != nil {
 		t.Fatalf("failed to unmarshal details: %v", err)
 	}
-	if details["from"] != "todo" {
+	if details["from"] != "Spec" {
 		t.Fatalf("expected from 'todo', got %q", details["from"])
 	}
 	if details["to"] != "in_progress" {
@@ -106,8 +123,10 @@ func TestIssueFunnelTriggerRecordsStatusChanged(t *testing.T) {
 	}
 }
 
-func TestIssueFunnelTriggerRecordsAssigneeChanged(t *testing.T) {
+func TestActivityIssueUpdated_AssigneeChanged(t *testing.T) {
 	queries := db.New(testPool)
+	bus := events.New()
+	registerActivityListeners(bus, queries)
 
 	assigneeEmail := "activity-assignee-test@multica.ai"
 	assigneeID := createTestUser(t, assigneeEmail)
@@ -119,10 +138,29 @@ func TestIssueFunnelTriggerRecordsAssigneeChanged(t *testing.T) {
 		cleanupTestIssue(t, issueID)
 	})
 
-	if _, err := testPool.Exec(context.Background(),
-		`UPDATE issue SET assignee_type = 'member', assignee_id = $2 WHERE id = $1`, issueID, assigneeID); err != nil {
-		t.Fatalf("assign issue: %v", err)
-	}
+	assigneeType := "member"
+	bus.Publish(events.Event{
+		Type:        protocol.EventIssueUpdated,
+		WorkspaceID: testWorkspaceID,
+		ActorType:   "member",
+		ActorID:     testUserID,
+		Payload: map[string]any{
+			"issue": handler.IssueResponse{
+				ID:           issueID,
+				WorkspaceID:  testWorkspaceID,
+				Title:        "activity test issue",
+				Status:       "todo",
+				Priority:     "medium",
+				CreatorType:  "member",
+				CreatorID:    testUserID,
+				AssigneeType: &assigneeType,
+				AssigneeID:   &assigneeID,
+			},
+			"assignee_changed":   true,
+			"prev_assignee_type": (*string)(nil),
+			"prev_assignee_id":   (*string)(nil),
+		},
+	})
 
 	activities := listActivitiesForIssue(t, queries, issueID)
 	if len(activities) != 1 {
@@ -141,6 +179,50 @@ func TestIssueFunnelTriggerRecordsAssigneeChanged(t *testing.T) {
 	}
 	if details["to_id"] != assigneeID {
 		t.Fatalf("expected to_id %q, got %q", assigneeID, details["to_id"])
+	}
+}
+
+func TestIssueFunnelTransitionsRecordDeliveryStages(t *testing.T) {
+	issueID := createTestIssue(t, testWorkspaceID, testUserID)
+	t.Cleanup(func() { cleanupTestIssue(t, issueID) })
+
+	assigneeID := createTestUser(t, "funnel-assignee-test@multica.ai")
+	t.Cleanup(func() { cleanupTestUser(t, "funnel-assignee-test@multica.ai") })
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET assignee_type = 'member', assignee_id = $2, status = 'in_progress' WHERE id = $1`, issueID, assigneeID); err != nil {
+		t.Fatalf("assign and start issue: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'In Review' WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("send issue to review: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'Done' WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("complete issue: %v", err)
+	}
+
+	rows, err := testPool.Query(ctx, `SELECT stage FROM issue_funnel_stage_duration WHERE issue_id = $1 ORDER BY transition_sequence`, issueID)
+	if err != nil {
+		t.Fatalf("query funnel durations: %v", err)
+	}
+	defer rows.Close()
+	var stages []string
+	for rows.Next() {
+		var stage string
+		if err := rows.Scan(&stage); err != nil {
+			t.Fatalf("scan stage: %v", err)
+		}
+		stages = append(stages, stage)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate stages: %v", err)
+	}
+	want := []string{"created", "assigned", "in_progress", "review", "done"}
+	if len(stages) != len(want) {
+		t.Fatalf("stage count = %d, want %d (%v)", len(stages), len(want), stages)
+	}
+	for i, stage := range want {
+		if stages[i] != stage {
+			t.Fatalf("stage[%d] = %q, want %q", i, stages[i], stage)
+		}
 	}
 }
 

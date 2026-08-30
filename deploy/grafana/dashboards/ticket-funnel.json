@@ -8,7 +8,7 @@
     {
       "title": "Stage duration percentiles (last 500 tickets)",
       "type": "table",
-      "targets": [{"format": "table", "rawSql": "WITH last_500 AS (SELECT issue_id FROM issue_funnel_stage_duration WHERE workspace_id = '$workspace_id' GROUP BY issue_id ORDER BY max(entered_at) DESC LIMIT 500) SELECT stage, percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_seconds) AS p50_seconds, percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_seconds) AS p95_seconds, percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_seconds) AS p99_seconds FROM issue_funnel_stage_duration WHERE issue_id IN (SELECT issue_id FROM last_500) GROUP BY stage ORDER BY stage"}]
+      "targets": [{"format": "table", "rawSql": "WITH last_500 AS (SELECT id FROM issue WHERE workspace_id = '$workspace_id' ORDER BY created_at DESC LIMIT 500) SELECT stage, percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_seconds) AS p50_seconds, percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_seconds) AS p95_seconds, percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_seconds) AS p99_seconds FROM issue_funnel_stage_duration WHERE issue_id IN (SELECT id FROM last_500) GROUP BY stage ORDER BY stage"}]
     },
     {
       "title": "Stage flow rate",

@@ -63,10 +63,27 @@ func registerActivityListeners(bus *events.Bus, queries *db.Queries) {
 		assigneeChanged, _ := payload["assignee_changed"].(bool)
 		descriptionChanged, _ := payload["description_changed"].(bool)
 
-		// Status and assignee transitions are written by the database trigger in
-		// the issue transaction. Do not duplicate them here: this listener is
-		// asynchronous and misses writes that do not pass through this process.
-		_ = statusChanged
+		if statusChanged {
+			prevStatus, _ := payload["prev_status"].(string)
+			details, _ := json.Marshal(map[string]string{
+				"from": prevStatus,
+				"to":   issue.Status,
+			})
+			activity, err := queries.CreateActivity(ctx, db.CreateActivityParams{
+				WorkspaceID: parseUUID(issue.WorkspaceID),
+				IssueID:     parseUUID(issue.ID),
+				ActorType:   util.StrToText(e.ActorType),
+				ActorID:     optionalUUID(e.ActorID),
+				Action:      "status_changed",
+				Details:     details,
+			})
+			if err != nil {
+				slog.Error("activity: failed to record status change",
+					"issue_id", issue.ID, "error", err)
+			} else {
+				publishActivityEvent(bus, e, activity)
+			}
+		}
 
 		if priorityChanged {
 			prevPriority, _ := payload["prev_priority"].(string)
@@ -90,7 +107,40 @@ func registerActivityListeners(bus *events.Bus, queries *db.Queries) {
 			}
 		}
 
-		_ = assigneeChanged
+		if assigneeChanged {
+			prevAssigneeType, _ := payload["prev_assignee_type"].(*string)
+			prevAssigneeID, _ := payload["prev_assignee_id"].(*string)
+
+			detailsMap := map[string]string{}
+			if prevAssigneeType != nil {
+				detailsMap["from_type"] = *prevAssigneeType
+			}
+			if prevAssigneeID != nil {
+				detailsMap["from_id"] = *prevAssigneeID
+			}
+			if issue.AssigneeType != nil {
+				detailsMap["to_type"] = *issue.AssigneeType
+			}
+			if issue.AssigneeID != nil {
+				detailsMap["to_id"] = *issue.AssigneeID
+			}
+
+			details, _ := json.Marshal(detailsMap)
+			activity, err := queries.CreateActivity(ctx, db.CreateActivityParams{
+				WorkspaceID: parseUUID(issue.WorkspaceID),
+				IssueID:     parseUUID(issue.ID),
+				ActorType:   util.StrToText(e.ActorType),
+				ActorID:     optionalUUID(e.ActorID),
+				Action:      "assignee_changed",
+				Details:     details,
+			})
+			if err != nil {
+				slog.Error("activity: failed to record assignee change",
+					"issue_id", issue.ID, "error", err)
+			} else {
+				publishActivityEvent(bus, e, activity)
+			}
+		}
 
 		if startDateChanged, _ := payload["start_date_changed"].(bool); startDateChanged {
 			prevStartDate := ""
