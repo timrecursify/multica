@@ -72,10 +72,8 @@ func TestActivityIssueCreated(t *testing.T) {
 	}
 }
 
-func TestActivityIssueUpdated_StatusChanged(t *testing.T) {
+func TestIssueFunnelTriggerRecordsStatusChanged(t *testing.T) {
 	queries := db.New(testPool)
-	bus := events.New()
-	registerActivityListeners(bus, queries)
 
 	issueID := createTestIssue(t, testWorkspaceID, testUserID)
 	t.Cleanup(func() {
@@ -83,25 +81,10 @@ func TestActivityIssueUpdated_StatusChanged(t *testing.T) {
 		cleanupTestIssue(t, issueID)
 	})
 
-	bus.Publish(events.Event{
-		Type:        protocol.EventIssueUpdated,
-		WorkspaceID: testWorkspaceID,
-		ActorType:   "member",
-		ActorID:     testUserID,
-		Payload: map[string]any{
-			"issue": handler.IssueResponse{
-				ID:          issueID,
-				WorkspaceID: testWorkspaceID,
-				Title:       "activity test issue",
-				Status:      "in_progress",
-				Priority:    "medium",
-				CreatorType: "member",
-				CreatorID:   testUserID,
-			},
-			"status_changed": true,
-			"prev_status":    "Spec",
-		},
-	})
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE issue SET status = 'in_progress' WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("update issue status: %v", err)
+	}
 
 	activities := listActivitiesForIssue(t, queries, issueID)
 	if len(activities) != 1 {
@@ -115,7 +98,7 @@ func TestActivityIssueUpdated_StatusChanged(t *testing.T) {
 	if err := json.Unmarshal(activities[0].Details, &details); err != nil {
 		t.Fatalf("failed to unmarshal details: %v", err)
 	}
-	if details["from"] != "Spec" {
+	if details["from"] != "todo" {
 		t.Fatalf("expected from 'todo', got %q", details["from"])
 	}
 	if details["to"] != "in_progress" {
@@ -123,10 +106,8 @@ func TestActivityIssueUpdated_StatusChanged(t *testing.T) {
 	}
 }
 
-func TestActivityIssueUpdated_AssigneeChanged(t *testing.T) {
+func TestIssueFunnelTriggerRecordsAssigneeChanged(t *testing.T) {
 	queries := db.New(testPool)
-	bus := events.New()
-	registerActivityListeners(bus, queries)
 
 	assigneeEmail := "activity-assignee-test@multica.ai"
 	assigneeID := createTestUser(t, assigneeEmail)
@@ -138,29 +119,10 @@ func TestActivityIssueUpdated_AssigneeChanged(t *testing.T) {
 		cleanupTestIssue(t, issueID)
 	})
 
-	assigneeType := "member"
-	bus.Publish(events.Event{
-		Type:        protocol.EventIssueUpdated,
-		WorkspaceID: testWorkspaceID,
-		ActorType:   "member",
-		ActorID:     testUserID,
-		Payload: map[string]any{
-			"issue": handler.IssueResponse{
-				ID:           issueID,
-				WorkspaceID:  testWorkspaceID,
-				Title:        "activity test issue",
-				Status:       "todo",
-				Priority:     "medium",
-				CreatorType:  "member",
-				CreatorID:    testUserID,
-				AssigneeType: &assigneeType,
-				AssigneeID:   &assigneeID,
-			},
-			"assignee_changed":   true,
-			"prev_assignee_type": (*string)(nil),
-			"prev_assignee_id":   (*string)(nil),
-		},
-	})
+	if _, err := testPool.Exec(context.Background(),
+		`UPDATE issue SET assignee_type = 'member', assignee_id = $2 WHERE id = $1`, issueID, assigneeID); err != nil {
+		t.Fatalf("assign issue: %v", err)
+	}
 
 	activities := listActivitiesForIssue(t, queries, issueID)
 	if len(activities) != 1 {
