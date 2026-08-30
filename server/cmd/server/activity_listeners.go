@@ -249,6 +249,12 @@ func registerActivityListeners(bus *events.Bus, queries *db.Queries) {
 	bus.Subscribe(protocol.EventTaskFailed, func(e events.Event) {
 		handleTaskActivity(ctx, bus, queries, e, "task_failed")
 	})
+
+	// task:cancelled — keep the terminal cause queryable instead of folding it
+	// into an indistinguishable empty task_failed activity.
+	bus.Subscribe(protocol.EventTaskCancelled, func(e events.Event) {
+		handleTaskActivity(ctx, bus, queries, e, "task_cancelled")
+	})
 }
 
 // handleTaskActivity records an activity for task:completed or task:failed events.
@@ -271,13 +277,37 @@ func handleTaskActivity(ctx context.Context, bus *events.Bus, queries *db.Querie
 		return
 	}
 
+	detailsMap := make(map[string]any)
+	for _, key := range []string{"task_id", "status", "failure_reason", "cancellation_cause", "retry_pending", "runtime_id"} {
+		if value, exists := payload[key]; exists {
+			detailsMap[key] = value
+		}
+	}
+	details, err := json.Marshal(detailsMap)
+	if err != nil {
+		slog.Error("activity: failed to encode task activity details", "issue_id", issueID, "action", action, "error", err)
+		return
+	}
+
+	actorType := "agent"
+	actorID := agentID
+	if value, ok := payload["actor_type"].(string); ok && value != "" {
+		actorType = value
+	}
+	if value, ok := payload["actor_id"].(string); ok {
+		actorID = value
+	}
+	if actorType == "" {
+		actorType = "system"
+	}
+
 	activity, err := queries.CreateActivity(ctx, db.CreateActivityParams{
 		WorkspaceID: issue.WorkspaceID,
 		IssueID:     parseUUID(issueID),
-		ActorType:   util.StrToText("agent"),
-		ActorID:     parseUUID(agentID),
+		ActorType:   util.StrToText(actorType),
+		ActorID:     optionalUUID(actorID),
 		Action:      action,
-		Details:     []byte("{}"),
+		Details:     details,
 	})
 	if err != nil {
 		slog.Error("activity: failed to record task activity",

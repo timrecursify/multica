@@ -2250,6 +2250,11 @@ var ErrTaskNoLongerQueued = errors.New("task is no longer queued")
 // CancelTaskOptions carries what the caller knows about the client that asked
 // for the cancellation.
 type CancelTaskOptions struct {
+	// Cause and actor make server-side cancellation attributable after the
+	// terminal event has been written to activity_log.
+	Cause     string
+	ActorType string
+	ActorID   string
 	// ClientSupportsDraftRestore is true when the caller can recover a prompt
 	// through the durable draft-restore path (#5219). Only such a client may be
 	// handed a deferred outcome; for anyone else the empty-transcript judgment
@@ -2351,7 +2356,20 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 	s.ReconcileAgentStatus(ctx, task.AgentID)
 
 	// Broadcast cancellation as a task:failed event so frontends clear the live card
-	s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+	cause := opts.Cause
+	if cause == "" {
+		cause = "server_cancel"
+	}
+	actorType := opts.ActorType
+	if actorType == "" {
+		actorType = "system"
+	}
+	s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task, map[string]any{
+		"cancellation_cause": cause,
+		"actor_type":         actorType,
+		"actor_id":           opts.ActorID,
+		"runtime_id":         util.UUIDToString(task.RuntimeID),
+	})
 	s.NotifyTaskFinished(task)
 
 	return &CancelTaskResult{
@@ -5653,8 +5671,8 @@ func (s *TaskService) publishQuickCreateInbox(item db.InboxItem, workspaceID, ag
 func EvaluateTaskComplexity(issue db.Issue, contextTokenCount int) string {
 	const (
 		// Thresholds for junior-lane eligibility
-		maxContentLength = 2000   // characters in title+description
-		maxTokens        = 5000   // context token count
+		maxContentLength = 2000 // characters in title+description
+		maxTokens        = 5000 // context token count
 	)
 
 	// P0/critical issues always route to senior
