@@ -1127,6 +1127,18 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/{taskId}/requeue", h.RequeueOrphanedTask)
 	})
 
+	// Relay issue-stage advancement (GSP-591). Service-authenticated surface that
+	// upstreams the host-local multica-bridge.cjs POST /relay/advance: it advances
+	// an issue's stage and enqueues the successor agent_task_queue atomically. The
+	// existing protected POST /api/relay/advance (task -> daemon lane routing) is
+	// untouched; this is a distinct route with its own contract and is deliberately
+	// mounted OUTSIDE the user auth group, guarded by the same MULTICA_OPERATOR_SECRET
+	// shared bearer as the operator repair API (the bridge/MCP gateway holds the value).
+	r.Route("/api/relay/advance-stage", func(r chi.Router) {
+		r.Use(operatorAuth)
+		r.Post("/", h.RelayAdvanceStage)
+	})
+
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))

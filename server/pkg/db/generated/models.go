@@ -926,10 +926,26 @@ type QuickAction struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RelayRunLog struct {
+	ID        int64              `json:"id"`
+	IssueID   pgtype.UUID        `json:"issue_id"`
+	FromStage string             `json:"from_stage"`
+	ToStage   pgtype.Text        `json:"to_stage"`
+	AgentID   pgtype.UUID        `json:"agent_id"`
+	TaskID    pgtype.UUID        `json:"task_id"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type RelayStageConfig struct {
-	ID        int32       `json:"id"`
-	StageName string      `json:"stage_name"`
-	NextStage pgtype.Text `json:"next_stage"`
+	ID            int32              `json:"id"`
+	StageName     string             `json:"stage_name"`
+	NextStage     pgtype.Text        `json:"next_stage"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	AgentID       pgtype.UUID        `json:"agent_id"`
+	AgentName     pgtype.Text        `json:"agent_name"`
+	AltNextStages []string           `json:"alt_next_stages"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
 type RuntimeProfile struct {
