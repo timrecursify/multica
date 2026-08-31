@@ -71,6 +71,21 @@ func TestEvaluate_DefersAtNearLimitThreshold(t *testing.T) {
 	}
 }
 
+func TestEvaluate_NearLimitUsesEachResourceCap(t *testing.T) {
+	cfg := AdmissionPolicy{MaxQueueDepth: 1000, MaxConcurrent: 50, AlertThreshold: 0.8}
+	// Queue is only 4% utilized; active workers are idle. A shared smaller-cap
+	// comparison would incorrectly classify this as near-limit.
+	d := Evaluate(cfg, ClassStandard, Load{QueueDepth: 40, ActiveConcurrent: 0}, 0)
+	if !d.Admit || d.NearLimit {
+		t.Fatalf("independent utilization must admit below both thresholds, got %+v", d)
+	}
+	// Conversely, active workers at 80% must trigger even with a deep queue cap.
+	d = Evaluate(cfg, ClassStandard, Load{QueueDepth: 0, ActiveConcurrent: 40}, 0)
+	if !d.Defer || !d.NearLimit {
+		t.Fatalf("active utilization at threshold must defer, got %+v", d)
+	}
+}
+
 func TestEvaluate_CriticalStillDefersAtNearLimit(t *testing.T) {
 	// Critical class does not bypass the near-limit defer fold — it shares the
 	// policy's thresholds; class only feeds the reason string. The alert exists
