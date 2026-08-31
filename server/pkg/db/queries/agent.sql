@@ -1944,13 +1944,14 @@ WHERE agent_id = $1
 -- operator read surface (GSP-806): every configured source stage plus its
 -- primary successor and any alternate successors.
 SELECT * FROM relay_stage_config
+WHERE workspace_id = $1
 ORDER BY id ASC;
 
 -- name: GetRelayStageConfig :one
 -- One exact relay stage by name. Returns a single row or sql.ErrNoRows so an
 -- operator can never mutate a stage that is not configured.
 SELECT * FROM relay_stage_config
-WHERE stage_name = $1;
+WHERE workspace_id = $1 AND source_stage = $2 AND successor_stage = $3;
 
 -- name: SetRelayStageOwner :one
 -- Atomically set (or clear) the relay stage owner for ONE exact transition.
@@ -1959,7 +1960,7 @@ WHERE stage_name = $1;
 UPDATE relay_stage_config
 SET agent_id = $2,
     agent_name = $3
-WHERE stage_name = $1
+WHERE workspace_id = $1 AND source_stage = $2 AND successor_stage = $3
 RETURNING *;
 
 -- name: GetAgentInWorkspaceByName :one

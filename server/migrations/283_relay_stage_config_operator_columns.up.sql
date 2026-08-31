@@ -11,10 +11,18 @@
 -- operator surface can list/get/set/restore ownership for exact transitions.
 
 ALTER TABLE relay_stage_config
+    ADD COLUMN IF NOT EXISTS workspace_id uuid,
+    ADD COLUMN IF NOT EXISTS source_stage text,
+    ADD COLUMN IF NOT EXISTS successor_stage text,
     ADD COLUMN IF NOT EXISTS agent_id uuid,
     ADD COLUMN IF NOT EXISTS agent_name text,
     ADD COLUMN IF NOT EXISTS created_at timestamptz NOT NULL DEFAULT now(),
     ADD COLUMN IF NOT EXISTS alt_next_stages text[];
+
+UPDATE relay_stage_config SET source_stage = stage_name WHERE source_stage IS NULL;
+UPDATE relay_stage_config SET successor_stage = next_stage WHERE successor_stage IS NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS relay_stage_config_workspace_transition_uq
+    ON relay_stage_config (workspace_id, source_stage, successor_stage);
 
 INSERT INTO relay_stage_config (id, stage_name, next_stage, alt_next_stages)
 VALUES

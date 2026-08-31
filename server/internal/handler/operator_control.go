@@ -313,6 +313,10 @@ func (h *Handler) SetWorkspaceRelayStageOwner(w http.ResponseWriter, r *http.Req
 		writeErrorCode(w, http.StatusBadRequest, "invalid_input", "invalid request body: "+err.Error())
 		return
 	}
+	if strings.TrimSpace(req.SuccessorStage) == "" {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_input", "successor_stage is required")
+		return
+	}
 	if req.SuccessorStage != "" {
 		valid := target.NextStage.Valid && target.NextStage.String == req.SuccessorStage
 		if !valid { for _, s := range target.AltNextStages { if s == req.SuccessorStage { valid = true; break } } }
