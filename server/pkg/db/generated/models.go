@@ -927,9 +927,13 @@ type QuickAction struct {
 }
 
 type RelayStageConfig struct {
-	ID        int32       `json:"id"`
-	StageName string      `json:"stage_name"`
-	NextStage pgtype.Text `json:"next_stage"`
+	ID            int32              `json:"id"`
+	StageName     string             `json:"stage_name"`
+	NextStage     pgtype.Text        `json:"next_stage"`
+	AgentID       pgtype.UUID        `json:"agent_id"`
+	AgentName     pgtype.Text        `json:"agent_name"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	AltNextStages []string           `json:"alt_next_stages"`
 }
 
 type RuntimeProfile struct {
