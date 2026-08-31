@@ -1938,3 +1938,67 @@ WHERE agent_id = $1
   AND status = 'failed'
   AND failure_reason = 'agent_error.provider_capacity_or_rate_limit'
   AND completed_at >= $2;
+
+-- name: GetRelayStageEdge :one
+-- Resolves the legal successor edge(s) for a stage transition, preferring a
+-- workspace-scoped config row and falling back to the global default (NULL)
+-- row. alt_next_stages lets one stage fan out to several legal successors
+-- (e.g. Fable QC -> CI/CD & Deploy / Human Review / Done), so the relay
+-- service checks to_stage against next_stage and alt_next_stages before
+-- moving the issue.
+SELECT next_stage, alt_next_stages
+FROM relay_stage_config
+WHERE stage_name = $1
+  AND (workspace_id = $2 OR workspace_id IS NULL)
+ORDER BY (workspace_id IS NOT NULL) DESC, id
+LIMIT 1;
+
+-- name: GetRelayStageOwner :one
+-- Resolves the stage owner agent + runtime for a target stage, preferring a
+-- workspace-scoped config row and falling back to the global default. NULL
+-- agent_id means the stage is terminal (no successor agent/task), e.g. Done.
+-- The runtime resolves the agent's preferred bound runtime, falling back to
+-- the most recent online codex runtime in the workspace at request time.
+SELECT
+    rsc.agent_id, rsc.agent_name, a.runtime_id, a.archived_at,
+    COALESCE(a.runtime_id, (
+        SELECT ar.id
+        FROM agent_runtime ar
+        WHERE ar.workspace_id = $2
+          AND ar.provider = 'codex'
+          AND ar.status = 'online'
+        ORDER BY ar.updated_at DESC
+        LIMIT 1
+    )) AS selected_runtime_id
+FROM relay_stage_config rsc
+LEFT JOIN agent a ON a.id = rsc.agent_id
+WHERE rsc.stage_name = $1
+  AND (rsc.workspace_id = $2 OR rsc.workspace_id IS NULL)
+ORDER BY (rsc.workspace_id IS NOT NULL) DESC, rsc.id
+LIMIT 1;
+
+
+-- name: CreateRelayStageTask :one
+-- Idempotent successor-task insert for the relay issue-stage advancement
+-- service. Unlike generic CreateAgentTask, this uses ON CONFLICT DO NOTHING so
+-- repeated or concurrent relay delivery resolves to "already queued" instead of
+-- raising the pending-task unique-index violation. The physical unique index
+-- (idx_one_pending_task_per_issue_agent_v2 on (issue_id, agent_id) WHERE status
+-- IN ('queued','dispatched') OR deferred-media) is the at-most-one-successor
+-- guarantee the spec requires.
+--
+-- context is a Go-built JSONB object carrying source + edge so a daemon run can
+-- attribute the trigger without a separate comment. force_fresh_session=TRUE
+-- matches the bridge: a stage-owned successor is a fresh run, not a resume of
+-- the predecessor.
+INSERT INTO agent_task_queue (
+    agent_id, runtime_id, issue_id, status, priority,
+    trigger_summary, force_fresh_session, context,
+    originator_source, trigger_evidence_kind, trigger_evidence_ref_id
+)
+VALUES (
+    $1, $2, $3, 'queued', $4, $5,
+    TRUE, @context, 'unattributed', 'relay_stage_transition', $3
+)
+ON CONFLICT DO NOTHING
+RETURNING *;

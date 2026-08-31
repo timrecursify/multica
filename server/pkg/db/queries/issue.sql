@@ -433,3 +433,21 @@ UPDATE issue
 SET first_executed_at = now()
 WHERE id = $1 AND first_executed_at IS NULL
 RETURNING id, workspace_id, creator_type, creator_id, first_executed_at;
+
+-- name: LockIssueForRelayAdvance :one
+-- Exclusive row lock on the issue for the relay issue-stage advancement service.
+-- The relay must update the issue status and insert the successor agent_task_queue in
+-- one atomic transaction; the FOR UPDATE serializes concurrent relay requests so
+-- repeated/concurrent delivery resolves idempotently and cannot double-enqueue.
+
+SELECT * FROM issue
+WHERE id = $1
+FOR UPDATE;
+
+-- name: CreateRelayRunLog :one
+-- Records a stage transition attempt + its successor task for audit. Written
+-- inside the relay advancement transaction only when a successor task was
+-- created, so a dedup (task already pending) does not write a second row.
+INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING *;
