@@ -494,7 +494,8 @@ async function relayAdvance(req, res, body) {
       // reached the flight receives an explicit human disposition.
       const history = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
-          WHERE issue_id = $1 AND context->>'to_stage' = $2`,
+          WHERE issue_id = $1 AND context->>'to_stage' = $2
+            AND started_at IS NOT NULL`,
         [issue.id, to_stage]
       );
       const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);

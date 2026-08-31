@@ -47,6 +47,9 @@ test('paid dispatch requires a live configured agent', () => {
 });
 
 test('stage cycle breaker parks repeated model calls for manual disposition', () => {
+  // queued_expired rows have no started_at and therefore do not consume the
+  // paid-attempt budget; two such rows still leave a flight admissible.
+  assert.deepEqual(stageCycleAdmission(0), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(2), {
     ok: false, reason: 'stage_cycle_limit', ceiling: 2, disposition: 'Human Review'

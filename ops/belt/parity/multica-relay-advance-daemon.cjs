@@ -462,8 +462,8 @@ async function requeueStrandedTasks() {
     if (candidates.rows.length === 0) return;
 
     // Backpressure, scoped per owning agent. Each agent carries its own
-    // authoritative ceiling in `agent.max_concurrent_tasks` (build lane 9, each
-    // QC worker 5 as of 2026-08-31), so no constant needs inventing here;
+    // authoritative concurrency ceiling in `agent.max_concurrent_tasks` (build
+    // lane 9, each QC worker 5 as of 2026-08-31), so no constant needs inventing;
     // RELAY_MAX_CONCURRENT survives only as the fallback for an agent with no
     // cap recorded.
     //
@@ -587,7 +587,8 @@ async function requeueStrandedTasks() {
         await client.query('SELECT id FROM issue WHERE id = $1 FOR UPDATE', [row.issue_id]);
         const history = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
-            WHERE issue_id = $1 AND context->>'to_stage' = $2`,
+            WHERE issue_id = $1 AND context->>'to_stage' = $2
+              AND started_at IS NOT NULL`,
           [row.issue_id, row.stage]
         );
         const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);

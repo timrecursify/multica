@@ -78,8 +78,9 @@ function spendPreflight(agent, selectedRuntime = {}) {
   const model = String(selectedRuntime.model || agent.model || '').trim();
   const provider = String(selectedRuntime.provider || '').toLowerCase();
   const paid = selectedRuntime.paid === true || provider === 'openrouter' || /^deepseek[/:]/i.test(model);
-  // Subscription lanes (Luna/Sol) are not blocked by an absent cap. A cap is
-  // mandatory only when the selected provider/model can spend OpenRouter funds.
+  // Subscription lanes (Luna/Sol) are not blocked by an absent concurrency
+  // setting. Both concurrency and an explicit token budget are mandatory when
+  // the selected provider/model can spend OpenRouter funds.
   if (paid && (!Number.isInteger(cap) || cap <= 0)) return { ok: false, reason: 'invalid_concurrency_cap' };
   if (paid && !model) return { ok: false, reason: 'missing_model' };
   const tokenBudget = Number(selectedRuntime.token_budget ?? agent.token_budget ??

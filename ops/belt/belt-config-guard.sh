@@ -457,8 +457,9 @@ guard_workspace_repos() {
 # 2026-08-31: the old headroom bound here was `12 - (queued+running)`, which with
 # 300+ queued is always negative, so this guard was a permanent no-op. The bound
 # was also the wrong idea: QUEUE DEPTH DOES NOT SPEND. The Tower's global
-# concurrency cap is the spend governor, so re-driving a stranded flight only
-# adds a queued row and costs nothing until a slot frees. Every stranded flight
+# concurrency setting limits simultaneous work; an explicit paid token budget is
+# the spend admission. Re-driving a stranded flight only adds a queued row and
+# costs nothing until a slot frees. Every stranded flight
 # is work Tim asked to see finished, so the correct batch size is "all of them".
 guard_stranded_review() {
   local number board ws
