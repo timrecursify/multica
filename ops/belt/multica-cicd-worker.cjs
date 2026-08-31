@@ -50,7 +50,6 @@ async function closePendingTask(issueId) {
 }
 
 async function finish(issue, note) {
-  await closePendingTask(issue.id);
   const verdict = await pool.query(
     `SELECT verdict, work_product_md5 FROM qc_verdict
       WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1`, [issue.id]);
@@ -59,6 +58,7 @@ async function finish(issue, note) {
     throw new Error('Done requires a current PASS verdict and work-product hash');
   }
   await relay(issue.id, 'Done', latest.work_product_md5);
+  await closePendingTask(issue.id);
   log(`DONE #${issue.number} — ${note}`);
 }
 
