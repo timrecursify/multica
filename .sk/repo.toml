@@ -1,0 +1,31 @@
+[[profile]]
+name = "backend-handler"
+command_argv = ["/bin/bash", "scripts/sk-backend-handler.sh"]
+working_directory = "."
+env_allowlist = ["SK_TEST_SELECTOR"]
+timeout = 600
+hermetic = true
+
+[[profile]]
+name = "bash-syntax"
+command_argv = ["/bin/bash", "scripts/sk-bash-syntax.sh"]
+working_directory = "."
+env_allowlist = []
+timeout = 120
+hermetic = true
+
+[[profile]]
+name = "diff-whitespace"
+command_argv = ["/bin/bash", "scripts/sk-diff-whitespace.sh"]
+working_directory = "."
+env_allowlist = []
+timeout = 120
+hermetic = true
+
+[[profile]]
+name = "docs-lint"
+command_argv = ["/usr/bin/python3", "scripts/sk-docs-lint.py"]
+working_directory = "."
+env_allowlist = []
+timeout = 120
+hermetic = true

@@ -692,3 +692,12 @@ Worktree:
 ```bash
 make check-worktree
 ```
+
+### Bounded repository checks
+
+Run `sk repo test --path . --profile NAME --json` for the committed hermetic profiles:
+`bash-syntax`, `diff-whitespace`, and `docs-lint`. The `backend-handler` profile runs the
+exact bounded command `go test ./internal/handler -run 'TestIssueCRUD|TestGitHubWebhook' -count=1`
+using the provisioned Go 1.26.1 toolchain under `.sk/toolchains/go1.26.1`; set
+`SK_TEST_SELECTOR` to choose an exact selector. Profiles use no caller credentials, network,
+`.git` state, or mutable files outside the checkout.
