@@ -39,9 +39,10 @@ as `python3 /home/newadmin/tools/multica-bundle.py`.
 ## Deploy and verify
 
 `./deploy.sh` is dry-run by default. Use `./deploy.sh --apply` only when an
-operator has approved changing the live runtime. Before every copy, it backs up
-the current runtime file as `<runtime-path>.bak-<UTC timestamp>` and restarts
-nothing.
+operator has approved changing the live runtime. It preflights every file,
+creates all backups before copying, and restores touched targets on a partial
+failure. A successful apply prints `./deploy.sh --rollback <UTC timestamp>`;
+that command restores the matching backup set. No process is restarted.
 
 `./verify.sh` compares every repository copy with its runtime path and exits
 non-zero when any file is missing or differs.
