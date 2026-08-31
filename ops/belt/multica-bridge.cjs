@@ -497,14 +497,14 @@ async function relayAdvance(req, res, body) {
           `SELECT count(*)::int AS n
              FROM relay_run_log
             WHERE issue_id = $1 AND from_stage = $2 AND to_stage = $3
-              AND status = 'failed'
+              AND status = 'rejected'
               AND created_at >= NOW() - INTERVAL '24 hours'`,
           [issue.id, issue.status, to_stage]
         );
         const rejectionCount = Number(rejected.rows[0]?.n || 0) + 1;
         await client.query(
           `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, status)
-           VALUES ($1, $2, $3, $4, 'failed')`,
+           VALUES ($1, $2, $3, $4, 'rejected')`,
           [issue.id, issue.status, to_stage, stage.agent_id]
         );
         const capped = rejectionCount >= STAGE_CYCLE_LIMIT;

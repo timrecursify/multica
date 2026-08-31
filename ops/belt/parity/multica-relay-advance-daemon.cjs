@@ -5,7 +5,8 @@ const {
   retryAdmission,
   spendPreflight,
   stageCycleAdmission,
-  lifetimeTaskAdmission
+  lifetimeTaskAdmission,
+  quotaCircuitAdmission
 } = require('../guardrails.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
@@ -41,6 +42,31 @@ const MAX_CONCURRENT = Number.parseInt(process.env.RELAY_MAX_CONCURRENT || '12',
 const QUEUED_TASK_TTL_MINUTES = Number.parseInt(process.env.MULTICA_QUEUED_TASK_TTL_MINUTES || '120', 10);
 const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || '2', 10);
 const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMIT || '6', 10);
+const QUOTA_FAILURE_LIMIT = Number.parseInt(process.env.RELAY_QUOTA_FAILURE_LIMIT || '3', 10);
+
+async function pauseQuotaLane(client, row, consecutiveFailures) {
+  const paused = await client.query(
+    `UPDATE agent
+        SET runtime_config = COALESCE(runtime_config, '{}'::jsonb) || '{"quota_paused":true}'::jsonb,
+            updated_at = NOW()
+      WHERE id = $1
+        AND runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
+      RETURNING id`,
+    [row.agent_id]
+  );
+  if (paused.rowCount > 0) {
+    await client.query(
+      `INSERT INTO activity_log
+         (workspace_id, issue_id, actor_type, action, details)
+       SELECT workspace_id, id, 'system', 'relay_lane_paused', $2::jsonb
+         FROM issue WHERE id = $1`,
+      [row.issue_id, JSON.stringify({ agent_id: row.agent_id,
+        reason: 'provider_quota_limit', consecutive_failures: consecutiveFailures,
+        ceiling: QUOTA_FAILURE_LIMIT })]
+    );
+  }
+  return paused.rowCount > 0;
+}
 
 async function applyDisposition(client, row, disposition, reason, evidence = {}) {
   const changed = await client.query(
@@ -340,7 +366,8 @@ async function findAndAdvanceRegistered() {
                WHERE r.issue_id = i.id
                  AND r.from_stage = 'Registered'
                  AND r.to_stage = 'Spec'
-                 AND r.status = 'failed'
+                 AND r.status = 'rejected'
+                 AND r.created_at >= NOW() - INTERVAL '24 hours'
             ) < $3
           )
           AND (
@@ -447,6 +474,7 @@ async function requeueStrandedTasks() {
              FROM relay_stage_config rsc
              JOIN agent a ON a.id = rsc.agent_id AND a.archived_at IS NULL
             WHERE rsc.next_stage = i.status
+              AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
             ORDER BY rsc.id LIMIT 1
          ) r ON true
         WHERE i.status = ANY($3)
@@ -645,12 +673,25 @@ async function requeueStrandedTasks() {
         // Serialize admission with the bridge and other recovery workers. The
         // issue lock plus stage-scoped predicate prevents duplicate paid rows.
         await client.query('SELECT id FROM issue WHERE id = $1 FOR UPDATE', [row.issue_id]);
-        if (/\b402\b|payment[ _-]?required/i.test(String(row.failure_reason || ''))) {
+        if (quotaCircuitAdmission([row.failure_reason], 1).pause) {
+          const recentFailures = await client.query(
+            `SELECT failure_reason FROM agent_task_queue
+              WHERE agent_id = $1 AND status = 'failed'
+              ORDER BY created_at DESC LIMIT $2`,
+            [row.agent_id, QUOTA_FAILURE_LIMIT]
+          );
+          const circuit = quotaCircuitAdmission(
+            recentFailures.rows.map((failure) => failure.failure_reason), QUOTA_FAILURE_LIMIT
+          );
+          const lanePaused = circuit.pause
+            ? await pauseQuotaLane(client, row, circuit.consecutive)
+            : false;
           const moved = await applyDisposition(client, row, 'Human Review', 'payment_required_402', {
-            dead_task_id: row.dead_task_id
+            dead_task_id: row.dead_task_id, consecutive_failures: circuit.consecutive,
+            lane_paused: lanePaused
           });
           await client.query('COMMIT');
-          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}`);
+          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}; lane_paused=${lanePaused}`);
           continue;
         }
         const history = await client.query(
