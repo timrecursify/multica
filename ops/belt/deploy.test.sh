@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+node "$root_dir/multica-cicd-worker.test.cjs"
 
 # Regression: an operator hold must suppress only the AI worker's self-healing
 # path; the other pipeline services must remain in the liveness set.
