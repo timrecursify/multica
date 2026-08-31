@@ -58,4 +58,15 @@ receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$appl
 [[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" >/dev/null
 [[ ! -e "$tmp_dir/gsp-multica/guardrails.cjs" ]] || { echo 'rollback did not remove new target' >&2; exit 1; }
+
+before_bridge="$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")"
+printf '\nstale-runtime\n' >> "$tmp_dir/multica-cicd-worker.cjs"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-cicd-worker >"$tmp_dir/selective.log"
+cmp -s -- "$root_dir/multica-cicd-worker.cjs" "$tmp_dir/multica-cicd-worker.cjs"
+[[ "$before_bridge" == "$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")" ]]
+grep -q 'Backed up .*/multica-cicd-worker.cjs' "$tmp_dir/selective.log"
+[[ "$(grep -c '^Backed up ' "$tmp_dir/selective.log")" -eq 1 ]]
+selective_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-cicd-worker$/\1/p' "$tmp_dir/selective.log")"
+[[ "$selective_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$selective_receipt" --only multica-cicd-worker >/dev/null
 echo 'deploy rollback test passed'
