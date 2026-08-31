@@ -78,3 +78,7 @@ data/
 # Python (agent tooling)
 __pycache__/
 *.pyc
+
+# sk repo test output and caches
+.sk/run/
+.sk/scripts/__pycache__/
