@@ -10,6 +10,13 @@ DECLARE
     agent_workspace UUID;
     runtime_workspace UUID;
 BEGIN
+    -- Historical/terminal rows are intentionally exempt.  Runtime and source
+    -- cleanup can null or delete their foreign keys, and these rows must remain
+    -- deletable and queryable.
+    IF NEW.completed_at IS NOT NULL OR NEW.status IN ('completed', 'failed', 'cancelled') THEN
+        RETURN NEW;
+    END IF;
+
     SELECT workspace_id INTO agent_workspace FROM agent WHERE id = NEW.agent_id;
     SELECT workspace_id INTO runtime_workspace FROM agent_runtime WHERE id = NEW.runtime_id;
 
@@ -20,8 +27,13 @@ BEGIN
         NULLIF(NEW.context->>'workspace_id', '')::uuid
     ) INTO task_workspace;
 
-    IF agent_workspace IS NULL OR runtime_workspace IS NULL OR task_workspace IS NULL
-       OR agent_workspace <> runtime_workspace OR agent_workspace <> task_workspace THEN
+    -- Some legacy active rows have no resolvable source (for example an old
+    -- quick-create record).  Enforce equality whenever a task workspace can
+    -- be resolved, while still requiring agent/runtime agreement for active
+    -- rows that carry a source.
+    IF task_workspace IS NOT NULL AND
+       (agent_workspace IS NULL OR runtime_workspace IS NULL
+        OR agent_workspace <> runtime_workspace OR agent_workspace <> task_workspace) THEN
         RAISE EXCEPTION 'agent task workspace invariant violated'
             USING ERRCODE = '23514';
     END IF;
