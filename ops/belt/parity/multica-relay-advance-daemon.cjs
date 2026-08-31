@@ -186,7 +186,9 @@ async function findAndAdvanceTasks() {
           console.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})`);
           await markRelayLogCompletedById(client, row.log_id);
         } else {
-          console.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}`);
+          // The relay's own error text was parsed and then discarded, so 76 of every
+          // 400 log lines were a bare `status 409` with no cause. Print the reason.
+          console.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
           await markRelayLogFailedById(client, row.log_id);
         }
       } catch (err) {
@@ -244,7 +246,7 @@ async function recoveryAdvanceTasks() {
           console.log(`${LOG_PREFIX} [recovery] Advanced Registered ticket ${row.issue_id} '${row.to_stage}' → '${row.next_stage}'`);
           await markRelayLogCompleted(client, row.issue_id);
         } else {
-          console.log(`${LOG_PREFIX} [recovery] Failed: ${row.issue_id} status ${response.status}`);
+          console.log(`${LOG_PREFIX} [recovery] Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
           await markRelayLogFailed(client, row.issue_id);
         }
       } catch (err) {
@@ -311,7 +313,7 @@ async function findAndAdvanceRegistered() {
         if (response.ok) {
           console.log(`${LOG_PREFIX} Advanced Registered ticket ${row.id} (#${row.number}) → Spec`);
         } else {
-          console.log(`${LOG_PREFIX} Failed: ${row.id} status ${response.status}`);
+          console.log(`${LOG_PREFIX} Failed: ${row.id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
         }
       } catch (err) {
         console.error(`${LOG_PREFIX} Error advancing Registered: ${err.message}`);
