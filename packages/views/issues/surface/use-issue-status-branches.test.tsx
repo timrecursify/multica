@@ -23,7 +23,7 @@ function makeIssue(id: string): Issue {
     identifier: id === "issue-1" ? "MUL-1" : "MUL-2",
     title: id,
     description: null,
-    status: "todo",
+    status: "Queue",
     priority: "none",
     assignee_type: null,
     assignee_id: null,
@@ -99,7 +99,7 @@ describe("useIssueStatusBranches", () => {
             facets: [
               {
                 kind: "status",
-                values: [{ key: "todo", count: 2 }],
+                values: [{ key: "Queue", count: 2 }],
               },
             ],
           },
@@ -108,7 +108,7 @@ describe("useIssueStatusBranches", () => {
           enabled: true,
         }),
       {
-        initialProps: { statuses: ["todo"] },
+        initialProps: { statuses: ["Queue"] },
         wrapper: wrapper(queryClient),
       },
     );
@@ -118,12 +118,12 @@ describe("useIssueStatusBranches", () => {
         "issue-1",
       ]),
     );
-    expect(result.current.pagination.todo.total).toBe(2);
-    expect(result.current.pagination.todo.hasMore).toBe(true);
+    expect(result.current.pagination["Queue"].total).toBe(2);
+    expect(result.current.pagination["Queue"].hasMore).toBe(true);
     expect(result.current.total).toBe(2);
     expect(result.current.isTotalKnown).toBe(true);
 
-    act(() => result.current.pagination.todo.loadMore());
+    act(() => result.current.pagination["Queue"].loadMore());
     await waitFor(() =>
       expect(result.current.issues.map((issue) => issue.id)).toEqual([
         "issue-1",
@@ -133,7 +133,7 @@ describe("useIssueStatusBranches", () => {
     expect(listIssueTableRows).toHaveBeenNthCalledWith(
       2,
       expect.objectContaining({
-        group_key: "status:todo",
+        group_key: "status:Queue",
         page: { limit: 50, cursor: "cursor-2" },
       }),
     );
@@ -142,7 +142,7 @@ describe("useIssueStatusBranches", () => {
     // reuses the settled cursor pages instead of restarting another chain.
     rerender({ statuses: [] });
     expect(result.current.issues).toEqual([]);
-    rerender({ statuses: ["todo"] });
+    rerender({ statuses: ["Queue"] });
     await waitFor(() => expect(result.current.issues).toHaveLength(2));
     expect(listIssueTableRows).toHaveBeenCalledTimes(2);
 

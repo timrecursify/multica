@@ -67,7 +67,7 @@ const baseIssue: Issue = {
   identifier: "MUL-1",
   title: "Test",
   description: null,
-  status: "todo",
+  status: "Queue",
   priority: "none",
   assignee_type: null,
   assignee_id: null,
@@ -101,7 +101,7 @@ const otherIssue: Issue = {
 function makeListCache(...issues: Issue[]): ListIssuesCache {
   return {
     byStatus: {
-      todo: { issues, total: issues.length },
+      "Queue": { issues, total: issues.length },
     },
   };
 }
@@ -183,7 +183,7 @@ describe("onIssueLabelsChanged", () => {
 
   it("still patches the list, Table row, and detail caches", () => {
     qc.setQueryData<ListIssuesCache>(issueKeys.list(WS_ID), {
-      byStatus: { todo: { issues: [baseIssue], total: 1 } },
+      byStatus: { "Queue": { issues: [baseIssue], total: 1 } },
     });
     qc.setQueryData<Issue>(issueKeys.detail(WS_ID, ISSUE_ID), baseIssue);
     seedTableRow(qc);
@@ -191,7 +191,7 @@ describe("onIssueLabelsChanged", () => {
     onIssueLabelsChanged(qc, WS_ID, ISSUE_ID, [labelB]);
 
     const list = qc.getQueryData<ListIssuesCache>(issueKeys.list(WS_ID));
-    expect(list?.byStatus.todo?.issues[0]?.labels).toEqual([labelB]);
+    expect(list?.byStatus["Queue"]?.issues[0]?.labels).toEqual([labelB]);
 
     const detail = qc.getQueryData<Issue>(issueKeys.detail(WS_ID, ISSUE_ID));
     expect(detail?.labels).toEqual([labelB]);
@@ -292,7 +292,7 @@ describe("onIssueMetadataChanged", () => {
     });
     qc.setQueryData<ListIssuesCache>(issueKeys.list(WS_ID), {
       byStatus: {
-        todo: {
+        "Queue": {
           issues: [{ ...baseIssue, metadata: { pr_number: 1 } }],
           total: 1,
         },
@@ -308,7 +308,7 @@ describe("onIssueMetadataChanged", () => {
     const detail = qc.getQueryData<Issue>(issueKeys.detail(WS_ID, ISSUE_ID));
     expect(detail?.metadata).toEqual({ pr_number: 2 });
     const list = qc.getQueryData<ListIssuesCache>(issueKeys.list(WS_ID));
-    expect(list?.byStatus.todo?.issues[0]?.metadata).toEqual({ pr_number: 2 });
+    expect(list?.byStatus["Queue"]?.issues[0]?.metadata).toEqual({ pr_number: 2 });
     expect(
       qc.getQueryData<IssueTableRowsResponse>(tableRowKey)?.rows[0]?.issue
         .metadata,
@@ -452,7 +452,7 @@ describe("project progress invalidation", () => {
         title: "Project",
         description: null,
         icon: null,
-        status: "in_progress",
+        status: "In Progress",
         priority: "none",
         lead_type: null,
         lead_id: null,
@@ -468,7 +468,7 @@ describe("project progress invalidation", () => {
   it("invalidates project queries when an issue status changes", () => {
     onIssueUpdated(qc, WS_ID, {
       id: ISSUE_ID,
-      status: "done",
+      status: "Done",
     });
 
     expectInvalidated(qc, projectKeys.list(WS_ID));
@@ -496,7 +496,7 @@ describe("onIssueCreated — carries the label snapshot into list cache", () => 
     onIssueCreated(qc, WS_ID, { ...baseIssue, labels: [labelA, labelB] });
 
     const cache = qc.getQueryData<ListIssuesCache>(issueKeys.list(WS_ID));
-    const cached = cache?.byStatus.todo?.issues.find((i) => i.id === ISSUE_ID);
+    const cached = cache?.byStatus["Queue"]?.issues.find((i) => i.id === ISSUE_ID);
     expect(cached?.labels).toEqual([labelA, labelB]);
   });
 });
@@ -519,7 +519,7 @@ describe("onIssueUpdated — position move is surgical, not a list refetch", () 
 
     const list = qc.getQueryData<ListIssuesCache>(issueKeys.list(WS_ID));
     // Surgically reordered into its new slot: proof the patch alone suffices.
-    expect(list?.byStatus.todo?.issues.map((i) => i.id)).toEqual(["issue-2", "issue-1"]);
+    expect(list?.byStatus["Queue"]?.issues.map((i) => i.id)).toEqual(["issue-2", "issue-1"]);
     // The old redundant `position -> invalidate(list)` is gone — no full-board
     // refetch on top of the surgical patch (that was the flicker source).
     expect(qc.getQueryState(issueKeys.list(WS_ID))?.isInvalidated).toBe(false);
@@ -533,7 +533,7 @@ describe("onIssueUpdated — position move is surgical, not a list refetch", () 
     onIssueUpdated(qc, WS_ID, { ...issueA, position: 20 });
 
     const my = qc.getQueryData<ListIssuesCache>(issueKeys.myAll(WS_ID));
-    expect(my?.byStatus.todo?.issues.map((i) => i.id)).toEqual(["issue-2", "issue-1"]);
+    expect(my?.byStatus["Queue"]?.issues.map((i) => i.id)).toEqual(["issue-2", "issue-1"]);
     // Reconciled in place — no full-list refetch on My Issues (that was the
     // remaining drag flicker on filtered boards).
     expect(qc.getQueryState(issueKeys.myAll(WS_ID))?.isInvalidated).toBe(false);
@@ -559,8 +559,8 @@ describe("onIssueUpdated — position move is surgical, not a list refetch", () 
     // The card LEAVES the loaded list surgically — the fix for the residue
     // that used to wait on a refetch (and on the mutation path never came).
     const list = qc.getQueryData<ListIssuesCache>(assignedKey);
-    expect(list?.byStatus.todo?.issues).toEqual([]);
-    expect(list?.byStatus.todo?.total).toBe(0);
+    expect(list?.byStatus["Queue"]?.issues).toEqual([]);
+    expect(list?.byStatus["Queue"]?.total).toBe(0);
     expect(qc.getQueryState(assignedKey)?.isInvalidated).toBe(false);
   });
 
@@ -579,7 +579,7 @@ describe("onIssueUpdated — position move is surgical, not a list refetch", () 
     // Union membership (assigned ∪ created ∪ involved) is server knowledge:
     // the card is patched in place and the list refetches to reconcile.
     const list = qc.getQueryData<ListIssuesCache>(myAllListKey);
-    expect(list?.byStatus.todo?.issues[0]?.assignee_id).toBe("user-2");
+    expect(list?.byStatus["Queue"]?.issues[0]?.assignee_id).toBe("user-2");
     expectInvalidated(qc, myAllListKey);
   });
 
@@ -600,7 +600,7 @@ describe("onIssueUpdated — position move is surgical, not a list refetch", () 
     // Never hard-inserted (its page/slot is server knowledge) — the loaded
     // target list is refetched instead.
     expect(
-      qc.getQueryData<ListIssuesCache>(targetKey)?.byStatus.todo?.issues,
+      qc.getQueryData<ListIssuesCache>(targetKey)?.byStatus["Queue"]?.issues,
     ).toEqual([]);
     expectInvalidated(qc, targetKey);
   });
@@ -624,7 +624,7 @@ describe("onIssueUpdated — position move is surgical, not a list refetch", () 
     onIssueUpdated(qc, WS_ID, moved, { projectChanged: true });
 
     expect(
-      qc.getQueryData<ListIssuesCache>(oldProjectKey)?.byStatus.todo?.issues,
+      qc.getQueryData<ListIssuesCache>(oldProjectKey)?.byStatus["Queue"]?.issues,
     ).toEqual([]);
   });
 
@@ -670,15 +670,15 @@ describe("onIssueUpdated — off-screen status change reconciles column counts",
     // arrays are the loaded window — the moved issue lives beyond it.
     qc.setQueryData<ListIssuesCache>(issueKeys.list(WS_ID), {
       byStatus: {
-        in_review: { issues: [], total: 1 },
-        done: { issues: [], total: 60 },
+        "In Review": { issues: [], total: 1 },
+        "Done": { issues: [], total: 60 },
       },
     });
 
     onIssueUpdated(
       qc,
       WS_ID,
-      { id: "off-screen", status: "done" },
+      { id: "off-screen", status: "Done" },
       { statusChanged: true },
     );
 
@@ -687,13 +687,13 @@ describe("onIssueUpdated — off-screen status change reconciles column counts",
 
   it("refetches the filtered myAll list under the same condition", () => {
     qc.setQueryData<ListIssuesCache>(issueKeys.myAll(WS_ID), {
-      byStatus: { done: { issues: [], total: 60 } },
+      byStatus: { "Done": { issues: [], total: 60 } },
     });
 
     onIssueUpdated(
       qc,
       WS_ID,
-      { id: "off-screen", status: "done" },
+      { id: "off-screen", status: "Done" },
       { statusChanged: true },
     );
 
@@ -708,47 +708,47 @@ describe("onIssueUpdated — off-screen status change reconciles column counts",
     // (Before the fix this branch moved counts with no stale key: an open
     // board showed "done 61" with 60 visible rows until something else
     // happened to invalidate the list.)
-    const offScreen: Issue = { ...baseIssue, id: "off-screen", status: "in_review" };
+    const offScreen: Issue = { ...baseIssue, id: "off-screen", status: "In Review" };
     qc.setQueryData<Issue>(issueKeys.detail(WS_ID, "off-screen"), offScreen);
     qc.setQueryData<ListIssuesCache>(issueKeys.list(WS_ID), {
       byStatus: {
-        in_review: { issues: [], total: 1 },
-        done: { issues: [], total: 60 },
+        "In Review": { issues: [], total: 1 },
+        "Done": { issues: [], total: 60 },
       },
     });
 
     onIssueUpdated(
       qc,
       WS_ID,
-      { ...offScreen, status: "done" },
+      { ...offScreen, status: "Done" },
       { statusChanged: true },
     );
 
     const list = qc.getQueryData<ListIssuesCache>(issueKeys.list(WS_ID));
-    expect(list?.byStatus.in_review?.total).toBe(0);
-    expect(list?.byStatus.done?.total).toBe(61);
+    expect(list?.byStatus["In Review"]?.total).toBe(0);
+    expect(list?.byStatus["Done"]?.total).toBe(61);
     expectInvalidated(qc, issueKeys.list(WS_ID));
   });
 
   it("does NOT refetch when the status-changed issue is loaded (surgical patch suffices)", () => {
-    const loaded: Issue = { ...baseIssue, id: "loaded", status: "in_review" };
+    const loaded: Issue = { ...baseIssue, id: "loaded", status: "In Review" };
     qc.setQueryData<ListIssuesCache>(issueKeys.list(WS_ID), {
       byStatus: {
-        in_review: { issues: [loaded], total: 1 },
-        done: { issues: [], total: 60 },
+        "In Review": { issues: [loaded], total: 1 },
+        "Done": { issues: [], total: 60 },
       },
     });
 
     onIssueUpdated(
       qc,
       WS_ID,
-      { ...loaded, status: "done" },
+      { ...loaded, status: "Done" },
       { statusChanged: true },
     );
 
     const list = qc.getQueryData<ListIssuesCache>(issueKeys.list(WS_ID));
-    expect(list?.byStatus.in_review?.total).toBe(0);
-    expect(list?.byStatus.done?.total).toBe(61);
+    expect(list?.byStatus["In Review"]?.total).toBe(0);
+    expect(list?.byStatus["Done"]?.total).toBe(61);
     // Reconciled in place — the no-flicker fast path from #4415 must hold.
     expect(qc.getQueryState(issueKeys.list(WS_ID))?.isInvalidated).toBe(false);
   });
@@ -757,7 +757,7 @@ describe("onIssueUpdated — off-screen status change reconciles column counts",
     // A title/label edit of an off-screen issue cannot affect any count, so it
     // must not trigger a fallback refetch.
     qc.setQueryData<ListIssuesCache>(issueKeys.list(WS_ID), {
-      byStatus: { done: { issues: [], total: 60 } },
+      byStatus: { "Done": { issues: [], total: 60 } },
     });
 
     onIssueUpdated(qc, WS_ID, { id: "off-screen", title: "renamed" });
@@ -881,14 +881,14 @@ describe("onIssueDeleted", () => {
     const myList = qc.getQueryData<ListIssuesCache>(
       issueKeys.myList(WS_ID, "assigned", myFilter),
     );
-    expect(list?.byStatus.todo?.issues.map((i) => i.id)).toEqual([
+    expect(list?.byStatus["Queue"]?.issues.map((i) => i.id)).toEqual([
       OTHER_ISSUE_ID,
     ]);
-    expect(list?.byStatus.todo?.total).toBe(1);
-    expect(myList?.byStatus.todo?.issues.map((i) => i.id)).toEqual([
+    expect(list?.byStatus["Queue"]?.total).toBe(1);
+    expect(myList?.byStatus["Queue"]?.issues.map((i) => i.id)).toEqual([
       OTHER_ISSUE_ID,
     ]);
-    expect(myList?.byStatus.todo?.total).toBe(1);
+    expect(myList?.byStatus["Queue"]?.total).toBe(1);
     expectInvalidated(qc, issueKeys.list(WS_ID));
     expectInvalidated(qc, issueKeys.myList(WS_ID, "assigned", myFilter));
   });
@@ -947,7 +947,7 @@ describe("onIssueDeleted", () => {
     const myList = qc.getQueryData<ListIssuesCache>(
       issueKeys.myList(WS_ID, "assigned", myFilter),
     );
-    expect(myList?.byStatus.todo?.issues.map((i) => i.id)).toEqual([
+    expect(myList?.byStatus["Queue"]?.issues.map((i) => i.id)).toEqual([
       OTHER_ISSUE_ID,
     ]);
     expectInvalidated(qc, issueKeys.children(WS_ID, PARENT_ISSUE_ID));
@@ -964,7 +964,7 @@ describe("onIssueDeleted", () => {
     ]);
     qc.setQueryData(
       issueKeys.childProgress(WS_ID),
-      new Map([[ISSUE_ID, { done: 0, total: 1 }]]),
+      new Map([[ISSUE_ID, { "Done": 0, total: 1 }]]),
     );
 
     onIssueDeleted(qc, WS_ID, ISSUE_ID);

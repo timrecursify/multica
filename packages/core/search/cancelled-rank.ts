@@ -20,6 +20,7 @@
  */
 
 import type { SearchIssueResult, SearchProjectResult } from "../types/api";
+import { isCancelledIssueStatus } from "../issues/config/status";
 
 /**
  * Mirrors the server's identifier pattern (parseQueryNumber in
@@ -153,7 +154,8 @@ export function partitionAggregatedSearchResults({
 }): AggregatedSearchPartition {
   const issueParts = partitionStable(
     issues,
-    (issue) => issue.status === "cancelled" && !isIssueDirectHit(issue, query),
+    (issue) =>
+      isCancelledIssueStatus(issue.status) && !isIssueDirectHit(issue, query),
   );
   const projectParts = partitionStable(
     projects,

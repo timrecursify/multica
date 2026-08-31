@@ -280,8 +280,8 @@ describe("TableView cell editors under data refresh", () => {
   // it never masks a real hang.
   it("keeps the status picker open and the row order frozen across a refresh, then catches up on close", async () => {
     const user = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
-    const issueA = makeIssue("a", "Alpha task", "todo");
-    const issueB = makeIssue("b", "Beta task", "in_progress");
+    const issueA = makeIssue("a", "Alpha task", "Queue");
+    const issueB = makeIssue("b", "Beta task", "In Progress");
     serverIssues = [issueA, issueB];
     const progress1 = new Map<string, ChildProgress>();
     const surfaceKey = `test-surface-${Math.floor(Math.random() * 1e9)}`;
@@ -300,11 +300,11 @@ describe("TableView cell editors under data refresh", () => {
     await screen.findByText("MUL-a");
     expect(identifiers()).toEqual(["MUL-a", "MUL-b"]);
 
-    // Open the status picker on row A: its cell trigger shows "Todo".
+    // Open the status picker on row A: its cell trigger shows "Queue".
     const rowA = screen.getByText("MUL-a").closest("tr")!;
-    await user.click(within(rowA).getByRole("button", { name: /Todo/ }));
-    // Base UI portals the popup; "Backlog" only exists while it is open.
-    expect(screen.getByRole("button", { name: /Backlog/ })).toBeTruthy();
+    await user.click(within(rowA).getByRole("button", { name: /Queue/ }));
+    // Base UI portals the popup; "Registered" only exists while it is open.
+    expect(screen.getByRole("button", { name: /Registered/ })).toBeTruthy();
 
     // A realtime refresh lands: new array identities, rows reordered, new
     // childProgressMap. The popup must stay open and the structure must hold
@@ -338,15 +338,15 @@ describe("TableView cell editors under data refresh", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Backlog/ })).toBeTruthy();
+      expect(screen.getByRole("button", { name: /Registered/ })).toBeTruthy();
       expect(identifiers()).toEqual(["MUL-a", "MUL-b"]);
       // …while the VALUES inside the frozen rows keep tracking live data.
       expect(screen.getByText("Alpha task (updated)")).toBeTruthy();
     });
 
     // Selecting a value closes the editor; the deferred live order applies.
-    await user.click(screen.getByRole("button", { name: /Backlog/ }));
-    expect(screen.queryByRole("button", { name: /Backlog/ })).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Registered/ }));
+    expect(screen.queryByRole("button", { name: /Registered/ })).toBeNull();
     expect(identifiers()).toEqual(["MUL-b", "MUL-a"]);
   }, 60_000);
 
@@ -354,7 +354,7 @@ describe("TableView cell editors under data refresh", () => {
     const user = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
     const onCreateIssue = vi.fn();
     const issue = {
-      ...makeIssue("a", "Alpha task", "todo"),
+      ...makeIssue("a", "Alpha task", "Queue"),
       project_id: "project-1",
     };
     serverIssues = [issue];
@@ -383,7 +383,7 @@ describe("TableView cell editors under data refresh", () => {
 
   it("navigates in place on plain title and row clicks; modifiers open tabs", async () => {
     const user = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
-    serverIssues = [makeIssue("a", "Alpha task", "todo")];
+    serverIssues = [makeIssue("a", "Alpha task", "Queue")];
 
     renderWithI18n(
       <QueryClientProvider client={queryClient}>
@@ -424,7 +424,7 @@ describe("TableView cell editors under data refresh", () => {
   });
 
   it("middle click on an interactive cell does not trigger row navigation", async () => {
-    serverIssues = [makeIssue("a", "Alpha task", "todo")];
+    serverIssues = [makeIssue("a", "Alpha task", "Queue")];
 
     renderWithI18n(
       <QueryClientProvider client={queryClient}>
@@ -442,7 +442,7 @@ describe("TableView cell editors under data refresh", () => {
       );
 
     // Status cell trigger (interactive) — must NOT bubble into a row open.
-    auxClick(within(row).getByRole("button", { name: /Todo/ }));
+    auxClick(within(row).getByRole("button", { name: /Queue/ }));
     expect(navigationMocks.openInNewTab).not.toHaveBeenCalled();
     expect(navigationMocks.push).not.toHaveBeenCalled();
 
@@ -463,7 +463,7 @@ describe("TableView cell editors under data refresh", () => {
     const windowOpen = vi.fn();
     vi.stubGlobal("open", windowOpen);
     navigationState.hasOpenInNewTab = false;
-    serverIssues = [makeIssue("a", "Alpha task", "todo")];
+    serverIssues = [makeIssue("a", "Alpha task", "Queue")];
 
     renderWithI18n(
       <QueryClientProvider client={queryClient}>

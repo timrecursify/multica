@@ -88,9 +88,9 @@ var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
 // it — they canonicalize against h.IssueStatusContract so the configured
 // profile's vocabulary is authoritative. The CLI keeps its own union list.
 var validIssueStatuses = []string{
-	"Spec", "Queue", "in_progress", "in_review", "Human Review", "Done", "Cancelled", "Archived",
-	"Queue", "Spec", "Building", "QC", "In Review", "In Progress",
-	"Human Review", "Done", "Blocked", "Cancelled", "Archived", "dead_letter", "Registered",
+	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	"Registered", "Spec", "Queue", "Building", "In Progress", "QC", "In Review", "Human Review",
+	"CI/CD & Deploy", "Done", "Blocked", "Cancelled", "Archived", "dead_letter",
 }
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {

@@ -13,7 +13,17 @@
     "in_review": "レビュー中",
     "done": "完了",
     "blocked": "ブロック中",
-    "cancelled": "キャンセル済み"
+    "cancelled": "キャンセル済み",
+    "Registered": "登録済み",
+    "Spec": "仕様",
+    "Queue": "キュー",
+    "In Progress": "進行中",
+    "In Review": "レビュー中",
+    "Human Review": "人間によるレビュー",
+    "CI/CD & Deploy": "CI/CD・デプロイ",
+    "Done": "完了",
+    "Archived": "アーカイブ済み",
+    "Cancelled": "キャンセル"
   },
   "priority": {
     "urgent": "緊急",
