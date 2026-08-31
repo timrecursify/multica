@@ -110,11 +110,13 @@ running_tasks() {
 
 # 1. Tower concurrency must persist in the wrapper.
 guard_wrapper() {
-  grep -q -- "--max-concurrent-tasks=${WANT_CONCURRENCY}" "$WRAPPER" && return 0
-  if sed -i -E "s/--max-concurrent-tasks=[0-9]+/--max-concurrent-tasks=${WANT_CONCURRENCY}/" "$WRAPPER"; then
-    fixed+=("wrapper concurrency re-applied -> ${WANT_CONCURRENCY}")
-  else
-    unfixable+=("could not rewrite $WRAPPER")
+  # The wrapper resolves these values at launch; rewriting a literal flag would
+  # mask PM2 environment overrides. Drift is escalated without touching code.
+  if [[ ! -x "$WRAPPER" ]] ||
+     ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS-20' "$WRAPPER" ||
+     ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp' "$WRAPPER" ||
+     grep -q -- '--max-concurrent-tasks=' "$WRAPPER"; then
+    unfixable+=("wrapper configuration drifted; expected env-resolved concurrency/root in $WRAPPER")
   fi
 }
 
@@ -127,10 +129,10 @@ guard_tower_process() {
     unfixable+=("gsp-multica-worker held by ${AI_HOLD_FILE}")
     return 0
   fi
-  live=$(ps -eo args | grep "[m]ultica-daemon/server daemon start" \
-         | grep -o -- "--max-concurrent-tasks=[0-9]*" | head -1 | cut -d= -f2)
+  live=$(ps -eo args | grep "[m]ultica-daemon/server daemon start" | head -1)
   [[ -z "$live" ]] && { unfixable+=("Tower process not found"); return; }
-  [[ "$live" == "$WANT_CONCURRENCY" ]] && return 0
+  [[ "$live" != *"--max-concurrent-tasks="* ]] && return 0
+  [[ "$live" == *"--max-concurrent-tasks=${WANT_CONCURRENCY}"* ]] && return 0
   if (( $(running_tasks) > 0 )); then
     unfixable+=("Tower running concurrency=$live, want ${WANT_CONCURRENCY}; deferred, flights in progress")
     return
