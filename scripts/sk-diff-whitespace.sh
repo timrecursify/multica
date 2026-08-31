@@ -3,7 +3,7 @@ set -euo pipefail
 python3 - <<'PY'
 import pathlib,sys
 for path in pathlib.Path('.').rglob('*'):
- if not path.is_file() or '.git' in path.parts: continue
+ if not path.is_file() or '.git' in path.parts or not str(path).endswith('.md'): continue
  path=str(path)
  if path == 'ops/belt/multica-bridge.cjs': continue
  try:
