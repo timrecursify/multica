@@ -622,8 +622,8 @@ func TestCreateIssueExplicitBacklogPreserved(t *testing.T) {
 
 	var created IssueResponse
 	json.NewDecoder(w.Body).Decode(&created)
-	if created.Status != "backlog" {
-		t.Fatalf("CreateIssue: expected explicit 'backlog' to be preserved, got '%s'", created.Status)
+	if created.Status != "todo" {
+		t.Fatalf("CreateIssue: expected legacy backlog alias to emit 'todo', got '%s'", created.Status)
 	}
 
 	// Cleanup

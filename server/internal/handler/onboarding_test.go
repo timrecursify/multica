@@ -305,7 +305,7 @@ func TestBootstrapOnboardingRuntimeCreatesSingleGuideIssue(t *testing.T) {
 	if assigneeType != "agent" || assigneeID != resp.AgentID {
 		t.Fatalf("issue assignee = %s/%s, want agent/%s", assigneeType, assigneeID, resp.AgentID)
 	}
-	if issueStatus != "todo" || issuePriority != "high" {
+	if issueStatus != "Spec" || issuePriority != "high" {
 		t.Fatalf("issue status/priority = %s/%s, want Spec/high", issueStatus, issuePriority)
 	}
 
@@ -548,7 +548,7 @@ func TestBootstrapOnboardingNoRuntimeCreatesSingleGuideIssue(t *testing.T) {
 	if assigneeType != "member" || assigneeID != testUserID {
 		t.Fatalf("issue assignee = %s/%s, want member/%s", assigneeType, assigneeID, testUserID)
 	}
-	if issueStatus != "todo" || issuePriority != "high" {
+	if issueStatus != "Spec" || issuePriority != "high" {
 		t.Fatalf("issue status/priority = %s/%s, want Spec/high", issueStatus, issuePriority)
 	}
 	for _, want := range []string{

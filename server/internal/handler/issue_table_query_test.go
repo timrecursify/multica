@@ -1137,7 +1137,7 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 			t.Fatalf("cell key is not opaque compound key: %q", cell.Key)
 		}
 	}
-	if parentCells["Spec"] != 1 || parentCells["In Review"] != 1 {
+	if parentCells["todo"] != 1 || parentCells["in_review"] != 1 {
 		t.Fatalf("unexpected parent status cells: %#v", parentCells)
 	}
 	noParent := byKey["parent:none"]

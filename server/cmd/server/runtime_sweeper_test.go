@@ -765,9 +765,11 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	mkIssue := func(label string) string {
 		var issueID string
 		if err := testPool.QueryRow(ctx, `
-			WITH bumped AS (
-				UPDATE workspace SET issue_counter = issue_counter + 1
-				WHERE id = $1 RETURNING issue_counter
+		WITH bumped AS (
+			UPDATE workspace
+			SET issue_counter = GREATEST(issue_counter,
+				(SELECT COALESCE(MAX(number), 0) FROM issue WHERE workspace_id = $1)) + 1
+			WHERE id = $1 RETURNING issue_counter
 			)
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, assignee_type, assignee_id, number)
 			SELECT $1, $3, 'Spec', 'none', 'member', m.user_id, 'agent', $2, (SELECT issue_counter FROM bumped)
@@ -866,9 +868,11 @@ func TestExpireStaleQueuedTasksRespectsBatchLimit(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		var issueID string
 		if err := testPool.QueryRow(ctx, `
-			WITH bumped AS (
-				UPDATE workspace SET issue_counter = issue_counter + 1
-				WHERE id = $1 RETURNING issue_counter
+		WITH bumped AS (
+			UPDATE workspace
+			SET issue_counter = GREATEST(issue_counter,
+				(SELECT COALESCE(MAX(number), 0) FROM issue WHERE workspace_id = $1)) + 1
+			WHERE id = $1 RETURNING issue_counter
 			)
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, assignee_type, assignee_id, number)
 			SELECT $1, 'Queued TTL batch test', 'Spec', 'none', 'member', m.user_id, 'agent', $2, (SELECT issue_counter FROM bumped)
