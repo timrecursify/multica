@@ -300,11 +300,11 @@ describe("TableView cell editors under data refresh", () => {
     await screen.findByText("MUL-a");
     expect(identifiers()).toEqual(["MUL-a", "MUL-b"]);
 
-    // Open the status picker on row A: its cell trigger shows "Todo".
+    // Open the status picker on row A: its cell trigger shows "Queue".
     const rowA = screen.getByText("MUL-a").closest("tr")!;
-    await user.click(within(rowA).getByRole("button", { name: /Todo/ }));
-    // Base UI portals the popup; "Backlog" only exists while it is open.
-    expect(screen.getByRole("button", { name: /Backlog/ })).toBeTruthy();
+    await user.click(within(rowA).getByRole("button", { name: /Queue/ }));
+    // Base UI portals the popup; "Registered" only exists while it is open.
+    expect(screen.getByRole("button", { name: /Registered/ })).toBeTruthy();
 
     // A realtime refresh lands: new array identities, rows reordered, new
     // childProgressMap. The popup must stay open and the structure must hold
@@ -338,15 +338,15 @@ describe("TableView cell editors under data refresh", () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /Backlog/ })).toBeTruthy();
+      expect(screen.getByRole("button", { name: /Registered/ })).toBeTruthy();
       expect(identifiers()).toEqual(["MUL-a", "MUL-b"]);
       // …while the VALUES inside the frozen rows keep tracking live data.
       expect(screen.getByText("Alpha task (updated)")).toBeTruthy();
     });
 
     // Selecting a value closes the editor; the deferred live order applies.
-    await user.click(screen.getByRole("button", { name: /Backlog/ }));
-    expect(screen.queryByRole("button", { name: /Backlog/ })).toBeNull();
+    await user.click(screen.getByRole("button", { name: /Registered/ }));
+    expect(screen.queryByRole("button", { name: /Registered/ })).toBeNull();
     expect(identifiers()).toEqual(["MUL-b", "MUL-a"]);
   }, 60_000);
 
@@ -442,7 +442,7 @@ describe("TableView cell editors under data refresh", () => {
       );
 
     // Status cell trigger (interactive) — must NOT bubble into a row open.
-    auxClick(within(row).getByRole("button", { name: /Todo/ }));
+    auxClick(within(row).getByRole("button", { name: /Queue/ }));
     expect(navigationMocks.openInNewTab).not.toHaveBeenCalled();
     expect(navigationMocks.push).not.toHaveBeenCalled();
 
