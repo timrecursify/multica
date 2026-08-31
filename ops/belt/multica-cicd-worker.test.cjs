@@ -14,7 +14,7 @@ async function testFinishedRoutes() {
     relay: async (...args) => calls.push(args),
   });
   await worker.routeFinishedPR({ id: 'issue-1', number: 1 }, 'PR merged');
-  assert.deepStrictEqual(calls, [['issue-1', 'Human Review']]);
+  assert.deepStrictEqual(calls, [['issue-1', 'Parked']]);
   assert.match(queries[1].sql, /context->>'to_stage'='CI\/CD & Deploy'/);
 
   calls.length = 0;
@@ -32,7 +32,7 @@ async function testFinishedRoutes() {
     { repo: 'owner/repo', num: '7' },
     'red',
   );
-  assert.deepStrictEqual(calls, [['issue-3', 'Human Review']]);
+  assert.deepStrictEqual(calls, [['issue-3', 'Parked']]);
 }
 
 function testConsecutiveFailures() {

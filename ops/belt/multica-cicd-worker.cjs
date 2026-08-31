@@ -62,9 +62,9 @@ async function latestVerdict(issueId) {
 async function routeFinishedPR(issue, note) {
   const latest = await latestVerdict(issue.id);
   if (!latest || latest.verdict !== 'PASS' || !latest.work_product_md5) {
-    await relay(issue.id, 'Human Review');
+    await relay(issue.id, 'Parked');
     await closePendingTask(issue.id);
-    log(`HUMAN-REVIEW #${issue.number} — ${note}; latest QC is ${latest?.verdict || 'missing'}`);
+    log(`PARKED #${issue.number} — ${note}; latest QC is ${latest?.verdict || 'missing'}`);
     return;
   }
   await relay(issue.id, 'Done', latest.work_product_md5);
@@ -73,9 +73,9 @@ async function routeFinishedPR(issue, note) {
 }
 
 async function escalateCi(issue, pr, ci) {
-  await relay(issue.id, 'Human Review');
+  await relay(issue.id, 'Parked');
   await closePendingTask(issue.id);
-  log(`HUMAN-REVIEW #${issue.number} ${pr.repo}#${pr.num}: ci=${ci} for ${CI_FAILURE_POLLS} consecutive polls`);
+  log(`PARKED #${issue.number} ${pr.repo}#${pr.num}: ci=${ci} for ${CI_FAILURE_POLLS} consecutive polls`);
 }
 
 function countCiFailure(issue, pr, sha, ci) {
