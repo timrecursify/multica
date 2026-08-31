@@ -4638,7 +4638,7 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 				// Reset stuck in_progress issues only when no other active
 				// task exists for the issue and no retry was just enqueued.
 				issueKey := util.UUIDToString(t.IssueID)
-				if issue.Status == "in_progress" && !processedIssues[issueKey] && !retriedIssues[issueKey] {
+				if issue.Status == "In Progress" && !processedIssues[issueKey] && !retriedIssues[issueKey] {
 					processedIssues[issueKey] = true
 					hasActive, checkErr := s.Queries.HasActiveTaskForIssue(ctx, t.IssueID)
 					if checkErr != nil {

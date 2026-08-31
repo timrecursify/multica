@@ -516,8 +516,8 @@ func TestIssuesCRUDThroughRouter(t *testing.T) {
 	}
 	var updated map[string]any
 	readJSON(t, resp, &updated)
-	if updated["status"] != "in_progress" {
-		t.Fatalf("expected status 'in_progress', got '%s'", updated["status"])
+	if updated["status"] != "In Progress" {
+		t.Fatalf("expected status 'In Progress', got '%s'", updated["status"])
 	}
 	if updated["title"] != "Integration test issue" {
 		t.Fatalf("title should be preserved, got '%s'", updated["title"])
@@ -535,7 +535,7 @@ func TestIssuesCRUDThroughRouter(t *testing.T) {
 	if updated2["title"] != "Renamed integration issue" {
 		t.Fatalf("expected title 'Renamed integration issue', got '%s'", updated2["title"])
 	}
-	if updated2["status"] != "in_progress" {
+	if updated2["status"] != "In Progress" {
 		t.Fatalf("status should be preserved, got '%s'", updated2["status"])
 	}
 

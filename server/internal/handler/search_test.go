@@ -48,8 +48,8 @@ func TestBuildSearchQuery_SingleTerm(t *testing.T) {
 	}
 
 	// Should exclude closed issues by default.
-	if !strings.Contains(query, "NOT IN ('done', 'cancelled')") {
-		t.Error("query should exclude done/cancelled when includeClosed=false")
+	if !strings.Contains(query, "NOT IN ('Done', 'Cancelled', 'Archived')") {
+		t.Error("query should exclude terminal statuses when includeClosed=false")
 	}
 }
 
@@ -328,7 +328,7 @@ func orderByClause(t *testing.T, query string) string {
 func TestBuildSearchQuery_CancelledDemotedAheadOfRelevance(t *testing.T) {
 	orderBy := orderByClause(t, buildSearchQueryForTest(t, "login bug", []string{"login", "bug"}, 0, false, true))
 
-	cancelledAt := strings.Index(orderBy, "i.status = 'cancelled' AND NOT")
+	cancelledAt := strings.Index(orderBy, "i.status = 'Cancelled' AND NOT")
 	if cancelledAt == -1 {
 		t.Fatalf("ORDER BY has no cancelled demotion:\n%s", orderBy)
 	}
@@ -343,7 +343,7 @@ func TestBuildSearchQuery_CancelledDemotedAheadOfRelevance(t *testing.T) {
 	}
 
 	// The demotion must not replace the existing status ordering.
-	if !strings.Contains(orderBy, "WHEN 'in_progress' THEN 0") {
+	if !strings.Contains(orderBy, "WHEN 'In Progress' THEN 0") {
 		t.Errorf("statusRank was dropped from ORDER BY:\n%s", orderBy)
 	}
 	if !strings.Contains(orderBy, "i.updated_at DESC") {
@@ -357,7 +357,7 @@ func TestBuildSearchQuery_CancelledDemotedAheadOfRelevance(t *testing.T) {
 func TestBuildSearchQuery_CancelledDirectHitExempt(t *testing.T) {
 	// $1 is the exact (non-wildcard) phrase param.
 	textOnly := orderByClause(t, buildSearchQueryForTest(t, "ship it", []string{"ship", "it"}, 0, false, true))
-	if !strings.Contains(textOnly, "i.status = 'cancelled' AND NOT (LOWER(i.title) = $1)") {
+	if !strings.Contains(textOnly, "i.status = 'Cancelled' AND NOT (LOWER(i.title) = $1)") {
 		t.Errorf("exact-title hit is not exempt from the cancelled demotion:\n%s", textOnly)
 	}
 	if strings.Contains(textOnly, "i.number = ") {

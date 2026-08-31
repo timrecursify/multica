@@ -444,7 +444,7 @@ func TestListWorkspaceWorkingAgents(t *testing.T) {
 	// being a safe claim source. Give the agent-owned issue the working status so
 	// the projection remains populated without relying on a running task.
 	if _, err := testPool.Exec(ctx,
-		`UPDATE issue SET status = 'in_progress' WHERE id = $1`,
+		`UPDATE issue SET status = 'In Progress' WHERE id = $1`,
 		ownedAgentIssueID,
 	); err != nil {
 		t.Fatalf("mark assigned issue In Progress: %v", err)
@@ -637,7 +637,7 @@ func TestListWorkspaceWorkingAgentsParentScope(t *testing.T) {
 				workspace_id, number, title, status, priority,
 				creator_type, creator_id, parent_issue_id
 			)
-			SELECT $1, COALESCE(MIN(number), 0) - 1, $2, CASE WHEN $4::uuid IS NULL THEN 'Spec' ELSE 'in_progress' END, 'none',
+		SELECT $1, COALESCE(MIN(number), 0) - 1, $2, CASE WHEN $4::uuid IS NULL THEN 'Spec' ELSE 'In Progress' END, 'none',
 			       'member', $3, $4
 			FROM issue
 			WHERE workspace_id = $1

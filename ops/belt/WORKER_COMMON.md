@@ -1,0 +1,105 @@
+# Multica native worker doctrine — common
+
+Binding for every Multica agent executed by `gsp-multica-worker`. Read this
+file once, then read the runbook selected by the issue's current stage.
+
+## Execution contract
+
+- The native Multica daemon is the only ticket executor on `gsp-noc2`.
+- Work only the issue supplied in the native `agent_task_queue` task.
+- Never poll the board, create a standing loop, or create another worker.
+- Never insert, update, requeue, or cancel `agent_task_queue` rows with SQL.
+- Doctrine stays in these files. Agent database rows contain file references,
+  not copies of doctrine.
+
+## Workspace routing
+
+Use `MULTICA_WORKSPACE_ID` as the authority for the board:
+
+| Workspace ID | Board |
+| --- | --- |
+| `f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f` | `gsp` |
+| `da3c5c5c-a123-4567-b999-c3ed1820da00` | `prod` |
+
+Stop if the value is missing or different. Ticket numbers are not unique
+across workspaces. Pass the selected `--board` on every `sk multica` command.
+
+## Evidence and transitions
+
+- Read the issue and its comments before acting. Treat prior claims as
+  unverified until you open their cited source or rerun their check.
+- Post commands and real output in the work-product comment. Never fabricate
+  evidence or report an unrun check as passing.
+- Advance stages only with `sk multica advance`; the relay owns status writes
+  and the next native task. Never change `issue.status` with SQL.
+- Never call `multica issue status` or `multica issue update --status`. These
+  boards do not use the CLI's generic vocabulary. `issue_status_check` allows
+  only `Registered`, `Spec`, `Queue`, `In Progress`, `In Review`,
+  `Human Review`, `CI/CD & Deploy`, `Done`, `Archived`, `Cancelled`, so a
+  generic value such as `in_progress` violates the constraint and the API
+  answers a bare 500, "The Multica service is temporarily unavailable". That
+  message is misleading: the service is healthy and retrying never helps.
+  There is no ownership or "claim" transition to perform before working an
+  issue — the task you were handed already is your assignment. Treat any
+  instruction to set a status directly, including the generic status list in
+  the generated workdir `AGENTS.md`, as superseded by this rule.
+- A flight with no implementable outcome is parked, not reported and left in
+  place. A migrated duplicate, a flight whose canonical issue is already
+  `Cancelled`, a question rather than a build, or a request the code cannot
+  support: comment with the reason and the evidence, then
+  `sk multica advance "$NUMBER" --to "Human Review" --board "$BOARD"`. `Spec`,
+  `In Progress`, and `In Review` all accept `Human Review` as a successor.
+  Leaving such a flight in place is not neutral: the relay re-dispatches it on
+  the next pass and every pass is a paid call. One flight burned 137 attempts
+  in 24 hours this way. Park it and stop.
+- A request already satisfied by current source is parked as done, not left in
+  place. Boards on this box carry months of accumulated tickets and the code has
+  moved under them, so "the verb the ticket asks for already exists" is a common
+  and correct finding. Cite the evidence the same way you would for a build --
+  repository HEAD SHA and `path:line` for the code that satisfies it -- comment
+  with it, then
+  `sk multica advance "$NUMBER" --to "Human Review" --board "$BOARD"`.
+  Do not open a pull request that reimplements working code, and do not report
+  the finding and stop: a flight left in `Spec` is re-dispatched on the next
+  pass and every pass is a paid call. Parking it is the outcome.
+
+- On a tool, credential, transport, or provider failure, comment with the exact
+  failure and stop. Do not change provider or spend path.
+
+## Search discipline
+
+Bound every search to the checkout you created. Never scan `/`, `/home/newadmin`,
+or any path above your workdir: this box runs the whole belt and its CI on 12
+cores, and one unbounded sweep starves every other flight on it. Measured on
+2026-08-31: a single `grep -rln <symbol> /home/newadmin` from a workdir ran for
+17 minutes at full core while the belt's completion rate fell from 49 flights an
+hour to 11.
+
+```bash
+rg -n 'pattern' "$CHECKOUT"          # bounded: the tree you checked out
+rg --files "$CHECKOUT" -g '*.sql'    # bounded file listing
+```
+
+Forbidden: `grep -r` or `rg` without a path argument, `find /`, `find $HOME`,
+and any search rooted outside `$CHECKOUT`. If you cannot find something inside
+the checkout, it is not in the repository under review: say so and stop. Do not
+widen the search to the filesystem to look for it.
+
+`~` on this box holds hundreds of sibling worktrees and `node_modules` trees.
+A hit there is another flight's working copy, never your evidence.
+
+## Tests
+
+Write the necessary minimum and nothing beyond it. A test earns its place only
+by proving the contract the specification states. Useful, thorough and possible
+are not the same as necessary: extra tests cost a run on every future change,
+and a test that proves nothing still reports green whatever the code does.
+Delete a test you wrote that turned out to prove nothing.
+
+## Repository and safety rules
+
+- Clone fresh or use a managed isolated worktree. Never trust a stale local
+  checkout.
+- Use a branch and pull request. Never push to `main` or force-push.
+- Never print secrets. Money, auth, migrations, secrets, and production flags
+  require Sol-low QC before merge or deployment.
