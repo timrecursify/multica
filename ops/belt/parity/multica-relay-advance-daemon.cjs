@@ -358,13 +358,13 @@ async function requeueStrandedTasks() {
       // every tick: ~300 Spec tickets are all older than any In Review one,
       // so the In Review lane would never appear in a 3-row window and its
       // tickets could not be recovered at all. Ranking per agent gives each
-      // owning lane its own oldest-first slice; the per-agent capacity check
+      // owning lane its own oldest-created-first slice; the per-agent capacity check
       // below is still what decides how many actually dispatch.
       `SELECT * FROM (
        SELECT c.*, ROW_NUMBER() OVER (
-                PARTITION BY c.agent_id ORDER BY c.updated_at ASC
+                PARTITION BY c.agent_id ORDER BY c.created_at ASC, c.issue_id ASC
               ) AS rn FROM (
-       SELECT i.id AS issue_id, i.number, i.status AS stage, i.updated_at,
+       SELECT i.id AS issue_id, i.number, i.status AS stage, i.created_at,
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason,
               r.from_stage, r.agent_id, r.runtime_mode,
@@ -441,7 +441,7 @@ async function requeueStrandedTasks() {
        ) c
        ) ranked
         WHERE ranked.rn <= $2
-        ORDER BY ranked.updated_at ASC`,
+        ORDER BY ranked.created_at ASC, ranked.issue_id ASC`,
       [INFRA_FAILURE_REASONS, REQUEUE_BATCH, REQUEUE_STAGES]
     );
 
