@@ -57,9 +57,17 @@ readonly GUARDED_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver g
 # multica-relay-advance is here but NOT in GUARDED_APPS: it is not defined in
 # ECOSYSTEM, so it is restarted by name and cannot be started via --only.
 readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver gsp-multica-worker multica-relay-advance)
+# Operators may intentionally hold the AI worker while investigating spend or
+# deploying guardrails.  This marker suppresses only worker self-healing; all
+# pipeline services remain under the normal liveness guard.
+readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-/home/newadmin/.local/state/multica-ai-hold}"
 readonly PSQL=(docker exec -i gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At)
 
 fixed=(); unfixable=()
+
+ai_hold_active() {
+  [[ -f "$AI_HOLD_FILE" ]]
+}
 
 file_p0() {
   local title="$1" body="$2" out rc
@@ -115,6 +123,10 @@ guard_wrapper() {
 # file and a wrong process, which the file check alone cannot see.
 guard_tower_process() {
   local live
+  if ai_hold_active; then
+    unfixable+=("gsp-multica-worker held by ${AI_HOLD_FILE}")
+    return 0
+  fi
   live=$(ps -eo args | grep "[m]ultica-daemon/server daemon start" \
          | grep -o -- "--max-concurrent-tasks=[0-9]*" | head -1 | cut -d= -f2)
   [[ -z "$live" ]] && { unfixable+=("Tower process not found"); return; }
@@ -143,6 +155,10 @@ sys.exit(0 if a and a[0]['pm2_env'].get('max_restarts') else 1)
   done
   (( ${#missing[@]} == 0 )) && return 0
   for app in "${missing[@]}"; do
+    if [[ "$app" == gsp-multica-worker ]] && ai_hold_active; then
+      unfixable+=("$app guardrails missing; held by ${AI_HOLD_FILE}")
+      continue
+    fi
     # Restarting the Tower kills in-flight flights; only do it when idle.
     if [[ "$app" == gsp-multica-worker ]] && (( $(running_tasks) > 0 )); then
       unfixable+=("$app guardrails missing; deferred, flights in progress")
@@ -208,6 +224,10 @@ guard_build_capacity() {
 guard_pm2_liveness() {
   local app status
   for app in "${LIVENESS_APPS[@]}"; do
+    if [[ "$app" == gsp-multica-worker ]] && ai_hold_active; then
+      unfixable+=("$app held by ${AI_HOLD_FILE}")
+      continue
+    fi
     status=$("$PM2" jlist 2>/dev/null | python3 -c "
 import json,sys
 a=[x for x in json.load(sys.stdin) if x['name']=='$app']

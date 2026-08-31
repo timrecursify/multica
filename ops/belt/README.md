@@ -13,6 +13,11 @@ behavior until it is deployed with `./deploy.sh --apply`.
 | `parity/multica-relay-advance-daemon.cjs` | `/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs` | PM2 app `multica-relay-advance`, through its wrapper and launcher |
 | `multica-cicd-worker.cjs` | `/home/newadmin/multica-cicd-worker.cjs` | PM2 app `multica-cicd-worker` |
 | `belt-config-guard.sh` | `/home/newadmin/tools/belt-config-guard.sh` | `belt-config-guard.timer`, which activates `belt-config-guard.service` |
+
+To intentionally hold the AI worker during spend investigations or guarded
+deploys, create `/home/newadmin/.local/state/multica-ai-hold`. The guard then
+skips only `gsp-multica-worker`; bridge, CI/CD, archiver, and relay liveness
+checks continue. Remove the marker only after the worker may safely resume.
 | `multica-bundle.py` | `/home/newadmin/tools/multica-bundle.py` | No always-running PM2 app or systemd unit; the runbook invokes it with `python3` |
 | `RUNBOOK_SPEC_WORKER.md` | `/home/newadmin/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | No process; this is the operational runbook |
 

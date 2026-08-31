@@ -2,6 +2,14 @@
 set -Eeuo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# Regression: an operator hold must suppress only the AI worker's self-healing
+# path; the other pipeline services must remain in the liveness set.
+guard_source="$root_dir/belt-config-guard.sh"
+grep -q 'AI_HOLD_FILE=' "$guard_source"
+grep -q 'gsp-multica-worker.*held by' "$guard_source"
+grep -q 'readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver gsp-multica-worker multica-relay-advance)' "$guard_source"
+bash -n "$guard_source"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 mkdir -p "$tmp_dir/gsp-multica/parity" "$tmp_dir/tools" "$tmp_dir/multica-doctrine"
