@@ -102,7 +102,8 @@ WITH candidate AS (
     SELECT b.id
     FROM build_budget b
     JOIN candidate c
-      ON b.scope = 'issue' AND b.scope_ref = c.issue_id::text
+      ON b.workspace_id = c.workspace_id
+     AND b.scope = 'issue' AND b.scope_ref = c.issue_id::text
     WHERE b.state = 'open'
     LIMIT 1
 ), next_number AS (
