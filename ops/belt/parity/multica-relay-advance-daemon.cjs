@@ -1,5 +1,10 @@
 const http = require('http');
 const { Pool } = require('pg');
+const {
+  instructionCompatibility,
+  retryAdmission,
+  spendPreflight
+} = require('../guardrails.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -31,6 +36,7 @@ const REQUEUE_STAGES = (process.env.RELAY_REQUEUE_STAGES || 'Queue,Spec,In Revie
 // Mirrors --max-concurrent-tasks in fleet/multica-daemon-wrapper.sh. Not a
 // threshold of our own: it is the number of tasks the Tower can actually hold.
 const MAX_CONCURRENT = Number.parseInt(process.env.RELAY_MAX_CONCURRENT || '12', 10);
+const QUEUED_TASK_TTL_MINUTES = Number.parseInt(process.env.MULTICA_QUEUED_TASK_TTL_MINUTES || '120', 10);
 
 const configuredPoolMax = Number.parseInt(process.env.RELAY_PG_POOL_MAX || '2', 10);
 const poolMax = Number.isInteger(configuredPoolMax) && configuredPoolMax > 0
@@ -367,14 +373,21 @@ async function requeueStrandedTasks() {
        SELECT i.id AS issue_id, i.number, i.status AS stage, i.updated_at,
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason,
-              r.from_stage, r.agent_id, r.runtime_mode,
+              r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
+              r.model, r.max_concurrent_tasks, r.archived_at,
               COALESCE(
                 (SELECT ar.id FROM agent_runtime ar
                   WHERE ar.workspace_id = i.workspace_id
                     AND ar.provider = 'codex'
                     AND ar.status = 'online'
                   ORDER BY ar.updated_at DESC LIMIT 1)
-              ) AS runtime_id
+              ) AS runtime_id,
+              (SELECT ar.provider FROM agent_runtime ar
+                WHERE ar.id = (SELECT ar2.id FROM agent_runtime ar2
+                  WHERE ar2.workspace_id = i.workspace_id
+                    AND ar2.provider = 'codex'
+                    AND ar2.status = 'online'
+                  ORDER BY ar2.updated_at DESC LIMIT 1)) AS runtime_provider
          FROM issue i
          LEFT JOIN LATERAL (
            SELECT * FROM agent_task_queue
@@ -382,7 +395,8 @@ async function requeueStrandedTasks() {
          ) t ON true
          JOIN LATERAL (
            SELECT rsc.stage_name AS from_stage, rsc.agent_id,
-                  COALESCE(a.runtime_mode, 'local') AS runtime_mode
+                  COALESCE(a.runtime_mode, 'local') AS runtime_mode,
+                  a.instructions, a.model, a.max_concurrent_tasks, a.archived_at
              FROM relay_stage_config rsc
              JOIN agent a ON a.id = rsc.agent_id AND a.archived_at IS NULL
             WHERE rsc.next_stage = i.status
@@ -422,7 +436,8 @@ async function requeueStrandedTasks() {
                    AND t.attempt < t.max_attempts))
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue q
-             WHERE q.issue_id = i.id AND q.status IN ('queued', 'running')
+             WHERE q.issue_id = i.id AND q.status IN
+               ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
           )
           -- A bundled child is never its own unit of work: its MEGA parent
           -- carries the fix. The bridge withholds the child's task at the
@@ -431,13 +446,10 @@ async function requeueStrandedTasks() {
           -- daemon resurrected 235 children the bridge had just withheld and
           -- paid for the same change twice. Exclude them here too: the
           -- invariant has to hold at BOTH creation points or neither.
-          AND NOT EXISTS (
-            SELECT 1 FROM issue p
-             WHERE p.id = i.parent_issue_id
-               AND p.title LIKE 'MEGA%'
-               AND p.status NOT IN ('Done', 'Cancelled', 'Archived')
-               AND i.title NOT LIKE 'MEGA%'
-          )
+          -- Any parent link marks a bundled child. Its MEGA is the only unit
+          -- of work, even after the parent has shipped and the child is still
+          -- open for disposition.
+          AND i.parent_issue_id IS NULL
        ) c
        ) ranked
         WHERE ranked.rn <= $2
@@ -524,10 +536,38 @@ async function requeueStrandedTasks() {
       // A cold start has no prior task, so it is attempt 1 of the queue's own
       // default ceiling -- never row.attempt + 1 on a NULL.
       const coldStart = !row.dead_task_id;
+      const compatibility = instructionCompatibility(row.instructions, row.stage);
+      if (!compatibility.ok) {
+        console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: agent instructions do not authorize '${compatibility.stage}'`);
+        continue;
+      }
+      const preflight = spendPreflight(row, { provider: row.runtime_provider });
+      if (!preflight.ok) {
+        console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: paid dispatch preflight ${preflight.reason}`);
+        continue;
+      }
       // A 'completed' predecessor means QC finished without writing a verdict.
       // That is a real retry, not an infra replay, so it costs an attempt.
       const noArtifact = row.dead_task_status === 'completed';
       const infra = INFRA_FAILURE_REASONS.includes(row.failure_reason || 'cancelled');
+      if (infra) {
+        const headroom = await client.query(
+          `SELECT COALESCE(max(EXTRACT(epoch FROM (now() - created_at)) / 60), 0) AS age
+             FROM agent_task_queue WHERE status = 'queued'`
+        );
+        const admission = retryAdmission({
+          attempt: row.attempt,
+          maxAttempts: row.max_attempts == null ? 2 : row.max_attempts,
+          failureReason: row.failure_reason || 'cancelled',
+          queueAgeMinutes: Number(headroom.rows[0]?.age || 0),
+          queueTtlMinutes: QUEUED_TASK_TTL_MINUTES,
+          infraReasons: INFRA_FAILURE_REASONS
+        });
+        if (!admission.ok) {
+          console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: ${admission.reason}`);
+          continue;
+        }
+      }
       // noArtifact must be checked BEFORE infra: a completed task has a NULL
       // failure_reason, which coalesces to 'cancelled' -- an INFRA reason --
       // and infra replays reuse the same attempt number. Left in that order
@@ -540,6 +580,9 @@ async function requeueStrandedTasks() {
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
         await client.query('BEGIN');
+        // Serialize admission with the bridge and other recovery workers. The
+        // issue lock plus stage-scoped predicate prevents duplicate paid rows.
+        await client.query('SELECT id FROM issue WHERE id = $1 FOR UPDATE', [row.issue_id]);
         const context = JSON.stringify({
           source: coldStart ? 'relay-cold-start'
             : noArtifact
@@ -556,8 +599,15 @@ async function requeueStrandedTasks() {
              trigger_summary, force_fresh_session, originator_source,
              trigger_evidence_kind, attempt, max_attempts, retry_of_task_id
            )
-           VALUES ($1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
-                   'unattributed', 'relay_stage_transition', $6, $7, $8)
+           SELECT $1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
+                  'unattributed', 'relay_stage_transition', $6, $7, $8
+            WHERE NOT EXISTS (
+              SELECT 1 FROM agent_task_queue active
+               WHERE active.issue_id = $2
+                 AND active.status IN ('queued', 'dispatched', 'running',
+                                       'waiting_local_directory', 'deferred')
+                 AND active.context->>'to_stage' = $9
+            )
            ON CONFLICT DO NOTHING
            RETURNING id`,
           [row.agent_id, row.issue_id, row.runtime_id, context,
@@ -566,7 +616,7 @@ async function requeueStrandedTasks() {
              : noArtifact
                ? `Relay requeue: task completed in ${row.stage} without producing its artifact`
                : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`,
-           attempt, maxAttempts, row.dead_task_id]
+           attempt, maxAttempts, row.dead_task_id, row.stage]
         );
         if (task.rows.length === 0) {
           // ON CONFLICT DO NOTHING matched, or a BEFORE INSERT trigger cancelled

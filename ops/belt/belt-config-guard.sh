@@ -224,6 +224,52 @@ print(a[0]['pm2_env'].get('status','missing') if a else 'missing')
   done
 }
 
+# A second relay/worker process races the first one's claims and can double-spend
+# a ticket. PM2 normally enforces one app name, but a supervisor restart can
+# leave duplicate processes behind. Also fail closed when the paid opt-in does
+# not agree with the selected executable: a non-paid lane must never advertise
+# paid access, and a paid executable must not run without an explicit opt-in.
+guard_single_instance_and_paid_lane() {
+  local snapshot
+  snapshot=$("$PM2" jlist 2>/dev/null) || {
+    unfixable+=("could not inspect PM2 for duplicate workers or paid-lane drift")
+    return 0
+  }
+  while IFS='|' read -r app count; do
+    [[ "$count" =~ ^[0-9]+$ ]] || continue
+    (( count <= 1 )) || unfixable+=("${app} has ${count} PM2 entries; single-instance guard refuses paid dispatch")
+  done < <(printf '%s' "$snapshot" | python3 -c '
+import json,sys,collections
+try: data=json.load(sys.stdin)
+except Exception: raise SystemExit(0)
+counts=collections.Counter(x.get("name") for x in data)
+for name in ("gsp-multica-worker","gsp-multica-bridge","multica-relay-advance"):
+ print(f"{name}|{counts.get(name,0)}")
+')
+
+  local lane paid status
+  while IFS='|' read -r lane paid status; do
+    [[ "$status" == online ]] || continue
+    if [[ "$lane" == paid-openrouter && "$paid" != 1 ]]; then
+      unfixable+=("paid OpenRouter executable is online without MULTICA_ALLOW_PAID_LANE=1")
+    elif [[ "$lane" == non-paid && "$paid" == 1 ]]; then
+      unfixable+=("non-paid executable is online with MULTICA_ALLOW_PAID_LANE=1")
+    fi
+  done < <(printf '%s' "$snapshot" | python3 -c '
+import json,sys
+try: data=json.load(sys.stdin)
+except Exception: raise SystemExit(0)
+for x in data:
+ if x.get("name") != "gsp-multica-worker": continue
+ e=x.get("pm2_env",{}).get("env",{})
+ b=e.get("CODEX_BIN","")
+ lane="paid-openrouter" if b.endswith("codex-openrouter") else "non-paid"
+ paid=e.get("MULTICA_ALLOW_PAID_LANE","")
+ status=x.get("pm2_env",{}).get("status","")
+ print(f"{lane}|{paid}|{status}")
+')
+}
+
 # The GSP relay is only a pipeline if every stage has an owner and every exit has
 # a route. Both are plain table rows, and losing one is silent: the belt keeps
 # looking busy while nothing is scoped, reviewed or closed. Each row below was
@@ -788,7 +834,7 @@ guard_unshipped_closures() {
   return 0
 }
 
-guard_wrapper; guard_tower_process; guard_pm2; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+guard_wrapper; guard_tower_process; guard_pm2; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 for f in "${fixed[@]:-}";     do [[ -n "$f" ]] && echo "belt-config-guard: FIXED $f"; done
 for u in "${unfixable[@]:-}"; do [[ -n "$u" ]] && echo "belt-config-guard: UNFIXABLE $u" >&2; done

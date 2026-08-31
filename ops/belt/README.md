@@ -9,6 +9,7 @@ behavior until it is deployed with `./deploy.sh --apply`.
 | Repository file | Runtime path | Current runner |
 | --- | --- | --- |
 | `multica-bridge.cjs` | `/home/newadmin/gsp-multica/multica-bridge.cjs` | PM2 app `gsp-multica-bridge` |
+| `guardrails.cjs` | `/home/newadmin/gsp-multica/guardrails.cjs` | Required by bridge and relay daemon |
 | `parity/multica-relay-advance-daemon.cjs` | `/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs` | PM2 app `multica-relay-advance`, through its wrapper and launcher |
 | `multica-cicd-worker.cjs` | `/home/newadmin/multica-cicd-worker.cjs` | PM2 app `multica-cicd-worker` |
 | `belt-config-guard.sh` | `/home/newadmin/tools/belt-config-guard.sh` | `belt-config-guard.timer`, which activates `belt-config-guard.service` |

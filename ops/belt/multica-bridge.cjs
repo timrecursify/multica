@@ -3,6 +3,11 @@ const { URL } = require("url");
 const { Client } = require("pg");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const {
+  isBundledChild,
+  instructionCompatibility,
+  spendPreflight
+} = require("./guardrails.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -389,6 +394,8 @@ async function relayAdvance(req, res, body) {
 
     const stageResult = await client.query(
       `SELECT rsc.agent_id, rsc.agent_name, a.runtime_id, a.archived_at,
+              a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
+              (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
               COALESCE(
                 a.runtime_id,
                 (
@@ -419,6 +426,47 @@ async function relayAdvance(req, res, body) {
       throw new Error(`No online Codex runtime for stage: ${to_stage}`);
     }
 
+    // A paid call is admitted only when the target stage is explicitly covered
+    // by the owner's runbook and its concurrency/model configuration is valid.
+    // Unknown instructions fail closed: a worker that would stop on this stage
+    // has no useful outcome and still consumes vendor tokens.
+    if (stage.agent_id) {
+      const compatibility = instructionCompatibility(stage.instructions, to_stage);
+      if (!compatibility.ok) {
+        await client.query("ROLLBACK");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: "agent_stage_incompatible",
+          issue_id: issue.id,
+          agent_id: stage.agent_id,
+          stage: compatibility.stage,
+          allowed_stages: compatibility.allowed
+        }));
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: "agent_stage_incompatible",
+          message: "the assigned agent instructions do not authorize this stage",
+          stage: compatibility.stage,
+          allowed_stages: compatibility.allowed
+        }));
+        return;
+      }
+      const preflight = spendPreflight(stage, { provider: stage.selected_runtime_provider });
+      if (!preflight.ok) {
+        await client.query("ROLLBACK");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: "paid_dispatch_preflight",
+          detail: preflight.reason,
+          issue_id: issue.id,
+          agent_id: stage.agent_id
+        }));
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "paid_dispatch_preflight", detail: preflight.reason }));
+        return;
+      }
+    }
+
     const result = await client.query(
       `UPDATE "issue"
        SET status = $1, updated_at = NOW()
@@ -435,18 +483,11 @@ async function relayAdvance(req, res, body) {
     // and, on 2026-08-31, tripled in-flight by re-dispatching 235 children that
     // had just been bundled. The stage transition still commits -- the child
     // keeps moving with its parent -- only the paid task is withheld.
-    // A MEGA that is itself someone's child is exempt: it is still a work unit.
     let childOfOpenMega = false;
-    if (stage.agent_id && issue.parent_issue_id && !/^MEGA/.test(issue.title || '')) {
-      const parent = await client.query(
-        `SELECT status FROM "issue" WHERE id = $1`, [issue.parent_issue_id]
-      );
-      if (parent.rows.length &&
-          !['Done', 'Cancelled', 'Archived'].includes(parent.rows[0].status)) {
-        childOfOpenMega = true;
-        console.error('[relay] child of open MEGA - stage advanced, task withheld:',
-          issue_id, issue.status, '->', to_stage);
-      }
+    if (stage.agent_id && isBundledChild(issue)) {
+      childOfOpenMega = true;
+      console.error('[relay] bundled child - stage advanced, task withheld:',
+        issue_id, issue.status, '->', to_stage);
     }
 
     if (stage.agent_id && !childOfOpenMega) {
@@ -467,16 +508,24 @@ async function relayAdvance(req, res, body) {
            trigger_summary, force_fresh_session, originator_source,
            trigger_evidence_kind
          )
-         VALUES ($1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
-                 'unattributed', 'relay_stage_transition')
-         ON CONFLICT DO NOTHING
-         RETURNING id`,
+         SELECT $1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
+                'unattributed', 'relay_stage_transition'
+          WHERE NOT EXISTS (
+            SELECT 1 FROM agent_task_queue active
+             WHERE active.issue_id = $2
+               AND active.status IN ('queued', 'dispatched', 'running',
+                                     'waiting_local_directory', 'deferred')
+               AND active.context->>'to_stage' = $6
+          )
+           ON CONFLICT DO NOTHING
+           RETURNING id`,
         [
           stage.agent_id,
           issue_id,
           stage.selected_runtime_id,
           context,
-          `Relay stage transition: ${issue.status} -> ${to_stage}`
+          `Relay stage transition: ${issue.status} -> ${to_stage}`,
+          to_stage
         ]
       );
       if (taskResult.rows.length === 0) {
