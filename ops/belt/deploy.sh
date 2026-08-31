@@ -3,26 +3,23 @@ set -Eeuo pipefail
 
 mode="dry-run"
 rollback_timestamp=""
+only_target=""
 
-case "${1:---dry-run}" in
-  --dry-run)
-    ;;
-  --apply)
-    mode="apply"
-    ;;
-  --rollback)
-    mode="rollback"
-    rollback_timestamp="${2:-}"
-    ;;
-  *)
-    printf 'Usage: %s [--dry-run|--apply] | %s --rollback YYYYMMDDTHHMMSSZ\n' "$0" "$0" >&2
-    exit 2
-    ;;
-esac
+while (( $# )); do
+  case "$1" in
+    --dry-run) mode="dry-run"; shift ;;
+    --apply) mode="apply"; shift ;;
+    --rollback) mode="rollback"; rollback_timestamp="${2:-}"; shift 2 ;;
+    --only) only_target="${2:-}"; shift 2 ;;
+    *)
+      printf 'Usage: %s [--dry-run|--apply] [--only multica-cicd-worker] | %s --rollback YYYYMMDDTHHMMSSZ [--only multica-cicd-worker]\n' "$0" "$0" >&2
+      exit 2
+      ;;
+  esac
+done
 
-if [[ "$mode" != rollback && $# -gt 1 ]] ||
-   [[ "$mode" == rollback && $# -ne 2 ]]; then
-  printf 'Usage: %s [--dry-run|--apply] | %s --rollback YYYYMMDDTHHMMSSZ\n' "$0" "$0" >&2
+if [[ -n "$only_target" && "$only_target" != multica-cicd-worker ]]; then
+  printf 'Invalid --only target: %s\n' "$only_target" >&2
   exit 2
 fi
 if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
@@ -58,9 +55,14 @@ declare -a targets=(
   "$runtime_root/multica-doctrine/WORKER_COMMON.md"
 )
 
+selected() {
+  [[ -z "$only_target" || ( "$only_target" == multica-cicd-worker && "$1" -eq 3 ) ]]
+}
+
 invalid=0
 declare -a new_targets=()
 for index in "${!sources[@]}"; do
+  selected "$index" || continue
   new_targets[$index]=0
   [[ "${targets[$index]}" == "$runtime_root/gsp-multica/guardrails.cjs" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
@@ -84,6 +86,7 @@ fi
 
 if [[ "$mode" == rollback ]]; then
   for index in "${!targets[@]}"; do
+    selected "$index" || continue
     if [[ -f "${targets[$index]}.bak-${rollback_timestamp}.absent" ]]; then
       rm -f -- "${targets[$index]}"
       printf 'Removed new target %s\n' "${targets[$index]}"
@@ -120,6 +123,7 @@ trap restore_on_failure ERR
 # Create every backup before the first target is modified. A partial backup set
 # cannot produce a misleading rollback claim.
 for index in "${!targets[@]}"; do
+  selected "$index" || continue
   source_file="${sources[$index]}"
   target_file="${targets[$index]}"
   backup_file="${target_file}.bak-${timestamp}"
@@ -139,6 +143,7 @@ for index in "${!targets[@]}"; do
 done
 
 for index in "${!sources[@]}"; do
+  selected "$index" || continue
   source_file="${sources[$index]}"
   target_file="${targets[$index]}"
   if [[ "$mode" == dry-run ]]; then
@@ -157,5 +162,7 @@ done
 trap - ERR
 printf 'No processes were restarted.\n'
 if [[ "$mode" == apply ]]; then
-  printf 'Rollback receipt: %s --rollback %s\n' "$0" "$timestamp"
+  printf 'Rollback receipt: %s --rollback %s' "$0" "$timestamp"
+  [[ -n "$only_target" ]] && printf ' --only %s' "$only_target"
+  printf '\n'
 fi
