@@ -420,9 +420,16 @@ async function requeueStrandedTasks() {
                OR (i.status = 'Spec'
                    AND t.status = 'completed'
                    AND t.attempt < t.max_attempts))
+               -- A live task may belong to the stage the flight just left.
+               -- Treat that mismatch as stranded so the repair pass can
+               -- supersede it and enqueue the current-stage task.
+               OR (t.id IS NOT NULL
+                   AND t.status IN ('queued', 'dispatched', 'running')
+                   AND COALESCE(t.context->>'to_stage', '') IS DISTINCT FROM i.status)
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue q
-             WHERE q.issue_id = i.id AND q.status IN ('queued', 'running')
+             WHERE q.issue_id = i.id AND q.status IN ('queued', 'dispatched', 'running')
+               AND COALESCE(q.context->>'to_stage', '') = i.status
           )
           -- A bundled child is never its own unit of work: its MEGA parent
           -- carries the fix. The bridge withholds the child's task at the
@@ -540,6 +547,16 @@ async function requeueStrandedTasks() {
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
         await client.query('BEGIN');
+        await client.query(
+          `UPDATE agent_task_queue
+              SET status = 'cancelled', completed_at = NOW(),
+                  prepare_lease_expires_at = NULL,
+                  failure_reason = 'relay_stage_transition_superseded'
+            WHERE issue_id = $1
+              AND status IN ('queued', 'dispatched', 'running')
+              AND COALESCE(context->>'to_stage', '') IS DISTINCT FROM $2`,
+          [row.issue_id, row.stage]
+        );
         const context = JSON.stringify({
           source: coldStart ? 'relay-cold-start'
             : noArtifact
