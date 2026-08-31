@@ -8,6 +8,7 @@ const STAGE_ALIASES = new Map([
   ['in_progress', 'In Progress'],
   ['in_review', 'In Review']
 ]);
+const NON_EXECUTION_STAGES = new Set(['Human Review', 'Parked', 'Rejected']);
 
 function canonicalStage(stage) {
   return STAGE_ALIASES.get(stage) || stage;
@@ -27,6 +28,7 @@ function instructionStages(instructions) {
     [/RUNBOOK_SPEC_WORKER(?:\.md)?/i, 'Spec'],
     [/RUNBOOK_QC_WORKER(?:\.md)?/i, 'In Review'],
     [/\b(?:in the )?(Spec)\b/i, 'Spec'],
+    [/\b(In Progress)\b/i, 'In Progress'],
     [/\b(In Review)\b/i, 'In Review'],
     [/\b(Queue)\b/i, 'Queue'],
     [/\b(Registered)\b/i, 'Registered']
@@ -97,7 +99,22 @@ function stageCycleAdmission(taskCount, limit = 2) {
   if (!Number.isInteger(ceiling) || ceiling < 1) return { ok: false, reason: 'invalid_stage_cycle_limit' };
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Human Review' };
+    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Parked' };
+}
+
+function lifetimeTaskAdmission(taskCount, limit = 6) {
+  const count = Number(taskCount);
+  const ceiling = Number(limit);
+  if (!Number.isInteger(ceiling) || ceiling < 1) {
+    return { ok: false, reason: 'invalid_lifetime_task_limit' };
+  }
+  return count < ceiling
+    ? { ok: true, ceiling }
+    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Parked' };
+}
+
+function isExecutionStage(stage) {
+  return !NON_EXECUTION_STAGES.has(canonicalStage(stage));
 }
 
 module.exports = {
@@ -109,5 +126,7 @@ module.exports = {
   hasActiveTaskForIssueStage,
   retryAdmission,
   spendPreflight,
-  stageCycleAdmission
+  stageCycleAdmission,
+  lifetimeTaskAdmission,
+  isExecutionStage
 };

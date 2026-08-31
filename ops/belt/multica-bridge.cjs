@@ -7,7 +7,9 @@ const {
   isBundledChild,
   instructionCompatibility,
   spendPreflight,
-  stageCycleAdmission
+  stageCycleAdmission,
+  lifetimeTaskAdmission,
+  isExecutionStage
 } = require("./guardrails.cjs");
 
 // Relay configuration is supplied by the host environment.
@@ -58,6 +60,34 @@ const SPEC_ENFORCED_WORKSPACE = "f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f";
 const SPEC_BEGIN = "<!-- RELAY-SPEC:BEGIN -->";
 const SPEC_END = "<!-- RELAY-SPEC:END -->";
 const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || "2", 10);
+const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMIT || "6", 10);
+
+async function applyDisposition(client, issue, disposition, reason, evidence = {}) {
+  const changed = await client.query(
+    `UPDATE issue SET status = $1, updated_at = NOW()
+      WHERE id = $2 AND status <> $1 RETURNING id`,
+    [disposition, issue.id]
+  );
+  await client.query(
+    `UPDATE agent_task_queue
+        SET status = 'cancelled', completed_at = NOW(),
+            prepare_lease_expires_at = NULL, failure_reason = $2
+      WHERE issue_id = $1
+        AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')`,
+    [issue.id, reason]
+  );
+  if (changed.rowCount > 0) {
+    await client.query(
+      `INSERT INTO activity_log
+         (workspace_id, issue_id, actor_type, action, details)
+       VALUES ($1, $2, 'system', 'relay_disposition_applied', $3::jsonb)`,
+      [issue.workspace_id, issue.id, JSON.stringify({
+        from: issue.status, to: disposition, reason, ...evidence
+      })]
+    );
+  }
+  return changed.rowCount > 0;
+}
 
 // The spec agent's output is recognised by its required headings, not by author:
 // re-running the spec lane under a different agent must keep working.
@@ -260,7 +290,7 @@ async function relayAdvance(req, res, body) {
     }
 
     const issueResult = await client.query(
-      `SELECT id, status, workspace_id, description, parent_issue_id, title
+      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority
        FROM "issue"
        WHERE id = $1
        FOR UPDATE`,
@@ -333,9 +363,9 @@ async function relayAdvance(req, res, body) {
           issue_id,
           bounces: n,
           ceiling,
-          redirected_to: "Human Review"
+          redirected_to: "Parked"
         }));
-        to_stage = "Human Review";
+        to_stage = "Parked";
       }
     }
 
@@ -434,6 +464,10 @@ async function relayAdvance(req, res, body) {
        FROM relay_stage_config rsc
        LEFT JOIN agent a ON a.id = rsc.agent_id
        WHERE rsc.stage_name = $2`,
+      // Stage owners are keyed by the stage being left: Spec -> Queue wakes
+      // the builder, and In Progress -> In Review wakes QC. Looking up the
+      // target stage would select the next lane's owner and can burn a paid
+      // call on an incompatible runbook.
       [issue.workspace_id, issue.status]
     );
 
@@ -442,10 +476,10 @@ async function relayAdvance(req, res, body) {
     }
 
     const stage = stageResult.rows[0];
-    if (stage.agent_id && stage.archived_at) {
+    if (stage.agent_id && isExecutionStage(to_stage) && stage.archived_at) {
       throw new Error(`Relay owner is archived: ${stage.agent_name} (${stage.agent_id}) for ${issue.status} -> ${to_stage}`);
     }
-    if (stage.agent_id && !stage.selected_runtime_id) {
+    if (stage.agent_id && isExecutionStage(to_stage) && !stage.selected_runtime_id) {
       throw new Error(`No online Codex runtime for stage: ${to_stage}`);
     }
 
@@ -453,24 +487,60 @@ async function relayAdvance(req, res, body) {
     // by the owner's runbook and its concurrency/model configuration is valid.
     // Unknown instructions fail closed: a worker that would stop on this stage
     // has no useful outcome and still consumes vendor tokens.
-    if (stage.agent_id) {
+    if (stage.agent_id && isExecutionStage(to_stage)) {
       const compatibility = instructionCompatibility(stage.instructions, to_stage);
       if (!compatibility.ok) {
-        await client.query("ROLLBACK");
+        // Persist rejected advances so the Registered recovery pass can apply
+        // a durable ceiling.  A rollback here leaves no trace, and its
+        // NOT-EXISTS probe retries the same incompatible paid lane forever.
+        const rejected = await client.query(
+          `SELECT count(*)::int AS n
+             FROM relay_run_log
+            WHERE issue_id = $1 AND from_stage = $2 AND to_stage = $3
+              AND status = 'failed'
+              AND created_at >= NOW() - INTERVAL '24 hours'`,
+          [issue.id, issue.status, to_stage]
+        );
+        const rejectionCount = Number(rejected.rows[0]?.n || 0) + 1;
+        await client.query(
+          `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, status)
+           VALUES ($1, $2, $3, $4, 'failed')`,
+          [issue.id, issue.status, to_stage, stage.agent_id]
+        );
+        const capped = rejectionCount >= STAGE_CYCLE_LIMIT;
+        const dispositionApplied = capped
+          ? await applyDisposition(client, issue, 'Rejected', 'agent_stage_incompatible_window', {
+              target_stage: to_stage, rejection_count: rejectionCount,
+              ceiling: STAGE_CYCLE_LIMIT, window_hours: 24
+            })
+          : false;
+        await client.query("COMMIT");
         console.warn(JSON.stringify({
           event: "relay_advance_rejected",
-          reason: "agent_stage_incompatible",
+          reason: capped ? "stage_retry_ceiling" : "agent_stage_incompatible",
           issue_id: issue.id,
           agent_id: stage.agent_id,
           stage: compatibility.stage,
-          allowed_stages: compatibility.allowed
+          allowed_stages: compatibility.allowed,
+          rejection_count: rejectionCount,
+          ceiling: STAGE_CYCLE_LIMIT,
+          disposition: capped ? "Rejected" : "retry_allowed",
+          disposition_applied: dispositionApplied
         }));
         res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
+        res.end(JSON.stringify(capped ? {
+          error: "stage_retry_ceiling",
+          message: "stage advance rejected after repeated incompatible owner rejections",
+          disposition: "Rejected",
+          rejection_count: rejectionCount,
+          ceiling: STAGE_CYCLE_LIMIT
+        } : {
           error: "agent_stage_incompatible",
           message: "the assigned agent instructions do not authorize this stage",
           stage: compatibility.stage,
-          allowed_stages: compatibility.allowed
+          allowed_stages: compatibility.allowed,
+          rejection_count: rejectionCount,
+          ceiling: STAGE_CYCLE_LIMIT
         }));
         return;
       }
@@ -500,7 +570,11 @@ async function relayAdvance(req, res, body) {
       );
       const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
       if (!cycle.ok) {
-        await client.query("ROLLBACK");
+        const moved = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
+          target_stage: to_stage, historical_tasks: history.rows[0]?.n || 0,
+          ceiling: cycle.ceiling
+        });
+        await client.query("COMMIT");
         console.warn(JSON.stringify({
           event: "relay_advance_rejected",
           reason: cycle.reason,
@@ -508,17 +582,36 @@ async function relayAdvance(req, res, body) {
           target_stage: to_stage,
           historical_tasks: history.rows[0]?.n || 0,
           ceiling: cycle.ceiling,
-          disposition: cycle.disposition
+          disposition: cycle.disposition,
+          disposition_applied: moved
         }));
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end(JSON.stringify({
           error: cycle.reason,
-          message: "stage retry ceiling reached; manual disposition required",
+          message: "stage retry ceiling reached; issue parked and retry eligibility removed",
           disposition: cycle.disposition,
           target_stage: to_stage,
           historical_tasks: history.rows[0]?.n || 0,
           ceiling: cycle.ceiling
         }));
+        return;
+      }
+      const lifetimeHistory = await client.query(
+        `SELECT count(*)::int AS n FROM agent_task_queue
+          WHERE issue_id = $1 AND started_at IS NOT NULL`,
+        [issue.id]
+      );
+      const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
+      if (!lifetime.ok) {
+        const moved = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
+          target_stage: to_stage, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
+          ceiling: lifetime.ceiling
+        });
+        await client.query("COMMIT");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: lifetime.reason, disposition: lifetime.disposition,
+          disposition_applied: moved, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
+          ceiling: lifetime.ceiling }));
         return;
       }
     }
@@ -546,7 +639,17 @@ async function relayAdvance(req, res, body) {
         issue_id, issue.status, '->', to_stage);
     }
 
-    if (stage.agent_id && !bundledChild) {
+    if (stage.agent_id && !bundledChild && isExecutionStage(to_stage)) {
+      // Preserve the board's issue priority on the queue row. The daemon
+      // orders claims by this integer (urgent=4 .. none=0); omitting it
+      // silently defaulted every relay task to 0 and defeated priority FIFO.
+      const taskPriority = {
+        urgent: 4,
+        high: 3,
+        medium: 2,
+        low: 1,
+        none: 0
+      }[String(issue.priority || "none").toLowerCase()] ?? 0;
       const context = JSON.stringify({
         source: "relay-advance",
         from_stage: issue.status,
@@ -560,24 +663,25 @@ async function relayAdvance(req, res, body) {
       // task is redundant; the stage transition must not be sacrificed to it.
       const taskResult = await client.query(
         `INSERT INTO agent_task_queue (
-           agent_id, issue_id, status, runtime_id, context,
+           agent_id, issue_id, status, priority, runtime_id, context,
            trigger_summary, force_fresh_session, originator_source,
            trigger_evidence_kind
          )
-         SELECT $1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
+         SELECT $1, $2, 'queued', $3, $4, $5::jsonb, $6, TRUE,
                 'unattributed', 'relay_stage_transition'
           WHERE NOT EXISTS (
             SELECT 1 FROM agent_task_queue active
              WHERE active.issue_id = $2
                AND active.status IN ('queued', 'dispatched', 'running',
                                      'waiting_local_directory', 'deferred')
-               AND active.context->>'to_stage' = $6
+               AND active.context->>'to_stage' = $7
           )
            ON CONFLICT DO NOTHING
            RETURNING id`,
         [
           stage.agent_id,
           issue_id,
+          taskPriority,
           stage.selected_runtime_id,
           context,
           `Relay stage transition: ${issue.status} -> ${to_stage}`,
