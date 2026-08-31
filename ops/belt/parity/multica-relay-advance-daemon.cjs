@@ -5,7 +5,7 @@ const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
-if (!MULTICA_DB || !RELAY_AGENT_SECRET || !WORKSPACE_ID) {
+if (require.main === module && (!MULTICA_DB || !RELAY_AGENT_SECRET || !WORKSPACE_ID)) {
   console.error('[relay-advance-daemon] FATAL: env vars missing');
   process.exit(1);
 }
@@ -335,8 +335,20 @@ const INFRA_FAILURE_REASONS = [
   'timeout',
   'queued_expired',
   'cancelled',
-  'stream_disconnected'
+  'stream_disconnected',
+  'agent_error.provider_quota_limit'
 ];
+
+function isInfrastructureFailure(reason) {
+  return INFRA_FAILURE_REASONS.includes(reason || 'cancelled');
+}
+
+function selectReplayAttempt(row) {
+  if (!row.dead_task_id) return 1;
+  const noArtifact = row.dead_task_status === 'completed';
+  const infra = isInfrastructureFailure(row.failure_reason);
+  return (noArtifact || !infra) ? row.attempt + 1 : row.attempt;
+}
 
 // The relay only ever creates a task at the MOMENT a ticket transitions into a
 // stage (multica-bridge.cjs). If that task later dies while the ticket is still
@@ -527,16 +539,14 @@ async function requeueStrandedTasks() {
       // A 'completed' predecessor means QC finished without writing a verdict.
       // That is a real retry, not an infra replay, so it costs an attempt.
       const noArtifact = row.dead_task_status === 'completed';
-      const infra = INFRA_FAILURE_REASONS.includes(row.failure_reason || 'cancelled');
+      const infra = isInfrastructureFailure(row.failure_reason);
       // noArtifact must be checked BEFORE infra: a completed task has a NULL
       // failure_reason, which coalesces to 'cancelled' -- an INFRA reason --
       // and infra replays reuse the same attempt number. Left in that order
       // the retry would never consume an attempt and these tickets would
       // requeue forever, which is the QC bounce loop that burned 134 paid
       // calls on a single ticket. A missing verdict is a real failed try.
-      const attempt = coldStart ? 1
-        : (noArtifact || !infra) ? row.attempt + 1
-        : row.attempt;
+      const attempt = selectReplayAttempt(row);
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
         await client.query('BEGIN');
@@ -600,12 +610,16 @@ async function requeueStrandedTasks() {
   }
 }
 
-console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
-setInterval(findAndAdvanceTasks, 15000);
-setInterval(findAndAdvanceRegistered, 20000);
-setInterval(recoveryAdvanceTasks, 120000);
-setInterval(cleanupStalePendingRows, 300000);
-setInterval(requeueStrandedTasks, 60000);
-findAndAdvanceTasks().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
-findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
-cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
+if (require.main === module) {
+  console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
+  setInterval(findAndAdvanceTasks, 15000);
+  setInterval(findAndAdvanceRegistered, 20000);
+  setInterval(recoveryAdvanceTasks, 120000);
+  setInterval(cleanupStalePendingRows, 300000);
+  setInterval(requeueStrandedTasks, 60000);
+  findAndAdvanceTasks().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
+  findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
+  cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
+}
+
+module.exports = { INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt };
