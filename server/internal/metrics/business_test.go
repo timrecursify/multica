@@ -108,6 +108,10 @@ func TestBusinessMetricsRegistryExposesAllFamilies(t *testing.T) {
 	m.RecordTaskFailed("issue", "local", taskfailure.ReasonTimeout.String())
 	m.RecordTaskQueuedExpired("issue", "local")
 	m.RecordTaskLeaseExpired("issue")
+	m.RecordAdmissionAdmitted("standard")
+	m.RecordAdmissionDeferred("standard")
+	m.RecordAdmissionRejected("standard")
+	m.RecordAdmissionNearLimit("standard")
 	m.RecordLLMUsage("issue", "local", "codex", "gpt-5.4", 1, 1, 1, 1, 0)
 	m.RecordLLMUsage("issue", "local", "custom-provider", "custom-model", 1, 0, 0, 0, 0)
 

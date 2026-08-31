@@ -210,6 +210,10 @@ type RouterOptions struct {
 	DaemonHub    *daemonws.Hub
 	DaemonWakeup service.TaskWakeupNotifier
 	FeatureFlags *featureflag.Service
+	// DispatchAdmission configures the MINT-5 dispatch/load admission gate.
+	// When nil (the default) the gate is disabled and every enqueue proceeds
+	// as before. See service.DispatchAdmissionPolicy for the fields.
+	DispatchAdmission *service.DispatchAdmissionPolicy
 	// HeartbeatScheduler, when non-nil, replaces the default synchronous
 	// passthrough scheduler on the constructed Handler. main.go injects a
 	// BatchedHeartbeatScheduler here so the caller can also drive Run/Stop;
@@ -285,6 +289,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	h.FeatureFlags = opts.FeatureFlags
 	h.TaskService.FeatureFlags = opts.FeatureFlags
 	h.TaskService.Metrics = opts.BusinessMetrics
+	h.TaskService.DispatchAdmission = opts.DispatchAdmission
 	h.IssueService.Metrics = opts.BusinessMetrics
 	if opts.BusinessMetrics != nil {
 		// Wire the BusinessMetrics receiver into the cloud runtime client

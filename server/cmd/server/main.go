@@ -172,6 +172,48 @@ func envBool(name string, def bool) bool {
 	return v
 }
 
+// envFloatClamped reads a float env var and clamps it to [min, max]. Empty or
+// unparsable values fall back to def.
+func envFloatClamped(name string, def, min, max float64) float64 {
+	raw := os.Getenv(name)
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		slog.Warn("invalid env var, using default", "name", name, "value", raw, "default", def, "error", err)
+		return def
+	}
+	if v < min {
+		v = min
+	}
+	if v > max {
+		v = max
+	}
+	return v
+}
+
+// dispatchAdmissionPolicyFromEnv builds the MINT-5 dispatch admission gate
+// policy from environment variables. The gate is enabled only when at least
+// one capacity cap (queue depth or concurrency) is configured; otherwise it
+// returns nil and the dispatcher behaves exactly as before. Alert threshold
+// defaults to 0.8 of the smaller configured cap; backoff defaults to a 1s
+// base capped at 30s.
+func dispatchAdmissionPolicyFromEnv() *service.DispatchAdmissionPolicy {
+	maxQueue := envPositiveInt("MULTICA_DISPATCH_MAX_QUEUE_DEPTH", 0)
+	maxConcurrent := envPositiveInt("MULTICA_DISPATCH_MAX_CONCURRENT", 0)
+	if maxQueue <= 0 && maxConcurrent <= 0 {
+		return nil
+	}
+	return &service.DispatchAdmissionPolicy{
+		MaxQueueDepth:  maxQueue,
+		MaxConcurrent:  maxConcurrent,
+		AlertThreshold: envFloatClamped("MULTICA_DISPATCH_ALERT_THRESHOLD", 0.8, 0, 1),
+		BackoffBase:    envDuration("MULTICA_DISPATCH_BACKOFF_BASE", 1*time.Second),
+		BackoffCap:     envDuration("MULTICA_DISPATCH_BACKOFF_CAP", 30*time.Second),
+	}
+}
+
 func backgroundServices(h *handler.Handler) (*service.TaskService, *service.AutopilotService) {
 	return h.TaskService, h.AutopilotService
 }
@@ -403,6 +445,7 @@ func main() {
 		DaemonHub:          daemonHub,
 		DaemonWakeup:       daemonWakeup,
 		FeatureFlags:       flags,
+		DispatchAdmission:  dispatchAdmissionPolicyFromEnv(),
 		HeartbeatScheduler: heartbeatScheduler,
 	})
 
