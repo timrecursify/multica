@@ -279,11 +279,12 @@ async function relayAdvance(req, res, body) {
     await client.connect();
     await client.query("BEGIN");
 
+    const dispositionStages = new Set(["Parked", "Rejected"]);
     const targetStageResult = await client.query(
       "SELECT stage_name FROM relay_stage_config WHERE stage_name = $1",
       [to_stage]
     );
-    if (targetStageResult.rows.length === 0) {
+    if (targetStageResult.rows.length === 0 && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayStage(res, to_stage);
       return;
@@ -334,7 +335,6 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    const dispositionStages = new Set(["Parked", "Rejected"]);
     if (!allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
