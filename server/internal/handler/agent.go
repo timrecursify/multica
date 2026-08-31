@@ -2470,7 +2470,7 @@ func (h *Handler) ListWorkspaceStageCounts(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	rows, err := h.Queries.ListWorkspaceStageCounts(r.Context())
+	rows, err := h.Queries.ListWorkspaceStageCounts(r.Context(), parseUUID(workspaceID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list stage counts")
 		return

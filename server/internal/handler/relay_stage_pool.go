@@ -102,6 +102,11 @@ func (h *Handler) ReplaceRelayStagePool(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	defer tx.Rollback(r.Context())
+	var configured bool
+	if err = tx.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM relay_stage_config WHERE workspace_id=$1::uuid AND stage_name=$2)`, workspaceID, stage).Scan(&configured); err != nil || !configured {
+		writeError(w, http.StatusBadRequest, "relay pool stage must be configured in this workspace")
+		return
+	}
 	if _, err = tx.Exec(r.Context(), `INSERT INTO relay_stage_pool (workspace_id, stage_name, enabled) VALUES ($1::uuid,$2,$3) ON CONFLICT (workspace_id,stage_name) DO UPDATE SET enabled=EXCLUDED.enabled,updated_at=now()`, workspaceID, stage, body.Enabled); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to save relay pool")
 		return
