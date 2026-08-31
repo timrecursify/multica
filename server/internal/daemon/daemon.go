@@ -6842,6 +6842,8 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	var toolCount atomic.Int32
 	var prURLMu sync.Mutex
 	var prURL string
+	prCreationCalls := make(map[string]bool)
+	var prCreationMissingURL bool
 	// lastActivityAt records (as unix nanos) when the drain loop most
 	// recently received a message from the backend. The idle watchdog
 	// reads this to decide whether the agent has gone silent for too long.
@@ -6992,6 +6994,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						mu.Lock()
 						callIDToTool[msg.CallID] = msg.Tool
 						mu.Unlock()
+						if isPullRequestCreationInvocation(msg) {
+							prURLMu.Lock()
+							prCreationCalls[msg.CallID] = true
+							prURLMu.Unlock()
+						}
 					}
 					s := msgSeq.Add(1)
 					mu.Lock()
@@ -7012,11 +7019,16 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					})
 					mu.Unlock()
 				case agent.MessageToolResult:
-					if candidate, ok := structuredPullRequestURL(msg.Output); ok {
-						prURLMu.Lock()
-						prURL = candidate
-						prURLMu.Unlock()
+					prURLMu.Lock()
+					if prCreationCalls[msg.CallID] {
+						if candidate, ok := pullRequestURLFromCreationResult(msg.Output); ok {
+							prURL = candidate
+							prCreationMissingURL = false
+						} else {
+							prCreationMissingURL = true
+						}
 					}
+					prURLMu.Unlock()
 					// Decrement only when the count would stay >= 0. A stray
 					// tool_result with no matching tool_use (backend bug or
 					// reconnect mid-stream) shouldn't push the counter
@@ -7116,7 +7128,12 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 		waitForDrain()
 		prURLMu.Lock()
 		result.PRURL = prURL
+		missingPRURL := prCreationMissingURL
 		prURLMu.Unlock()
+		if missingPRURL {
+			result.Status = "failed"
+			result.Error = "pull request creation returned no URL"
+		}
 		if idleWatchdogFired.Load() {
 			// The backend's wait goroutine (e.g. claude.go) translates the
 			// SIGKILL we delivered via agentCancel into Status="aborted".
@@ -7163,10 +7180,34 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	}
 }
 
-// structuredPullRequestURL accepts only machine-readable tool results. Agent
-// prose is deliberately ignored so a sentence mentioning a URL cannot be
-// mistaken for a pull request that was actually created.
-func structuredPullRequestURL(raw string) (string, bool) {
+// isPullRequestCreationInvocation identifies the actual creation call rather
+// than inferring it from a URL-shaped result. ACP command tools report the
+// command under either cmd or command; dedicated GitHub tools expose their
+// creation operation in the tool name.
+func isPullRequestCreationInvocation(msg agent.Message) bool {
+	tool := strings.ToLower(strings.ReplaceAll(msg.Tool, "-", "_"))
+	if strings.Contains(tool, "create_pull_request") || strings.Contains(tool, "createpullrequest") {
+		return true
+	}
+	for _, key := range []string{"cmd", "command"} {
+		command, _ := msg.Input[key].(string)
+		fields := strings.Fields(command)
+		for i := 0; i+2 < len(fields); i++ {
+			if fields[i] == "gh" && fields[i+1] == "pr" && fields[i+2] == "create" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pullRequestURLFromCreationResult reads only the result paired with a
+// positively identified creation call. A GitHub CLI creation returns the URL
+// directly; API tools return it in url or html_url JSON fields.
+func pullRequestURLFromCreationResult(raw string) (string, bool) {
+	if url := strings.TrimSpace(raw); strings.HasPrefix(url, "https://") && strings.Contains(url, "/pull/") && !strings.ContainsAny(url, " \t\r\n") {
+		return url, true
+	}
 	var payload struct {
 		URL     string `json:"url"`
 		HTMLURL string `json:"html_url"`
