@@ -139,7 +139,7 @@ func (h *Handler) issueTableOrderBy(w http.ResponseWriter, r *http.Request, work
 		resolved.castType = "date"
 		resolved.nullsLast = true
 	case "status":
-		resolved.expression = "CASE i.status WHEN 'backlog' THEN 0 WHEN 'todo' THEN 1 WHEN 'in_progress' THEN 2 WHEN 'in_review' THEN 3 WHEN 'done' THEN 4 WHEN 'blocked' THEN 5 WHEN 'cancelled' THEN 6 ELSE 7 END"
+		resolved.expression = h.IssueStatusContract.orderCASE("i.status")
 		resolved.castType = "integer"
 	case "priority":
 		resolved.expression = "CASE i.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END"
@@ -467,7 +467,7 @@ SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 	labelsByIssue := baseHandler.labelsByIssue(r.Context(), compiled.workspaceID, issueIDs)
 	responseRows := make([]issueTableRowResponse, len(scanned))
 	for index, row := range scanned {
-		issue := issueListRowToResponse(row.issue, prefix)
+		issue := issueListRowToResponse(row.issue, prefix, baseHandler.IssueStatusContract)
 		labels := labelsByIssue[issue.ID]
 		if labels == nil {
 			labels = []LabelResponse{}

@@ -4649,7 +4649,7 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 					} else if !hasActive {
 						updatedIssue, updateErr := s.Queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{
 							ID:          t.IssueID,
-							Status:      "todo",
+							Status:      "Spec",
 							WorkspaceID: issue.WorkspaceID,
 						})
 						if updateErr != nil {
@@ -5653,8 +5653,8 @@ func (s *TaskService) publishQuickCreateInbox(item db.InboxItem, workspaceID, ag
 func EvaluateTaskComplexity(issue db.Issue, contextTokenCount int) string {
 	const (
 		// Thresholds for junior-lane eligibility
-		maxContentLength = 2000   // characters in title+description
-		maxTokens        = 5000   // context token count
+		maxContentLength = 2000 // characters in title+description
+		maxTokens        = 5000 // context token count
 	)
 
 	// P0/critical issues always route to senior

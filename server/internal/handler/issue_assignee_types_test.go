@@ -53,7 +53,7 @@ func TestListIssues_AssigneeTypesFilter(t *testing.T) {
 		var id string
 		if err := testPool.QueryRow(ctx, `
 			INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_type, creator_id, position, number, project_id)
-			VALUES ($1, $2, 'todo', 'none', $3, $4, 'member', $5, 0, $6, $7) RETURNING id
+			VALUES ($1, $2, 'Spec', 'none', $3, $4, 'member', $5, 0, $6, $7) RETURNING id
 		`, testWorkspaceID, title, assigneeType, assigneeID, testUserID, number, projectID).Scan(&id); err != nil {
 			t.Fatalf("create issue %q: %v", title, err)
 		}

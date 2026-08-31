@@ -2686,15 +2686,10 @@ func TestRunIssueCommentList_DoesNotPrintShowingPreamble(t *testing.T) {
 }
 
 func TestValidIssueStatuses(t *testing.T) {
+	// The CLI accepts the union of both vocabularies so it keeps working
+	// against either board during the convergence rollout. Every spelling the
+	// server accepts on either profile must be CLI-valid.
 	expected := map[string]bool{
-		"Registered":     true,
-		"Spec":           true,
-		"Queue":          true,
-		"In Progress":    true,
-		"In Review":      true,
-		"Human Review":   true,
-		"CI/CD & Deploy": true,
-		"Done":           true,
 		"backlog":        true,
 		"todo":           true,
 		"in_progress":    true,
@@ -2702,8 +2697,20 @@ func TestValidIssueStatuses(t *testing.T) {
 		"done":           true,
 		"blocked":        true,
 		"cancelled":      true,
-		"Archived":       true,
+		"Registered":     true,
+		"Spec":           true,
+		"Queue":          true,
+		"Building":       true,
+		"In Progress":    true,
+		"QC":             true,
+		"In Review":      true,
+		"Human Review":   true,
+		"CI/CD & Deploy": true,
+		"Done":           true,
+		"Blocked":        true,
 		"Cancelled":      true,
+		"Archived":       true,
+		"dead_letter": true,
 	}
 	for _, s := range validIssueStatuses {
 		if !expected[s] {

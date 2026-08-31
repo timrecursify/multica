@@ -1229,7 +1229,7 @@ func TestGetTaskStatus_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	var issueID, taskID string
 	err := testPool.QueryRow(context.Background(), `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type)
-		VALUES ($1, 'daemon-auth-test-issue', 'todo', 'medium', $2, 'member')
+		VALUES ($1, 'daemon-auth-test-issue', 'Spec', 'medium', $2, 'member')
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID)
 	if err != nil {
@@ -1337,7 +1337,7 @@ func TestGetIssueGCCheck_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	var issueID string
 	err := testPool.QueryRow(context.Background(), `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type)
-		VALUES ($1, 'gc-check-auth-test-issue', 'done', 'medium', $2, 'member')
+		VALUES ($1, 'gc-check-auth-test-issue', 'Done', 'medium', $2, 'member')
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID)
 	if err != nil {
@@ -1391,7 +1391,7 @@ func TestBatchIssueGCCheck_WithDaemonToken(t *testing.T) {
 	var issueID string
 	err := testPool.QueryRow(context.Background(), `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type)
-		VALUES ($1, 'batch-gc-check-auth-test-issue', 'done', 'medium', $2, 'member')
+		VALUES ($1, 'batch-gc-check-auth-test-issue', 'Done', 'medium', $2, 'member')
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID)
 	if err != nil {
@@ -1519,7 +1519,7 @@ func setupForeignWorkspaceFixture(t *testing.T) (string, string) {
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type)
-		VALUES ($1, 'foreign-workspace-issue', 'todo', 'medium', $2, 'agent')
+		VALUES ($1, 'foreign-workspace-issue', 'Spec', 'medium', $2, 'agent')
 		RETURNING id
 	`, foreignWorkspaceID, agentID).Scan(&issueID); err != nil {
 		t.Fatalf("setup: create foreign issue: %v", err)
@@ -1611,7 +1611,7 @@ func TestCancelTask_TaskBelongsToDifferentIssue_Returns404(t *testing.T) {
 	var issueXID, taskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'cancel-crossissue-x', 'todo', 'medium', $2, 'member', 91001, 0)
+		VALUES ($1, 'cancel-crossissue-x', 'Spec', 'medium', $2, 'member', 91001, 0)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueXID); err != nil {
 		t.Fatalf("setup: create issue X: %v", err)
@@ -1631,7 +1631,7 @@ func TestCancelTask_TaskBelongsToDifferentIssue_Returns404(t *testing.T) {
 	var issueYID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'cancel-crossissue-y', 'todo', 'medium', $2, 'member', 91002, 0)
+		VALUES ($1, 'cancel-crossissue-y', 'Spec', 'medium', $2, 'member', 91002, 0)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueYID); err != nil {
 		t.Fatalf("setup: create issue Y: %v", err)
@@ -1678,7 +1678,7 @@ func TestCancelTask_SameIssue_Succeeds(t *testing.T) {
 	var issueID, taskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'cancel-happy-path', 'todo', 'medium', $2, 'member', 91003, 0)
+		VALUES ($1, 'cancel-happy-path', 'Spec', 'medium', $2, 'member', 91003, 0)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("setup: create issue: %v", err)
@@ -1900,7 +1900,7 @@ func TestDaemonRegister_MergesLegacyDaemonIDRuntime(t *testing.T) {
 	var legacyIssueID, legacyTaskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'legacy-task-owner', 'todo', 'medium', $2, 'member', 97501, 0)
+		VALUES ($1, 'legacy-task-owner', 'Spec', 'medium', $2, 'member', 97501, 0)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&legacyIssueID); err != nil {
 		t.Fatalf("seed legacy issue: %v", err)
@@ -2391,7 +2391,7 @@ func TestClaimTask_ProjectGithubReposOverrideWorkspaceRepos(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (
 			workspace_id, project_id, title, status, priority, creator_id, creator_type, number, position
-		) VALUES ($1, $2, 'project repo override', 'todo', 'medium', $3, 'member', 88001, 0)
+		) VALUES ($1, $2, 'project repo override', 'Spec', 'medium', $3, 'member', 88001, 0)
 		RETURNING id
 	`, testWorkspaceID, projectID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)
@@ -2482,7 +2482,7 @@ func TestClaimTask_ProjectDescriptionInjected(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (
 			workspace_id, project_id, title, status, priority, creator_id, creator_type, number, position
-		) VALUES ($1, $2, 'project description', 'todo', 'medium', $3, 'member', 88002, 0)
+		) VALUES ($1, $2, 'project description', 'Spec', 'medium', $3, 'member', 88002, 0)
 		RETURNING id
 	`, testWorkspaceID, projectID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)
@@ -2604,7 +2604,7 @@ func TestClaimTask_ProjectWithoutRepos_FallsBackToWorkspaceRepos(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (
 			workspace_id, project_id, title, status, priority, creator_id, creator_type, number, position
-		) VALUES ($1, $2, 'no project repos', 'todo', 'medium', $3, 'member', 88002, 0)
+		) VALUES ($1, $2, 'no project repos', 'Spec', 'medium', $3, 'member', 88002, 0)
 		RETURNING id
 	`, testWorkspaceID, projectID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)
@@ -2773,7 +2773,7 @@ func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T
 	var foreignIssueID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position)
-		VALUES ($1, 'mismatch-foreign-issue', 'todo', 'medium', $2, 'member', 77001, 0)
+		VALUES ($1, 'mismatch-foreign-issue', 'Spec', 'medium', $2, 'member', 77001, 0)
 		RETURNING id
 	`, foreignWorkspaceID, testUserID).Scan(&foreignIssueID); err != nil {
 		t.Fatalf("setup: create foreign issue: %v", err)

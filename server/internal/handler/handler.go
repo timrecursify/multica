@@ -128,6 +128,12 @@ type Config struct {
 	// Surfaced through /api/config so self-hosted operators can confirm which
 	// server build is deployed. Empty in dev builds.
 	ServerVersion string
+	// IssueStatusContract is the immutable, per-deployment issue-status
+	// vocabulary selected at startup (MULTICA_ISSUE_STATUS_PROFILE). It is
+	// stored on the immutable Config so every validation, canonicalization,
+	// grouping, filtering, and ordering path in the handler shares one
+	// contract; it is never re-read from the environment per request.
+	IssueStatusContract *IssueStatusContract
 }
 
 type cloudRuntimeProxy interface {
@@ -307,6 +313,11 @@ type Handler struct {
 	// Wired in cmd/server/router.go after New.
 	PRRefresh *ghsnapshot.Manager
 	cfg       Config
+	// IssueStatusContract is the active, immutable status vocabulary for this
+	// Handler (defaulted from cfg in New when the router did not supply one).
+	// All handlers read it via h.IssueStatusContract; the environment is never
+	// consulted per request.
+	IssueStatusContract *IssueStatusContract
 }
 
 func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *events.Bus, emailService *service.EmailService, store storage.Storage, cfSigner *auth.CloudFrontSigner, analyticsClient analytics.Client, cfg Config, daemonHubs ...*daemonws.Hub) *Handler {
@@ -326,6 +337,13 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 	}
 	if cfg.AttachmentDownloadURLTTL <= 0 {
 		cfg.AttachmentDownloadURLTTL = defaultAttachmentDownloadURLTTL
+	}
+
+	// Default the issue-status contract to the converged canonical profile when
+	// the operator did not configure one. Router.go can select a display profile
+	// with MULTICA_ISSUE_STATUS_PROFILE without changing persisted values.
+	if cfg.IssueStatusContract == nil {
+		cfg.IssueStatusContract, _ = NewIssueStatusContract(IssueStatusProfilePPP)
 	}
 
 	var daemonHub *daemonws.Hub
@@ -360,6 +378,7 @@ func New(queries *db.Queries, txStarter txStarter, hub *realtime.Hub, bus *event
 		DaemonProfileRefresh:         daemonProfileRefresh,
 		DaemonWorkspaceRefresh:       daemonWorkspaceRefresh,
 		Bus:                          bus,
+		IssueStatusContract:          cfg.IssueStatusContract,
 		TaskService:                  taskSvc,
 		IssueService:                 service.NewIssueService(queries, txStarter, bus, analyticsClient, taskSvc),
 		AutopilotService:             service.NewAutopilotService(queries, txStarter, bus, taskSvc),

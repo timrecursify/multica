@@ -414,7 +414,7 @@ func (h *Handler) compileIssueTableQuery(w http.ResponseWriter, r *http.Request,
 	}
 
 	for _, status := range spec.Filters.Statuses {
-		if !issueTableContainsString(validIssueStatuses, status) {
+		if strings.TrimSpace(status) == "" {
 			writeError(w, http.StatusBadRequest, "invalid filters.statuses")
 			return issueTableSQL{}, false
 		}

@@ -214,7 +214,7 @@ func insertIssueTo(t *testing.T, ctx context.Context, workspaceID, title, assign
 			assignee_type, assignee_id, creator_type, creator_id,
 			position, number
 		)
-		VALUES ($1, $2, NULL, 'todo', 'none', $3, $4, 'member', $5, 0, $6)
+		VALUES ($1, $2, NULL, 'Spec', 'none', $3, $4, 'member', $5, 0, $6)
 		RETURNING id
 	`, workspaceID, title, assigneeType, assigneeID, testUserID, number).Scan(&id); err != nil {
 		t.Fatalf("create issue %q: %v", title, err)

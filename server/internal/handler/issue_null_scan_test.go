@@ -23,7 +23,7 @@ func TestIssueListSurfacesTolerateNullCreatorType(t *testing.T) {
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, 'null creator regression row', 'todo', 'none', NULL, $2, 1)
+		VALUES ($1, 'null creator regression row', 'Spec', 'none', NULL, $2, 1)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
 		t.Fatalf("insert null-creator row: %v", err)
@@ -57,7 +57,7 @@ func TestIssueListsRejectNullCreatorIDAndNumber(t *testing.T) {
 	insert := func(creatorType, creatorID, number any) error {
 		return testPool.QueryRow(ctx, `
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-			VALUES ($1, 'null contract regression row', 'todo', 'none', $2, $3, $4)
+			VALUES ($1, 'null contract regression row', 'Spec', 'none', $2, $3, $4)
 			RETURNING id
 		`, testWorkspaceID, creatorType, creatorID, number).Scan(new(string))
 	}

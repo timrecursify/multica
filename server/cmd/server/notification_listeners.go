@@ -19,15 +19,17 @@ type mention struct {
 	ID   string // user_id, agent_id, issue_id, or "all"
 }
 
-// statusLabels maps DB status values to human-readable labels for notifications.
+// statusLabels is the notification presentation boundary for canonical DB values.
+// Legacy notification wording remains here rather than leaking back into storage.
 var statusLabels = map[string]string{
-	"backlog":     "Backlog",
-	"todo":        "Todo",
-	"in_progress": "In Progress",
-	"in_review":   "In Review",
-	"done":        "Done",
-	"blocked":     "Blocked",
-	"cancelled":   "Cancelled",
+	"Spec":         "Todo",
+	"Queue":        "Backlog",
+	"in_progress":  "In Progress",
+	"in_review":    "In Review",
+	"Human Review": "Blocked",
+	"Done":         "Done",
+	"Cancelled":    "Cancelled",
+	"Archived":     "Archived",
 }
 
 // priorityLabels maps DB priority values to human-readable labels for notifications.
@@ -96,10 +98,11 @@ var delegatedAlwaysNotifTypes = map[string]bool{
 // specific issue: routine forward progress (todo, in_progress), deliberate
 // parking (backlog), comment traffic, and field edits.
 var delegatedStatusNotify = map[string]bool{
-	"in_review": true,
-	"done":      true,
-	"cancelled": true,
-	"blocked":   true,
+	"in_review":    true,
+	"Done":         true,
+	"Cancelled":    true,
+	"Human Review": true,
+	"Archived":     true,
 }
 
 // deliverToSubscriber reports whether a subscriber row should receive this
@@ -202,9 +205,11 @@ func loadUserPrefs(
 // reliable "work delivered" handoff — and a status flip back to in_progress
 // will simply produce new task_failed rows that surface normally.
 var terminalStatusForTaskFailedDismiss = map[string]bool{
-	"in_review": true,
-	"done":      true,
-	"cancelled": true,
+	"in_review":    true,
+	"Done":         true,
+	"Cancelled":    true,
+	"Human Review": true,
+	"Archived":     true,
 }
 
 // archiveStaleTaskFailedInbox archives all task_failed inbox rows for the

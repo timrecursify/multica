@@ -591,7 +591,7 @@ func TestProjectResourceCountBreadcrumb(t *testing.T) {
 			workspace_id, creator_type, creator_id, title, status, priority,
 			project_id, number, position
 		)
-		VALUES ($1, 'member', $2, 'Project update stats breadcrumb', 'done', 'none', $3, $4, 0)
+		VALUES ($1, 'member', $2, 'Project update stats breadcrumb', 'Done', 'none', $3, $4, 0)
 		RETURNING id
 	`, testWorkspaceID, testUserID, project.ID, number).Scan(&issueID); err != nil {
 		t.Fatalf("create project issue: %v", err)

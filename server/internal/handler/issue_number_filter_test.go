@@ -19,7 +19,7 @@ func TestListIssuesNumberFilterReturnsSingleIssue(t *testing.T) {
 	var wantID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, 'RECONSTRUCTED number filter target', 'todo', 'none', NULL, $2, 987654)
+		VALUES ($1, 'RECONSTRUCTED number filter target', 'Spec', 'none', NULL, $2, 987654)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&wantID); err != nil {
 		t.Fatalf("insert numbered row: %v", err)
@@ -29,7 +29,7 @@ func TestListIssuesNumberFilterReturnsSingleIssue(t *testing.T) {
 	var otherID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, 'number filter decoy', 'todo', 'none', 'member', $2, 987655)
+		VALUES ($1, 'number filter decoy', 'Spec', 'none', 'member', $2, 987655)
 		RETURNING id
 	`, testWorkspaceID, testUserID).Scan(&otherID); err != nil {
 		t.Fatalf("insert decoy row: %v", err)

@@ -90,3 +90,22 @@ func TestBatchUpdateIssuesInvalidPriorityReturns400(t *testing.T) {
 		t.Fatalf("expected 400 for invalid priority, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+func TestValidateIssueEnumAcceptsPPPWorkflowStatuses(t *testing.T) {
+	for _, status := range []string{"Queue", "Spec", "Building", "QC", "In Review", "In Progress", "Human Review", "Done", "Blocked", "Cancelled", "Archived", "dead_letter", "Registered"} {
+		rec := httptest.NewRecorder()
+		if ok := validateIssueEnum(rec, "status", status, validIssueStatuses); !ok {
+			t.Fatalf("validateIssueEnum(%q) should be accepted, body: %s", status, rec.Body.String())
+		}
+	}
+}
+
+func TestValidateIssueEnumStillRejectsUnknownStatus(t *testing.T) {
+	rec := httptest.NewRecorder()
+	if ok := validateIssueEnum(rec, "status", "BOGUSSTATUS", validIssueStatuses); ok {
+		t.Fatal("validateIssueEnum(BOGUSSTATUS) should be rejected")
+	}
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", rec.Code)
+	}
+}

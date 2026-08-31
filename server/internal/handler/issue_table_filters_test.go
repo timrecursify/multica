@@ -194,7 +194,7 @@ func TestQueryIssues_PostTwinMatchesGet(t *testing.T) {
 			INSERT INTO issue (
 				workspace_id, title, status, priority, creator_type, creator_id,
 				position, number, metadata
-			) VALUES ($1, $2, 'todo', 'none', 'member', $3, 0, $4, $5::jsonb)
+			) VALUES ($1, $2, 'Spec', 'none', 'member', $3, 0, $4, $5::jsonb)
 			RETURNING id
 		`, testWorkspaceID, title, testUserID, nextNumber(), metadata).Scan(&id); err != nil {
 			t.Fatalf("create issue %q: %v", title, err)
@@ -311,7 +311,7 @@ func TestListIssues_OffsetPaginationStableOnCreatedAtTies(t *testing.T) {
 			INSERT INTO issue (
 				workspace_id, title, status, priority, creator_type, creator_id,
 				position, number, metadata, created_at, updated_at
-			) VALUES ($1, $2, 'todo', 'none', 'member', $3, 0, $4, $5::jsonb,
+			) VALUES ($1, $2, 'Spec', 'none', 'member', $3, 0, $4, $5::jsonb,
 				'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')
 			RETURNING id
 		`, testWorkspaceID, fmt.Sprintf("%s %d", token, i), testUserID,
