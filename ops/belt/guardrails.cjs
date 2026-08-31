@@ -82,6 +82,11 @@ function spendPreflight(agent, selectedRuntime = {}) {
   // mandatory only when the selected provider/model can spend OpenRouter funds.
   if (paid && (!Number.isInteger(cap) || cap <= 0)) return { ok: false, reason: 'invalid_concurrency_cap' };
   if (paid && !model) return { ok: false, reason: 'missing_model' };
+  const tokenBudget = Number(selectedRuntime.token_budget ?? agent.token_budget ??
+    (agent.runtime_config && agent.runtime_config.token_budget));
+  if (paid && (!Number.isFinite(tokenBudget) || tokenBudget <= 0)) {
+    return { ok: false, reason: 'missing_paid_token_budget' };
+  }
   return { ok: true, cap };
 }
 

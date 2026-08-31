@@ -39,8 +39,9 @@ test('infra retry stops when queue loses headroom and never spends attempt', () 
 });
 
 test('paid dispatch requires a live configured agent', () => {
-  assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter' }).ok, true);
-  assert.equal(spendPreflight({ max_concurrent_tasks: 0, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter' }).ok, false);
+  assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter', token_budget: 1000 }).ok, true);
+  assert.equal(spendPreflight({ max_concurrent_tasks: 0, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter', token_budget: 1000 }).ok, false);
+  assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter' }).ok, false);
   assert.equal(spendPreflight({ max_concurrent_tasks: null, instructions: 'Queue', model: 'gpt-5.6-luna' }, { provider: 'codex' }).ok, true);
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: '' }, { provider: 'codex' }).ok, true);
 });

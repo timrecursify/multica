@@ -417,7 +417,7 @@ async function relayAdvance(req, res, body) {
 
     const stageResult = await client.query(
       `SELECT rsc.agent_id, rsc.agent_name, a.runtime_id, a.archived_at,
-              a.instructions, a.model, a.max_concurrent_tasks,
+              a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
               (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
               COALESCE(
                 a.runtime_id,
