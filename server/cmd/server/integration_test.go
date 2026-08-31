@@ -535,7 +535,7 @@ func TestIssuesCRUDThroughRouter(t *testing.T) {
 	if updated2["title"] != "Renamed integration issue" {
 		t.Fatalf("expected title 'Renamed integration issue', got '%s'", updated2["title"])
 	}
-	if updated2["status"] != "in_progress" {
+	if updated2["status"] != "In Progress" {
 		t.Fatalf("status should be preserved, got '%s'", updated2["status"])
 	}
 
