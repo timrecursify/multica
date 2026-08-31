@@ -435,11 +435,18 @@ async function requeueStrandedTasks() {
                -- The stage is the evidence, so no content test is needed.
                OR (i.status = 'Spec'
                    AND t.status = 'completed'
-                   AND t.attempt < t.max_attempts))
+                   AND t.attempt < t.max_attempts)
+               OR (t.id IS NOT NULL
+                   AND t.status IN ('queued', 'dispatched', 'running')
+                   AND ((t.context ? 'to_stage'
+                         AND t.context->>'to_stage' IS DISTINCT FROM i.status)
+                        OR (NOT (t.context ? 'to_stage')
+                            AND t.created_at < i.updated_at))))
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue q
              WHERE q.issue_id = i.id AND q.status IN
                ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+               AND COALESCE(q.context->>'to_stage', '') = i.status
           )
           -- A bundled child is never its own unit of work: its MEGA parent
           -- carries the fix. The bridge withholds the child's task at the
@@ -582,6 +589,14 @@ async function requeueStrandedTasks() {
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
         await client.query('BEGIN');
+        await client.query(
+          `UPDATE agent_task_queue SET status = 'cancelled', completed_at = NOW(),
+                  prepare_lease_expires_at = NULL,
+                  failure_reason = 'relay_stage_transition_superseded'
+             WHERE issue_id = $1 AND status IN ('queued','dispatched','running')
+               AND COALESCE(context->>'to_stage','') IS DISTINCT FROM $2`,
+          [row.issue_id, row.stage]
+        );
         // Serialize admission with the bridge and other recovery workers. The
         // issue lock plus stage-scoped predicate prevents duplicate paid rows.
         await client.query('SELECT id FROM issue WHERE id = $1 FOR UPDATE', [row.issue_id]);

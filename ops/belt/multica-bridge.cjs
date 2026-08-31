@@ -547,6 +547,14 @@ async function relayAdvance(req, res, body) {
     }
 
     if (stage.agent_id && !bundledChild) {
+      await client.query(
+        `UPDATE agent_task_queue SET status = 'cancelled', completed_at = NOW(),
+                prepare_lease_expires_at = NULL,
+                failure_reason = 'relay_stage_transition_superseded'
+           WHERE issue_id = $1 AND status IN ('queued','dispatched','running')
+             AND COALESCE(context->>'to_stage','') IS DISTINCT FROM $2`,
+        [issue_id, to_stage]
+      );
       const context = JSON.stringify({
         source: "relay-advance",
         from_stage: issue.status,
@@ -556,8 +564,8 @@ async function relayAdvance(req, res, body) {
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
       });
-      // A pending task will pick the issue up at its current stage, so a second
-      // task is redundant; the stage transition must not be sacrificed to it.
+      // The prior-stage live rows were superseded above; always insert the
+      // successor so the committed transition has exactly one target task.
       const taskResult = await client.query(
         `INSERT INTO agent_task_queue (
            agent_id, issue_id, status, runtime_id, context,
@@ -572,8 +580,7 @@ async function relayAdvance(req, res, body) {
                AND active.status IN ('queued', 'dispatched', 'running',
                                      'waiting_local_directory', 'deferred')
                AND active.context->>'to_stage' = $6
-          )
-           ON CONFLICT DO NOTHING
+           )
            RETURNING id`,
         [
           stage.agent_id,
@@ -584,9 +591,7 @@ async function relayAdvance(req, res, body) {
           to_stage
         ]
       );
-      if (taskResult.rows.length === 0) {
-        console.error('[relay] task already pending for issue', issue_id, 'agent', stage.agent_id, '- stage transition committed without new task');
-      } else {
+      if (taskResult.rows.length > 0) {
         taskId = taskResult.rows[0].id;
 
         const logResult = await client.query(
