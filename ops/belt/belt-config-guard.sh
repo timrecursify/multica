@@ -230,6 +230,16 @@ print(a[0]['pm2_env'].get('status','missing') if a else 'missing')
 # not agree with the selected executable: a non-paid lane must never advertise
 # paid access, and a paid executable must not run without an explicit opt-in.
 guard_single_instance_and_paid_lane() {
+  # The wrapper's default must be fail-closed. Explicitly selecting the paid
+  # executable still requires MULTICA_ALLOW_PAID_LANE=1; an absent variable on
+  # the non-paid Luna/Sol lane must stay 0 rather than inheriting 1.
+  if [[ -f "$WRAPPER" ]] && grep -q 'MULTICA_ALLOW_PAID_LANE="${MULTICA_ALLOW_PAID_LANE:-1}"' "$WRAPPER"; then
+    if sed -i 's/MULTICA_ALLOW_PAID_LANE:-1/MULTICA_ALLOW_PAID_LANE:-0/' "$WRAPPER"; then
+      fixed+=("paid-lane opt-in default repaired to 0 in ${WRAPPER}")
+    else
+      unfixable+=("could not repair paid-lane opt-in default in ${WRAPPER}")
+    fi
+  fi
   local snapshot
   snapshot=$("$PM2" jlist 2>/dev/null) || {
     unfixable+=("could not inspect PM2 for duplicate workers or paid-lane drift")
