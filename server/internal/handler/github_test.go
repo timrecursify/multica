@@ -1323,15 +1323,15 @@ func TestWebhook_CloseKeywordRemovedBeforeMergeDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after post-merge edit: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Errorf("after adding closing keyword post-merge: status = %q, want in_progress", got.Status)
+	if got.Status != "In Progress" {
+		t.Errorf("after adding closing keyword post-merge: status = %q, want In Progress", got.Status)
 	}
 	got, err = testHandler.Queries.GetIssue(ctx, parseUUID(second.ID))
 	if err != nil {
 		t.Fatalf("GetIssue second after post-merge edit: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Errorf("second issue after post-merge closing keyword: status = %q, want in_progress", got.Status)
+	if got.Status != "In Progress" {
+		t.Errorf("second issue after post-merge closing keyword: status = %q, want In Progress", got.Status)
 	}
 }
 
