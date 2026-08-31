@@ -258,10 +258,12 @@ async function ssoBridge(req, res) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token, current_work_product_md5 } = body;
+    let { issue_id, to_stage, agent_token, agent_task_token, current_work_product_md5 } = body;
     
-    // Validate agent token
-    if (agent_token !== RELAY_AGENT_SECRET) {
+    // The shared relay secret remains the credential for system workers.  A
+    // QC FAIL return is deliberately stronger: it is authorized later from a
+    // task-scoped mat_ token, never from a caller supplied agent id.
+    if (agent_token !== RELAY_AGENT_SECRET && typeof agent_task_token !== "string") {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
@@ -339,6 +341,54 @@ async function relayAdvance(req, res, body) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
+    }
+
+    const qcReturn = issue.status === "In Review" && to_stage === "In Progress";
+    let qcTask = null;
+    if (qcReturn) {
+      if (typeof agent_task_token !== "string" || !agent_task_token.startsWith("mat_")) {
+        await client.query("ROLLBACK");
+        res.writeHead(401, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "qc_task_auth_required" }));
+        return;
+      }
+      const tokenHash = crypto.createHash("sha256").update(agent_task_token).digest("hex");
+      const task = await client.query(
+        `SELECT q.id, q.agent_id
+           FROM task_token t
+           JOIN agent_task_queue q ON q.id = t.task_id
+          WHERE t.token_hash = $1
+            AND t.expires_at > NOW()
+            AND q.issue_id = $2
+            AND q.status IN ('dispatched', 'running')
+            AND q.context->>'to_stage' = 'In Review'
+          FOR UPDATE OF q`,
+        [tokenHash, issue.id]
+      );
+      qcTask = task.rows[0];
+      if (!qcTask) {
+        await client.query("ROLLBACK");
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "qc_task_not_active" }));
+        return;
+      }
+      const verdict = await client.query(
+        `SELECT verdict, work_product_md5
+           FROM qc_verdict
+          WHERE issue_id = $1
+          ORDER BY created_at DESC
+          LIMIT 1`,
+        [issue.id]
+      );
+      const latest = verdict.rows[0];
+      if (!latest || latest.verdict !== "FAIL" ||
+          typeof current_work_product_md5 !== "string" ||
+          current_work_product_md5.toLowerCase() !== String(latest.work_product_md5 || "").toLowerCase()) {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "qualifying_fail_required" }));
+        return;
+      }
     }
 
     // A QC FAIL sends the ticket back to the builder, and nothing counted how
@@ -449,6 +499,10 @@ async function relayAdvance(req, res, body) {
       );
     }
 
+    // Normal hops use the owner of the stage being left.  A QC FAIL return is
+    // the exception: authenticate the owner of In Review above, then dispatch
+    // the configured builder for In Progress.
+    const dispatchStage = qcReturn ? to_stage : issue.status;
     const stageResult = await client.query(
       `SELECT rsc.agent_id, rsc.agent_name, a.runtime_id, a.archived_at,
               a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
@@ -472,7 +526,7 @@ async function relayAdvance(req, res, body) {
       // the builder, and In Progress -> In Review wakes QC. Looking up the
       // target stage would select the next lane's owner and can burn a paid
       // call on an incompatible runbook.
-      [issue.workspace_id, issue.status]
+      [issue.workspace_id, dispatchStage]
     );
 
     if (stageResult.rows.length === 0) {
@@ -480,6 +534,17 @@ async function relayAdvance(req, res, body) {
     }
 
     const stage = stageResult.rows[0];
+    if (qcReturn) {
+      const qcOwner = await client.query(
+        `SELECT agent_id FROM relay_stage_config WHERE stage_name = 'In Review'`
+      );
+      if (!qcOwner.rows[0]?.agent_id || qcOwner.rows[0].agent_id !== qcTask.agent_id) {
+        await client.query("ROLLBACK");
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "qc_task_owner_mismatch" }));
+        return;
+      }
+    }
     if (stage.agent_id && isExecutionStage(to_stage) && stage.archived_at) {
       throw new Error(`Relay owner is archived: ${stage.agent_name} (${stage.agent_id}) for ${issue.status} -> ${to_stage}`);
     }
@@ -709,6 +774,19 @@ async function relayAdvance(req, res, body) {
       }
     }
 
+    // The authenticated QC task is the work product that produced the FAIL.
+    // Closing it is in the same transaction as the replacement builder task,
+    // preventing a partial return from stranding either lane.
+    if (qcReturn) {
+      const closed = await client.query(
+        `UPDATE agent_task_queue
+            SET status = 'completed', completed_at = NOW()
+          WHERE id = $1 AND status IN ('dispatched', 'running')`,
+        [qcTask.id]
+      );
+      if (closed.rowCount !== 1) throw new Error("qc task was no longer active");
+    }
+
     await client.query("COMMIT");
 
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -736,7 +814,8 @@ async function relayAdvance(req, res, body) {
   }
 }
 
-http.createServer(async (req, res) => {
+function createRelayServer() {
+  return http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/relay/advance") {
     let body = "";
     req.on("data", chunk => body += chunk);
@@ -758,9 +837,14 @@ http.createServer(async (req, res) => {
     res.writeHead(404);
     res.end("Not found");
   }
-}).listen(PORT, "127.0.0.1", () => {
+  });
+}
+
+if (require.main === module) createRelayServer().listen(PORT, "127.0.0.1", () => {
   console.log(`GSP Multica relay bridge listening on 127.0.0.1:${PORT}`);
   console.log(`SSO workspace: ${SSO_WORKSPACE_ID}`);
   console.log(`SSO Bridge: /sso/bridge (CF Access)`);
   console.log(`Relay: /relay/advance (ticket updates)`);
 });
+
+module.exports = { relayAdvance, createRelayServer };
