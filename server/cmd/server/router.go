@@ -1127,18 +1127,16 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/{taskId}/requeue", h.RequeueOrphanedTask)
 	})
 
-	// GSP-806 operator control surface. Same service-authenticated
-	// MULTICA_OPERATOR_SECRET bearer as the task-queue repair API above.
-	// Board-scoped: each call targets the selected board's own backend, so the
-	// workspace_id path segment is validated against that instance and a
-	// caller-supplied id can never switch boards.
-	r.Route("/api/operator", func(r chi.Router) {
+	// Relay issue-stage advancement (GSP-591). Service-authenticated surface that
+	// upstreams the host-local multica-bridge.cjs POST /relay/advance: it advances
+	// an issue's stage and enqueues the successor agent_task_queue atomically. The
+	// existing protected POST /api/relay/advance (task -> daemon lane routing) is
+	// untouched; this is a distinct route with its own contract and is deliberately
+	// mounted OUTSIDE the user auth group, guarded by the same MULTICA_OPERATOR_SECRET
+	// shared bearer as the operator repair API (the bridge/MCP gateway holds the value).
+	r.Route("/api/relay/advance-stage", func(r chi.Router) {
 		r.Use(operatorAuth)
-		r.Route("/workspaces/{workspaceId}/agents", func(r chi.Router) {
-			r.Get("/", h.ListWorkspaceOperatorAgents)
-			r.Get("/{ref}", h.GetWorkspaceOperatorAgent)
-			r.Patch("/{ref}", h.UpdateWorkspaceOperatorAgent)
-		})
+		r.Post("/", h.RelayAdvanceStage)
 	})
 
 	// Protected API routes
@@ -1439,7 +1437,6 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Post("/labels", h.AttachLabel)
 					r.Delete("/labels/{labelId}", h.DetachLabel)
 					r.Get("/metadata", h.ListIssueMetadata)
-					r.Post("/metadata/implementation-evidence", h.SetImplementationEvidence)
 					r.Put("/metadata/{key}", h.SetIssueMetadataKey)
 					r.Delete("/metadata/{key}", h.DeleteIssueMetadataKey)
 					r.Put("/properties/{propertyId}", h.SetIssueProperty)
@@ -1624,13 +1621,6 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Get("/env", h.GetAgentEnv)
 					r.Put("/env", h.UpdateAgentEnv)
 				})
-			})
-			// Relay stage pools are an operator-only, workspace-scoped dispatch
-			// contract.  The bridge reads this product-owned data; it never owns
-			// deployment-local stage bindings.
-			r.Route("/api/relay-stage-pools", func(r chi.Router) {
-				r.Get("/", h.ListRelayStagePools)
-				r.Put("/{stage}", h.ReplaceRelayStagePool)
 			})
 
 			// Agent templates catalog (browse + detail). The Create flow
