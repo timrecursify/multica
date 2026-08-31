@@ -9,14 +9,20 @@ The required lane is `gpt-5.6-sol` with `low` effort.
 
 ## Procedure
 
-1. Read the issue and identify its one requested outcome.
-2. Reconcile every named path, identifier, and command against current source.
-3. Search precedent once with `sk brain search` before deciding.
-4. Use `sk graph impact <file>` before changing a known source file. Treat an
+1. Bundle FIRST, before any other work. See "Bundling". Every flight you scope
+   either folds into a mega or is proved to be its own unit of work. This step
+   is never skipped and never left to QC.
+2. Read the issue and identify its one requested outcome.
+3. Reconcile every named path, identifier, and command against current source.
+4. Search precedent once with `sk brain search` before deciding.
+5. Use `sk graph impact <file>` before changing a known source file. Treat an
    empty, caveated answer as unknown.
-5. Bundle sibling flights into one mega flight. See "Bundling".
-6. Post a minimum, independently checkable specification.
+6. Post a minimum, independently checkable specification on the unit of work:
+   the mega if you folded, otherwise the flight itself.
 7. Advance `Spec` to `Queue`; the relay queues the native build task.
+
+Bundling is step 1 because a bundle made after a specification is written has
+already spent that specification.
 
 The relay refuses `Spec` to `Queue` for a flight that carries no specification,
 and answers `spec_required`. Post the specification first; a build never starts
@@ -73,6 +79,38 @@ merge on every copy of one change.
 Bundle when two or more parked flights would be closed by the same change. The
 count is not the test: shared root cause is. Two reports of one broken function
 bundle; twenty unrelated requests against one file do not.
+
+Bundling belongs to the scoping agent and to nobody else. It happens on
+arrival, before a specification exists. QC does not bundle: by the time a flight
+reaches review its build has already been paid for, so a bundle made there saves
+nothing that was worth saving.
+
+### Join an existing mega before you create one
+
+Most arriving flights belong to a mega that already exists. Search open megas
+for the same root cause first, and fold into the match rather than opening a
+second one:
+
+```bash
+sk multica issue-list --board gsp --status Spec --search "MEGA" | head -40
+sk multica issue-update <this-flight> --parent <existing-mega-id> --no-start
+python3 /home/newadmin/tools/multica-bundle.py --mega <existing-mega-number> --apply
+```
+
+A second mega for a root cause that already has one splits the work in two, and
+both halves get built.
+
+### Tooling-gap reports
+
+Two thirds of intake is `sk` gap reports: 649 of the 963 flights raised in the
+24h to 2026-08-31. The contract requires filing them, so that volume is correct
+and must not be suppressed. What is wrong is filing one flight per SYMPTOM.
+`sk github REST facade cannot retrieve git refs` and `sk github REST facade:
+repeated --query filters are ignored on actions runs` are one broken facade, not
+two units of work.
+
+Fold tooling-gap reports by module and root cause: one mega per broken surface,
+with each symptom folded in as evidence for it.
 
 A mega flight is the ONLY unit of work its children have. A worker must never
 be shown both a mega and one of its children: given two canonical options it
