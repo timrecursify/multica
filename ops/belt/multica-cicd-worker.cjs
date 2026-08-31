@@ -13,12 +13,14 @@ const { Pool } = require('/home/newadmin/node_modules/pg');
 
 const ENV = fs.readFileSync('/home/newadmin/.secrets/multica-remote/remote-bridge.env', 'utf8');
 const RELAY_TOKEN = ENV.split('\n').find(l => l.startsWith('RELAY_AGENT_SECRET=')).split('=')[1];
-const pool = new Pool({ connectionString: ENV.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });
+let pool = new Pool({ connectionString: ENV.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });
 const BOT = 'b8ecc1c4-d58c-4233-a669-7ede7060531c';
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
+const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
 // Merging is the one irreversible action here, so it is opt-in and defaults on
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
+const ciFailureCounts = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -26,7 +28,7 @@ function gh(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
 }
 
-function relay(issueId, toStage, currentWorkProductMd5) {
+let relay = function relayRequest(issueId, toStage, currentWorkProductMd5) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: RELAY_TOKEN,
       ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}) });
@@ -39,27 +41,52 @@ function relay(issueId, toStage, currentWorkProductMd5) {
     req.on('timeout', () => { req.destroy(); reject(new Error('relay timeout')); });
     req.write(body); req.end();
   });
-}
+};
 
 // Each relay hop enqueues a task for the stage owner. This stage is that task's
 // consumer, so closing it is what finishing the stage means.
 async function closePendingTask(issueId) {
   await pool.query(
     `UPDATE agent_task_queue SET status='completed'
-      WHERE issue_id=$1 AND status IN ('queued','dispatched')`, [issueId]);
+      WHERE issue_id=$1 AND status IN ('queued','dispatched')
+        AND context->>'to_stage'='CI/CD & Deploy'`, [issueId]);
 }
 
-async function finish(issue, note) {
+async function latestVerdict(issueId) {
   const verdict = await pool.query(
     `SELECT verdict, work_product_md5 FROM qc_verdict
-      WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1`, [issue.id]);
-  const latest = verdict.rows[0];
+      WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1`, [issueId]);
+  return verdict.rows[0];
+}
+
+async function routeFinishedPR(issue, note) {
+  const latest = await latestVerdict(issue.id);
   if (!latest || latest.verdict !== 'PASS' || !latest.work_product_md5) {
-    throw new Error('Done requires a current PASS verdict and work-product hash');
+    await relay(issue.id, 'Human Review');
+    await closePendingTask(issue.id);
+    log(`HUMAN-REVIEW #${issue.number} — ${note}; latest QC is ${latest?.verdict || 'missing'}`);
+    return;
   }
   await relay(issue.id, 'Done', latest.work_product_md5);
   await closePendingTask(issue.id);
   log(`DONE #${issue.number} — ${note}`);
+}
+
+async function escalateCi(issue, pr, ci) {
+  await relay(issue.id, 'Human Review');
+  await closePendingTask(issue.id);
+  log(`HUMAN-REVIEW #${issue.number} ${pr.repo}#${pr.num}: ci=${ci} for ${CI_FAILURE_POLLS} consecutive polls`);
+}
+
+function countCiFailure(issue, pr, sha, ci) {
+  const key = `${issue.id}:${pr.repo}#${pr.num}:${sha}`;
+  if (ci !== 'red' && ci !== 'unknown') {
+    ciFailureCounts.delete(key);
+    return 0;
+  }
+  const count = (ciFailureCounts.get(key) || 0) + 1;
+  ciFailureCounts.set(key, count);
+  return count;
 }
 
 function findPR(work) {
@@ -172,7 +199,7 @@ async function sweep() {
           if (!seenPR.has(k)) { seenPR.add(k); prs.push(cand); }
         }
       }
-      if (!prs.length) { await finish(issue, 'no PR referenced; nothing to deploy'); continue; }
+      if (!prs.length) { await routeFinishedPR(issue, 'no PR referenced; nothing to deploy'); continue; }
 
       // Resolve every referenced PR first, then decide once.
       const states = [];
@@ -182,7 +209,7 @@ async function sweep() {
       }
       const openStates = states.filter(s2 => s2.info.state !== 'MERGED' && s2.info.state !== 'CLOSED');
       if (!openStates.length) {
-        await finish(issue, states.map(s2 => `${s2.pr.repo}#${s2.pr.num} ${s2.info.state.toLowerCase()}`).join(', '));
+        await routeFinishedPR(issue, states.map(s2 => `${s2.pr.repo}#${s2.pr.num} ${s2.info.state.toLowerCase()}`).join(', '));
         continue;
       }
       if (openStates.length > 1) {
@@ -193,7 +220,13 @@ async function sweep() {
       const info = openStates[0].info;
 
       const ci = ciState(pr.repo, info.headRefOid);
-      if (ci !== 'green') { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}`); continue; }
+      const failures = countCiFailure(issue, pr, info.headRefOid, ci);
+      if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
+      if (ci !== 'green') {
+        const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
+        log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}`);
+        continue;
+      }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
       if (info.mergeable === 'CONFLICTING') { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} conflicting`); continue; }
 
@@ -202,7 +235,10 @@ async function sweep() {
 
       try {
         gh(['pr', 'merge', pr.num, '-R', pr.repo, '--squash', '--delete-branch']);
-        await finish(issue, `merged ${pr.repo}#${pr.num} on green CI`);
+        // Closing is intentionally deferred to the next poll. If relay or task
+        // cleanup fails then, the PR is already observed as MERGED and this
+        // worker cannot issue a second merge command.
+        log(`MERGED #${issue.number} ${pr.repo}#${pr.num}; close on next poll`);
       } catch (e) {
         // A required check the fleet must not weaken (the reviewer gate) blocks
         // the merge. That is the gate doing its job; report and move on.
@@ -214,10 +250,20 @@ async function sweep() {
   }
 }
 
-(async () => {
+async function main() {
   log(`[cicd-worker] started; poll=${POLL_MS}ms merge=${MERGE_ENABLED}`);
   for (;;) {
     await sweep().catch(e => log('[sweep] error:', e.message));
     await new Promise(r => setTimeout(r, POLL_MS));
   }
-})();
+}
+
+if (require.main === module) main();
+
+function setTestDependencies(dependencies) {
+  if (require.main === module) throw new Error('test dependencies unavailable in worker process');
+  if (dependencies.pool) pool = dependencies.pool;
+  if (dependencies.relay) relay = dependencies.relay;
+}
+
+module.exports = { countCiFailure, escalateCi, routeFinishedPR, setTestDependencies, sweep };
