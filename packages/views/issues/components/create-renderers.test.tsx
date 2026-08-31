@@ -119,7 +119,7 @@ describe("issue renderer create entrypoints", () => {
 
     render(
       <BoardColumn
-        group={{ id: "todo", title: "todo", status: "todo", createData: { status: "todo" } }}
+        group={{ id: "Queue", title: "Queue", status: "Queue", createData: { status: "Queue" } }}
         issueIds={[]}
         issueMap={new Map()}
         projectId="project-1"
@@ -131,7 +131,7 @@ describe("issue renderer create entrypoints", () => {
     fireEvent.click(buttons[buttons.length - 1]!);
 
     expect(onCreateIssue).toHaveBeenCalledWith({
-      status: "todo",
+      status: "Queue",
       project_id: "project-1",
     });
     expect(openModal).not.toHaveBeenCalled();
@@ -143,7 +143,7 @@ describe("issue renderer create entrypoints", () => {
     render(
       <ListView
         issues={[]}
-        visibleStatuses={["todo"]}
+        visibleStatuses={["Queue"]}
         statusPagination={emptyStatusPagination()}
         projectId="project-1"
         onCreateIssue={onCreateIssue}
@@ -154,7 +154,7 @@ describe("issue renderer create entrypoints", () => {
     fireEvent.click(buttons[buttons.length - 1]!);
 
     expect(onCreateIssue).toHaveBeenCalledWith({
-      status: "todo",
+      status: "Queue",
       project_id: "project-1",
     });
     expect(openModal).not.toHaveBeenCalled();

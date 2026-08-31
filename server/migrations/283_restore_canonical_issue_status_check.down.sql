@@ -1,0 +1,3 @@
+-- 283 intentionally has no data-changing rollback. Reinstating 282's
+-- vocabulary would require rewriting canonical production rows, which is
+-- unsafe. Keep the repaired storage contract and compatibility trigger.

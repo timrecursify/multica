@@ -42,9 +42,9 @@ function ids(c: ListIssuesCache, status: Issue["status"]): string[] {
 
 describe("insertByPosition", () => {
   it("inserts at the position-sorted slot", () => {
-    const a = mk("a", "todo", 1);
-    const c = mk("c", "todo", 3);
-    const b = mk("b", "todo", 2);
+    const a = mk("a", "Queue", 1);
+    const c = mk("c", "Queue", 3);
+    const b = mk("b", "Queue", 2);
     expect(insertByPosition([a, c], b).map((i) => i.id)).toEqual([
       "a",
       "b",
@@ -53,14 +53,14 @@ describe("insertByPosition", () => {
   });
 
   it("appends when the new position is the largest", () => {
-    const a = mk("a", "todo", 1);
-    const z = mk("z", "todo", 9);
+    const a = mk("a", "Queue", 1);
+    const z = mk("z", "Queue", 9);
     expect(insertByPosition([a], z).map((i) => i.id)).toEqual(["a", "z"]);
   });
 
   it("prepends when the new position is the smallest", () => {
-    const b = mk("b", "todo", 2);
-    const a = mk("a", "todo", 1);
+    const b = mk("b", "Queue", 2);
+    const a = mk("a", "Queue", 1);
     expect(insertByPosition([b], a).map((i) => i.id)).toEqual(["a", "b"]);
   });
 });
@@ -68,32 +68,32 @@ describe("insertByPosition", () => {
 describe("patchIssueInBuckets — cross-status move", () => {
   it("inserts the moved card at its position slot, not the end", () => {
     const c0 = cache({
-      todo: { issues: [mk("moved", "todo", 5)], total: 1 },
-      in_progress: {
-        issues: [mk("x", "in_progress", 1), mk("y", "in_progress", 3)],
+      "Queue": { issues: [mk("moved", "Queue", 5)], total: 1 },
+      "In Progress": {
+        issues: [mk("x", "In Progress", 1), mk("y", "In Progress", 3)],
         total: 2,
       },
     });
     // Move "moved" into in_progress at position 2 (between x and y).
     const next = patchIssueInBuckets(c0, "moved", {
-      status: "in_progress",
+      status: "In Progress",
       position: 2,
     });
-    expect(ids(next, "in_progress")).toEqual(["x", "moved", "y"]);
-    expect(ids(next, "todo")).toEqual([]);
+    expect(ids(next, "In Progress")).toEqual(["x", "moved", "y"]);
+    expect(ids(next, "Queue")).toEqual([]);
   });
 
   it("adjusts both bucket totals", () => {
     const c0 = cache({
-      todo: { issues: [mk("moved", "todo", 5)], total: 1 },
-      in_progress: { issues: [mk("x", "in_progress", 1)], total: 1 },
+      "Queue": { issues: [mk("moved", "Queue", 5)], total: 1 },
+      "In Progress": { issues: [mk("x", "In Progress", 1)], total: 1 },
     });
     const next = patchIssueInBuckets(c0, "moved", {
-      status: "in_progress",
+      status: "In Progress",
       position: 2,
     });
-    expect(next.byStatus.todo?.total).toBe(0);
-    expect(next.byStatus.in_progress?.total).toBe(2);
+    expect(next.byStatus["Queue"]?.total).toBe(0);
+    expect(next.byStatus["In Progress"]?.total).toBe(2);
   });
 
   // MUL-4261: `cancelled` is now a first-class paginated bucket, so cancelling
@@ -101,50 +101,50 @@ describe("patchIssueInBuckets — cross-status move", () => {
   // rebucketed card stays locatable for later patches.
   it("rebuckets a cancelled issue and keeps it locatable", () => {
     const c0 = cache({
-      todo: { issues: [mk("a", "todo", 1)], total: 1 },
-      cancelled: { issues: [], total: 0 },
+      "Queue": { issues: [mk("a", "Queue", 1)], total: 1 },
+      "Cancelled": { issues: [], total: 0 },
     });
-    const cancelled = patchIssueInBuckets(c0, "a", { status: "cancelled" });
-    expect(ids(cancelled, "todo")).toEqual([]);
-    expect(ids(cancelled, "cancelled")).toEqual(["a"]);
-    expect(cancelled.byStatus.cancelled?.total).toBe(1);
+    const cancelled = patchIssueInBuckets(c0, "a", { status: "Cancelled" });
+    expect(ids(cancelled, "Queue")).toEqual([]);
+    expect(ids(cancelled, "Cancelled")).toEqual(["a"]);
+    expect(cancelled.byStatus["Cancelled"]?.total).toBe(1);
 
     // A follow-up edit still finds the card in the cancelled bucket.
     const renamed = patchIssueInBuckets(cancelled, "a", { title: "renamed" });
-    expect(renamed.byStatus.cancelled?.issues[0]?.title).toBe("renamed");
+    expect(renamed.byStatus["Cancelled"]?.issues[0]?.title).toBe("renamed");
   });
 });
 
 describe("patchIssueInBuckets — same status", () => {
   it("keeps the slot for a plain field update (no reorder)", () => {
     const c0 = cache({
-      todo: {
-        issues: [mk("a", "todo", 1), mk("b", "todo", 2), mk("c", "todo", 3)],
+      "Queue": {
+        issues: [mk("a", "Queue", 1), mk("b", "Queue", 2), mk("c", "Queue", 3)],
         total: 3,
       },
     });
     // A remote label/title edit must not move the card.
     const next = patchIssueInBuckets(c0, "b", { title: "renamed" });
-    expect(ids(next, "todo")).toEqual(["a", "b", "c"]);
-    expect(next.byStatus.todo?.issues[1]?.title).toBe("renamed");
+    expect(ids(next, "Queue")).toEqual(["a", "b", "c"]);
+    expect(next.byStatus["Queue"]?.issues[1]?.title).toBe("renamed");
   });
 
   it("re-sorts within the column when position changes", () => {
     const c0 = cache({
-      todo: {
-        issues: [mk("a", "todo", 1), mk("b", "todo", 2), mk("c", "todo", 3)],
+      "Queue": {
+        issues: [mk("a", "Queue", 1), mk("b", "Queue", 2), mk("c", "Queue", 3)],
         total: 3,
       },
     });
     // Drag "a" below "b" (new position 2.5).
     const next = patchIssueInBuckets(c0, "a", { position: 2.5 });
-    expect(ids(next, "todo")).toEqual(["b", "a", "c"]);
+    expect(ids(next, "Queue")).toEqual(["b", "a", "c"]);
   });
 });
 
 describe("patchIssueInBuckets — unknown issue", () => {
   it("returns the cache unchanged when the id is absent", () => {
-    const c0 = cache({ todo: { issues: [mk("a", "todo", 1)], total: 1 } });
+    const c0 = cache({ "Queue": { issues: [mk("a", "Queue", 1)], total: 1 } });
     expect(patchIssueInBuckets(c0, "ghost", { position: 9 })).toBe(c0);
   });
 });

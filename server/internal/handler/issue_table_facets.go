@@ -214,7 +214,7 @@ JOIN agent a ON a.id = i.assignee_id AND a.workspace_id = i.workspace_id AND i.a
 WHERE %s
   AND a.kind = 'user'
   AND a.archived_at IS NULL
-  AND lower(i.status) = 'in_progress'
+  AND i.status = 'In Progress'
 GROUP BY a.id`, compiled.where)
 	case "property":
 		propertyID, err := util.ParseUUID(facet.PropertyID)

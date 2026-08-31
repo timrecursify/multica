@@ -52,7 +52,7 @@ const baseIssue: Issue = {
   identifier: "TST-1",
   title: "Deleted issue",
   description: null,
-  status: "todo",
+  status: "Queue",
   priority: "none",
   assignee_type: null,
   assignee_id: null,
@@ -133,7 +133,7 @@ const issueLabels: IssueLabelsResponse = {
 function makeListCache(...issues: Issue[]): ListIssuesCache {
   return {
     byStatus: {
-      todo: { issues, total: issues.length },
+      "Queue": { issues, total: issues.length },
     },
   };
 }
@@ -192,7 +192,7 @@ function setup(
 }
 
 function ids(cache: ListIssuesCache | undefined) {
-  return cache?.byStatus.todo?.issues.map((issue) => issue.id);
+  return cache?.byStatus["Queue"]?.issues.map((issue) => issue.id);
 }
 
 function expectInvalidated(qc: QueryClient, queryKey: readonly unknown[]) {

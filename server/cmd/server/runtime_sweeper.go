@@ -52,17 +52,6 @@ const (
 	// liveness + DB stale + FailTasksForOfflineRuntimes), which typically
 	// reclaims orphaned tasks within ~180s.
 	runningTimeoutSeconds = 9000.0
-	// queuedTTLSeconds expires tasks that have been sitting in 'queued'
-	// for longer than this without ever being claimed. This is the cleanup
-	// arm of the MUL-1899 backlog fix: even with the dispatch-time
-	// admission gate that blocks new enqueues against offline runtimes,
-	// tasks already on the queue when a runtime drops off (or that lost
-	// the race against a runtime that went offline mid-tick) need a
-	// time-bounded exit. 2 hours is conservatively above any reasonable
-	// "queued behind a long-running task" window for an online runtime, so we
-	// don't expire legitimately-pending work, while still draining the historical
-	// 87k autopilot backlog within ~24h once enabled.
-	queuedTTLSeconds = 2 * 3600.0
 	// queuedExpireBatchSize caps how many queued rows a single sweeper tick
 	// transitions to failed. Keeps the sweep transaction short even when
 	// the historical backlog is large (~89k at MUL-1899 baseline). At 30s
@@ -79,6 +68,19 @@ const (
 	chatFinalizeBatchSize = 100
 )
 
+const (
+	queuedTaskTTLEnv = "MULTICA_QUEUED_TASK_TTL"
+	// defaultQueuedTaskTTL gives queued tasks margin beyond the observed
+	// 115-minute p99 time-to-start. The prior 120-minute TTL sat only five
+	// minutes above p99 and clipped starts at 120.4 minutes; four hours leaves
+	// a meaningful dispatch margin.
+	defaultQueuedTaskTTL = 4 * time.Hour
+)
+
+func queuedTaskTTLFromEnv() time.Duration {
+	return envDuration(queuedTaskTTLEnv, defaultQueuedTaskTTL)
+}
+
 // runRuntimeSweeper periodically marks runtimes as offline if their
 // last_seen_at exceeds the stale threshold, and fails orphaned tasks.
 // This handles cases where the daemon crashes, is killed without calling
@@ -90,7 +92,7 @@ const (
 // hot heartbeat path; the DB is allowed to lag up to runtimeHeartbeatDBFlushInterval).
 // When liveness is unavailable or errors, we fall back to trusting the DB
 // stale window — that is the original behavior.
-func runRuntimeSweeper(ctx context.Context, queries *db.Queries, liveness handler.LivenessStore, taskSvc *service.TaskService, bus *events.Bus) {
+func runRuntimeSweeper(ctx context.Context, queries *db.Queries, liveness handler.LivenessStore, taskSvc *service.TaskService, bus *events.Bus, queuedTaskTTL time.Duration) {
 	ticker := time.NewTicker(sweepInterval)
 	defer ticker.Stop()
 
@@ -101,7 +103,7 @@ func runRuntimeSweeper(ctx context.Context, queries *db.Queries, liveness handle
 		case <-ticker.C:
 			sweepStaleRuntimes(ctx, queries, liveness, taskSvc, bus)
 			sweepStaleTasks(ctx, queries, taskSvc, bus)
-			sweepExpiredQueuedTasks(ctx, queries, taskSvc)
+			sweepExpiredQueuedTasks(ctx, queries, taskSvc, queuedTaskTTL)
 			sweepDeferredChatFinalizations(ctx, queries, taskSvc)
 			gcRuntimes(ctx, queries, bus)
 		}
@@ -296,9 +298,9 @@ func sweepStaleTasks(ctx context.Context, queries *db.Queries, taskSvc *service.
 // historical backlog and catches the race where a runtime goes offline AFTER
 // a task is already queued. Capped to queuedExpireBatchSize per tick so a
 // big backlog can't monopolise the DB.
-func sweepExpiredQueuedTasks(ctx context.Context, queries *db.Queries, taskSvc *service.TaskService) {
+func sweepExpiredQueuedTasks(ctx context.Context, queries *db.Queries, taskSvc *service.TaskService, queuedTaskTTL time.Duration) {
 	failedTasks, err := queries.ExpireStaleQueuedTasks(ctx, db.ExpireStaleQueuedTasksParams{
-		TtlSecs:    queuedTTLSeconds,
+		TtlSecs:    queuedTaskTTL.Seconds(),
 		MaxPerTick: queuedExpireBatchSize,
 	})
 	if err != nil {
@@ -309,7 +311,16 @@ func sweepExpiredQueuedTasks(ctx context.Context, queries *db.Queries, taskSvc *
 		return
 	}
 
-	slog.Info("task sweeper: expired stale queued tasks", "count", len(failedTasks))
+	oldestQueuedAt := failedTasks[0].CreatedAt.Time
+	for _, task := range failedTasks[1:] {
+		if task.CreatedAt.Time.Before(oldestQueuedAt) {
+			oldestQueuedAt = task.CreatedAt.Time
+		}
+	}
+	slog.Info("task sweeper: expired stale queued tasks",
+		"count", len(failedTasks),
+		"oldest_queued_age", time.Since(oldestQueuedAt).Round(time.Second),
+	)
 	taskSvc.CaptureQueuedExpiredTasks(ctx, failedTasks)
 	taskSvc.HandleFailedTasks(ctx, failedTasks)
 }
@@ -360,7 +371,7 @@ func broadcastFailedTasks(ctx context.Context, queries *db.Queries, taskSvc *ser
 			if issue, err := queries.GetIssue(ctx, t.IssueID); err == nil {
 				workspaceID = util.UUIDToString(issue.WorkspaceID)
 				issueKey := util.UUIDToString(t.IssueID)
-				if issue.Status == "in_progress" && !processedIssues[issueKey] {
+				if issue.Status == "In Progress" && !processedIssues[issueKey] {
 					processedIssues[issueKey] = true
 					if hasActive, herr := queries.HasActiveTaskForIssue(ctx, t.IssueID); herr == nil && !hasActive {
 						queries.UpdateIssueStatus(ctx, db.UpdateIssueStatusParams{ID: t.IssueID, Status: "Spec", WorkspaceID: issue.WorkspaceID})
