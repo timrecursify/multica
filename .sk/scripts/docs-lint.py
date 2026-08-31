@@ -19,7 +19,7 @@ import sys
 import tomllib
 
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
 TRACKED = os.path.join(ROOT, ".sk", "tracked-docs.txt")
 RULES = os.path.join(ROOT, ".sk", "scripts", "docs-rules.toml")
 
