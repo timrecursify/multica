@@ -280,8 +280,8 @@ describe("TableView cell editors under data refresh", () => {
   // it never masks a real hang.
   it("keeps the status picker open and the row order frozen across a refresh, then catches up on close", async () => {
     const user = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
-    const issueA = makeIssue("a", "Alpha task", "todo");
-    const issueB = makeIssue("b", "Beta task", "in_progress");
+    const issueA = makeIssue("a", "Alpha task", "Queue");
+    const issueB = makeIssue("b", "Beta task", "In Progress");
     serverIssues = [issueA, issueB];
     const progress1 = new Map<string, ChildProgress>();
     const surfaceKey = `test-surface-${Math.floor(Math.random() * 1e9)}`;
@@ -354,7 +354,7 @@ describe("TableView cell editors under data refresh", () => {
     const user = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
     const onCreateIssue = vi.fn();
     const issue = {
-      ...makeIssue("a", "Alpha task", "todo"),
+      ...makeIssue("a", "Alpha task", "Queue"),
       project_id: "project-1",
     };
     serverIssues = [issue];
@@ -383,7 +383,7 @@ describe("TableView cell editors under data refresh", () => {
 
   it("navigates in place on plain title and row clicks; modifiers open tabs", async () => {
     const user = userEvent.setup({ delay: null, pointerEventsCheck: 0 });
-    serverIssues = [makeIssue("a", "Alpha task", "todo")];
+    serverIssues = [makeIssue("a", "Alpha task", "Queue")];
 
     renderWithI18n(
       <QueryClientProvider client={queryClient}>
@@ -424,7 +424,7 @@ describe("TableView cell editors under data refresh", () => {
   });
 
   it("middle click on an interactive cell does not trigger row navigation", async () => {
-    serverIssues = [makeIssue("a", "Alpha task", "todo")];
+    serverIssues = [makeIssue("a", "Alpha task", "Queue")];
 
     renderWithI18n(
       <QueryClientProvider client={queryClient}>
@@ -463,7 +463,7 @@ describe("TableView cell editors under data refresh", () => {
     const windowOpen = vi.fn();
     vi.stubGlobal("open", windowOpen);
     navigationState.hasOpenInNewTab = false;
-    serverIssues = [makeIssue("a", "Alpha task", "todo")];
+    serverIssues = [makeIssue("a", "Alpha task", "Queue")];
 
     renderWithI18n(
       <QueryClientProvider client={queryClient}>

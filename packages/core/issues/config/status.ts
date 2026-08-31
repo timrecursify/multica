@@ -54,3 +54,17 @@ export const STATUS_CONFIG: Record<
   blocked: { label: "Blocked", iconColor: "text-destructive", hoverBg: "hover:bg-destructive/10", dividerColor: "bg-destructive", columnBg: "bg-destructive/5" },
   cancelled: { label: "Cancelled", iconColor: "text-muted-foreground", hoverBg: "hover:bg-accent", dividerColor: "bg-muted-foreground/40", columnBg: "bg-muted/40" },
 };
+
+/**
+ * Cancelled in either vocabulary.
+ *
+ * IssueStatus carries both the live relay chain ("Cancelled") and the original
+ * build's lowercase values, which are retained for existing rows. Anything that
+ * ranks, filters or hides cancelled work must accept both spellings: comparing
+ * against one alone silently stops demoting every row stored in the other.
+ */
+export function isCancelledIssueStatus(
+  status: IssueStatus | null | undefined,
+): boolean {
+  return status === "Cancelled" || status === "cancelled";
+}
