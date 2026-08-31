@@ -219,7 +219,7 @@ func TestCreateMediaGatedIssueCommitsDeferredTaskAtomicallyBeforeCreatedEvent(t 
 	result, err := issueService.Create(ctx, IssueCreateParams{
 		WorkspaceID:  workspaceUUID,
 		Title:        "Media-gated issue",
-		Status:       "todo",
+		Status:       "Spec",
 		Priority:     "medium",
 		AssigneeType: pgtype.Text{String: "agent", Valid: true},
 		AssigneeID:   agentUUID,
