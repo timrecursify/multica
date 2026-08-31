@@ -554,8 +554,8 @@ func TestWebhook_MergedPR_PreservesCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if updated.Status != "cancelled" {
-		t.Errorf("expected status to remain 'cancelled', got %q", updated.Status)
+	if updated.Status != "Cancelled" {
+		t.Errorf("expected status to remain 'Cancelled', got %q", updated.Status)
 	}
 }
 
@@ -897,8 +897,8 @@ func TestWebhook_AllClosedWithoutMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if final.Status != "in_progress" {
-		t.Errorf("issue must stay in_progress when no linked PR ever merged, got %q", final.Status)
+	if final.Status != "In Progress" {
+		t.Errorf("issue must stay In Progress when no linked PR ever merged, got %q", final.Status)
 	}
 }
 
@@ -1111,8 +1111,8 @@ func TestWebhook_MergedPR_TitlePrefixDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Errorf("expected issue to stay in_progress (title prefix alone is not closing intent), got %q", got.Status)
+	if got.Status != "In Progress" {
+		t.Errorf("expected issue to stay In Progress (title prefix alone is not closing intent), got %q", got.Status)
 	}
 }
 
@@ -1173,8 +1173,8 @@ func TestWebhook_MergedPR_BranchNameDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Errorf("expected issue to stay in_progress (branch-name reference is not closing intent), got %q", got.Status)
+	if got.Status != "In Progress" {
+		t.Errorf("expected issue to stay In Progress (branch-name reference is not closing intent), got %q", got.Status)
 	}
 }
 
@@ -1287,8 +1287,8 @@ func TestWebhook_CloseKeywordRemovedBeforeMergeDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after merge: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Fatalf("after closing keyword was removed before merge: status = %q, want in_progress", got.Status)
+	if got.Status != "In Progress" {
+		t.Fatalf("after closing keyword was removed before merge: status = %q, want In Progress", got.Status)
 	}
 	counts, err := testHandler.Queries.GetIssuePullRequestCloseAggregate(ctx, parseUUID(created.ID))
 	if err != nil {
@@ -1323,15 +1323,15 @@ func TestWebhook_CloseKeywordRemovedBeforeMergeDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after post-merge edit: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Errorf("after adding closing keyword post-merge: status = %q, want in_progress", got.Status)
+	if got.Status != "In Progress" {
+		t.Errorf("after adding closing keyword post-merge: status = %q, want In Progress", got.Status)
 	}
 	got, err = testHandler.Queries.GetIssue(ctx, parseUUID(second.ID))
 	if err != nil {
 		t.Fatalf("GetIssue second after post-merge edit: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Errorf("second issue after post-merge closing keyword: status = %q, want in_progress", got.Status)
+	if got.Status != "In Progress" {
+		t.Errorf("second issue after post-merge closing keyword: status = %q, want In Progress", got.Status)
 	}
 }
 

@@ -83,7 +83,6 @@ func TestMain(m *testing.M) {
 		pool.Close()
 		os.Exit(1)
 	}
-
 	code := m.Run()
 	if err := cleanupHandlerTestFixture(context.Background(), pool); err != nil {
 		fmt.Printf("Failed to clean up handler test fixture: %v\n", err)
