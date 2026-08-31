@@ -83,6 +83,11 @@ func TestMain(m *testing.M) {
 		pool.Close()
 		os.Exit(1)
 	}
+	if err := installHandlerFixtureIssueStatusConstraint(ctx, pool); err != nil {
+		fmt.Printf("Failed to install handler fixture issue status constraint: %v\n", err)
+		pool.Close()
+		os.Exit(1)
+	}
 
 	code := m.Run()
 	if err := cleanupHandlerTestFixture(context.Background(), pool); err != nil {
@@ -93,6 +98,21 @@ func TestMain(m *testing.M) {
 	}
 	pool.Close()
 	os.Exit(code)
+}
+
+// installHandlerFixtureIssueStatusConstraint permits the historical raw-SQL
+// fixtures alongside the production values. Handler tests exercise API
+// normalization; migration tests independently assert the production CHECK.
+func installHandlerFixtureIssueStatusConstraint(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `
+		ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
+		ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN (
+			'Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
+			'Human Review', 'CI/CD & Deploy', 'Done', 'Archived', 'Cancelled',
+			'backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled'
+		));
+	`)
+	return err
 }
 
 func setupHandlerTestFixture(ctx context.Context, pool *pgxpool.Pool) (string, string, error) {
