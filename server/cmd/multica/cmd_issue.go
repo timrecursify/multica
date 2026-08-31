@@ -370,7 +370,9 @@ var issueSearchCmd = &cobra.Command{
 }
 
 var validIssueStatuses = []string{
-	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	"Registered", "Spec", "Queue", "In Progress", "In Review", "Human Review", "CI/CD & Deploy",
+	"Done", "backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	"Archived", "Cancelled",
 }
 
 var validIssuePriorities = []string{

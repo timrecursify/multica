@@ -298,6 +298,16 @@ const STATUS_BAR_BG: Record<IssueStatus, string> = {
   done: "bg-info",
   blocked: "bg-destructive",
   cancelled: "bg-muted-foreground/40",
+  Registered: "bg-muted-foreground/60",
+  Spec: "bg-muted-foreground/60",
+  Queue: "bg-muted-foreground/70",
+  "In Progress": "bg-warning",
+  "In Review": "bg-success",
+  "Human Review": "bg-success",
+  "CI/CD & Deploy": "bg-warning",
+  Done: "bg-info",
+  Archived: "bg-muted-foreground/40",
+  Cancelled: "bg-muted-foreground/40",
 };
 
 // ---------------------------------------------------------------------------

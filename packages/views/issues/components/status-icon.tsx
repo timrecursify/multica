@@ -151,6 +151,16 @@ const STATUS_RENDERERS: Record<IssueStatus, () => React.ReactNode> = {
   done: DoneIcon,
   blocked: BlockedIcon,
   cancelled: CancelledIcon,
+  Registered: BacklogIcon,
+  Spec: BacklogIcon,
+  Queue: TodoIcon,
+  "In Progress": InProgressIcon,
+  "In Review": InReviewIcon,
+  "Human Review": InReviewIcon,
+  "CI/CD & Deploy": InProgressIcon,
+  Done: DoneIcon,
+  Archived: CancelledIcon,
+  Cancelled: CancelledIcon,
 };
 
 // ---------------------------------------------------------------------------

@@ -74,10 +74,17 @@ type IssueResponse struct {
 }
 
 // validIssueStatuses / validIssuePriorities mirror the CHECK constraints on
-// the issue table. Write handlers pre-validate these so callers get a clean
-// 400 with the allowed values instead of a database CHECK violation bubbling
-// up as a 500.
-var validIssueStatuses = []string{"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"}
+// the issue table (issue_status_check / issue_priority_check). Keep this list
+// in step with the constraint: the board's status grouping validates group
+// keys against it, so a status missing here renders an empty column even
+// though the rows exist.
+// Write handlers pre-validate these so callers get a clean 400 with the
+// allowed values instead of a database CHECK violation bubbling up as a 500.
+var validIssueStatuses = []string{
+	"Registered", "Spec", "Queue", "In Progress", "In Review", "Human Review", "CI/CD & Deploy",
+	"Done", "backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	"Archived", "Cancelled",
+}
 var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {
