@@ -1375,8 +1375,8 @@ func TestGetIssueGCCheck_WithDaemonToken_CrossWorkspace(t *testing.T) {
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if resp.Status != "done" {
-		t.Fatalf("expected status %q, got %q", "done", resp.Status)
+	if resp.Status != "Done" {
+		t.Fatalf("expected status %q, got %q", "Done", resp.Status)
 	}
 	if resp.UpdatedAt == "" {
 		t.Fatal("expected updated_at to be set")
