@@ -27,6 +27,7 @@ function instructionStages(instructions) {
     [/RUNBOOK_SPEC_WORKER(?:\.md)?/i, 'Spec'],
     [/RUNBOOK_QC_WORKER(?:\.md)?/i, 'In Review'],
     [/\b(?:in the )?(Spec)\b/i, 'Spec'],
+    [/\b(In Progress)\b/i, 'In Progress'],
     [/\b(In Review)\b/i, 'In Review'],
     [/\b(Queue)\b/i, 'Queue'],
     [/\b(Registered)\b/i, 'Registered']

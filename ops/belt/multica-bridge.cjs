@@ -260,7 +260,7 @@ async function relayAdvance(req, res, body) {
     }
 
     const issueResult = await client.query(
-      `SELECT id, status, workspace_id, description, parent_issue_id, title
+      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority
        FROM "issue"
        WHERE id = $1
        FOR UPDATE`,
@@ -434,7 +434,11 @@ async function relayAdvance(req, res, body) {
        FROM relay_stage_config rsc
        LEFT JOIN agent a ON a.id = rsc.agent_id
        WHERE rsc.stage_name = $2`,
-      [issue.workspace_id, issue.status]
+      // Dispatch ownership follows the stage being entered. Looking up the
+      // current stage here routes Registered -> Spec work to the Registered
+      // owner (often a QC agent), which then rejects the task and burns a
+      // paid run. The target stage is the only correct owner key.
+      [issue.workspace_id, to_stage]
     );
 
     if (stageResult.rows.length === 0) {
@@ -547,6 +551,16 @@ async function relayAdvance(req, res, body) {
     }
 
     if (stage.agent_id && !bundledChild) {
+      // Preserve the board's issue priority on the queue row. The daemon
+      // orders claims by this integer (urgent=4 .. none=0); omitting it
+      // silently defaulted every relay task to 0 and defeated priority FIFO.
+      const taskPriority = {
+        urgent: 4,
+        high: 3,
+        medium: 2,
+        low: 1,
+        none: 0
+      }[String(issue.priority || "none").toLowerCase()] ?? 0;
       const context = JSON.stringify({
         source: "relay-advance",
         from_stage: issue.status,
@@ -560,24 +574,25 @@ async function relayAdvance(req, res, body) {
       // task is redundant; the stage transition must not be sacrificed to it.
       const taskResult = await client.query(
         `INSERT INTO agent_task_queue (
-           agent_id, issue_id, status, runtime_id, context,
+           agent_id, issue_id, status, priority, runtime_id, context,
            trigger_summary, force_fresh_session, originator_source,
            trigger_evidence_kind
          )
-         SELECT $1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
+         SELECT $1, $2, 'queued', $3, $4, $5::jsonb, $6, TRUE,
                 'unattributed', 'relay_stage_transition'
           WHERE NOT EXISTS (
             SELECT 1 FROM agent_task_queue active
              WHERE active.issue_id = $2
                AND active.status IN ('queued', 'dispatched', 'running',
                                      'waiting_local_directory', 'deferred')
-               AND active.context->>'to_stage' = $6
+               AND active.context->>'to_stage' = $7
           )
            ON CONFLICT DO NOTHING
            RETURNING id`,
         [
           stage.agent_id,
           issue_id,
+          taskPriority,
           stage.selected_runtime_id,
           context,
           `Relay stage transition: ${issue.status} -> ${to_stage}`,

@@ -15,6 +15,7 @@ test('dispatch requires the target stage to be named by agent instructions', () 
   assert.equal(instructionCompatibility('read RUNBOOK_SPEC_WORKER.md; stop elsewhere', 'Spec').ok, true);
   assert.equal(instructionCompatibility('read RUNBOOK_SPEC_WORKER.md; stop elsewhere', 'Queue').ok, false);
   assert.equal(instructionCompatibility('read RUNBOOK_BUILD_WORKER.md', 'Queue').ok, true);
+  assert.equal(instructionCompatibility('Own Queue and In Progress build stages', 'In Progress').ok, true);
   assert.equal(instructionCompatibility('', 'Queue').ok, false);
 });
 
