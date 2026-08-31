@@ -4994,7 +4994,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		err := d.reportTerminalTask(ctx, terminalTaskReport{
 			kind:                  terminalTaskReportComplete,
 			taskID:                taskID,
-			output:                result.Comment,
+				output:                result.Comment,
 				branchName:            result.BranchName,
 				prURL:                 result.PRURL,
 			sessionID:             result.SessionID,
