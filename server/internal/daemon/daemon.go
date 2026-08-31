@@ -189,6 +189,7 @@ type terminalTaskReport struct {
 	taskID        string
 	output        string
 	branchName    string
+	prURL         string
 	errorMessage  string
 	sessionID     string
 	workDir       string
@@ -4994,7 +4995,8 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			kind:                  terminalTaskReportComplete,
 			taskID:                taskID,
 			output:                result.Comment,
-			branchName:            result.BranchName,
+				branchName:            result.BranchName,
+				prURL:                 result.PRURL,
 			sessionID:             result.SessionID,
 			workDir:               result.WorkDir,
 			sessionRolloutMissing: result.SessionRolloutMissing,
@@ -5086,7 +5088,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
+		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.prURL, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
 	case terminalTaskReportFail:
 		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID)
 	default:
