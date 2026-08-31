@@ -305,8 +305,8 @@ func TestBootstrapOnboardingRuntimeCreatesSingleGuideIssue(t *testing.T) {
 	if assigneeType != "agent" || assigneeID != resp.AgentID {
 		t.Fatalf("issue assignee = %s/%s, want agent/%s", assigneeType, assigneeID, resp.AgentID)
 	}
-	if issueStatus != "todo" || issuePriority != "high" {
-		t.Fatalf("issue status/priority = %s/%s, want todo/high", issueStatus, issuePriority)
+	if issueStatus != "Spec" || issuePriority != "high" {
+		t.Fatalf("issue status/priority = %s/%s, want Spec/high", issueStatus, issuePriority)
 	}
 
 	var (
@@ -335,8 +335,8 @@ func TestBootstrapOnboardingRuntimeCreatesSingleGuideIssue(t *testing.T) {
 	`, resp.IssueID, resp.AgentID).Scan(&taskCount); err != nil {
 		t.Fatalf("count queued tasks: %v", err)
 	}
-	if taskCount == 0 {
-		t.Fatal("expected onboarding issue to enqueue an agent task")
+	if taskCount != 0 {
+		t.Fatalf("expected no agent tasks for Spec onboarding issue, got %d", taskCount)
 	}
 
 	w2 := httptest.NewRecorder()
@@ -548,8 +548,8 @@ func TestBootstrapOnboardingNoRuntimeCreatesSingleGuideIssue(t *testing.T) {
 	if assigneeType != "member" || assigneeID != testUserID {
 		t.Fatalf("issue assignee = %s/%s, want member/%s", assigneeType, assigneeID, testUserID)
 	}
-	if issueStatus != "todo" || issuePriority != "high" {
-		t.Fatalf("issue status/priority = %s/%s, want todo/high", issueStatus, issuePriority)
+	if issueStatus != "Spec" || issuePriority != "high" {
+		t.Fatalf("issue status/priority = %s/%s, want Spec/high", issueStatus, issuePriority)
 	}
 	for _, want := range []string{
 		"Try Multica first",

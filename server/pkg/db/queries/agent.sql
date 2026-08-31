@@ -1738,7 +1738,7 @@ JOIN issue i ON
   i.assignee_type = 'agent'
   AND i.assignee_id = a.id
   AND i.workspace_id = a.workspace_id
-  AND lower(i.status) = 'in_progress'
+  AND i.status = 'In Progress'
 WHERE a.workspace_id = $1
   AND a.kind = 'user'
   AND a.archived_at IS NULL

@@ -483,8 +483,8 @@ func TestWebhook_MergedPR_AdvancesLinkedIssueToDone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if updated.Status != "done" {
-		t.Errorf("expected issue status 'done', got %q", updated.Status)
+	if updated.Status != "Done" {
+		t.Errorf("expected issue status 'Done', got %q", updated.Status)
 	}
 }
 
@@ -554,8 +554,8 @@ func TestWebhook_MergedPR_PreservesCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if updated.Status != "cancelled" {
-		t.Errorf("expected status to remain 'cancelled', got %q", updated.Status)
+	if updated.Status != "Cancelled" {
+		t.Errorf("expected status to remain 'Cancelled', got %q", updated.Status)
 	}
 }
 
@@ -708,7 +708,7 @@ func TestWebhook_MergedPR_WaitsForOpenSibling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if issueAfterA.Status != "in_progress" {
+	if issueAfterA.Status != "In Progress" {
 		t.Errorf("issue should stay in_progress while sibling PR is open, got %q", issueAfterA.Status)
 	}
 
@@ -718,7 +718,7 @@ func TestWebhook_MergedPR_WaitsForOpenSibling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if issueAfterB.Status != "done" {
+	if issueAfterB.Status != "Done" {
 		t.Errorf("expected issue 'done' after every linked PR merged, got %q", issueAfterB.Status)
 	}
 }
@@ -829,7 +829,7 @@ func TestWebhook_ClosedSiblingAfterMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if intermediate.Status != "in_progress" {
+	if intermediate.Status != "In Progress" {
 		t.Fatalf("issue should stay in_progress while sibling PR open, got %q", intermediate.Status)
 	}
 
@@ -840,7 +840,7 @@ func TestWebhook_ClosedSiblingAfterMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if final.Status != "done" {
+	if final.Status != "Done" {
 		t.Errorf("expected issue 'done' after sibling closed-without-merge follows a prior merge, got %q", final.Status)
 	}
 }
@@ -897,7 +897,7 @@ func TestWebhook_AllClosedWithoutMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if final.Status != "in_progress" {
+	if final.Status != "In Progress" {
 		t.Errorf("issue must stay in_progress when no linked PR ever merged, got %q", final.Status)
 	}
 }
@@ -1040,9 +1040,9 @@ func TestWebhook_MergedPR_OnlyClosesIdentifiersWithClosingKeyword(t *testing.T) 
 
 	// Only the closing-keyword identifier advances to done.
 	wantStatus := map[string]string{
-		closes.ID:   "done",
-		followUp.ID: "in_progress",
-		unblocks.ID: "in_progress",
+		closes.ID:   "Done",
+		followUp.ID: "In Progress",
+		unblocks.ID: "In Progress",
 	}
 	for _, issue := range []IssueResponse{closes, followUp, unblocks} {
 		got, err := testHandler.Queries.GetIssue(ctx, parseUUID(issue.ID))
@@ -1111,7 +1111,7 @@ func TestWebhook_MergedPR_TitlePrefixDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if got.Status != "in_progress" {
+	if got.Status != "In Progress" {
 		t.Errorf("expected issue to stay in_progress (title prefix alone is not closing intent), got %q", got.Status)
 	}
 }
@@ -1173,7 +1173,7 @@ func TestWebhook_MergedPR_BranchNameDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if got.Status != "in_progress" {
+	if got.Status != "In Progress" {
 		t.Errorf("expected issue to stay in_progress (branch-name reference is not closing intent), got %q", got.Status)
 	}
 }
@@ -1287,7 +1287,7 @@ func TestWebhook_CloseKeywordRemovedBeforeMergeDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after merge: %v", err)
 	}
-	if got.Status != "in_progress" {
+	if got.Status != "In Progress" {
 		t.Fatalf("after closing keyword was removed before merge: status = %q, want in_progress", got.Status)
 	}
 	counts, err := testHandler.Queries.GetIssuePullRequestCloseAggregate(ctx, parseUUID(created.ID))
@@ -1323,15 +1323,15 @@ func TestWebhook_CloseKeywordRemovedBeforeMergeDoesNotClose(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after post-merge edit: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Errorf("after adding closing keyword post-merge: status = %q, want in_progress", got.Status)
+	if got.Status != "In Progress" {
+		t.Errorf("after adding closing keyword post-merge: status = %q, want In Progress", got.Status)
 	}
 	got, err = testHandler.Queries.GetIssue(ctx, parseUUID(second.ID))
 	if err != nil {
 		t.Fatalf("GetIssue second after post-merge edit: %v", err)
 	}
-	if got.Status != "in_progress" {
-		t.Errorf("second issue after post-merge closing keyword: status = %q, want in_progress", got.Status)
+	if got.Status != "In Progress" {
+		t.Errorf("second issue after post-merge closing keyword: status = %q, want In Progress", got.Status)
 	}
 }
 
@@ -1398,7 +1398,7 @@ func TestWebhook_LinkOnlySiblingMergeAfterCloseKeywordPR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after open: %v", err)
 	}
-	if got.Status != "in_progress" {
+	if got.Status != "In Progress" {
 		t.Fatalf("after both PRs opened: status = %q, want in_progress", got.Status)
 	}
 
@@ -1408,7 +1408,7 @@ func TestWebhook_LinkOnlySiblingMergeAfterCloseKeywordPR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after A merge: %v", err)
 	}
-	if got.Status != "in_progress" {
+	if got.Status != "In Progress" {
 		t.Fatalf("after PR A merged with PR B still open: status = %q, want in_progress", got.Status)
 	}
 
@@ -1419,7 +1419,7 @@ func TestWebhook_LinkOnlySiblingMergeAfterCloseKeywordPR(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after B merge: %v", err)
 	}
-	if got.Status != "done" {
+	if got.Status != "Done" {
 		t.Errorf("after both PRs merged (A with close_intent, B link-only): status = %q, want done", got.Status)
 	}
 }
@@ -1559,7 +1559,7 @@ func TestWebhook_HiddenBodyMentionDoesNotBlockAutoAdvance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after open: %v", err)
 	}
-	if got.Status != "in_progress" {
+	if got.Status != "In Progress" {
 		t.Fatalf("after both PRs opened: status = %q, want in_progress", got.Status)
 	}
 
@@ -1570,7 +1570,7 @@ func TestWebhook_HiddenBodyMentionDoesNotBlockAutoAdvance(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue after merge: %v", err)
 	}
-	if got.Status != "done" {
+	if got.Status != "Done" {
 		t.Errorf("closing PR merged while only a hidden body-only mention is open: status = %q, want done", got.Status)
 	}
 }
@@ -2181,8 +2181,8 @@ func TestWebhook_MergedPR_ChildWithParent_NotifiesParent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue child: %v", err)
 	}
-	if updatedChild.Status != "done" {
-		t.Fatalf("expected child status 'done', got %q", updatedChild.Status)
+	if updatedChild.Status != "Done" {
+		t.Fatalf("expected child status 'Done', got %q", updatedChild.Status)
 	}
 
 	// Parent must have received exactly one platform-generated system comment.

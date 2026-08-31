@@ -30,7 +30,7 @@ func insertAgentAssignedIssue(t *testing.T, agentID string, number int, title st
 	var issueID string
 	if err := testPool.QueryRow(context.Background(), `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_id, creator_type, number, position, assignee_type, assignee_id)
-		VALUES ($1, $2, 'Spec', 'medium', $3, 'member', $4, 0, 'agent', $5)
+		VALUES ($1, $2, 'Queue', 'medium', $3, 'member', $4, 0, 'agent', $5)
 		RETURNING id
 	`, testWorkspaceID, title, testUserID, number, agentID).Scan(&issueID); err != nil {
 		t.Fatalf("insert issue: %v", err)
