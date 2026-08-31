@@ -692,3 +692,16 @@ Worktree:
 ```bash
 make check-worktree
 ```
+### Hermetic repository profiles
+
+This repository declares bounded `sk repo test` profiles in `.sk/repo.toml`.
+Run a profile from a clean checkout with:
+
+```sh
+sk repo test --path <checkout> --profile <backend|bash-syntax|diff-whitespace|docs-lint> --json
+```
+
+`backend` runs the CI Go build and test sequence (and applies migrations only
+when a local `DATABASE_URL` is explicitly supplied). The other profiles check
+tracked shell syntax, whitespace errors, and maintained Markdown/MDX files;
+they require no credentials or network services.

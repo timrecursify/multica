@@ -1,0 +1,31 @@
+[[profile]]
+name = "backend"
+command_argv = ["bash", "scripts/sk-repo-backend.sh"]
+working_directory = "."
+env_allowlist = []
+timeout = 600
+hermetic = true
+
+[[profile]]
+name = "bash-syntax"
+command_argv = ["bash", "scripts/sk-repo-bash-syntax.sh"]
+working_directory = "."
+env_allowlist = []
+timeout = 120
+hermetic = true
+
+[[profile]]
+name = "diff-whitespace"
+command_argv = ["bash", "scripts/sk-repo-diff-whitespace.sh"]
+working_directory = "."
+env_allowlist = []
+timeout = 120
+hermetic = true
+
+[[profile]]
+name = "docs-lint"
+command_argv = ["bash", "scripts/sk-repo-docs-lint.sh"]
+working_directory = "."
+env_allowlist = []
+timeout = 120
+hermetic = true
