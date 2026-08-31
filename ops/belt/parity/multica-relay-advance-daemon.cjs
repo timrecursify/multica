@@ -567,8 +567,20 @@ const INFRA_FAILURE_REASONS = [
   'timeout',
   'queued_expired',
   'cancelled',
-  'stream_disconnected'
+  'stream_disconnected',
+  'agent_error.provider_quota_limit'
 ];
+
+function isInfrastructureFailure(reason) {
+  return INFRA_FAILURE_REASONS.includes(reason || 'cancelled');
+}
+
+function selectReplayAttempt(row) {
+  if (!row.dead_task_id) return 1;
+  const noArtifact = row.dead_task_status === 'completed';
+  const infra = isInfrastructureFailure(row.failure_reason);
+  return (noArtifact || !infra) ? row.attempt + 1 : row.attempt;
+}
 
 // The relay only ever creates a task at the MOMENT a ticket transitions into a
 // stage (multica-bridge.cjs). If that task later dies while the ticket is still
@@ -804,7 +816,7 @@ async function requeueStrandedTasks() {
       // A 'completed' predecessor means QC finished without writing a verdict.
       // That is a real retry, not an infra replay, so it costs an attempt.
       const noArtifact = row.dead_task_status === 'completed';
-      const infra = INFRA_FAILURE_REASONS.includes(row.failure_reason || 'cancelled');
+      const infra = isInfrastructureFailure(row.failure_reason);
       if (infra) {
         const headroom = await client.query(
           `SELECT COALESCE(max(EXTRACT(epoch FROM (now() - created_at)) / 60), 0) AS age
@@ -829,9 +841,7 @@ async function requeueStrandedTasks() {
       // the retry would never consume an attempt and these tickets would
       // requeue forever, which is the QC bounce loop that burned 134 paid
       // calls on a single ticket. A missing verdict is a real failed try.
-      const attempt = coldStart ? 1
-        : (noArtifact || !infra) ? row.attempt + 1
-        : row.attempt;
+      const attempt = selectReplayAttempt(row);
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
         await client.query('BEGIN');
@@ -1167,4 +1177,5 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { pauseQuotaLane, reconcileQuotaPauses, startDaemon };
+module.exports = { INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt,
+  pauseQuotaLane, reconcileQuotaPauses, startDaemon };
