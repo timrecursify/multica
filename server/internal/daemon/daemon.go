@@ -6469,6 +6469,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			return TaskResult{
 				Status:    "completed",
 				Comment:   "",
+				PRURL:     result.PRURL,
 				SessionID: result.SessionID,
 				WorkDir:   env.WorkDir,
 				EnvRoot:   env.RootDir,
@@ -6499,6 +6500,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		taskResult = TaskResult{
 			Status:    "completed",
 			Comment:   result.Output,
+			PRURL:     result.PRURL,
 			SessionID: result.SessionID,
 			WorkDir:   env.WorkDir,
 			EnvRoot:   env.RootDir,
@@ -6838,6 +6840,8 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	defer drainCancel()
 
 	var toolCount atomic.Int32
+	var prURLMu sync.Mutex
+	var prURL string
 	// lastActivityAt records (as unix nanos) when the drain loop most
 	// recently received a message from the backend. The idle watchdog
 	// reads this to decide whether the agent has gone silent for too long.
@@ -7008,6 +7012,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					})
 					mu.Unlock()
 				case agent.MessageToolResult:
+					if candidate, ok := structuredPullRequestURL(msg.Output); ok {
+						prURLMu.Lock()
+						prURL = candidate
+						prURLMu.Unlock()
+					}
 					// Decrement only when the count would stay >= 0. A stray
 					// tool_result with no matching tool_use (backend bug or
 					// reconnect mid-stream) shouldn't push the counter
@@ -7105,6 +7114,9 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	select {
 	case result := <-session.Result:
 		waitForDrain()
+		prURLMu.Lock()
+		result.PRURL = prURL
+		prURLMu.Unlock()
 		if idleWatchdogFired.Load() {
 			// The backend's wait goroutine (e.g. claude.go) translates the
 			// SIGKILL we delivered via agentCancel into Status="aborted".
@@ -7149,6 +7161,27 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 			Error:  "agent did not produce result within drain timeout",
 		}, toolCount.Load(), nil
 	}
+}
+
+// structuredPullRequestURL accepts only machine-readable tool results. Agent
+// prose is deliberately ignored so a sentence mentioning a URL cannot be
+// mistaken for a pull request that was actually created.
+func structuredPullRequestURL(raw string) (string, bool) {
+	var payload struct {
+		URL     string `json:"url"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil {
+		return "", false
+	}
+	url := strings.TrimSpace(payload.URL)
+	if url == "" {
+		url = strings.TrimSpace(payload.HTMLURL)
+	}
+	if !strings.HasPrefix(url, "https://") || !strings.Contains(url, "/pull/") {
+		return "", false
+	}
+	return url, true
 }
 
 // idleWatchdogReason formats the human-facing explanation surfaced on

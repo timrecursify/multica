@@ -55,6 +55,27 @@ func TestClient_IdentityHeaders_PostJSON(t *testing.T) {
 	}
 }
 
+func TestStructuredPullRequestURLRequiresMachineReadablePullURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "url", raw: `{"url":"https://github.com/acme/widget/pull/7"}`, want: "https://github.com/acme/widget/pull/7"},
+		{name: "html_url", raw: `{"html_url":"https://github.com/acme/widget/pull/8"}`, want: "https://github.com/acme/widget/pull/8"},
+		{name: "prose", raw: `Created https://github.com/acme/widget/pull/9`, want: ""},
+		{name: "empty", raw: `{"url":""}`, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := structuredPullRequestURL(tt.raw)
+			if got != tt.want || (ok != (tt.want != "")) {
+				t.Fatalf("structuredPullRequestURL(%q) = %q, %v; want %q, %v", tt.raw, got, ok, tt.want, tt.want != "")
+			}
+		})
+	}
+}
+
 func TestClient_IdentityHeaders_GetJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Client-Platform"); got != "daemon" {
