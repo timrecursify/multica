@@ -252,6 +252,7 @@ func (h *Handler) UpdateWorkspaceOperatorAgent(w http.ResponseWriter, r *http.Re
 
 // ListWorkspaceRelayStages lists the configured relay stages.
 func (h *Handler) ListWorkspaceRelayStages(w http.ResponseWriter, r *http.Request) {
+	if _, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "workspaceId"), "workspace_id"); !ok { return }
 	rows, err := h.Queries.ListRelayStageConfig(r.Context())
 	if err != nil {
 		slog.Warn("operator relay list failed", "error", err)
@@ -267,6 +268,7 @@ func (h *Handler) ListWorkspaceRelayStages(w http.ResponseWriter, r *http.Reques
 
 // GetWorkspaceRelayStage returns one exact relay stage by name.
 func (h *Handler) GetWorkspaceRelayStage(w http.ResponseWriter, r *http.Request) {
+	if _, ok := parseUUIDOrBadRequest(w, chi.URLParam(r, "workspaceId"), "workspace_id"); !ok { return }
 	row, err := h.Queries.GetRelayStageConfig(r.Context(), chi.URLParam(r, "stageName"))
 	if err == pgx.ErrNoRows {
 		writeErrorCode(w, http.StatusNotFound, "stage_not_found", "no such relay stage")
@@ -283,6 +285,7 @@ func (h *Handler) GetWorkspaceRelayStage(w http.ResponseWriter, r *http.Request)
 // relay stage transition. agent_id may be null/empty to clear ownership.
 type operatorRelayOwnerRequest struct {
 	AgentID *string `json:"agent_id"`
+	SuccessorStage string `json:"successor_stage,omitempty"`
 }
 
 // SetWorkspaceRelayStageOwner atomically sets (or clears) the relay stage
@@ -309,6 +312,11 @@ func (h *Handler) SetWorkspaceRelayStageOwner(w http.ResponseWriter, r *http.Req
 	if err := decoder.Decode(&req); err != nil {
 		writeErrorCode(w, http.StatusBadRequest, "invalid_input", "invalid request body: "+err.Error())
 		return
+	}
+	if req.SuccessorStage != "" {
+		valid := target.NextStage.Valid && target.NextStage.String == req.SuccessorStage
+		if !valid { for _, s := range target.AltNextStages { if s == req.SuccessorStage { valid = true; break } } }
+		if !valid { writeErrorCode(w, http.StatusBadRequest, "invalid_input", "successor_stage is not configured for this source stage"); return }
 	}
 
 	agentName := ""
