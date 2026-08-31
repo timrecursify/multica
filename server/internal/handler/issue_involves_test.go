@@ -252,7 +252,7 @@ func listIssuesInvolves(t *testing.T, userID string) []string {
 func listGroupedIssuesInvolves(t *testing.T, userID string) []string {
 	t.Helper()
 	path := fmt.Sprintf(
-		"/api/issues/grouped?workspace_id=%s&group_by=assignee&statuses=todo&involves_user_id=%s&limit=100",
+		"/api/issues/grouped?workspace_id=%s&group_by=assignee&statuses=Spec&involves_user_id=%s&limit=100",
 		testWorkspaceID, userID)
 	w := httptest.NewRecorder()
 	testHandler.ListGroupedIssues(w, newRequest("GET", path, nil))

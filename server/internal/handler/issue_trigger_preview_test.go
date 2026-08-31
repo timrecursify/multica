@@ -78,7 +78,7 @@ func TestPreviewIssueTrigger_CreateAgentVsBacklog(t *testing.T) {
 		"is_create":     true,
 		"assignee_type": "agent",
 		"assignee_id":   agentID,
-		"status":        "todo",
+		"status":        "Queue",
 	})
 	if active.TotalCount != 1 || len(active.Triggers) != 1 {
 		t.Fatalf("active create: expected 1 trigger, got %+v", active)
@@ -121,7 +121,7 @@ func TestPreviewIssueTrigger_BatchAggregates(t *testing.T) {
 
 	resp := previewIssueTrigger(t, map[string]any{
 		"issue_ids": []string{i1.ID, i2.ID},
-		"status":    "todo",
+		"status":    "Queue",
 	})
 	if resp.TotalCount != 2 {
 		t.Fatalf("batch promote: expected total_count 2, got %+v", resp)
@@ -145,7 +145,7 @@ func TestPreviewIssueTrigger_MatchesWritePath(t *testing.T) {
 	agentID := seededReadyAgentID(t)
 
 	// Case 1: preview says assign will start → write path enqueues.
-	issue := createIssueForTest(t, map[string]any{"title": "match write 1", "status": "todo"})
+	issue := createIssueForTest(t, map[string]any{"title": "match write 1", "status": "Queue"})
 	pv := previewIssueTrigger(t, map[string]any{
 		"issue_ids":     []string{issue.ID},
 		"assignee_type": "agent",
@@ -192,7 +192,7 @@ func TestUpdateIssueSuppressRunSkipsEnqueue(t *testing.T) {
 	agentID := seededReadyAgentID(t)
 
 	// Suppressed assign: assignee set, no task.
-	suppressed := createIssueForTest(t, map[string]any{"title": "suppress on", "status": "todo"})
+	suppressed := createIssueForTest(t, map[string]any{"title": "suppress on", "status": "Queue"})
 	w := httptest.NewRecorder()
 	req := withURLParam(newRequest("PUT", "/api/issues/"+suppressed.ID, map[string]any{
 		"assignee_type": "agent", "assignee_id": agentID, "suppress_run": true,
@@ -206,7 +206,7 @@ func TestUpdateIssueSuppressRunSkipsEnqueue(t *testing.T) {
 	}
 
 	// Control: same write without suppress_run enqueues.
-	control := createIssueForTest(t, map[string]any{"title": "suppress off", "status": "todo"})
+	control := createIssueForTest(t, map[string]any{"title": "suppress off", "status": "Queue"})
 	w2 := httptest.NewRecorder()
 	req2 := withURLParam(newRequest("PUT", "/api/issues/"+control.ID, map[string]any{
 		"assignee_type": "agent", "assignee_id": agentID,
@@ -227,7 +227,7 @@ func TestUpdateIssueHandoffNotePersistsOnTask(t *testing.T) {
 	agentID := seededReadyAgentID(t)
 	note := "Only touch the login flow."
 
-	issue := createIssueForTest(t, map[string]any{"title": "handoff persist", "status": "todo"})
+	issue := createIssueForTest(t, map[string]any{"title": "handoff persist", "status": "Queue"})
 	w := httptest.NewRecorder()
 	req := withURLParam(newRequest("PUT", "/api/issues/"+issue.ID, map[string]any{
 		"assignee_type": "agent", "assignee_id": agentID, "handoff_note": note,
@@ -249,7 +249,7 @@ func TestUpdateIssueHandoffNotePersistsOnTask(t *testing.T) {
 	}
 
 	// Suppressed assign with a note: no task at all (no run to inject into).
-	suppressed := createIssueForTest(t, map[string]any{"title": "handoff suppressed", "status": "todo"})
+	suppressed := createIssueForTest(t, map[string]any{"title": "handoff suppressed", "status": "Queue"})
 	w2 := httptest.NewRecorder()
 	req2 := withURLParam(newRequest("PUT", "/api/issues/"+suppressed.ID, map[string]any{
 		"assignee_type": "agent", "assignee_id": agentID, "handoff_note": note, "suppress_run": true,
