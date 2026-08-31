@@ -51,8 +51,8 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 		INSERT INTO issue (id, status) VALUES
 			('00000000-0000-0000-0000-000000000001', 'Spec'),
 			('00000000-0000-0000-0000-000000000002', 'Queue'),
-			('00000000-0000-0000-0000-000000000003', 'in_progress'),
-			('00000000-0000-0000-0000-000000000004', 'in_review'),
+			('00000000-0000-0000-0000-000000000003', 'In Progress'),
+			('00000000-0000-0000-0000-000000000004', 'In Review'),
 			('00000000-0000-0000-0000-000000000005', 'Human Review'),
 			('00000000-0000-0000-0000-000000000006', 'Done'),
 			('00000000-0000-0000-0000-000000000007', 'Cancelled'),
@@ -61,12 +61,9 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 			('00000000-0000-0000-0000-000000000010', 'Building'),
 			('00000000-0000-0000-0000-000000000011', 'done'),
 			('00000000-0000-0000-0000-000000000012', 'CI/CD & Deploy'),
-			('00000000-0000-0000-0000-000000000013', 'unknown legacy value'),
-			('00000000-0000-0000-0000-000000000014', 'Registered'),
-			('00000000-0000-0000-0000-000000000015', 'Parked'),
-			('00000000-0000-0000-0000-000000000016', 'Rejected');
+			('00000000-0000-0000-0000-000000000013', 'unknown legacy value');
 		ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (
-			status IN ('backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled')
+			status IN ('backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled', 'Spec', 'Queue', 'In Progress', 'In Review', 'Human Review', 'CI/CD & Deploy', 'Done', 'Archived', 'Cancelled')
 		) NOT VALID;
 	`); err != nil {
 		t.Fatalf("seed scratch issue table: %v", err)
@@ -86,23 +83,16 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 		"00000000-0000-0000-0000-000000000009": "Spec",
 		"00000000-0000-0000-0000-000000000010": "In Progress",
 		"00000000-0000-0000-0000-000000000011": "Done",
-		"00000000-0000-0000-0000-000000000012": "CI/CD & Deploy",
+		"00000000-0000-0000-0000-000000000012": "Spec",
 		"00000000-0000-0000-0000-000000000013": "Spec",
-		"00000000-0000-0000-0000-000000000014": "Registered",
-		"00000000-0000-0000-0000-000000000015": "Parked",
-		"00000000-0000-0000-0000-000000000016": "Rejected",
 	})
 
 	if _, err := conn.Exec(ctx, `
 		INSERT INTO issue (id, status) VALUES
-			('00000000-0000-0000-0000-000000000017', 'Queue'),
-			('00000000-0000-0000-0000-000000000018', 'Human Review'),
-			('00000000-0000-0000-0000-000000000019', 'Archived'),
-			('00000000-0000-0000-0000-000000000020', 'In Review'),
-			('00000000-0000-0000-0000-000000000021', 'Parked'),
-			('00000000-0000-0000-0000-000000000022', 'Rejected'),
-			('00000000-0000-0000-0000-000000000023', 'CI/CD & Deploy'),
-			('00000000-0000-0000-0000-000000000024', 'Registered')
+			('00000000-0000-0000-0000-000000000014', 'Queue'),
+			('00000000-0000-0000-0000-000000000015', 'Human Review'),
+			('00000000-0000-0000-0000-000000000016', 'Archived'),
+			('00000000-0000-0000-0000-000000000017', 'In Review')
 	`); err != nil {
 		t.Fatalf("write canonical rows after up: %v", err)
 	}
@@ -123,17 +113,10 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 		"00000000-0000-0000-0000-000000000011": "done",
 		"00000000-0000-0000-0000-000000000012": "CI/CD & Deploy",
 		"00000000-0000-0000-0000-000000000013": "unknown legacy value",
-		"00000000-0000-0000-0000-000000000014": "Registered",
-		"00000000-0000-0000-0000-000000000015": "Parked",
-		"00000000-0000-0000-0000-000000000016": "Rejected",
-		"00000000-0000-0000-0000-000000000017": "todo",
-		"00000000-0000-0000-0000-000000000018": "blocked",
-		"00000000-0000-0000-0000-000000000019": "cancelled",
-		"00000000-0000-0000-0000-000000000020": "In Review",
-		"00000000-0000-0000-0000-000000000021": "Parked",
-		"00000000-0000-0000-0000-000000000022": "Rejected",
-		"00000000-0000-0000-0000-000000000023": "CI/CD & Deploy",
-		"00000000-0000-0000-0000-000000000024": "Registered",
+		"00000000-0000-0000-0000-000000000014": "todo",
+		"00000000-0000-0000-0000-000000000015": "blocked",
+		"00000000-0000-0000-0000-000000000016": "cancelled",
+		"00000000-0000-0000-0000-000000000017": "In Review",
 	})
 
 	var sidecarExists bool
@@ -146,26 +129,19 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 
 	if _, err := conn.Exec(ctx, `
 		INSERT INTO issue (id, status)
-		VALUES ('00000000-0000-0000-0000-000000000025', 'new unrecorded value')
+		VALUES ('00000000-0000-0000-0000-000000000018', 'new unrecorded value')
 	`); !isCheckViolation(err) {
 		t.Fatalf("restored legacy constraint: got %v, want check violation", err)
 	}
 
 	applyMigrationFile(t, ctx, conn.Conn(), "282_drop_issue_status_check_constraint.up.sql")
 	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
-		"00000000-0000-0000-0000-000000000012": "CI/CD & Deploy",
+		"00000000-0000-0000-0000-000000000012": "Spec",
 		"00000000-0000-0000-0000-000000000013": "Spec",
-		"00000000-0000-0000-0000-000000000014": "Registered",
-		"00000000-0000-0000-0000-000000000015": "Parked",
-		"00000000-0000-0000-0000-000000000016": "Rejected",
-		"00000000-0000-0000-0000-000000000017": "Spec",
-		"00000000-0000-0000-0000-000000000018": "Human Review",
-		"00000000-0000-0000-0000-000000000019": "Cancelled",
-		"00000000-0000-0000-0000-000000000020": "In Review",
-		"00000000-0000-0000-0000-000000000021": "Parked",
-		"00000000-0000-0000-0000-000000000022": "Rejected",
-		"00000000-0000-0000-0000-000000000023": "CI/CD & Deploy",
-		"00000000-0000-0000-0000-000000000024": "Registered",
+		"00000000-0000-0000-0000-000000000014": "Spec",
+		"00000000-0000-0000-0000-000000000015": "Human Review",
+		"00000000-0000-0000-0000-000000000016": "Cancelled",
+		"00000000-0000-0000-0000-000000000017": "In Review",
 	})
 }
 
