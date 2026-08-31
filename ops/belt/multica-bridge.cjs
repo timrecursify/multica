@@ -137,7 +137,7 @@ async function ssoBridge(req, res) {
   try {
     // Read CF Access authenticated user email from header
     const userEmail = req.headers["cf-access-authenticated-user-email"];
-    
+
     if (!userEmail) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Not authenticated via CF Access" }));
