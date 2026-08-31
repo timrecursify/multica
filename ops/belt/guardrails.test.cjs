@@ -2,7 +2,8 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
-  retryAdmission, spendPreflight, stageCycleAdmission
+  retryAdmission, spendPreflight, stageCycleAdmission, lifetimeTaskAdmission,
+  isExecutionStage
 } = require('./guardrails.cjs');
 
 test('any bundled child is withheld, regardless of parent state', () => {
@@ -15,6 +16,7 @@ test('dispatch requires the target stage to be named by agent instructions', () 
   assert.equal(instructionCompatibility('read RUNBOOK_SPEC_WORKER.md; stop elsewhere', 'Spec').ok, true);
   assert.equal(instructionCompatibility('read RUNBOOK_SPEC_WORKER.md; stop elsewhere', 'Queue').ok, false);
   assert.equal(instructionCompatibility('read RUNBOOK_BUILD_WORKER.md', 'Queue').ok, true);
+  assert.equal(instructionCompatibility('Own Queue and In Progress build stages', 'In Progress').ok, true);
   assert.equal(instructionCompatibility('', 'Queue').ok, false);
 });
 
@@ -46,12 +48,26 @@ test('paid dispatch requires a live configured agent', () => {
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: '' }, { provider: 'codex' }).ok, true);
 });
 
-test('stage cycle breaker parks repeated model calls for manual disposition', () => {
+test('stage cycle breaker parks repeated model calls without human review', () => {
   // queued_expired rows have no started_at and therefore do not consume the
   // paid-attempt budget; two such rows still leave a flight admissible.
   assert.deepEqual(stageCycleAdmission(0), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(2), {
-    ok: false, reason: 'stage_cycle_limit', ceiling: 2, disposition: 'Human Review'
+    ok: false, reason: 'stage_cycle_limit', ceiling: 2, disposition: 'Parked'
   });
+});
+
+test('lifetime ceiling bounds paid work across stage changes', () => {
+  assert.deepEqual(lifetimeTaskAdmission(5), { ok: true, ceiling: 6 });
+  assert.deepEqual(lifetimeTaskAdmission(6), {
+    ok: false, reason: 'lifetime_task_limit', ceiling: 6, disposition: 'Parked'
+  });
+});
+
+test('human and disposition stages never execute tasks', () => {
+  assert.equal(isExecutionStage('Queue'), true);
+  assert.equal(isExecutionStage('Human Review'), false);
+  assert.equal(isExecutionStage('Parked'), false);
+  assert.equal(isExecutionStage('Rejected'), false);
 });

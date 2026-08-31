@@ -4,7 +4,8 @@ const {
   instructionCompatibility,
   retryAdmission,
   spendPreflight,
-  stageCycleAdmission
+  stageCycleAdmission,
+  lifetimeTaskAdmission
 } = require('../guardrails.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
@@ -39,6 +40,33 @@ const REQUEUE_STAGES = (process.env.RELAY_REQUEUE_STAGES || 'Queue,Spec,In Revie
 const MAX_CONCURRENT = Number.parseInt(process.env.RELAY_MAX_CONCURRENT || '12', 10);
 const QUEUED_TASK_TTL_MINUTES = Number.parseInt(process.env.MULTICA_QUEUED_TASK_TTL_MINUTES || '120', 10);
 const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || '2', 10);
+const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMIT || '6', 10);
+
+async function applyDisposition(client, row, disposition, reason, evidence = {}) {
+  const changed = await client.query(
+    `UPDATE issue SET status = $1, updated_at = NOW()
+      WHERE id = $2 AND status <> $1 RETURNING id`,
+    [disposition, row.issue_id]
+  );
+  await client.query(
+    `UPDATE agent_task_queue
+        SET status = 'cancelled', completed_at = NOW(),
+            prepare_lease_expires_at = NULL, failure_reason = $2
+      WHERE issue_id = $1
+        AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')`,
+    [row.issue_id, reason]
+  );
+  if (changed.rowCount > 0) {
+    await client.query(
+      `INSERT INTO activity_log
+         (workspace_id, issue_id, actor_type, action, details)
+       SELECT workspace_id, id, 'system', 'relay_disposition_applied', $2::jsonb
+         FROM issue WHERE id = $1`,
+      [row.issue_id, JSON.stringify({ from: row.stage, to: disposition, reason, ...evidence })]
+    );
+  }
+  return changed.rowCount > 0;
+}
 
 const configuredPoolMax = Number.parseInt(process.env.RELAY_PG_POOL_MAX || '2', 10);
 const poolMax = Number.isInteger(configuredPoolMax) && configuredPoolMax > 0
@@ -302,12 +330,29 @@ async function findAndAdvanceRegistered() {
       FROM issue i
       WHERE i.status = $1
         AND i.workspace_id = $2
-        AND NOT EXISTS (
-          SELECT 1 FROM relay_run_log WHERE issue_id = i.id
+        AND (
+          (
+            NOT EXISTS (
+              SELECT 1 FROM relay_run_log WHERE issue_id = i.id
+            )
+            OR (
+              SELECT count(*) FROM relay_run_log r
+               WHERE r.issue_id = i.id
+                 AND r.from_stage = 'Registered'
+                 AND r.to_stage = 'Spec'
+                 AND r.status = 'failed'
+            ) < $3
+          )
+          AND (
+            SELECT count(*) FROM agent_task_queue t
+             WHERE t.issue_id = i.id
+               AND t.context->>'to_stage' = 'Spec'
+               AND t.started_at IS NOT NULL
+          ) < $3
         )
       LIMIT 10`;
 
-    const result = await client.query(query, ['Registered', WORKSPACE_ID]);
+    const result = await client.query(query, ['Registered', WORKSPACE_ID, STAGE_CYCLE_LIMIT]);
 
     if (result.rows.length === 0) return;
 
@@ -435,11 +480,18 @@ async function requeueStrandedTasks() {
                -- The stage is the evidence, so no content test is needed.
                OR (i.status = 'Spec'
                    AND t.status = 'completed'
-                   AND t.attempt < t.max_attempts))
+                   AND t.attempt < t.max_attempts)
+               OR (t.id IS NOT NULL
+                   AND t.status IN ('queued', 'dispatched', 'running')
+                   AND ((t.context ? 'to_stage'
+                         AND t.context->>'to_stage' IS DISTINCT FROM i.status)
+                        OR (NOT (t.context ? 'to_stage')
+                            AND t.created_at < i.updated_at))))
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue q
              WHERE q.issue_id = i.id AND q.status IN
                ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+               AND COALESCE(q.context->>'to_stage', '') = i.status
           )
           -- A bundled child is never its own unit of work: its MEGA parent
           -- carries the fix. The bridge withholds the child's task at the
@@ -582,9 +634,25 @@ async function requeueStrandedTasks() {
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
         await client.query('BEGIN');
+        await client.query(
+          `UPDATE agent_task_queue SET status = 'cancelled', completed_at = NOW(),
+                  prepare_lease_expires_at = NULL,
+                  failure_reason = 'relay_stage_transition_superseded'
+             WHERE issue_id = $1 AND status IN ('queued','dispatched','running')
+               AND COALESCE(context->>'to_stage','') IS DISTINCT FROM $2`,
+          [row.issue_id, row.stage]
+        );
         // Serialize admission with the bridge and other recovery workers. The
         // issue lock plus stage-scoped predicate prevents duplicate paid rows.
         await client.query('SELECT id FROM issue WHERE id = $1 FOR UPDATE', [row.issue_id]);
+        if (/\b402\b|payment[ _-]?required/i.test(String(row.failure_reason || ''))) {
+          const moved = await applyDisposition(client, row, 'Human Review', 'payment_required_402', {
+            dead_task_id: row.dead_task_id
+          });
+          await client.query('COMMIT');
+          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}`);
+          continue;
+        }
         const history = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1 AND context->>'to_stage' = $2
@@ -593,8 +661,26 @@ async function requeueStrandedTasks() {
         );
         const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
         if (!cycle.ok) {
-          await client.query('ROLLBACK');
-          console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: ${cycle.reason}; manual disposition=${cycle.disposition}`);
+          const moved = await applyDisposition(client, row, cycle.disposition, cycle.reason, {
+            target_stage: row.stage, historical_tasks: history.rows[0]?.n || 0,
+            ceiling: cycle.ceiling
+          });
+          await client.query('COMMIT');
+          console.log(`${LOG_PREFIX} [requeue] PARKED #${row.number}: ${cycle.reason}; applied=${moved}`);
+          continue;
+        }
+        const lifetimeHistory = await client.query(
+          `SELECT count(*)::int AS n FROM agent_task_queue
+            WHERE issue_id = $1 AND started_at IS NOT NULL`,
+          [row.issue_id]
+        );
+        const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
+        if (!lifetime.ok) {
+          const moved = await applyDisposition(client, row, lifetime.disposition, lifetime.reason, {
+            historical_tasks: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling
+          });
+          await client.query('COMMIT');
+          console.log(`${LOG_PREFIX} [requeue] PARKED #${row.number}: ${lifetime.reason}; applied=${moved}`);
           continue;
         }
         const context = JSON.stringify({

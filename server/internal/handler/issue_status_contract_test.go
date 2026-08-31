@@ -41,6 +41,7 @@ func TestIssueStatusContractProfilesShareCanonicalStorage(t *testing.T) {
 		{"Queue", "Queue"}, {"In Progress", "In Progress"}, {"in_progress", "In Progress"}, {"Building", "In Progress"},
 		{"In Review", "In Review"}, {"in_review", "In Review"}, {"QC", "In Review"}, {"Human Review", "Human Review"},
 		{"CI/CD & Deploy", "CI/CD & Deploy"},
+		{"Parked", "Parked"}, {"Rejected", "Rejected"},
 		{"blocked", "Human Review"}, {"Done", "Done"}, {"done", "Done"},
 		{"Cancelled", "Cancelled"}, {"cancelled", "Cancelled"}, {"Archived", "Archived"},
 	} {
@@ -62,7 +63,7 @@ func TestIssueStatusContractProfilesShareCanonicalStorage(t *testing.T) {
 func TestIssueStatusContractCanonicalStatusesMatchRelayVocabulary(t *testing.T) {
 	want := []string{
 		"Registered", "Spec", "Queue", "In Progress", "In Review",
-		"Human Review", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
+		"Human Review", "Parked", "Rejected", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
 	}
 	for _, profile := range []IssueStatusProfile{IssueStatusProfileLinear, IssueStatusProfilePPP} {
 		if got := mustTestStatusContract(profile).CanonicalStatuses(); !reflect.DeepEqual(got, want) {
@@ -122,7 +123,7 @@ func TestIssueStatusContractOrderCASE(t *testing.T) {
 		if !strings.Contains(expr, "WHEN 'Registered' THEN 0") {
 			t.Errorf("%s orderCASE missing canonical first status: %s", profile, expr)
 		}
-		if !strings.Contains(expr, "WHEN 'Cancelled' THEN 9") {
+		if !strings.Contains(expr, "WHEN 'Cancelled' THEN 11") {
 			t.Errorf("%s orderCASE missing canonical last status: %s", profile, expr)
 		}
 	}
