@@ -5,6 +5,7 @@ root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
+  "$root_dir/guardrails.cjs"
   "$root_dir/parity/multica-relay-advance-daemon.cjs"
   "$root_dir/multica-cicd-worker.cjs"
   "$root_dir/belt-config-guard.sh"
@@ -16,6 +17,7 @@ declare -a sources=(
 
 declare -a targets=(
   "/home/newadmin/gsp-multica/multica-bridge.cjs"
+  "/home/newadmin/gsp-multica/guardrails.cjs"
   "/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs"
   "/home/newadmin/multica-cicd-worker.cjs"
   "/home/newadmin/tools/belt-config-guard.sh"

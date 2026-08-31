@@ -57,9 +57,17 @@ readonly GUARDED_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver g
 # multica-relay-advance is here but NOT in GUARDED_APPS: it is not defined in
 # ECOSYSTEM, so it is restarted by name and cannot be started via --only.
 readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver gsp-multica-worker multica-relay-advance)
+# Operators may intentionally hold the AI worker while investigating spend or
+# deploying guardrails.  This marker suppresses only worker self-healing; all
+# pipeline services remain under the normal liveness guard.
+readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-/home/newadmin/.local/state/multica-ai-hold}"
 readonly PSQL=(docker exec -i gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At)
 
 fixed=(); unfixable=()
+
+ai_hold_active() {
+  [[ -f "$AI_HOLD_FILE" ]]
+}
 
 file_p0() {
   local title="$1" body="$2" out rc
@@ -115,6 +123,10 @@ guard_wrapper() {
 # file and a wrong process, which the file check alone cannot see.
 guard_tower_process() {
   local live
+  if ai_hold_active; then
+    unfixable+=("gsp-multica-worker held by ${AI_HOLD_FILE}")
+    return 0
+  fi
   live=$(ps -eo args | grep "[m]ultica-daemon/server daemon start" \
          | grep -o -- "--max-concurrent-tasks=[0-9]*" | head -1 | cut -d= -f2)
   [[ -z "$live" ]] && { unfixable+=("Tower process not found"); return; }
@@ -143,6 +155,10 @@ sys.exit(0 if a and a[0]['pm2_env'].get('max_restarts') else 1)
   done
   (( ${#missing[@]} == 0 )) && return 0
   for app in "${missing[@]}"; do
+    if [[ "$app" == gsp-multica-worker ]] && ai_hold_active; then
+      unfixable+=("$app guardrails missing; held by ${AI_HOLD_FILE}")
+      continue
+    fi
     # Restarting the Tower kills in-flight flights; only do it when idle.
     if [[ "$app" == gsp-multica-worker ]] && (( $(running_tasks) > 0 )); then
       unfixable+=("$app guardrails missing; deferred, flights in progress")
@@ -208,6 +224,10 @@ guard_build_capacity() {
 guard_pm2_liveness() {
   local app status
   for app in "${LIVENESS_APPS[@]}"; do
+    if [[ "$app" == gsp-multica-worker ]] && ai_hold_active; then
+      unfixable+=("$app held by ${AI_HOLD_FILE}")
+      continue
+    fi
     status=$("$PM2" jlist 2>/dev/null | python3 -c "
 import json,sys
 a=[x for x in json.load(sys.stdin) if x['name']=='$app']
@@ -222,6 +242,62 @@ print(a[0]['pm2_env'].get('status','missing') if a else 'missing')
       unfixable+=("pm2 could not restart $app (status ${status:-unknown})")
     fi
   done
+}
+
+# A second relay/worker process races the first one's claims and can double-spend
+# a ticket. PM2 normally enforces one app name, but a supervisor restart can
+# leave duplicate processes behind. Also fail closed when the paid opt-in does
+# not agree with the selected executable: a non-paid lane must never advertise
+# paid access, and a paid executable must not run without an explicit opt-in.
+guard_single_instance_and_paid_lane() {
+  # The wrapper's default must be fail-closed. Explicitly selecting the paid
+  # executable still requires MULTICA_ALLOW_PAID_LANE=1; an absent variable on
+  # the non-paid Luna/Sol lane must stay 0 rather than inheriting 1.
+  if [[ -f "$WRAPPER" ]] && grep -q 'MULTICA_ALLOW_PAID_LANE="${MULTICA_ALLOW_PAID_LANE:-1}"' "$WRAPPER"; then
+    if sed -i 's/MULTICA_ALLOW_PAID_LANE:-1/MULTICA_ALLOW_PAID_LANE:-0/' "$WRAPPER"; then
+      fixed+=("paid-lane opt-in default repaired to 0 in ${WRAPPER}")
+    else
+      unfixable+=("could not repair paid-lane opt-in default in ${WRAPPER}")
+    fi
+  fi
+  local snapshot
+  snapshot=$("$PM2" jlist 2>/dev/null) || {
+    unfixable+=("could not inspect PM2 for duplicate workers or paid-lane drift")
+    return 0
+  }
+  while IFS='|' read -r app count; do
+    [[ "$count" =~ ^[0-9]+$ ]] || continue
+    (( count <= 1 )) || unfixable+=("${app} has ${count} PM2 entries; single-instance guard refuses paid dispatch")
+  done < <(printf '%s' "$snapshot" | python3 -c '
+import json,sys,collections
+try: data=json.load(sys.stdin)
+except Exception: raise SystemExit(0)
+counts=collections.Counter(x.get("name") for x in data)
+for name in ("gsp-multica-worker","gsp-multica-bridge","multica-relay-advance"):
+ print(f"{name}|{counts.get(name,0)}")
+')
+
+  local lane paid status
+  while IFS='|' read -r lane paid status; do
+    [[ "$status" == online ]] || continue
+    if [[ "$lane" == paid-openrouter && "$paid" != 1 ]]; then
+      unfixable+=("paid OpenRouter executable is online without MULTICA_ALLOW_PAID_LANE=1")
+    elif [[ "$lane" == non-paid && "$paid" == 1 ]]; then
+      unfixable+=("non-paid executable is online with MULTICA_ALLOW_PAID_LANE=1")
+    fi
+  done < <(printf '%s' "$snapshot" | python3 -c '
+import json,sys
+try: data=json.load(sys.stdin)
+except Exception: raise SystemExit(0)
+for x in data:
+ if x.get("name") != "gsp-multica-worker": continue
+ e=x.get("pm2_env",{}).get("env",{})
+ b=e.get("CODEX_BIN","")
+ lane="paid-openrouter" if b.endswith("codex-openrouter") else "non-paid"
+ paid=e.get("MULTICA_ALLOW_PAID_LANE","")
+ status=x.get("pm2_env",{}).get("status","")
+ print(f"{lane}|{paid}|{status}")
+')
 }
 
 # The GSP relay is only a pipeline if every stage has an owner and every exit has
@@ -401,8 +477,9 @@ guard_workspace_repos() {
 # 2026-08-31: the old headroom bound here was `12 - (queued+running)`, which with
 # 300+ queued is always negative, so this guard was a permanent no-op. The bound
 # was also the wrong idea: QUEUE DEPTH DOES NOT SPEND. The Tower's global
-# concurrency cap is the spend governor, so re-driving a stranded flight only
-# adds a queued row and costs nothing until a slot frees. Every stranded flight
+# concurrency setting limits simultaneous work; an explicit paid token budget is
+# the spend admission. Re-driving a stranded flight only adds a queued row and
+# costs nothing until a slot frees. Every stranded flight
 # is work Tim asked to see finished, so the correct batch size is "all of them".
 guard_stranded_review() {
   local number board ws
@@ -788,7 +865,7 @@ guard_unshipped_closures() {
   return 0
 }
 
-guard_wrapper; guard_tower_process; guard_pm2; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+guard_wrapper; guard_tower_process; guard_pm2; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 for f in "${fixed[@]:-}";     do [[ -n "$f" ]] && echo "belt-config-guard: FIXED $f"; done
 for u in "${unfixable[@]:-}"; do [[ -n "$u" ]] && echo "belt-config-guard: UNFIXABLE $u" >&2; done

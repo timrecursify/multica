@@ -3,6 +3,12 @@ const { URL } = require("url");
 const { Client } = require("pg");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const {
+  isBundledChild,
+  instructionCompatibility,
+  spendPreflight,
+  stageCycleAdmission
+} = require("./guardrails.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -51,6 +57,7 @@ const PORT = Number(process.env.PORT || 5005);
 const SPEC_ENFORCED_WORKSPACE = "f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f";
 const SPEC_BEGIN = "<!-- RELAY-SPEC:BEGIN -->";
 const SPEC_END = "<!-- RELAY-SPEC:END -->";
+const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || "2", 10);
 
 // The spec agent's output is recognised by its required headings, not by author:
 // re-running the spec lane under a different agent must keep working.
@@ -221,7 +228,7 @@ async function ssoBridge(req, res) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token } = body;
+    let { issue_id, to_stage, agent_token, current_work_product_md5 } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -359,6 +366,27 @@ async function relayAdvance(req, res, body) {
       }
     }
 
+    if (to_stage === "Done") {
+      const verdict = await client.query(
+        `SELECT verdict, work_product_md5 FROM qc_verdict
+          WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]
+      );
+      const latest = verdict.rows[0];
+      if (!latest || latest.verdict !== "PASS") {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "no_pass_verdict", message: "Done requires a current PASS verdict" }));
+        return;
+      }
+      if (typeof current_work_product_md5 !== "string" ||
+          current_work_product_md5.toLowerCase() !== String(latest.work_product_md5 || "").toLowerCase()) {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "work_product_mismatch", message: "Done requires the hash from the current PASS verdict" }));
+        return;
+      }
+    }
+
     // Enforcement point: no specification, no build.
     let bindingSpec = null;
     if (issue.workspace_id === SPEC_ENFORCED_WORKSPACE && to_stage === "Queue") {
@@ -389,6 +417,8 @@ async function relayAdvance(req, res, body) {
 
     const stageResult = await client.query(
       `SELECT rsc.agent_id, rsc.agent_name, a.runtime_id, a.archived_at,
+              a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
+              (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
               COALESCE(
                 a.runtime_id,
                 (
@@ -419,6 +449,80 @@ async function relayAdvance(req, res, body) {
       throw new Error(`No online Codex runtime for stage: ${to_stage}`);
     }
 
+    // A paid call is admitted only when the target stage is explicitly covered
+    // by the owner's runbook and its concurrency/model configuration is valid.
+    // Unknown instructions fail closed: a worker that would stop on this stage
+    // has no useful outcome and still consumes vendor tokens.
+    if (stage.agent_id) {
+      const compatibility = instructionCompatibility(stage.instructions, to_stage);
+      if (!compatibility.ok) {
+        await client.query("ROLLBACK");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: "agent_stage_incompatible",
+          issue_id: issue.id,
+          agent_id: stage.agent_id,
+          stage: compatibility.stage,
+          allowed_stages: compatibility.allowed
+        }));
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: "agent_stage_incompatible",
+          message: "the assigned agent instructions do not authorize this stage",
+          stage: compatibility.stage,
+          allowed_stages: compatibility.allowed
+        }));
+        return;
+      }
+      const preflight = spendPreflight(stage, { provider: stage.selected_runtime_provider });
+      if (!preflight.ok) {
+        await client.query("ROLLBACK");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: "paid_dispatch_preflight",
+          detail: preflight.reason,
+          issue_id: issue.id,
+          agent_id: stage.agent_id
+        }));
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "paid_dispatch_preflight", detail: preflight.reason }));
+        return;
+      }
+      // A stage re-entry creates a fresh task, so per-task max_attempts does not
+      // stop a QC FAIL loop. Count every historical task for this issue and
+      // target stage before admitting another paid call; once the ceiling is
+      // reached the flight receives an explicit human disposition.
+      const history = await client.query(
+        `SELECT count(*)::int AS n FROM agent_task_queue
+          WHERE issue_id = $1 AND context->>'to_stage' = $2
+            AND started_at IS NOT NULL`,
+        [issue.id, to_stage]
+      );
+      const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
+      if (!cycle.ok) {
+        await client.query("ROLLBACK");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: cycle.reason,
+          issue_id: issue.id,
+          target_stage: to_stage,
+          historical_tasks: history.rows[0]?.n || 0,
+          ceiling: cycle.ceiling,
+          disposition: cycle.disposition
+        }));
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: cycle.reason,
+          message: "stage retry ceiling reached; manual disposition required",
+          disposition: cycle.disposition,
+          target_stage: to_stage,
+          historical_tasks: history.rows[0]?.n || 0,
+          ceiling: cycle.ceiling
+        }));
+        return;
+      }
+    }
+
     const result = await client.query(
       `UPDATE "issue"
        SET status = $1, updated_at = NOW()
@@ -435,21 +539,14 @@ async function relayAdvance(req, res, body) {
     // and, on 2026-08-31, tripled in-flight by re-dispatching 235 children that
     // had just been bundled. The stage transition still commits -- the child
     // keeps moving with its parent -- only the paid task is withheld.
-    // A MEGA that is itself someone's child is exempt: it is still a work unit.
-    let childOfOpenMega = false;
-    if (stage.agent_id && issue.parent_issue_id && !/^MEGA/.test(issue.title || '')) {
-      const parent = await client.query(
-        `SELECT status FROM "issue" WHERE id = $1`, [issue.parent_issue_id]
-      );
-      if (parent.rows.length &&
-          !['Done', 'Cancelled', 'Archived'].includes(parent.rows[0].status)) {
-        childOfOpenMega = true;
-        console.error('[relay] child of open MEGA - stage advanced, task withheld:',
-          issue_id, issue.status, '->', to_stage);
-      }
+    let bundledChild = false;
+    if (stage.agent_id && isBundledChild(issue)) {
+      bundledChild = true;
+      console.error('[relay] bundled child - stage advanced, task withheld:',
+        issue_id, issue.status, '->', to_stage);
     }
 
-    if (stage.agent_id && !childOfOpenMega) {
+    if (stage.agent_id && !bundledChild) {
       const context = JSON.stringify({
         source: "relay-advance",
         from_stage: issue.status,
@@ -467,16 +564,24 @@ async function relayAdvance(req, res, body) {
            trigger_summary, force_fresh_session, originator_source,
            trigger_evidence_kind
          )
-         VALUES ($1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
-                 'unattributed', 'relay_stage_transition')
-         ON CONFLICT DO NOTHING
-         RETURNING id`,
+         SELECT $1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
+                'unattributed', 'relay_stage_transition'
+          WHERE NOT EXISTS (
+            SELECT 1 FROM agent_task_queue active
+             WHERE active.issue_id = $2
+               AND active.status IN ('queued', 'dispatched', 'running',
+                                     'waiting_local_directory', 'deferred')
+               AND active.context->>'to_stage' = $6
+          )
+           ON CONFLICT DO NOTHING
+           RETURNING id`,
         [
           stage.agent_id,
           issue_id,
           stage.selected_runtime_id,
           context,
-          `Relay stage transition: ${issue.status} -> ${to_stage}`
+          `Relay stage transition: ${issue.status} -> ${to_stage}`,
+          to_stage
         ]
       );
       if (taskResult.rows.length === 0) {

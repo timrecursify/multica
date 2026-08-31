@@ -26,9 +26,10 @@ function gh(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
 }
 
-function relay(issueId, toStage) {
+function relay(issueId, toStage, currentWorkProductMd5) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: RELAY_TOKEN });
+    const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: RELAY_TOKEN,
+      ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}) });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);
@@ -49,8 +50,15 @@ async function closePendingTask(issueId) {
 }
 
 async function finish(issue, note) {
+  const verdict = await pool.query(
+    `SELECT verdict, work_product_md5 FROM qc_verdict
+      WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1`, [issue.id]);
+  const latest = verdict.rows[0];
+  if (!latest || latest.verdict !== 'PASS' || !latest.work_product_md5) {
+    throw new Error('Done requires a current PASS verdict and work-product hash');
+  }
+  await relay(issue.id, 'Done', latest.work_product_md5);
   await closePendingTask(issue.id);
-  await relay(issue.id, 'Done');
   log(`DONE #${issue.number} — ${note}`);
 }
 
