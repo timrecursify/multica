@@ -1,0 +1,37 @@
+// GSP belt PM2 ecosystem — rendered from template by ops/gsp-belt/deploy/gsp-belt-deploy.sh.
+//
+// __GSP_BELT_RELEASE__ is the immutable release directory selected during cutover.
+// Every `script:` below must resolve inside that release; the deploy + guard
+// checks fail if any referenced path escapes it (e.g. back to a home-directory
+// copy), so an unmanaged script can never be wired back in by accident.
+//
+// Process guardrails (doctrine Tim 2026-08-30, see issue GSP-734):
+// sentinel fixes what code can fix; these values stop restart storms rather
+// than reporting them. An unattended crashloop re-runs work and burns fuel.
+// Derivation: observed storms reached 46 (qc-worker), 29/28 (QC), 24 (bridge);
+// max_restarts 5 is an order of magnitude below the pathological pattern and
+// min_uptime 60s means only a genuine crashloop counts.
+const guardrails = {
+  min_uptime: 60000,                  // must survive 60s to count as a good start
+  max_restarts: 5,                    // then pm2 stops retrying and marks it errored
+  exp_backoff_restart_delay: 5000,    // back off instead of hammering
+  autorestart: true,
+  kill_timeout: 10000,                // let in-flight work finish before SIGKILL
+};
+
+// Env names the bridge/relay/cicd processes require. Preflight refuses to run
+// when any of these is unset; names only — values stay in operator .env/secret
+// files and are never committed.
+const REQUIRED_ENV = ['DATABASE_URL', 'RELAY_AGENT_SECRET', 'GSP_WORKSPACE_ID', 'MULTICA_WORKSPACE_ID'];
+
+module.exports = {
+  required_env: REQUIRED_ENV,
+  apps: [
+    { name: 'gsp-multica-bridge',    script: '__GSP_BELT_RELEASE__/bridge/multica-bridge.cjs',                            ...guardrails },
+    { name: 'multica-cicd-worker',   script: '__GSP_BELT_RELEASE__/worker/multica-cicd-worker.cjs',                        ...guardrails },
+    { name: 'multica-archiver',      script: '__GSP_BELT_RELEASE__/worker/multica-archiver.cjs',                           ...guardrails },
+    { name: 'gsp-multica-worker',    script: '__GSP_BELT_RELEASE__/fleet/multica-daemon-wrapper.sh',                       ...guardrails,
+      kill_timeout: 30000 },         // Tower may hold long-running flights
+    { name: 'multica-relay-advance', script: '__GSP_BELT_RELEASE__/relay/multica-relay-advance-wrapper.sh',                ...guardrails },
+  ],
+};
