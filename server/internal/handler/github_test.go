@@ -554,8 +554,8 @@ func TestWebhook_MergedPR_PreservesCancelled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
-	if updated.Status != "cancelled" {
-		t.Errorf("expected status to remain 'cancelled', got %q", updated.Status)
+	if updated.Status != "Cancelled" {
+		t.Errorf("expected status to remain 'Cancelled', got %q", updated.Status)
 	}
 }
 

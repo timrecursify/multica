@@ -16,8 +16,7 @@ const (
 	// IssueStatusProfileLinear emits the historic lowercase display spellings
 	// for compatibility. It never changes persisted values.
 	IssueStatusProfileLinear IssueStatusProfile = "linear"
-	// IssueStatusProfilePPP emits the canonical board statuses (Spec, Queue,
-	// in_progress, in_review, Human Review, Done, Cancelled, Archived).
+	// IssueStatusProfilePPP emits the canonical production-board statuses.
 	IssueStatusProfilePPP IssueStatusProfile = "ppp"
 )
 
@@ -55,15 +54,17 @@ type IssueStatusContract struct {
 // profile is fixed for the process lifetime; callers must never switch it per
 // request.
 func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, error) {
-	canonical := []string{"Spec", "Queue", "in_progress", "in_review", "Human Review", "Done", "Cancelled", "Archived"}
+	canonical := []string{
+		"Registered", "Spec", "Queue", "In Progress", "In Review",
+		"Human Review", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
+	}
 	aliases := map[string]string{
 		"todo":        "Spec",
 		"backlog":     "Spec",
-		"Registered":  "Spec",
-		"In Progress": "in_progress",
-		"Building":    "in_progress",
-		"In Review":   "in_review",
-		"QC":          "in_review",
+		"in_progress": "In Progress",
+		"Building":    "In Progress",
+		"in_review":   "In Review",
+		"QC":          "In Review",
 		"blocked":     "Human Review",
 		"Blocked":     "Human Review",
 		"done":        "Done",
@@ -75,7 +76,7 @@ func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, e
 	switch profile {
 	case IssueStatusProfileLinear:
 		display = map[string]string{
-			"Spec": "todo", "Queue": "backlog", "in_progress": "in_progress", "in_review": "in_review",
+			"Spec": "todo", "Queue": "backlog", "In Progress": "in_progress", "In Review": "in_review",
 			"Human Review": "blocked", "Done": "done", "Cancelled": "cancelled", "Archived": "cancelled",
 		}
 	case IssueStatusProfilePPP:

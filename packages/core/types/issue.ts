@@ -1,9 +1,9 @@
 import type { Label } from "./label";
 import type { IssuePropertyValues } from "./property";
 
-// Mirrors the issue_status_check constraint and the workflow_state table.
-// The capitalised values are the live relay chain; the lowercase ones are
-// the original build's vocabulary, retained for existing rows.
+// The capitalised values are the canonical issue_status_check and relay
+// vocabulary. Lowercase spellings are retained only for compatibility while a
+// client may still receive a response from an older server.
 export type IssueStatus =
   | "Registered"
   | "Spec"

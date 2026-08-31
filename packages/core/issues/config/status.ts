@@ -58,10 +58,9 @@ export const STATUS_CONFIG: Record<
 /**
  * Cancelled in either vocabulary.
  *
- * IssueStatus carries both the live relay chain ("Cancelled") and the original
- * build's lowercase values, which are retained for existing rows. Anything that
- * ranks, filters or hides cancelled work must accept both spellings: comparing
- * against one alone silently stops demoting every row stored in the other.
+ * IssueStatus carries the canonical relay chain and temporary legacy response
+ * spellings. Anything that ranks, filters or hides cancelled work must accept
+ * both while older servers can still return the lowercase spelling.
  */
 export function isCancelledIssueStatus(
   status: IssueStatus | null | undefined,
