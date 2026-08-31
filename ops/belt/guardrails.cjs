@@ -85,6 +85,15 @@ function spendPreflight(agent, selectedRuntime = {}) {
   return { ok: true, cap };
 }
 
+function stageCycleAdmission(taskCount, limit = 2) {
+  const count = Number(taskCount);
+  const ceiling = Number(limit);
+  if (!Number.isInteger(ceiling) || ceiling < 1) return { ok: false, reason: 'invalid_stage_cycle_limit' };
+  return count < ceiling
+    ? { ok: true, ceiling }
+    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Human Review' };
+}
+
 module.exports = {
   NONTERMINAL_TASK_STATES,
   canonicalStage,
@@ -93,5 +102,6 @@ module.exports = {
   instructionCompatibility,
   hasActiveTaskForIssueStage,
   retryAdmission,
-  spendPreflight
+  spendPreflight,
+  stageCycleAdmission
 };

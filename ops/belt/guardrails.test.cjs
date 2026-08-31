@@ -2,7 +2,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
-  retryAdmission, spendPreflight
+  retryAdmission, spendPreflight, stageCycleAdmission
 } = require('./guardrails.cjs');
 
 test('any bundled child is withheld, regardless of parent state', () => {
@@ -43,4 +43,11 @@ test('paid dispatch requires a live configured agent', () => {
   assert.equal(spendPreflight({ max_concurrent_tasks: 0, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter' }).ok, false);
   assert.equal(spendPreflight({ max_concurrent_tasks: null, instructions: 'Queue', model: 'gpt-5.6-luna' }, { provider: 'codex' }).ok, true);
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: '' }, { provider: 'codex' }).ok, true);
+});
+
+test('stage cycle breaker parks repeated model calls for manual disposition', () => {
+  assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
+  assert.deepEqual(stageCycleAdmission(2), {
+    ok: false, reason: 'stage_cycle_limit', ceiling: 2, disposition: 'Human Review'
+  });
 });

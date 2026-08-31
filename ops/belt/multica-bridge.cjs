@@ -6,7 +6,8 @@ const crypto = require("crypto");
 const {
   isBundledChild,
   instructionCompatibility,
-  spendPreflight
+  spendPreflight,
+  stageCycleAdmission
 } = require("./guardrails.cjs");
 
 // Relay configuration is supplied by the host environment.
@@ -56,6 +57,7 @@ const PORT = Number(process.env.PORT || 5005);
 const SPEC_ENFORCED_WORKSPACE = "f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f";
 const SPEC_BEGIN = "<!-- RELAY-SPEC:BEGIN -->";
 const SPEC_END = "<!-- RELAY-SPEC:END -->";
+const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || "2", 10);
 
 // The spec agent's output is recognised by its required headings, not by author:
 // re-running the spec lane under a different agent must keep working.
@@ -226,7 +228,7 @@ async function ssoBridge(req, res) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token } = body;
+    let { issue_id, to_stage, agent_token, current_work_product_md5 } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -364,6 +366,27 @@ async function relayAdvance(req, res, body) {
       }
     }
 
+    if (to_stage === "Done") {
+      const verdict = await client.query(
+        `SELECT verdict, work_product_md5 FROM qc_verdict
+          WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]
+      );
+      const latest = verdict.rows[0];
+      if (!latest || latest.verdict !== "PASS") {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "no_pass_verdict", message: "Done requires a current PASS verdict" }));
+        return;
+      }
+      if (typeof current_work_product_md5 !== "string" ||
+          current_work_product_md5.toLowerCase() !== String(latest.work_product_md5 || "").toLowerCase()) {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "work_product_mismatch", message: "Done requires the hash from the current PASS verdict" }));
+        return;
+      }
+    }
+
     // Enforcement point: no specification, no build.
     let bindingSpec = null;
     if (issue.workspace_id === SPEC_ENFORCED_WORKSPACE && to_stage === "Queue") {
@@ -465,6 +488,38 @@ async function relayAdvance(req, res, body) {
         res.end(JSON.stringify({ error: "paid_dispatch_preflight", detail: preflight.reason }));
         return;
       }
+      // A stage re-entry creates a fresh task, so per-task max_attempts does not
+      // stop a QC FAIL loop. Count every historical task for this issue and
+      // target stage before admitting another paid call; once the ceiling is
+      // reached the flight receives an explicit human disposition.
+      const history = await client.query(
+        `SELECT count(*)::int AS n FROM agent_task_queue
+          WHERE issue_id = $1 AND context->>'to_stage' = $2`,
+        [issue.id, to_stage]
+      );
+      const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
+      if (!cycle.ok) {
+        await client.query("ROLLBACK");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: cycle.reason,
+          issue_id: issue.id,
+          target_stage: to_stage,
+          historical_tasks: history.rows[0]?.n || 0,
+          ceiling: cycle.ceiling,
+          disposition: cycle.disposition
+        }));
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: cycle.reason,
+          message: "stage retry ceiling reached; manual disposition required",
+          disposition: cycle.disposition,
+          target_stage: to_stage,
+          historical_tasks: history.rows[0]?.n || 0,
+          ceiling: cycle.ceiling
+        }));
+        return;
+      }
     }
 
     const result = await client.query(
@@ -483,14 +538,14 @@ async function relayAdvance(req, res, body) {
     // and, on 2026-08-31, tripled in-flight by re-dispatching 235 children that
     // had just been bundled. The stage transition still commits -- the child
     // keeps moving with its parent -- only the paid task is withheld.
-    let childOfOpenMega = false;
+    let bundledChild = false;
     if (stage.agent_id && isBundledChild(issue)) {
-      childOfOpenMega = true;
+      bundledChild = true;
       console.error('[relay] bundled child - stage advanced, task withheld:',
         issue_id, issue.status, '->', to_stage);
     }
 
-    if (stage.agent_id && !childOfOpenMega) {
+    if (stage.agent_id && !bundledChild) {
       const context = JSON.stringify({
         source: "relay-advance",
         from_stage: issue.status,

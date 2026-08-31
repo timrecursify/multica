@@ -3,7 +3,8 @@ const { Pool } = require('pg');
 const {
   instructionCompatibility,
   retryAdmission,
-  spendPreflight
+  spendPreflight,
+  stageCycleAdmission
 } = require('../guardrails.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
@@ -37,6 +38,7 @@ const REQUEUE_STAGES = (process.env.RELAY_REQUEUE_STAGES || 'Queue,Spec,In Revie
 // threshold of our own: it is the number of tasks the Tower can actually hold.
 const MAX_CONCURRENT = Number.parseInt(process.env.RELAY_MAX_CONCURRENT || '12', 10);
 const QUEUED_TASK_TTL_MINUTES = Number.parseInt(process.env.MULTICA_QUEUED_TASK_TTL_MINUTES || '120', 10);
+const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || '2', 10);
 
 const configuredPoolMax = Number.parseInt(process.env.RELAY_PG_POOL_MAX || '2', 10);
 const poolMax = Number.isInteger(configuredPoolMax) && configuredPoolMax > 0
@@ -583,6 +585,17 @@ async function requeueStrandedTasks() {
         // Serialize admission with the bridge and other recovery workers. The
         // issue lock plus stage-scoped predicate prevents duplicate paid rows.
         await client.query('SELECT id FROM issue WHERE id = $1 FOR UPDATE', [row.issue_id]);
+        const history = await client.query(
+          `SELECT count(*)::int AS n FROM agent_task_queue
+            WHERE issue_id = $1 AND context->>'to_stage' = $2`,
+          [row.issue_id, row.stage]
+        );
+        const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
+        if (!cycle.ok) {
+          await client.query('ROLLBACK');
+          console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: ${cycle.reason}; manual disposition=${cycle.disposition}`);
+          continue;
+        }
         const context = JSON.stringify({
           source: coldStart ? 'relay-cold-start'
             : noArtifact
