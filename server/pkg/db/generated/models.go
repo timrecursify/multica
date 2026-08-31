@@ -663,6 +663,27 @@ type IssueDependency struct {
 	Type             string      `json:"type"`
 }
 
+type IssueFunnelStageDuration struct {
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	IssueID            pgtype.UUID        `json:"issue_id"`
+	IssueNumber        int32              `json:"issue_number"`
+	Stage              string             `json:"stage"`
+	TransitionSequence int64              `json:"transition_sequence"`
+	EnteredAt          pgtype.Timestamptz `json:"entered_at"`
+	ExitedAt           interface{}        `json:"exited_at"`
+	DurationSeconds    int64              `json:"duration_seconds"`
+	IsOpen             interface{}        `json:"is_open"`
+}
+
+type IssueFunnelTransition struct {
+	ID          pgtype.UUID        `json:"id"`
+	Sequence    int64              `json:"sequence"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	IssueID     pgtype.UUID        `json:"issue_id"`
+	Stage       string             `json:"stage"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+}
+
 type IssueLabel struct {
 	ID           pgtype.UUID        `json:"id"`
 	WorkspaceID  pgtype.UUID        `json:"workspace_id"`

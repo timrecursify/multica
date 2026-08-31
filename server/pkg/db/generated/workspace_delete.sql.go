@@ -168,6 +168,9 @@ deleted_issue_views AS (
 deleted_issue_view_preferences AS (
     DELETE FROM issue_view_preference
     WHERE issue_view_preference.workspace_id = $1
+),
+deleted_issue_funnel_transitions AS (
+    DELETE FROM issue_funnel_transition WHERE workspace_id = $1
 )
 DELETE FROM quick_action WHERE quick_action.workspace_id = $1
 `

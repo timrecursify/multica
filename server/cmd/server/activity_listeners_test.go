@@ -192,7 +192,7 @@ func TestIssueFunnelTransitionsRecordDeliveryStages(t *testing.T) {
 	if _, err := testPool.Exec(ctx, `UPDATE issue SET assignee_type = 'member', assignee_id = $2, status = 'in_progress' WHERE id = $1`, issueID, assigneeID); err != nil {
 		t.Fatalf("assign and start issue: %v", err)
 	}
-	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'In Review' WHERE id = $1`, issueID); err != nil {
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'in_review' WHERE id = $1`, issueID); err != nil {
 		t.Fatalf("send issue to review: %v", err)
 	}
 	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'Done' WHERE id = $1`, issueID); err != nil {
