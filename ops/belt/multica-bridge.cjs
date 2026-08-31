@@ -434,11 +434,11 @@ async function relayAdvance(req, res, body) {
        FROM relay_stage_config rsc
        LEFT JOIN agent a ON a.id = rsc.agent_id
        WHERE rsc.stage_name = $2`,
-      // Dispatch ownership follows the stage being entered. Looking up the
-      // current stage here routes Registered -> Spec work to the Registered
-      // owner (often a QC agent), which then rejects the task and burns a
-      // paid run. The target stage is the only correct owner key.
-      [issue.workspace_id, to_stage]
+      // Stage owners are keyed by the stage being left: Spec -> Queue wakes
+      // the builder, and In Progress -> In Review wakes QC. Looking up the
+      // target stage would select the next lane's owner and can burn a paid
+      // call on an incompatible runbook.
+      [issue.workspace_id, issue.status]
     );
 
     if (stageResult.rows.length === 0) {
