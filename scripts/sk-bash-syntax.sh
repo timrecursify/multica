@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
-while IFS= read -r -d '' file; do
+while IFS= read -r file; do
   bash -n "$file" || exit $?
-done < <(git ls-files -z -- '*.sh')
+done < <(find . -type f -name '*.sh' -not -path './.git/*' -print)
