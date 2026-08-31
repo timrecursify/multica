@@ -30,6 +30,8 @@ function instructionStages(instructions) {
     [/\b(?:in the )?(Spec)\b/i, 'Spec'],
     [/\b(In Progress)\b/i, 'In Progress'],
     [/\b(In Review)\b/i, 'In Review'],
+    [/\b(CI\/CD & Deploy)\b/i, 'CI/CD & Deploy'],
+    [/\b(Done)\b/i, 'Done'],
     [/\b(Queue)\b/i, 'Queue'],
     [/\b(Registered)\b/i, 'Registered']
   ];
@@ -77,6 +79,9 @@ function spendPreflight(agent, selectedRuntime = {}) {
   const cap = Number(agent && agent.max_concurrent_tasks);
   if (!String(agent.instructions || '').trim()) return { ok: false, reason: 'missing_instructions' };
   if (agent.archived_at) return { ok: false, reason: 'agent_archived' };
+  if (agent.runtime_config && agent.runtime_config.quota_paused === true) {
+    return { ok: false, reason: 'provider_quota_paused' };
+  }
   const model = String(selectedRuntime.model || agent.model || '').trim();
   const provider = String(selectedRuntime.provider || '').toLowerCase();
   const paid = selectedRuntime.paid === true || provider === 'openrouter' || /^deepseek[/:]/i.test(model);
@@ -117,6 +122,19 @@ function isExecutionStage(stage) {
   return !NON_EXECUTION_STAGES.has(canonicalStage(stage));
 }
 
+function quotaCircuitAdmission(failureReasons, limit = 3) {
+  const ceiling = Number(limit);
+  if (!Number.isInteger(ceiling) || ceiling < 1) {
+    return { pause: true, reason: 'invalid_quota_failure_limit' };
+  }
+  let consecutive = 0;
+  for (const reason of failureReasons || []) {
+    if (!/\b402\b|provider_quota_limit|payment[ _-]?required/i.test(String(reason || ''))) break;
+    consecutive += 1;
+  }
+  return { pause: consecutive >= ceiling, consecutive, ceiling };
+}
+
 module.exports = {
   NONTERMINAL_TASK_STATES,
   canonicalStage,
@@ -128,5 +146,6 @@ module.exports = {
   spendPreflight,
   stageCycleAdmission,
   lifetimeTaskAdmission,
-  isExecutionStage
+  isExecutionStage,
+  quotaCircuitAdmission
 };

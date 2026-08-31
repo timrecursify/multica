@@ -3,7 +3,7 @@ const test = require('node:test');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
   retryAdmission, spendPreflight, stageCycleAdmission, lifetimeTaskAdmission,
-  isExecutionStage
+  isExecutionStage, quotaCircuitAdmission
 } = require('./guardrails.cjs');
 
 test('any bundled child is withheld, regardless of parent state', () => {
@@ -17,6 +17,8 @@ test('dispatch requires the target stage to be named by agent instructions', () 
   assert.equal(instructionCompatibility('read RUNBOOK_SPEC_WORKER.md; stop elsewhere', 'Queue').ok, false);
   assert.equal(instructionCompatibility('read RUNBOOK_BUILD_WORKER.md', 'Queue').ok, true);
   assert.equal(instructionCompatibility('Own Queue and In Progress build stages', 'In Progress').ok, true);
+  assert.equal(instructionCompatibility('Work only CI/CD & Deploy', 'CI/CD & Deploy').ok, true);
+  assert.equal(instructionCompatibility('Verify Done closure evidence', 'Done').ok, true);
   assert.equal(instructionCompatibility('', 'Queue').ok, false);
 });
 
@@ -46,6 +48,8 @@ test('paid dispatch requires a live configured agent', () => {
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter' }).ok, false);
   assert.equal(spendPreflight({ max_concurrent_tasks: null, instructions: 'Queue', model: 'gpt-5.6-luna' }, { provider: 'codex' }).ok, true);
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: '' }, { provider: 'codex' }).ok, true);
+  assert.deepEqual(spendPreflight({ instructions: 'Queue', runtime_config: { quota_paused: true } }, { provider: 'codex' }),
+    { ok: false, reason: 'provider_quota_paused' });
 });
 
 test('stage cycle breaker parks repeated model calls without human review', () => {
@@ -70,4 +74,11 @@ test('human and disposition stages never execute tasks', () => {
   assert.equal(isExecutionStage('Human Review'), false);
   assert.equal(isExecutionStage('Parked'), false);
   assert.equal(isExecutionStage('Rejected'), false);
+});
+
+test('quota circuit pauses only after consecutive money failures', () => {
+  assert.deepEqual(quotaCircuitAdmission(['402', 'provider_quota_limit', 'payment required']),
+    { pause: true, consecutive: 3, ceiling: 3 });
+  assert.deepEqual(quotaCircuitAdmission(['402', 'timeout', '402']),
+    { pause: false, consecutive: 1, ceiling: 3 });
 });

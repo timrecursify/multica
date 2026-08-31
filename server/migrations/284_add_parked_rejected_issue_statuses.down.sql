@@ -13,3 +13,15 @@ ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
      'Human Review', 'CI/CD & Deploy', 'Done', 'Archived', 'Cancelled'));
+
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM relay_run_log WHERE status = 'rejected') THEN
+        RAISE EXCEPTION 'cannot remove Rejected relay logs while rows use that status';
+    END IF;
+END;
+$$;
+
+ALTER TABLE relay_run_log DROP CONSTRAINT IF EXISTS relay_run_log_status_check;
+ALTER TABLE relay_run_log ADD CONSTRAINT relay_run_log_status_check CHECK
+    (status IN ('pending', 'completed', 'failed'));

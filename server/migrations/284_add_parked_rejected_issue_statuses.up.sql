@@ -6,3 +6,7 @@ ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
      'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
      'Archived', 'Cancelled'));
+
+ALTER TABLE relay_run_log DROP CONSTRAINT IF EXISTS relay_run_log_status_check;
+ALTER TABLE relay_run_log ADD CONSTRAINT relay_run_log_status_check CHECK
+    (status IN ('pending', 'completed', 'failed', 'rejected'));
