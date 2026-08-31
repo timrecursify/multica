@@ -1424,7 +1424,7 @@ func TestBatchIssueGCCheck_WithDaemonToken(t *testing.T) {
 	if len(resp.Issues) != 2 {
 		t.Fatalf("issues length = %d, want 2", len(resp.Issues))
 	}
-	if got := resp.Issues[0]; got.ID != issueID || !got.Found || got.Status != "done" || got.UpdatedAt == "" {
+	if got := resp.Issues[0]; got.ID != issueID || !got.Found || got.Status != "Done" || got.UpdatedAt == "" {
 		t.Fatalf("found issue result = %+v", got)
 	}
 	if got := resp.Issues[1]; got.ID != missingID || got.Found || got.Status != "" || got.UpdatedAt != "" {

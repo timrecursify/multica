@@ -719,8 +719,8 @@ func TestSweepDoesNotResetIssueAlreadyInReview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query issue status: %v", err)
 	}
-	if issueStatus != "in_review" {
-		t.Fatalf("expected issue status 'in_review' to be preserved, got '%s'", issueStatus)
+	if issueStatus != "In Review" {
+		t.Fatalf("expected issue status 'In Review' to be preserved, got '%s'", issueStatus)
 	}
 }
 

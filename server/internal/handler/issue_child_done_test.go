@@ -668,8 +668,8 @@ func TestStageLeaderPrepareTimeoutRetryCanAdvanceNextStage(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, stage2.ID).Scan(&stage2Status); err != nil {
 		t.Fatalf("load promoted Stage 2: %v", err)
 	}
-	if stage2Status != "todo" {
-		t.Fatalf("Stage 2 status = %q, want todo", stage2Status)
+	if stage2Status != "Spec" {
+		t.Fatalf("Stage 2 status = %q, want Spec", stage2Status)
 	}
 	if got := countPendingTasksForAgent(t, stage2.ID, sq.LeaderID); got != 1 {
 		t.Fatalf("promoted Stage 2 queued %d leader tasks, want 1", got)

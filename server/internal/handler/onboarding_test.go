@@ -306,7 +306,7 @@ func TestBootstrapOnboardingRuntimeCreatesSingleGuideIssue(t *testing.T) {
 		t.Fatalf("issue assignee = %s/%s, want agent/%s", assigneeType, assigneeID, resp.AgentID)
 	}
 	if issueStatus != "todo" || issuePriority != "high" {
-		t.Fatalf("issue status/priority = %s/%s, want todo/high", issueStatus, issuePriority)
+		t.Fatalf("issue status/priority = %s/%s, want Spec/high", issueStatus, issuePriority)
 	}
 
 	var (
@@ -549,7 +549,7 @@ func TestBootstrapOnboardingNoRuntimeCreatesSingleGuideIssue(t *testing.T) {
 		t.Fatalf("issue assignee = %s/%s, want member/%s", assigneeType, assigneeID, testUserID)
 	}
 	if issueStatus != "todo" || issuePriority != "high" {
-		t.Fatalf("issue status/priority = %s/%s, want todo/high", issueStatus, issuePriority)
+		t.Fatalf("issue status/priority = %s/%s, want Spec/high", issueStatus, issuePriority)
 	}
 	for _, want := range []string{
 		"Try Multica first",

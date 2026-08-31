@@ -89,7 +89,7 @@ func TestListGroupedIssuesAssigneePaginatesPerGroup(t *testing.T) {
 	createIssue("Grouped agent one", "agent", agentID, 1, nil, nil)
 
 	path := fmt.Sprintf(
-		"/api/issues/grouped?workspace_id=%s&group_by=assignee&statuses=todo&limit=2&assignee_filters=member:%s,agent:%s",
+		"/api/issues/grouped?workspace_id=%s&group_by=assignee&statuses=Spec&limit=2&assignee_filters=member:%s,agent:%s",
 		testWorkspaceID,
 		assigneeID,
 		agentID,
@@ -138,7 +138,7 @@ func TestListGroupedIssuesAssigneePaginatesPerGroup(t *testing.T) {
 	}
 
 	nextPath := fmt.Sprintf(
-		"/api/issues/grouped?workspace_id=%s&group_by=assignee&statuses=todo&limit=2&offset=2&group_assignee_type=member&group_assignee_id=%s",
+		"/api/issues/grouped?workspace_id=%s&group_by=assignee&statuses=Spec&limit=2&offset=2&group_assignee_type=member&group_assignee_id=%s",
 		testWorkspaceID,
 		assigneeID,
 	)
