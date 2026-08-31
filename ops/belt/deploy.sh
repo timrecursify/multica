@@ -30,6 +30,8 @@ declare -a sources=(
   "$root_dir/belt-config-guard.sh"
   "$root_dir/multica-bundle.py"
   "$root_dir/RUNBOOK_SPEC_WORKER.md"
+  "$root_dir/RUNBOOK_BUILD_WORKER.md"
+  "$root_dir/WORKER_COMMON.md"
 )
 
 declare -a targets=(
@@ -39,6 +41,8 @@ declare -a targets=(
   "/home/newadmin/tools/belt-config-guard.sh"
   "/home/newadmin/tools/multica-bundle.py"
   "/home/newadmin/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
+  "/home/newadmin/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
+  "/home/newadmin/multica-doctrine/WORKER_COMMON.md"
 )
 
 invalid=0
