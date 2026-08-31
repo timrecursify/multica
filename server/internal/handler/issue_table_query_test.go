@@ -1249,7 +1249,9 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 		}
 		return result
 	}
-	noParentTodo := listCell(cellKey(filteredNoParent, "Spec"))
+	// The Linear-profile handler renders canonical Spec as the legacy `todo`
+	// response spelling, while request filters remain canonical.
+	noParentTodo := listCell(cellKey(filteredNoParent, "todo"))
 	if len(noParentTodo.Rows) != 2 {
 		t.Fatalf("unexpected visible no-parent rows: %#v", noParentTodo.Rows)
 	}
@@ -1260,7 +1262,7 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 	if noParentIDs[parentID] || !noParentIDs[hiddenParentID] {
 		t.Fatalf("parent header/card semantics diverged: %#v", noParentIDs)
 	}
-	noParentDone := listCell(cellKey(filteredNoParent, "Done"))
+	noParentDone := listCell(cellKey(filteredNoParent, "done"))
 	if len(noParentDone.Rows) != 0 {
 		t.Fatalf("promoted parent remained in No-parent rows: %#v", noParentDone.Rows)
 	}

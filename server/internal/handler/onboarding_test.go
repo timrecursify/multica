@@ -335,8 +335,8 @@ func TestBootstrapOnboardingRuntimeCreatesSingleGuideIssue(t *testing.T) {
 	`, resp.IssueID, resp.AgentID).Scan(&taskCount); err != nil {
 		t.Fatalf("count queued tasks: %v", err)
 	}
-	if taskCount == 0 {
-		t.Fatal("expected onboarding issue to enqueue an agent task")
+	if taskCount != 0 {
+		t.Fatalf("expected no agent tasks for Spec onboarding issue, got %d", taskCount)
 	}
 
 	w2 := httptest.NewRecorder()
