@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS relay_stage_agent_pool_workspace_stage_agent_key;

@@ -17,7 +17,8 @@ const {
   recordBookkeepingHandoff,
   isCicdReturn,
   consumeCicdReturnAuthorization,
-  authorizeCicdReturnCapBypass
+  authorizeCicdReturnCapBypass,
+  selectStageOwner
 } = require('./multica-bridge.cjs');
 
 test('only a named CI/CD return is eligible for a repair authorization', () => {
@@ -54,6 +55,56 @@ test('CI/CD return authorization is consumed only by a cap bypass after admissio
   assert.ok(admission >= 0 && authorization > admission,
     'the 202 cross-stage admission must precede authorization consumption');
   assert.match(source, /!issue\.metadata\?\.cicd_return_consumed_at/);
+});
+
+function scoper(overrides = {}) {
+  return {
+    agent_id: 'agent-b', agent_name: 'ppp-spec-sol-low-2', owner_id: 'agent-b',
+    runtime_id: 'runtime-1', archived_at: null, agent_status: 'idle',
+    instructions: 'Own Spec tickets only.', model: 'gpt-5.6-sol', thinking_level: 'low',
+    selected_runtime_id: 'runtime-1', active_task_count: 0, max_concurrent_tasks: 1, ...overrides
+  };
+}
+
+test('scoper pool selects the least-loaded eligible Sol-low owner', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    return { rows: [scoper({ agent_id: 'agent-b', active_task_count: 0 }),
+      scoper({ agent_id: 'agent-a', active_task_count: 1 })] };
+  } };
+  const owner = await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec');
+  assert.equal(owner.agent_id, 'agent-b');
+  assert.match(calls[0].sql, /pg_advisory_xact_lock/);
+  assert.match(calls[1].sql, /ORDER BY active_task_count, p.agent_id/);
+});
+
+test('configured scoper pool fails closed when no Sol-low owner is eligible', async () => {
+  const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
+    ? { rows: [] } : { rows: [scoper({ model: 'deepseek/deepseek-v4-flash-0731' })] } };
+  await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
+    /No eligible Sol-low scoper in pool/);
+});
+
+test('configured scoper pool does not overfill an agent concurrency limit', async () => {
+  const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
+    ? { rows: [] } : { rows: [scoper({ active_task_count: 1, max_concurrent_tasks: 1 })] } };
+  await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
+    /No eligible Sol-low scoper in pool/);
+});
+
+test('empty scoper pool preserves the canonical relay owner fallback', async () => {
+  const calls = [];
+  const fallback = { agent_id: 'canonical-agent' };
+  const client = { query: async (sql) => {
+    calls.push(sql);
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
+    return { rows: [fallback] };
+  } };
+  assert.equal(await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'), fallback);
+  assert.match(calls[2], /FROM relay_stage_config/);
 });
 
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
