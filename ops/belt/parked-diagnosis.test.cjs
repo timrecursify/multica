@@ -9,6 +9,7 @@ const {
   namedBlocker,
   isConcreteRuntimeEvidence,
   verifyRuntimeEvidence,
+  recordParkAndQueueDiagnosis,
   isSolLowDiagnosisAgent,
   PARK_REASON_MARKER,
   PARK_DIAGNOSIS_KIND
@@ -70,4 +71,23 @@ test('runtime evidence must resolve to an issue-scoped durable row', async () =>
   assert.equal(await verifyRuntimeEvidence(client, 'issue-1', 'relay.log:42'), false);
   assert.equal(queries.length, 1);
   assert.match(queries[0].sql, /t\.issue_id = \$2/);
+});
+
+test('missing Sol-low owner persists a named blocker instead of parking silently', async () => {
+  const queries = [];
+  const client = { query: async (sql, values) => {
+    queries.push({ sql, values });
+    if (/SELECT failure_reason, error/.test(sql)) return { rows: [] };
+    if (/SELECT verdict FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/SELECT a\.id, a\.name/.test(sql)) return { rows: [] };
+    if (/UPDATE issue/.test(sql)) return { rowCount: 1, rows: [] };
+    return { rowCount: 0, rows: [] };
+  } };
+  const taskId = await recordParkAndQueueDiagnosis(client, {
+    id: 'issue-1', workspace_id: 'workspace-1', status: 'Queue', priority: 'high'
+  }, { reason: 'lifetime_task_limit', attempts: 6, ceiling: 6 });
+  assert.equal(taskId, null);
+  const trace = queries.map(({ sql, values }) => `${sql}\n${JSON.stringify(values)}`).join('\n');
+  assert.match(trace, /no_sol_low_diagnosis_owner/);
+  assert.match(trace, /multica-park-diagnosis-blocker/);
 });

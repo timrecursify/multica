@@ -848,11 +848,13 @@ async function processParkedDiagnoses() {
   const client = await pool.connect();
   try {
     const { rows: candidates } = await client.query(
-      `SELECT t.id
+      `SELECT t.id, i.workspace_id
          FROM agent_task_queue t
+         JOIN issue i ON i.id = t.issue_id
         WHERE t.status = 'completed'
           AND t.context->>'kind' = $1
           AND COALESCE(t.context->>'diagnosis_processed', 'false') <> 'true'
+          AND i.workspace_id IS NOT NULL
         ORDER BY t.completed_at ASC
         LIMIT 25`, [PARK_DIAGNOSIS_KIND]);
     for (const candidate of candidates) {
@@ -864,10 +866,12 @@ async function processParkedDiagnoses() {
                 i.workspace_id, i.status, i.number
            FROM agent_task_queue t
            JOIN issue i ON i.id = t.issue_id
-          WHERE t.id = $1 AND t.status = 'completed'
+          WHERE t.id = $1
             AND t.context->>'kind' = $2
+            AND i.workspace_id = $3
+            AND t.status = 'completed'
             AND COALESCE(t.context->>'diagnosis_processed', 'false') <> 'true'
-          FOR UPDATE OF t SKIP LOCKED`, [candidate.id, PARK_DIAGNOSIS_KIND]);
+          FOR UPDATE OF t SKIP LOCKED`, [candidate.id, PARK_DIAGNOSIS_KIND, candidate.workspace_id]);
       if (locked.rows.length === 0) {
         await client.query('ROLLBACK');
         continue;

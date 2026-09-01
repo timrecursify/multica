@@ -3,6 +3,7 @@
 // friendly so both bridge entry points apply the same rules.
 
 const PARK_REASON_MARKER = '<!-- multica-park-reason -->';
+const PARK_BLOCKER_MARKER = '<!-- multica-park-diagnosis-blocker -->';
 const PARK_DIAGNOSIS_KIND = 'parked_diagnosis';
 const DIAGNOSIS_OUTCOMES = new Set([
   'fixable', 'already_fixed', 'duplicate', 'genuinely_blocked'
@@ -11,7 +12,7 @@ const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 const PRIORITY = { urgent: 4, high: 3, medium: 2, low: 1, none: 0 };
 
 function formatParkReason({ reason, stage, attempts, ceiling, lastError, qcVerdict }) {
-  const detail = lastError || qcVerdict || 'not recoverable';
+  const detail = lastError || qcVerdict || 'unrecoverable_after_bounded_lookup';
   return [
     PARK_REASON_MARKER,
     '**Parked diagnosis required**',
@@ -19,6 +20,7 @@ function formatParkReason({ reason, stage, attempts, ceiling, lastError, qcVerdi
     `failed_stage: ${stage || 'unknown'}`,
     `attempts: ${attempts == null ? 'unknown' : attempts}/${ceiling == null ? 'unknown' : ceiling}`,
     `last_error_or_qc_verdict: ${String(detail).slice(0, 1000)}`,
+    'causal_lookup: bounded task history and QC verdict evidence',
     'A Sol-low diagnosis must classify this as fixable, already_fixed, duplicate, or genuinely_blocked.'
   ].join('\n');
 }
@@ -143,8 +145,29 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   );
   const ownerRow = owner.rows.find(isSolLowDiagnosisAgent);
   if (!ownerRow) {
+    const blocker = 'no_sol_low_diagnosis_owner';
+    await client.query(
+      `UPDATE issue
+          SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+                jsonb_build_object('parked_blocker', $2),
+              updated_at = NOW()
+        WHERE id = $1 AND status = 'Parked'`,
+      [issue.id, blocker]
+    );
+    await client.query(
+      `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+       SELECT $1, $2, 'system', $3, $4, 'system'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM comment
+           WHERE issue_id = $1 AND content LIKE $5
+        )`,
+      [issue.id, issue.workspace_id, ZERO_UUID,
+        `${PARK_BLOCKER_MARKER}\nparked_diagnosis_blocker: ${blocker}\n` +
+        'No eligible Sol-low diagnosis owner is active in this workspace; operator assignment is required.',
+        `${PARK_BLOCKER_MARKER}%`]
+    );
     console.warn(JSON.stringify({ event: 'parked_diagnosis_unassigned', issue_id: issue.id,
-      workspace_id: issue.workspace_id, reason: evidence.reason || evidence.reason_code }));
+      workspace_id: issue.workspace_id, blocker }));
     return null;
   }
   const context = diagnosisContext({ reason: evidence.reason || evidence.reason_code,
@@ -176,6 +199,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
 module.exports = {
   DIAGNOSIS_OUTCOMES,
   PARK_DIAGNOSIS_KIND,
+  PARK_BLOCKER_MARKER,
   PARK_REASON_MARKER,
   diagnosisContext,
   diagnosisEvidence,
