@@ -56,6 +56,29 @@ test('Registered recovery applies the same completion gate', () => {
   assert.match(recovery, /reason=task_not_completed/);
 });
 
+test('runtime-evidence recovery is one-shot, typed, and stays on relay authority', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const diagnosis = source.slice(source.indexOf('async function processParkedDiagnoses'),
+    source.indexOf('function startDaemon'));
+  assert.match(diagnosis, /t\.context->>'evidence_correction_retry' = 'true'/);
+  assert.match(diagnosis, /i\.metadata->>'parked_blocker' = 'runtime_evidence_unverified'/);
+  assert.match(diagnosis, /runtime_evidence_recovery_consumed/);
+  assert.match(diagnosis, /t\.id = \$1::uuid/);
+  assert.match(diagnosis, /t\.context->>'kind' = \$2::text/);
+  assert.match(diagnosis, /i\.workspace_id = \$3::uuid/);
+  assert.match(diagnosis, /postToRelay\(\{ issue_id: task\.issue_id, to_stage: nextStage/);
+  assert.match(diagnosis, /const needsQC = outcome === 'already_fixed' && evidenceVerified && !completionMD5/);
+  assert.match(diagnosis, /runtime_evidence_verified:\$\{evidence\}/);
+  assert.match(diagnosis, /WHERE id = \$1::uuid/);
+  assert.doesNotMatch(diagnosis, /UPDATE issue SET status/);
+});
+
+test('canonical evidence rejects a parked-diagnosis citation', () => {
+  const contract = fs.readFileSync(require.resolve('../parked-diagnosis.cjs'), 'utf8');
+  assert.match(contract, /t\.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
+  assert.match(contract, /t\.id = \$1::uuid AND t\.issue_id = \$2::uuid/);
+});
+
 test('quota pause flips are timestamped and stale unbudgeted pauses self-clear', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /'quota_paused_at', to_jsonb\(NOW\(\)\)/);
