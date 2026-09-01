@@ -52,6 +52,16 @@ REQUIRED_ENV_NAMES="${REQUIRED_ENV_NAMES:-$REQUIRED_ENV_NAMES_DEFAULT}"
 APPS="${APPS:-$APPS_DEFAULT}"
 IFS=',' read -r -a app_arr <<< "$APPS"
 
+# The env file is operator-controlled and may contain secrets.  Load it only
+# into this process so preflight can validate names without printing values.
+if [[ -n "${GSP_BELT_ENV_FILE:-}" ]]; then
+  [[ -r "$GSP_BELT_ENV_FILE" ]] || { echo "Error: GSP_BELT_ENV_FILE is not readable" >&2; exit 2; }
+  set -a
+  # shellcheck disable=SC1090
+  source "$GSP_BELT_ENV_FILE"
+  set +a
+fi
+
 # ---- resolve immutable source ref ----
 if ! (cd "$checkout_root" && git rev-parse --verify --quiet "$ref^{commit}" >/dev/null); then
   echo "Error: ref '$ref' is not a commit in $checkout_root" >&2; exit 2
@@ -99,13 +109,22 @@ if $do_preflight; then
   exit 0
 fi
 
+# Dry-run proves the source/ref and validation path without creating a release
+# or changing PM2.  This also makes it safe to run from a read-only checkout.
+if $do_dryrun; then
+  echo "DRY-RUN OK — no release or PM2 state changed."
+  exit 0
+fi
+
 # ---- capture current (prior) script paths BEFORE mutating anything ----
-prev_json="/tmp/gsp-belt-prev.json"
-"$PM2" jlist >"$prev_json" 2>/dev/null || true
+state_dir="$(mktemp -d "${TMPDIR:-/tmp}/gsp-belt-deploy.XXXXXX")"
+trap 'rm -rf "$state_dir"' EXIT
+prior_json="$state_dir/prior-pm2.json"
+"$PM2" jlist >"$prior_json" 2>/dev/null || true
 declare -A prev_paths
 for app in "${app_arr[@]}"; do
   prev_paths["$app"]="$(python3 -c "import json,sys
-try: d=json.load(open('$prev_json'))
+try: d=json.load(open('$prior_json'))
 except: d=[]
 r=[x['pm2_env'].get('pm_exec_path') for x in d if x['name']=='$app']
 print(r[0] if r else '')" 2>/dev/null || true)"
@@ -119,11 +138,6 @@ gsp_release="$release_dir/ops/gsp-belt"
 sed "s|__GSP_BELT_RELEASE__|$gsp_release|g" \
   "$checkout_root/$ECO_TEMPLATE_REL" > "$release_dir/$RENDERED_ECO_REL"
 
-if $do_dryrun; then
-  echo "DRY-RUN OK — release installed at $release_dir; no PM2 reload performed."
-  exit 0
-fi
-
 deploy_eco() { # deploy_eco <rendered-eco-path>; returns 0 when pm2 accepted it
   "$PM2" startOrReload "$1" >/dev/null 2>&1
 }
@@ -134,16 +148,17 @@ if ! deploy_eco "$release_dir/$RENDERED_ECO_REL"; then
   rollback_paths=1
 else
   echo "== reload issued; verifying resolved script paths =="
-  "$PM2" jlist >"$prev_json" 2>/dev/null || true
+  current_json="$state_dir/current-pm2.json"
+  "$PM2" jlist >"$current_json" 2>/dev/null || true
   ok=true
   for app in "${app_arr[@]}"; do
     resolved="$(python3 -c "import json,sys
-try: d=json.load(open('$prev_json'))
+try: d=json.load(open('$current_json'))
 except: d=[]
 r=[x['pm2_env'].get('pm_exec_path') for x in d if x['name']=='$app']
 print(r[0] if r else '')" 2>/dev/null || true)"
     st="$(python3 -c "import json,sys
-try: d=json.load(open('$prev_json'))
+try: d=json.load(open('$current_json'))
 except: d=[]
 r=[x['pm2_env'].get('status') for x in d if x['name']=='$app']
 print(r[0] if r else '')" 2>/dev/null || true)"
@@ -161,7 +176,7 @@ fi
 # ---- rollback: re-materialize an ecosystem pointing back at prior script paths ----
 echo "DEPLOY/VERIFY FAILED — rolling back to previous script paths"
 rollback_eco="$release_dir/rollback-ecosystem.gsp-belt.config.js"
-python3 - "$checkout_root/$ECO_TEMPLATE_REL" "$rollback_eco" "${app_arr[*]}" "$prev_json" <<'PY'
+python3 - "$checkout_root/$ECO_TEMPLATE_REL" "$rollback_eco" "${app_arr[*]}" "$prior_json" <<'PY'
 import json, sys, re
 template, out, apps, prev_json = sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4]
 try:

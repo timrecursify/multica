@@ -37,11 +37,11 @@ current running baseline, not the spec's stale citation.
 | File | SHA-256 (current running baseline, 2026-08-31 ~14:57Z) |
 | --- | --- |
 | `ops/gsp-belt/bridge/multica-bridge.cjs` | `9387e6a885aa0c1a70791ed3f5f9e43280ae90c5c1a1e32a61925d57369f38a5` |
-| `ops/gsp-belt/relay/multica-relay-advance-daemon.cjs` | `381e553bb943517e1d6a48c1cd3dd216357aa0761ad51a1508835cd7c2c3428b` |
+| `ops/gsp-belt/relay/multica-relay-advance-daemon.cjs` | `7edb2154ddfde9705e7d632f8b02511ae182a2d84b412eb62b3b2d9f0e2fcfad` |
 | `ops/gsp-belt/worker/multica-cicd-worker.cjs` | `94f0372679932c7a946f35c3ee1c18f276d77b44bdb58e3e1038e6172ff55098` |
 | `ops/gsp-belt/worker/multica-archiver.cjs` | `37489eda36e7bc828138e9f279eaf87b5bdb055c3cf43b2eb9988e97c3884893` |
 
-Run `bash ops/gsp-belt/sql/belt-fingerprint.sh` (or `belt-guard-check.sh`) on a
+Run `bash ops/gsp-belt/scripts/belt-fingerprint.sh` (or `belt-guard-check.sh`) on a
 deployed release to reconfirm the checksums of every manifest file against the
 source commit; a mismatch is reported as drift.
 

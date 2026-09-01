@@ -24,6 +24,10 @@ export MULTICA_WORKSPACE_ID="00000000-0000-4000-8000-000000000001"
 HOST="$WORK/host"; RELEASE1="$WORK/releases/sha1"; RELEASE2="$WORK/releases/sha2"
 mkdir -p "$HOST"
 mkdir -p "$HOST/ops" && cp -R "$ROOT" "$HOST/ops/gsp-belt"
+# The fixture is intentionally mutated to create bad and restored refs.  A
+# managed clean checkout may be read-only, so make only this disposable copy
+# writable; the source checkout remains untouched.
+chmod -R u+w "$HOST/ops/gsp-belt"
 git -C "$HOST" init -q
 git -C "$HOST" add -A
 git -C "$HOST" -c user.email=t@t -c user.name=t commit -qm base
@@ -112,11 +116,12 @@ python3 - "$FAKE_PM2_STATE" "$RELEASE1" <<'PY'
 import json,sys
 apps=json.load(open(sys.argv[1]))
 rel=sys.argv[2]
-# After rollback the fake consumed the failure flag and its subsequent reload
-# of the release1 ecosystem leaves apps at the release1 (deployed) path; we
-# assert rollback returned apps online (the irreversible drift we care about).
-assert all(a['pm2_env']['status'] == 'online' for a in apps), apps
-print("PASS: apps online after rollback (failure consumed, state consistent)")
+# A healthy status alone would not prove rollback: each app must again consume
+# the exact paths captured before the failed release2 reload.
+for a in apps:
+    assert a['pm2_env']['status'] == 'online', a
+    assert a['pm2_env']['pm_exec_path'].startswith(rel), (a['name'], a['pm2_env']['pm_exec_path'])
+print("PASS: apps online and restored to the prior release paths")
 PY
 
 echo ""
