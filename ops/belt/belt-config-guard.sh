@@ -380,7 +380,7 @@ guard_relay_config() {
   local row expected actual
   for row in "1:gsp-spec-sol-low-public" "2:gsp-build-terra-low-02" \
              "3:gsp-build-terra-low-02" "4:gsp-qc-sol-low-1" \
-             "5:gsp-deploy-sol-low-1" "6:(none)" \
+             "5:gsp-deploy-sol-low-1" "6:gsp-deploy-sol-low-1" \
              "7:gsp-deploy-sol-low-1" "11:gsp-build-terra-low-02"; do
     expected="${row#*:}"
     actual=$("${PSQL[@]}" -c "SELECT coalesce(a.name,'(none)') FROM relay_stage_config r
