@@ -46,6 +46,14 @@ function diagnosisEvidence(text) {
   return match && match[1].trim() ? match[1].trim() : null;
 }
 
+function isConcreteRuntimeEvidence(value) {
+  const evidence = String(value || '').trim();
+  return evidence.length >= 8 && (
+    /(?:^|\s)[\w./-]+:\d+(?:\s|$)/.test(evidence) ||
+    /\b(?:sha|commit|status|http|output|command)\s*[=:]/i.test(evidence)
+  );
+}
+
 function namedBlocker(text) {
   const match = String(text || '').match(/blocker\s*[:=]\s*([^\n]+)/i);
   return match && match[1].trim() ? match[1].trim() : null;
@@ -150,6 +158,7 @@ module.exports = {
   diagnosisEvidence,
   formatParkReason,
   isBuilderDispatchAllowed,
+  isConcreteRuntimeEvidence,
   isSolLowDiagnosisAgent,
   namedBlocker,
   parseDiagnosisOutcome,

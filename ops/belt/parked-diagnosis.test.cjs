@@ -7,6 +7,7 @@ const {
   parseDiagnosisOutcome,
   diagnosisEvidence,
   namedBlocker,
+  isConcreteRuntimeEvidence,
   isSolLowDiagnosisAgent,
   PARK_REASON_MARKER,
   PARK_DIAGNOSIS_KIND
@@ -42,6 +43,8 @@ test('diagnosis parser accepts only the four bounded outcomes', () => {
 test('diagnosis evidence and owner validation fail closed', () => {
   assert.equal(diagnosisEvidence('outcome: already_fixed\nruntime_evidence: relay.log:42'), 'relay.log:42');
   assert.equal(namedBlocker('outcome: genuinely_blocked\nblocker: billing hold'), 'billing hold');
+  assert.equal(isConcreteRuntimeEvidence('relay.log:42'), true);
+  assert.equal(isConcreteRuntimeEvidence('looks good'), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.5', runtime_config: { reasoning_effort: 'low', role: 'qc' } }), true);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-build-terra-low-1', model: 'gpt-5.6-terra', runtime_config: { role: 'build' } }), false);
 });
