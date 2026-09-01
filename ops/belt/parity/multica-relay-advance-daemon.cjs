@@ -856,14 +856,15 @@ async function processParkedDiagnoses() {
         LIMIT 25`, [PARK_DIAGNOSIS_KIND]);
     for (const task of rows) {
       const text = diagnosisText(task.result);
-      const outcome = parseDiagnosisOutcome(text);
-      if (!outcome) {
-        console.warn(`${LOG_PREFIX} [diagnosis] #${task.number}: missing explicit outcome; held`);
-        continue;
-      }
+      const parsedOutcome = parseDiagnosisOutcome(text);
+      // A malformed Sol-low response must not create an unbounded retry or a
+      // silent parked ticket. Treat it as a named blocker until an operator
+      // can rerun the single diagnosis task deliberately.
+      const outcome = parsedOutcome || 'genuinely_blocked';
+      const missingOutcome = !parsedOutcome;
       const duplicate = text.match(/duplicate[_ ](?:of|issue)\s*[:#]?\s*([0-9a-f-]{8,}|\d+)/i)?.[1] || null;
       await client.query('BEGIN');
-      const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${text.slice(0, 2000)}`;
+      const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${missingOutcome ? 'blocker: diagnosis response omitted an explicit outcome.\n' : ''}${text.slice(0, 2000)}`;
       await client.query(
         `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
          SELECT $1, $2, 'system', $3, $4, 'system'
@@ -902,9 +903,10 @@ async function processParkedDiagnoses() {
       } else {
         await client.query(
           `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
-                    jsonb_build_object('parked_blocker', 'Sol-low diagnosis: genuinely_blocked'),
+                    jsonb_build_object('parked_blocker', $2),
                   updated_at = NOW()
-             WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
+             WHERE id = $1 AND status = 'Parked'`, [task.issue_id,
+            missingOutcome ? 'Sol-low diagnosis response omitted an explicit outcome' : 'Sol-low diagnosis: genuinely_blocked']);
       }
       await client.query(
         `UPDATE agent_task_queue
