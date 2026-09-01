@@ -14,8 +14,19 @@ const {
   ensureCompletedRelayLog,
   completedTerminalRelayLog,
   isBookkeepingTransition,
-  recordBookkeepingHandoff
+  recordBookkeepingHandoff,
+  isCicdReturn
 } = require('./multica-bridge.cjs');
+
+test('only a named CI/CD return receives one bounded repair admission', () => {
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
+    'RETURN:In Progress — owner/repo#1 merge conflict'), true);
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress', ''), false);
+  assert.equal(isCicdReturn('In Review', 'In Progress',
+    'RETURN:In Progress — retry'), false);
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'Queue',
+    'RETURN:Queue — retry'), false);
+});
 
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
   assert.equal(isBookkeepingTransition('Queue', 'In Progress'), true);

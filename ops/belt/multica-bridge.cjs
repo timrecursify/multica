@@ -227,6 +227,11 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
   }));
 }
 
+function isCicdReturn(fromStage, toStage, reason) {
+  return fromStage === "CI/CD & Deploy" && toStage === "In Progress" &&
+    typeof reason === "string" && reason.startsWith("RETURN:In Progress — ");
+}
+
 async function replaceStageTask(client, task) {
   const context = typeof task.context === 'string' ? JSON.parse(task.context) : task.context;
   if (!isBuilderDispatchAllowed(context)) {
@@ -502,7 +507,7 @@ async function ssoBridge(req, res) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token, current_work_product_md5 } = body;
+    let { issue_id, to_stage, agent_token, current_work_product_md5, reason } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -561,6 +566,11 @@ async function relayAdvance(req, res, body) {
     // outcome. It still reaches the current PASS + work-product-hash gate
     // below; the relay secret is the authority boundary for this exception.
     const parkedDiagnosisDone = issue.status === "Parked" && to_stage === "Done";
+    // A deploy worker return is a bounded change-of-hands, not another blind
+    // retry. It admits exactly one repair task after a named terminal deploy
+    // blocker (merge conflict or absent CI), even when historical retry counts
+    // are exhausted. The next build/QC cycle remains subject to normal gates.
+    const cicdReturn = isCicdReturn(issue.status, to_stage, reason);
     const releaseAt = issue.metadata?.parked_release_at || null;
     if (issue.status === to_stage) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
@@ -871,7 +881,8 @@ async function relayAdvance(req, res, body) {
             AND ($3::timestamptz IS NULL OR created_at >= $3)`,
         [issue.id, to_stage, releaseAt]
       );
-      const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
+      const cycle = cicdReturn ? { ok: true } :
+        stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
       if (!cycle.ok) {
         const moved = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
           target_stage: to_stage, historical_tasks: history.rows[0]?.n || 0,
@@ -905,7 +916,8 @@ async function relayAdvance(req, res, body) {
             AND ($2::timestamptz IS NULL OR created_at >= $2)`,
         [issue.id, releaseAt]
       );
-      const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
+      const lifetime = cicdReturn ? { ok: true } :
+        lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       if (!lifetime.ok) {
         const moved = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
           target_stage: to_stage, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
@@ -1029,6 +1041,7 @@ async function relayAdvance(req, res, body) {
         from_stage: issue.status,
         to_stage,
         agent_name: stage.agent_name,
+        ...(cicdReturn ? { return_reason: reason } : {}),
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
@@ -1142,5 +1155,6 @@ module.exports = {
   ensureCompletedRelayLog,
   completedTerminalRelayLog,
   isBookkeepingTransition,
-  recordBookkeepingHandoff
+  recordBookkeepingHandoff,
+  isCicdReturn
 };
