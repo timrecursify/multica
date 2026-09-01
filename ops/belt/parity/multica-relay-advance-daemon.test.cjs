@@ -1,7 +1,135 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
-const { qcCompletionAdvance, processParkedDiagnoses } = require('./multica-relay-advance-daemon.cjs');
+const { qcCompletionAdvance, processParkedDiagnoses,
+  requeueStrandedTasks } = require('./multica-relay-advance-daemon.cjs');
+
+function strandedFixture(overrides = {}) {
+  return {
+    issue_id: '223e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000',
+    number: 159,
+    stage: 'Queue',
+    updated_at: '2026-09-01T21:46:00Z',
+    metadata: {},
+    dead_task_id: '123e4567-e89b-42d3-a456-426614174000',
+    dead_task_status: 'failed',
+    attempt: 1,
+    max_attempts: 2,
+    failure_reason: 'cancelled',
+    dead_task_result: null,
+    dead_task_error: 'task cancelled by server',
+    from_stage: 'Queue',
+    agent_id: '423e4567-e89b-42d3-a456-426614174000',
+    runtime_id: '523e4567-e89b-42d3-a456-426614174000',
+    runtime_provider: 'codex',
+    runtime_mode: 'cloud',
+    instructions: 'Queue',
+    model: 'deepseek/chat',
+    thinking_level: 'low',
+    max_concurrent_tasks: 1,
+    token_budget: 1,
+    runtime_config: {},
+    archived_at: null,
+    agent_name: 'builder',
+    ...overrides
+  };
+}
+
+function strandedHarness(fixtures) {
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('FROM issue i') && sql.includes('LIMIT $1')) {
+      return { rows: fixtures.filter((row) => row.eligible !== false)
+        .sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at))
+        .slice(0, values[0]) };
+    }
+    if (sql.includes('COALESCE(a.max_concurrent_tasks')) {
+      return { rows: fixtures.map((row) => ({ agent_id: row.agent_id, cap: 1, in_flight: 0 })) };
+    }
+    if (sql.includes('max(EXTRACT(epoch')) return { rows: [{ age: 0 }] };
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (sql.includes('pg_advisory_xact_lock') || sql.includes('FROM issue WHERE id')) return { rows: [] };
+    if (sql.includes('FROM agent_task_queue') && sql.includes('FOR UPDATE')) return { rows: [] };
+    if (sql.includes('count(*)::int AS n')) return { rows: [{ n: 1 }] };
+    if (sql.includes('INSERT INTO agent_task_queue')) {
+      return { rows: [{ id: '623e4567-e89b-42d3-a456-426614174000' }] };
+    }
+    if (sql.includes('INSERT INTO relay_run_log')) return { rows: [] };
+    throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
+  }, release() {} };
+  return { queries, run: () => requeueStrandedTasks({ dbPool: { connect: async () => client } }) };
+}
+
+test('stranded-task fixture redispatches a cancelled-only task', async () => {
+  const harness = strandedHarness([strandedFixture()]);
+  await harness.run();
+  const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.ok(insert);
+  assert.match(insert.values[3], /"source":"relay-requeue"/);
+  assert.match(insert.values[3], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
+});
+
+test('stranded-task fixtures leave running tasks and bundled children untouched', async () => {
+  for (const fixture of [
+    { ...strandedFixture({ dead_task_status: 'running', eligible: false }), label: 'running' },
+    { ...strandedFixture({ parent_issue_id: '723e4567-e89b-42d3-a456-426614174000', eligible: false }), label: 'bundled child' }
+  ]) {
+    const harness = strandedHarness([fixture]);
+    await harness.run();
+    assert.equal(harness.queries.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue')), false,
+      `${fixture.label} must not be redispatched`);
+    const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
+    assert.match(candidateQuery.sql, /t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)/);
+    assert.match(candidateQuery.sql, /i\.parent_issue_id IS NULL/);
+  }
+});
+
+test('In Review fixture is outside the exact requeue stage set', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const inReview = strandedFixture({ stage: 'In Review' });
+  assert.equal(inReview.stage, 'In Review');
+  assert.match(source, /RELAY_REQUEUE_STAGES \|\| 'Queue,In Progress,Spec'/);
+  assert.doesNotMatch(source, /RELAY_REQUEUE_STAGES \|\| '[^']*In Review/);
+});
+
+test('completed-latest fixture is excluded by the candidate predicate', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('function diagnosisText'));
+  const completed = strandedFixture({ dead_task_status: 'completed' });
+  assert.equal(completed.dead_task_status, 'completed');
+  assert.match(requeue, /AND \(t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)\)/);
+  assert.doesNotMatch(requeue, /t\.status = 'completed'/);
+});
+
+test('live task on another stage fixture is excluded for every stage', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const liveOtherStage = strandedFixture({ live_task_stage: 'Spec' });
+  assert.equal(liveOtherStage.live_task_stage, 'Spec');
+  assert.match(source, /WHERE q\.issue_id = i\.id AND q\.status IN/);
+  assert.doesNotMatch(source, /COALESCE\(q\.context->>'to_stage', ''\) = i\.status/);
+});
+
+test('five eligible fixtures dispatch exactly the three oldest globally', async () => {
+  const fixtures = [
+    strandedFixture({ number: 5, issue_id: '223e4567-e89b-42d3-a456-426614174005', agent_id: '423e4567-e89b-42d3-a456-426614174005', issue_created_at: '2026-09-01T00:05:00Z' }),
+    strandedFixture({ number: 1, issue_id: '223e4567-e89b-42d3-a456-426614174001', agent_id: '423e4567-e89b-42d3-a456-426614174001', issue_created_at: '2026-09-01T00:01:00Z' }),
+    strandedFixture({ number: 4, issue_id: '223e4567-e89b-42d3-a456-426614174004', agent_id: '423e4567-e89b-42d3-a456-426614174004', issue_created_at: '2026-09-01T00:04:00Z' }),
+    strandedFixture({ number: 2, issue_id: '223e4567-e89b-42d3-a456-426614174002', agent_id: '423e4567-e89b-42d3-a456-426614174002', issue_created_at: '2026-09-01T00:02:00Z' }),
+    strandedFixture({ number: 3, issue_id: '223e4567-e89b-42d3-a456-426614174003', agent_id: '423e4567-e89b-42d3-a456-426614174003', issue_created_at: '2026-09-01T00:03:00Z' })
+  ];
+  const harness = strandedHarness(fixtures);
+  await harness.run();
+  const dispatched = harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.equal(dispatched.length, 3);
+  assert.deepEqual(dispatched.map(({ values }) => values[1]), fixtures.slice(1, 2)
+    .concat(fixtures.slice(3, 5)).map((row) => row.issue_id));
+  const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
+  assert.match(candidateQuery.sql, /ORDER BY i\.created_at ASC\s+LIMIT \$1/);
+  assert.doesNotMatch(candidateQuery.sql, /ROW_NUMBER\(\) OVER/);
+});
 
 const QC_ROW = {
   task_id: '11111111-1111-4111-8111-111111111111',
@@ -147,11 +275,12 @@ test('retry ceilings leave the daemon through relay authority instead of direct 
   assert.doesNotMatch(requeue, /applyDisposition\(client, row, lifetime\.disposition/);
 });
 
-test('stranded-task recovery does not retry a semantically blocked completion', () => {
+test('stranded-task recovery excludes completed predecessors before admission', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  assert.match(source, /t\.result AS dead_task_result/);
-  assert.match(source, /row\.dead_task_status === 'completed'/);
-  assert.match(source, /completed predecessor failed completion admission/);
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('function diagnosisText'));
+  assert.match(requeue, /t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)/);
+  assert.doesNotMatch(requeue, /row\.dead_task_status === 'completed'/);
 });
 
 test('Registered recovery applies the same completion gate', () => {
