@@ -58,6 +58,42 @@ func TestNormalizeServerBaseURL(t *testing.T) {
 	}
 }
 
+func TestSweepOrphanTaskTempDirsRemovesOnlyOldUntrackedDirectories(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+	makeDir := func(name string, age time.Duration) string {
+		t.Helper()
+		path := filepath.Join(root, name)
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "payload"), []byte("payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, now.Add(-age), now.Add(-age)); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	fresh := makeDir("multica-task-fresh", time.Hour)
+	old := makeDir("multica-task-old", 3*time.Hour)
+	tracked := makeDir("multica-task-tracked", 3*time.Hour)
+	removed, bytesFreed := sweepOrphanTaskTempDirs(root, 2*time.Hour, map[string]struct{}{tracked: {}}, now)
+
+	if removed != 1 || bytesFreed == 0 {
+		t.Fatalf("sweep = (%d, %d), want (1, >0)", removed, bytesFreed)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("old untracked dir stat error = %v, want not exist", err)
+	}
+	for _, path := range []string{fresh, tracked} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("preserved dir %q stat error = %v", path, err)
+		}
+	}
+}
+
 func TestTriggerRestart_BrewLinuxCellarDeleted(t *testing.T) {
 	originalIsBrewInstall := isBrewInstall
 	originalGetBrewPrefix := getBrewPrefix
