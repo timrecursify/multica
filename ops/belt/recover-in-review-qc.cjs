@@ -17,7 +17,9 @@ function parseArgs(argv) {
   return out;
 }
 
-async function recover(client, issueId) {
+async function recover(client, issueId, dependencies = {}) {
+  const selectOwner = dependencies.selectStageOwner || selectStageOwner;
+  const replaceTask = dependencies.replaceStageTask || replaceStageTask;
   const issue = await client.query(
     `SELECT i.id, i.workspace_id, i.priority FROM issue i
       WHERE i.id = $1::uuid AND i.status = 'In Review'
@@ -32,9 +34,9 @@ async function recover(client, issueId) {
       FOR UPDATE`, [issueId]);
   const row = issue.rows[0];
   if (!row) return null;
-  const owner = await selectStageOwner(client, row.workspace_id, 'In Progress', 'In Review');
+  const owner = await selectOwner(client, row.workspace_id, 'In Progress', 'In Review');
   if (!owner?.agent_id) throw new Error(`no QC owner for ${issueId}`);
-  return replaceStageTask(client, { issueId: row.id, workspaceId: row.workspace_id,
+  return replaceTask(client, { issueId: row.id, workspaceId: row.workspace_id,
     fromStage: 'Parked', toStage: 'In Review', agentId: owner.agent_id,
     runtimeId: owner.selected_runtime_id, priority: ({ urgent: 4, high: 3, medium: 2, low: 1 }[row.priority] || 0),
     context: JSON.stringify({ source: 'operator-qc-recovery', from_stage: 'Parked', to_stage: 'In Review' }),
