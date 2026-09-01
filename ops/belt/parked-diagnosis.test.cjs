@@ -50,6 +50,7 @@ test('diagnosis evidence and owner validation fail closed', () => {
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.6-sol', runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'qc' } }), true);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.6-sol', runtime_config: {} }), true);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-1', model: 'gpt-5.6-sol', runtime_config: {} }), false);
+  assert.equal(isSolLowDiagnosisAgent({ name: 'fake-qc-sol-low-01', model: 'gpt-5.6-sol', runtime_config: {} }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.5', runtime_config: { reasoning_effort: 'low', role: 'qc' } }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-build-terra-low-1', model: 'gpt-5.6-terra', runtime_config: { role: 'build' } }), false);
 });

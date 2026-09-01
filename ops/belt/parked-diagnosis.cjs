@@ -74,7 +74,8 @@ function isSolLowDiagnosisAgent(agent) {
     .filter(Boolean).join(' ').toLowerCase();
   const solLowModel = model === 'gpt-5.6-sol' && configuredModel === 'gpt-5.6-sol' &&
     configuredEffort === 'low';
-  return solLowModel && /qc|scop|diagnos/.test(role) &&
+  const canonicalWorkspaceSeat = /^(?:gsp|ppp)-/.test(name);
+  return canonicalWorkspaceSeat && solLowModel && /qc|scop|diagnos/.test(role) &&
     cfg.parked_diagnosis !== false;
 }
 
