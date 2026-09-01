@@ -82,6 +82,15 @@ test('stage transition fails before commit when no successor task exists', async
   assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
 });
 
+test('builder dispatcher rejects diagnosis tasks marked no_builder', async () => {
+  const { replaceStageTask } = require('./multica-bridge.cjs');
+  let queries = 0;
+  await assert.rejects(() => replaceStageTask({ query: async () => { queries++; } }, {
+    ...transition(), context: JSON.stringify({ kind: 'parked_diagnosis', no_builder: true })
+  }), /no_builder diagnosis task/);
+  assert.equal(queries, 0);
+});
+
 test('an already-created matching successor is linked instead of permitting a taskless transition', async () => {
   const replies = [{ rows: [] }, { rows: [] }, { rows: [{ id: 'task-existing' }] }, { rows: [] }];
   const client = { query: async () => replies.shift() };
