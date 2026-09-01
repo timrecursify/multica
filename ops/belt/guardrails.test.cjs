@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const fs = require('node:fs');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
   retryAdmission, spendPreflight, stageCycleAdmission, lifetimeTaskAdmission,
@@ -62,14 +63,26 @@ test('paid dispatch requires a live configured agent', () => {
     { ok: false, reason: 'provider_quota_paused' });
 });
 
-test('stage cycle breaker parks repeated model calls without human review', () => {
-  // queued_expired rows have no started_at and therefore do not consume the
-  // paid-attempt budget; two such rows still leave a flight admissible.
+test('stage cycle breaker parks repeated task creation without human review', () => {
   assert.deepEqual(stageCycleAdmission(0), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(2), {
     ok: false, reason: 'stage_cycle_limit', ceiling: 2, disposition: 'Parked'
   });
+});
+
+test('recovery ceilings count queued tasks that never started', () => {
+  const source = fs.readFileSync(
+    require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8'
+  );
+  const stageHistory = source.match(
+    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1 AND context->>'to_stage' = \$2/
+  );
+  const lifetimeHistory = source.match(
+    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1`/
+  );
+  assert.ok(stageHistory, 'stage ceiling must count every created task');
+  assert.ok(lifetimeHistory, 'lifetime ceiling must count every created task');
 });
 
 test('lifetime ceiling bounds paid work across stage changes', () => {

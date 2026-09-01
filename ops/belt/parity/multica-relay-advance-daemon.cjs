@@ -696,8 +696,7 @@ async function requeueStrandedTasks() {
         }
         const history = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
-            WHERE issue_id = $1 AND context->>'to_stage' = $2
-              AND started_at IS NOT NULL`,
+            WHERE issue_id = $1 AND context->>'to_stage' = $2`,
           [row.issue_id, row.stage]
         );
         const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
@@ -712,7 +711,7 @@ async function requeueStrandedTasks() {
         }
         const lifetimeHistory = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
-            WHERE issue_id = $1 AND started_at IS NOT NULL`,
+            WHERE issue_id = $1`,
           [row.issue_id]
         );
         const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
