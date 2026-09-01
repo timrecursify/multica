@@ -13,6 +13,7 @@ const {
   assertRoutableStageOwners,
   crossStageExecutionAdmission
 } = require("./guardrails.cjs");
+const { recordParkAndQueueDiagnosis } = require("./parked-diagnosis.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -91,6 +92,11 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
     [issue.id, reason]
   );
   if (changed.rowCount > 0) {
+    if (disposition === 'Parked') {
+      const diagnosisTaskId = await recordParkAndQueueDiagnosis(client, issue,
+        { ...evidence, reason });
+      if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
+    }
     await client.query(
       `INSERT INTO activity_log
          (workspace_id, issue_id, actor_type, action, details)
