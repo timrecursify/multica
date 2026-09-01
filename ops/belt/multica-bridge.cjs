@@ -921,6 +921,8 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
             COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id,
             COALESCE(active.task_count, 0)::int AS active_task_count
        FROM relay_stage_agent_pool p
+       JOIN relay_stage_pool policy ON policy.workspace_id = p.workspace_id
+        AND policy.stage_name = p.stage_name AND policy.enabled = true
        LEFT JOIN agent a ON a.id = p.agent_id AND a.workspace_id = p.workspace_id
        LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
         AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
@@ -1677,6 +1679,7 @@ async function relayAdvance(req, res, body) {
         from_stage: issue.status,
         to_stage,
         agent_name: stage.agent_name,
+        pool_stage: stage.pool_stage || (stage.agent_id ? to_stage : null),
         ...(retryEscalation ? {
           kind: "retry_escalation",
           escalation_reason: retryEscalation.reason,
