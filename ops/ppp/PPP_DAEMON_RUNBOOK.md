@@ -1,49 +1,62 @@
 # PPP Multica daemon parity runbook
 
-This is a production handoff only. The service is a user-level systemd unit;
-these steps do not run in the build or GSP workspace.
+This is a production handoff for the user-level `ppp-prod-codex` unit. No
+command below starts the daemon until the final, explicit `systemctl start`.
 
-## Contract
+## Build and deliver one immutable release
 
-- Unit: `multica-daemon-ppp.service`.
-- Profile and daemon ID: `ppp-prod-codex`.
-- Profile-derived health port: `19909` (`19514 + 1 + byte-sum(profile) % 1000`).
-- Workspace root: `/var/lib/multica-ppp/workspaces`.
-- Provider policy: `MULTICA_DAEMON_ALLOWED_PROVIDERS=codex`; no paid relay or
-  alternate provider is exposed.
-- Concurrency: two tasks. The entrypoint holds an `flock` over the workspace
-  root, so a duplicate launch exits without claiming work.
-- Restart durability: all daemon flags live in the committed entrypoint and
-  `Restart=always`/bounded start limits live in the unit. `--no-auto-update`
-  and `--no-auto-reload` keep systemd as the supervisor.
-
-## Proposed live installation (do not run as part of this PR)
+Run on the merged checkout at the exact PR head, then copy the resulting
+artifact to `ppp-prod` (the release directory name is the commit SHA):
 
 ```bash
-cd /home/newadmin/multica-daemon
-sudo install -d -o newadmin -g newadmin -m 0750 /var/lib/multica-ppp/workspaces
-sudo install -d -m 0755 /etc/multica
-sudo install -m 0600 ops/ppp/ppp-daemon.env.example /etc/multica/ppp-daemon.env
-# Replace only <PPP_MULTICA_SERVER_URL>; keep credentials in the profile config.
+SHA="$(git rev-parse HEAD)"
+make build
+sudo install -d -m 0755 "/opt/multica/releases/$SHA/ops/ppp/systemd"
+sudo install -m 0755 server/bin/multica "/opt/multica/releases/$SHA/multica"
+sudo install -m 0755 ops/ppp/multica-daemon-ppp.sh "/opt/multica/releases/$SHA/ops/ppp/multica-daemon-ppp.sh"
+sudo install -m 0644 ops/ppp/systemd/multica-daemon-ppp.service "/opt/multica/releases/$SHA/ops/ppp/systemd/multica-daemon-ppp.service"
+```
+
+The four `install` commands are the deployment boundary: transfer those exact
+files (or the equivalent CI artifact) to the same paths on `ppp-prod`; never
+use a `current`/`latest` symlink or a source checkout as the daemon binary.
+
+## Install and preflight on `ppp-prod`
+
+```bash
+export MULTICA_RELEASE_DIR="/opt/multica/releases/$SHA"
+export MULTICA_DAEMON_BIN="$MULTICA_RELEASE_DIR/multica"
+export MULTICA_SERVER_URL="https://multica.ai"
 multica login --profile ppp-prod-codex
 ops/ppp/install-multica-daemon-ppp.sh
+ops/ppp/install-multica-daemon-ppp.sh --check
+```
+
+The installer discovers and verifies `codex` (or uses an executable
+`MULTICA_CODEX_PATH`), verifies the profile token without printing it, checks
+the isolated workspace root and the derived health port `19909`, writes a
+0600 environment file, and backs up replaced unit/wrapper/env files. It never
+copies `ppp-daemon.env.example` and never starts the service.
+
+After the operator reviews the check output:
+
+```bash
 systemctl --user start multica-daemon-ppp.service
-systemctl --user status multica-daemon-ppp.service --no-pager
+systemctl --user --no-pager status multica-daemon-ppp.service
 curl --fail --silent http://127.0.0.1:19909/health
 ```
 
-Before starting, run `ops/ppp/install-multica-daemon-ppp.sh --check` and verify
-that `multica daemon probe-runtimes --profile ppp-prod-codex` reports only
-`codex`. Do not enable or start any GSP profile from this runbook.
+## Rollback and uninstall
 
-## Rollback
+An ordinary uninstall refuses while the unit is active. To stop it, the
+operator must make that action explicit; the installer then disables the unit,
+restores the last backed-up files (or removes newly-created files), and reloads
+systemd:
 
 ```bash
-systemctl --user stop multica-daemon-ppp.service
-ops/ppp/install-multica-daemon-ppp.sh --uninstall
+ops/ppp/install-multica-daemon-ppp.sh --uninstall --confirm-stop
 ```
 
-The stop is the only production mutation in rollback; workspace data and the
-profile token remain for supervised recovery. Restore the previous unit and
-wrapper from the deployment artifact, then run `systemctl --user daemon-reload`
-and `systemctl --user start` only after the operator confirms the replacement.
+Backups remain under
+`~/.local/state/multica/ppp-daemon-backups/`. Workspace data and the profile
+token are retained. Do not delete either until recovery is confirmed.

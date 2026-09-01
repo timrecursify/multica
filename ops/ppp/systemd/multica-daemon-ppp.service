@@ -7,12 +7,11 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-EnvironmentFile=-/etc/multica/ppp-daemon.env
-Environment=HOME=/home/newadmin
+EnvironmentFile=%h/.config/multica/ppp-daemon.env
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 Environment=MULTICA_DAEMON_ALLOWED_PROVIDERS=codex
-WorkingDirectory=/home/newadmin/multica-daemon
-ExecStart=/home/newadmin/bin/multica-daemon-ppp.sh
+WorkingDirectory=%h
+ExecStart=%h/bin/multica-daemon-ppp.sh
 Restart=always
 RestartSec=15
 UMask=0077
