@@ -466,6 +466,19 @@ test('runbook-shaped PASS and BLOCKED verdicts bridge into daemon dispositions',
   } finally { setTestClientFactory(null); }
 });
 
+test('QC runbook emits bridge evidence and advances both verdict dispositions', () => {
+  const runbook = fs.readFileSync(require.resolve('./RUNBOOK_QC_WORKER.md'), 'utf8');
+  assert.match(runbook, /QC_EVIDENCE_JSON=/);
+  assert.match(runbook, /sk multica verdict "\$NUMBER" --board "\$BOARD" --verdict "\$VERDICT"/);
+  assert.match(runbook, /--bound-sha "\$BOUND_SHA" --observed-sha "\$OBSERVED_SHA"/);
+  assert.match(runbook, /--work-product-md5 "\$WORK_PRODUCT_MD5" --failure-class "\$FAILURE_CLASS"/);
+  assert.match(runbook, /--qualifying "\$QUALIFYING" --model gpt-5\.6-sol --effort low --idem-key "\$IDEM_KEY"/);
+  assert.match(runbook, /--to "CI\/CD & Deploy" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
+  assert.match(runbook, /--to "In Progress" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
+  assert.match(runbook, /BLOCKED: <reason>/);
+  assert.doesNotMatch(runbook, /curl --|RELAY_URL|RELAY_AGENT_SECRET/);
+});
+
 test('only a named CI/CD return is eligible for a repair authorization', () => {
   assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
     'RETURN:In Progress — owner/repo#1 merge conflict; verify master..merge diff after rebase'), true);
