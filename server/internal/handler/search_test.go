@@ -74,6 +74,24 @@ func TestBuildSearchQuery_MultiTerm(t *testing.T) {
 	}
 }
 
+func TestBuildSearchQuery_MultiTermDoesNotRepeatPhrasePredicate(t *testing.T) {
+	query, _ := buildSearchQuery(linearTestContract, "task.list operation failed", []string{"task.list", "operation", "failed"}, 0, false, false)
+	whereStart := strings.Index(query, "WHERE ")
+	orderStart := strings.LastIndex(query, "ORDER BY ")
+	if whereStart == -1 || orderStart <= whereStart {
+		t.Fatalf("query does not contain a bounded WHERE clause: %s", query)
+	}
+	whereClause := query[whereStart:orderStart]
+	if strings.Contains(whereClause, "$2") {
+		t.Errorf("multi-word WHERE repeats the redundant full-phrase predicate: %s", whereClause)
+	}
+	for _, termParam := range []string{"$5", "$6", "$7"} {
+		if !strings.Contains(whereClause, termParam) {
+			t.Errorf("multi-word WHERE lost term predicate %s: %s", termParam, whereClause)
+		}
+	}
+}
+
 func TestBuildSearchQuery_WithNumber(t *testing.T) {
 	query, args := buildSearchQuery(linearTestContract, "MUL-42", []string{"MUL-42"}, 42, true, false)
 
