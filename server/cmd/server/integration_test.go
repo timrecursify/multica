@@ -15,6 +15,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/multica-ai/multica/server/internal/analytics"
@@ -47,7 +48,19 @@ func TestMain(m *testing.M) {
 		dbURL = "postgres://multica:multica@localhost:5432/multica?sslmode=disable"
 	}
 
-	pool, err := pgxpool.New(ctx, dbURL)
+	poolConfig, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		fmt.Printf("Skipping integration tests: invalid database URL: %v\n", err)
+		os.Exit(0)
+	}
+	// Production grants this capability inside the relay transaction. Integration
+	// tests exercise status writes through the HTTP server, so grant it on each
+	// test-only connection.
+	poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, "SELECT set_config('multica.relay_authorized', 'on', false)")
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		fmt.Printf("Skipping integration tests: could not connect to database: %v\n", err)
 		os.Exit(0)
