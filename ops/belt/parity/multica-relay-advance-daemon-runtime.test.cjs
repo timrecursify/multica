@@ -59,6 +59,24 @@ test('quota-pause rollback emits no false clear flip', async () => {
   assert.ok(!events.includes('COMMIT'));
 });
 
+test('quota-pause reconciliation absorbs rejected connections without unhandled rejections', async () => {
+  const errors = [];
+  const unhandled = [];
+  const onUnhandledRejection = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandledRejection);
+  try {
+    await assert.doesNotReject(reconcileQuotaPauses({
+      connect: async () => { throw new Error('pool unavailable'); },
+      onError: (err) => errors.push(err)
+    }));
+    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    process.off('unhandledRejection', onUnhandledRejection);
+  }
+  assert.deepEqual(errors.map((err) => err.message), ['pool unavailable']);
+  assert.deepEqual(unhandled, []);
+});
+
 test('concurrent reconciliation clears one locked agent only once', async () => {
   const firstEvents = [];
   const secondEvents = [];

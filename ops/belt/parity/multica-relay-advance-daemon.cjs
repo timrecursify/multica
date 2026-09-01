@@ -84,9 +84,10 @@ function logQuotaPauseFlip({ agent_name: agentName, timestamp, paused }) {
 async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () => Date.now(),
   onFlip = logQuotaPauseFlip,
   onError = (err) => console.error(`${LOG_PREFIX} [quota-pause] reconciliation error: ${err.message}`) } = {}) {
-  const client = await connect();
+  let client;
   const committedFlips = [];
   try {
+    client = await connect();
     await client.query('BEGIN');
     // Lock each paused agent before deciding whether to clear it. This makes a
     // fresh quota failure wait behind reconciliation instead of losing its
@@ -140,10 +141,12 @@ async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () =
     await client.query('COMMIT');
     for (const flip of committedFlips) onFlip(flip);
   } catch (err) {
-    try { await client.query('ROLLBACK'); } catch (_) {}
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
     onError(err);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 }
 
