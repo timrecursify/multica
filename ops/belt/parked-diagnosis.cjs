@@ -90,6 +90,14 @@ function isBuilderDispatchAllowed(context) {
   return !(context && context.no_builder === true);
 }
 
+// Prefer the original Spec owner when that owner is also explicitly admitted
+// to the Sol-low diagnosis lane. Attribution must never widen authority: an
+// ordinary scoper cannot receive a diagnosis task.
+function selectDiagnosisOwner(rows) {
+  const eligible = (rows || []).filter(isSolLowDiagnosisAgent);
+  return eligible.find((row) => row.is_original_scoper === true) || eligible[0] || null;
+}
+
 // Convert a validated diagnosis into one bounded state action. Keeping this
 // mapping explicit prevents a completed diagnosis from being treated as an
 // ordinary QC result (or from falling through to a builder dispatch).
@@ -175,7 +183,12 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   );
 
   const owner = await client.query(
-    `SELECT a.id, a.name, a.model, a.runtime_config, a.runtime_id, a.instructions
+    `SELECT a.id, a.name, a.model, a.runtime_config, a.runtime_id, a.instructions,
+             EXISTS (
+               SELECT 1 FROM agent_task_queue prior
+                WHERE prior.issue_id = $2::uuid AND prior.agent_id = a.id
+                  AND prior.context->>'to_stage' = 'Spec'
+             ) AS is_original_scoper
        FROM agent a
       WHERE a.workspace_id = $1 AND a.archived_at IS NULL
         AND a.status IN ('idle', 'working')
@@ -183,9 +196,9 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
              OR a.runtime_config::text ILIKE '%sol%')
       ORDER BY (a.status = 'idle') DESC, a.updated_at ASC
       LIMIT 20`,
-    [issue.workspace_id]
+    [issue.workspace_id, issue.id]
   );
-  const ownerRow = owner.rows.find(isSolLowDiagnosisAgent);
+  const ownerRow = selectDiagnosisOwner(owner.rows);
   if (!ownerRow) {
     const blocker = 'no_sol_low_diagnosis_owner';
     await client.query(
@@ -212,8 +225,11 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
       workspace_id: issue.workspace_id, blocker }));
     return null;
   }
-  const context = diagnosisContext({ reason: evidence.reason || evidence.reason_code,
-    stage: issue.status, attempts, ceiling: evidence.ceiling });
+  const context = {
+    ...diagnosisContext({ reason: evidence.reason || evidence.reason_code,
+      stage: issue.status, attempts, ceiling: evidence.ceiling }),
+    owner_selection: ownerRow.is_original_scoper === true ? 'original_scoper' : 'dedicated_sol_low'
+  };
   const task = await client.query(
     `INSERT INTO agent_task_queue (
        agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
@@ -249,6 +265,7 @@ module.exports = {
   diagnosisOutcomeAction,
   isConcreteRuntimeEvidence,
   isSolLowDiagnosisAgent,
+  selectDiagnosisOwner,
   currentPassWorkProductMD5,
   namedBlocker,
   parseDiagnosisOutcome,
