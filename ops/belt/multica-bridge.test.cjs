@@ -11,8 +11,105 @@ const {
   existingStageTask,
   replaceStageTask,
   ownerStageForTransition,
-  ensureCompletedRelayLog
+  ensureCompletedRelayLog,
+  isBookkeepingTransition,
+  recordBookkeepingHandoff
 } = require('./multica-bridge.cjs');
+
+test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
+  assert.equal(isBookkeepingTransition('Queue', 'In Progress'), true);
+  assert.equal(isBookkeepingTransition('Spec', 'Queue'), false);
+  assert.equal(isBookkeepingTransition('In Progress', 'In Review'), false);
+});
+
+test('bookkeeping handoff links the existing builder task to the QC trigger', async () => {
+  const calls = [];
+  const replies = [
+    { rows: [{ id: 'builder-task', agent_id: 'builder-agent', status: 'completed',
+      result: { output: 'Implemented the fix; work product: PR #123' } }] },
+    { rows: [{ id: 'handoff-log' }] }
+  ];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return replies.shift();
+  } };
+
+  const result = await recordBookkeepingHandoff(client, 'issue-1');
+
+  assert.deepEqual(result, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.match(calls[0].sql, /context->>'to_stage' = 'Queue'/);
+  assert.match(calls[0].sql, /status = 'completed'/);
+  assert.match(calls[0].sql, /SELECT id, agent_id, status, result/);
+  assert.match(calls[1].sql, /INSERT INTO relay_run_log/);
+  assert.deepEqual(calls[1].values, ['issue-1', 'builder-agent', 'builder-task']);
+  assert.doesNotMatch(calls.map(({ sql }) => sql).join('\n'), /INSERT INTO agent_task_queue/);
+});
+
+test('bookkeeping handoff rejects a running predecessor even if a mock returns it', async () => {
+  const calls = [];
+  const client = { query: async (sql) => {
+    calls.push(sql);
+    return { rows: [{ id: 'running-builder', agent_id: 'builder-agent', status: 'running',
+      result: { output: 'work product: PR #123' } }] };
+  } };
+
+  assert.equal(await recordBookkeepingHandoff(client, 'issue-running'), null);
+  assert.equal(calls.length, 1);
+  assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
+});
+
+test('bookkeeping handoff rejects a failed predecessor and missing work product', async () => {
+  for (const task of [
+    { id: 'failed-builder', agent_id: 'builder-agent', status: 'completed', result: { output: 'FAILED: tests' } },
+    { id: 'empty-builder', agent_id: 'builder-agent', status: 'completed', result: null }
+  ]) {
+    const calls = [];
+    const client = { query: async (sql) => {
+      calls.push(sql);
+      return { rows: [task] };
+    } };
+    assert.equal(await recordBookkeepingHandoff(client, 'issue-invalid'), null);
+    assert.equal(calls.length, 1);
+    assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
+  }
+});
+
+test('bookkeeping handoff replay reuses the existing correlated relay row', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return calls.length % 2 === 1
+      ? { rows: [{ id: 'builder-task', agent_id: 'builder-agent', status: 'completed',
+          result: { output: 'work product: PR #123' } }] }
+      : { rows: [{ id: 'handoff-log' }] };
+  } };
+
+  const first = await recordBookkeepingHandoff(client, 'issue-replay');
+  const second = await recordBookkeepingHandoff(client, 'issue-replay');
+  assert.deepEqual(first, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.deepEqual(second, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.equal(calls.filter(({ sql }) => /INSERT INTO relay_run_log/.test(sql)).length, 2);
+  assert.match(calls[1].sql, /WHERE NOT EXISTS/);
+});
+
+test('bookkeeping handoff refuses a Queue shortcut without a builder predecessor', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [] };
+  } };
+
+  assert.equal(await recordBookkeepingHandoff(client, 'issue-without-build'), null);
+  assert.equal(calls.length, 1);
+  assert.doesNotMatch(calls[0].sql, /INSERT INTO relay_run_log/);
+});
+
+test('relay dispatch gates bypass paid admission only for the bookkeeping hop', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /isExecutionStage\(to_stage\) && !parkedRelease && !bookkeepingTransition/);
+  assert.match(source, /isExecutionStage\(to_stage\) && !bookkeepingTransition/);
+  assert.match(source, /if \(bookkeepingTransition\) \{[\s\S]*relayLogId = bookkeepingHandoff\.relayLogId/);
+});
 
 test('transition owner selection preserves forward lanes and routes backward branches to lane owners', () => {
   assert.equal(ownerStageForTransition('Spec', 'Queue'), 'Spec');

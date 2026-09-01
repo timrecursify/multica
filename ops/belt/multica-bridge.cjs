@@ -14,6 +14,7 @@ const {
   crossStageExecutionAdmission
 } = require("./guardrails.cjs");
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed } = require("./parked-diagnosis.cjs");
+const { completionAdmission } = require("./relay-completion-admission.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -73,6 +74,16 @@ const LIVE_TASK_STATUSES = [
 const REPLACEABLE_TASK_STATUSES = [
   "queued", "dispatched", "waiting_local_directory", "deferred"
 ];
+
+// Queue is a bookkeeping stage after the builder has produced its work
+// product. The builder task is admitted on Spec -> Queue; Queue -> In Progress
+// records that the same flight is ready for QC and must never buy another
+// builder run. The pending relay row is correlated to the original builder
+// task so the relay daemon can enqueue QC after that task reaches a terminal
+// state.
+function isBookkeepingTransition(fromStage, toStage) {
+  return fromStage === "Queue" && toStage === "In Progress";
+}
 
 // Relay owners are normally keyed by the stage being left: Spec -> Queue
 // wakes the builder and In Progress -> In Review wakes QC. A backward branch
@@ -279,6 +290,50 @@ async function replaceStageTask(client, task) {
     [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
   );
   return { taskId, relayLogId: log.rows[0]?.id || null };
+}
+
+// Link the Queue -> In Progress bookkeeping hop to the builder task that
+// produced the work product. This gives the relay daemon a task-correlated
+// trigger for the following In Progress -> In Review QC hop without creating a
+// second paid builder task. A missing predecessor is rejected by relayAdvance
+// before the issue status changes, so a manual shortcut cannot skip the build.
+async function recordBookkeepingHandoff(client, issueId) {
+  const predecessor = await client.query(
+    `SELECT id, agent_id, status, result
+       FROM agent_task_queue
+      WHERE issue_id = $1
+        AND context->>'to_stage' = 'Queue'
+        AND status = 'completed'
+      ORDER BY created_at DESC
+      LIMIT 1
+      FOR UPDATE`,
+    [issueId]
+  );
+  const task = predecessor.rows[0];
+  // A terminal status alone is not a work-product proof. Keep this check
+  // aligned with the completion daemon so a handoff cannot race a failing
+  // builder or turn a missing result into a paid QC dispatch.
+  if (!task || task.status !== 'completed' || !completionAdmission(task.result).ok) {
+    return null;
+  }
+
+  const log = await client.query(
+    `WITH existing AS (
+       SELECT id FROM relay_run_log
+        WHERE issue_id = $1 AND from_stage = 'Queue'
+          AND to_stage = 'In Progress' AND task_id = $3
+        ORDER BY created_at DESC LIMIT 1 FOR UPDATE
+     ), inserted AS (
+       INSERT INTO relay_run_log
+         (issue_id, from_stage, to_stage, agent_id, task_id, status)
+       SELECT $1, 'Queue', 'In Progress', $2, $3, 'pending'
+        WHERE NOT EXISTS (SELECT 1 FROM existing)
+       RETURNING id
+     )
+     SELECT id FROM inserted UNION ALL SELECT id FROM existing LIMIT 1`,
+    [issueId, task.agent_id, task.id]
+  );
+  return { taskId: task.id, relayLogId: log.rows[0]?.id || null };
 }
 
 // Terminal transitions do not create a successor task, so they cannot use the
@@ -499,6 +554,28 @@ async function relayAdvance(req, res, body) {
       return;
     }
 
+    const bookkeepingTransition = isBookkeepingTransition(issue.status, to_stage);
+    let bookkeepingHandoff = null;
+    if (bookkeepingTransition) {
+      bookkeepingHandoff = await recordBookkeepingHandoff(client, issue.id);
+      if (!bookkeepingHandoff) {
+        await client.query("ROLLBACK");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: "builder_work_product_required",
+          issue_id: issue.id,
+          from_stage: issue.status,
+          to_stage
+        }));
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: "builder_work_product_required",
+          message: "Queue -> In Progress is bookkeeping for a completed builder task; re-enter Spec to start a build"
+        }));
+        return;
+      }
+    }
+
     const transitionResult = await client.query(
       `SELECT next_stage, alt_next_stages
        FROM relay_stage_config
@@ -678,10 +755,10 @@ async function relayAdvance(req, res, body) {
     if (stage.agent_id && !stage.owner_id) {
       throw new Error(`Relay owner workspace mismatch: ${stage.agent_name} (${stage.agent_id}) for ${issue.workspace_id}`);
     }
-    if (stage.agent_id && isExecutionStage(to_stage) && stage.archived_at) {
+    if (stage.agent_id && isExecutionStage(to_stage) && !bookkeepingTransition && stage.archived_at) {
       throw new Error(`Relay owner is archived: ${stage.agent_name} (${stage.agent_id}) for ${issue.status} -> ${to_stage}`);
     }
-    if (stage.agent_id && isExecutionStage(to_stage) && !stage.selected_runtime_id) {
+    if (stage.agent_id && isExecutionStage(to_stage) && !bookkeepingTransition && !stage.selected_runtime_id) {
       throw new Error(`No online Codex runtime for stage: ${to_stage}`);
     }
 
@@ -689,7 +766,7 @@ async function relayAdvance(req, res, body) {
     // by the owner's runbook and its concurrency/model configuration is valid.
     // Unknown instructions fail closed: a worker that would stop on this stage
     // has no useful outcome and still consumes vendor tokens.
-    if (stage.agent_id && isExecutionStage(to_stage) && !parkedRelease) {
+    if (stage.agent_id && isExecutionStage(to_stage) && !parkedRelease && !bookkeepingTransition) {
       const compatibility = instructionCompatibility(stage.instructions, to_stage);
       if (!compatibility.ok) {
         // Persist rejected advances so the Registered recovery pass can apply
@@ -836,7 +913,7 @@ async function relayAdvance(req, res, body) {
     // read locks the live rows so the decision and later insert are atomic.
     // Manual and terminal/disposition destinations stay available because they
     // create no paid execution task.
-    if (isExecutionStage(to_stage)) {
+    if (isExecutionStage(to_stage) && !bookkeepingTransition) {
       const liveRows = await client.query(
         `SELECT id, issue_id, status,
                 jsonb_build_object(
@@ -910,7 +987,9 @@ async function relayAdvance(req, res, body) {
         issue_id, issue.status, '->', to_stage);
     }
 
-    if (stage.agent_id && !bundledChild && isExecutionStage(to_stage)) {
+    if (bookkeepingTransition) {
+      relayLogId = bookkeepingHandoff.relayLogId;
+    } else if (stage.agent_id && !bundledChild && isExecutionStage(to_stage)) {
       // Preserve the board's issue priority on the queue row. The daemon
       // orders claims by this integer (urgent=4 .. none=0); omitting it
       // silently defaulted every relay task to 0 and defeated priority FIFO.
@@ -1035,5 +1114,7 @@ module.exports = {
   existingStageTask,
   replaceStageTask,
   ownerStageForTransition,
-  ensureCompletedRelayLog
+  ensureCompletedRelayLog,
+  isBookkeepingTransition,
+  recordBookkeepingHandoff
 };
