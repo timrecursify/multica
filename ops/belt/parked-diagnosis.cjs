@@ -41,15 +41,50 @@ function parseDiagnosisOutcome(text) {
   return match ? match[1].toLowerCase() : null;
 }
 
+function diagnosisEvidence(text) {
+  const match = String(text || '').match(/(?:evidence|runtime_evidence)\s*[:=]\s*([^\n]+)/i);
+  return match && match[1].trim() ? match[1].trim() : null;
+}
+
+function namedBlocker(text) {
+  const match = String(text || '').match(/blocker\s*[:=]\s*([^\n]+)/i);
+  return match && match[1].trim() ? match[1].trim() : null;
+}
+
+function isSolLowDiagnosisAgent(agent) {
+  const cfg = agent && agent.runtime_config && typeof agent.runtime_config === 'object'
+    ? agent.runtime_config : {};
+  const model = [agent && agent.model, cfg.model, cfg.model_alias, cfg.model_name]
+    .filter(Boolean).join(' ').toLowerCase();
+  const role = [agent && agent.name, cfg.role, cfg.lane, cfg.agent_role]
+    .filter(Boolean).join(' ').toLowerCase();
+  const solLowModel = /sol[-_ ]?low/.test(model) ||
+    (/gpt-5\.5/.test(model) && (cfg.reasoning_effort === 'low' || cfg.tier === 'low'));
+  return solLowModel && /qc|scop|diagnos/.test(role) &&
+    cfg.parked_diagnosis !== false;
+}
+
+function isBuilderDispatchAllowed(context) {
+  return !(context && context.no_builder === true);
+}
+
 async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   const attempts = evidence.historical_tasks ?? evidence.rejection_count ?? evidence.attempt_count;
+  const history = await client.query(
+    `SELECT failure_reason, error FROM agent_task_queue
+      WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]);
+  const verdict = await client.query(
+    `SELECT verdict FROM qc_verdict WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]);
+  const lastError = evidence.last_error || evidence.failure_reason || evidence.error ||
+    history.rows[0]?.failure_reason || history.rows[0]?.error;
+  const qcVerdict = evidence.qc_verdict || verdict.rows[0]?.verdict;
   const content = formatParkReason({
     reason: evidence.reason || evidence.reason_code,
     stage: issue.status,
     attempts,
     ceiling: evidence.ceiling,
-    lastError: evidence.last_error || evidence.failure_reason || evidence.error,
-    qcVerdict: evidence.qc_verdict
+    lastError,
+    qcVerdict
   });
   // System comments use the documented zero UUID (migration 107). The marker
   // makes a repeated rejection idempotent without hiding the first diagnosis.
@@ -65,21 +100,22 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   );
 
   const owner = await client.query(
-    `SELECT a.id, a.runtime_id
+    `SELECT a.id, a.name, a.model, a.runtime_config, a.runtime_id
        FROM agent a
       WHERE a.workspace_id = $1 AND a.archived_at IS NULL
-        AND a.name ILIKE '%sol-low%'
         AND a.status IN ('idle', 'working')
+        AND (a.name ILIKE '%sol%' OR a.model ILIKE '%gpt-5.5%'
+             OR a.runtime_config::text ILIKE '%sol%')
       ORDER BY (a.status = 'idle') DESC, a.updated_at ASC
-      LIMIT 1`,
+      LIMIT 20`,
     [issue.workspace_id]
   );
-  if (owner.rows.length === 0) {
+  const ownerRow = owner.rows.find(isSolLowDiagnosisAgent);
+  if (!ownerRow) {
     console.warn(JSON.stringify({ event: 'parked_diagnosis_unassigned', issue_id: issue.id,
       workspace_id: issue.workspace_id, reason: evidence.reason || evidence.reason_code }));
     return null;
   }
-  const ownerRow = owner.rows[0];
   const context = diagnosisContext({ reason: evidence.reason || evidence.reason_code,
     stage: issue.status, attempts, ceiling: evidence.ceiling });
   const task = await client.query(
@@ -111,7 +147,11 @@ module.exports = {
   PARK_DIAGNOSIS_KIND,
   PARK_REASON_MARKER,
   diagnosisContext,
+  diagnosisEvidence,
   formatParkReason,
+  isBuilderDispatchAllowed,
+  isSolLowDiagnosisAgent,
+  namedBlocker,
   parseDiagnosisOutcome,
   recordParkAndQueueDiagnosis
 };
