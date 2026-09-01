@@ -1086,6 +1086,17 @@ test('release admission is explicit, one-use, and resets task history by time', 
   assert.match(source, /if \(!bindingSpec && parkedRelease\) \{[\s\S]*?to_stage = "Spec"/);
 });
 
+test('authenticated Human Review release resets both retry windows and stamps its reason', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /operator_release === true/);
+  assert.match(source, /explicitHumanReviewReleaseRequested && !explicitHumanReviewRelease/);
+  assert.match(source, /error: "terminal_stage_operator_secret_conflict"/);
+  assert.match(source, /human_review_release_at/);
+  assert.match(source, /human_review_release_reason/);
+  assert.match(source, /issue\.metadata\?\.human_review_release_at \|\|\s+issue\.metadata\?\.parked_release_at/);
+  assert.match(source, /WHEN \$4 THEN COALESCE\(metadata, '\{\}'::jsonb\) \|\| jsonb_build_object/);
+});
+
 test('lifetime ceiling emits a named, deadline-bound re-spec escalation', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
