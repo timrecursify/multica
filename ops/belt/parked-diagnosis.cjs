@@ -49,7 +49,14 @@ function diagnosisEvidence(text) {
 }
 
 function parseRuntimeEvidenceReference(value) {
-  const match = String(value || '').trim().match(/^(task|qc|activity):([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i);
+  const text = String(value || '').trim();
+  const qc = text.match(/^qc:(\d+)$/i);
+  if (qc) {
+    const id = Number(qc[1]);
+    return Number.isSafeInteger(id) && id >= 0 && id <= 2147483647
+      ? { kind: 'qc', id } : null;
+  }
+  const match = text.match(/^(task|activity):([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i);
   return match ? { kind: match[1].toLowerCase(), id: match[2].toLowerCase() } : null;
 }
 
@@ -134,7 +141,7 @@ async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = 
              WHERE t.id = $1::uuid AND t.issue_id = $2::uuid AND t.id IS DISTINCT FROM $3::uuid
                AND t.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'
                AND t.status = 'completed'`,
-    qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1::uuid AND v.issue_id = $2::uuid`,
+    qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1::integer AND v.issue_id = $2::uuid`,
     activity: `SELECT 1 FROM activity_log WHERE id = $1::uuid AND issue_id = $2::uuid`
   };
   const values = kind === 'task' ? [id, issueId, excludeTaskId] : [id, issueId];
