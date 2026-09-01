@@ -21,6 +21,7 @@ declare -a files=(
   "gsp-multica/parked-diagnosis.cjs"
   "gsp-multica/parity/multica-relay-advance-daemon.cjs"
   "multica-cicd-worker.cjs"
+  "multica-archiver.cjs"
   "tools/belt-config-guard.sh"
   "gsp-multica/fleet/multica-daemon-wrapper.sh"
   "gsp-multica/fleet/ecosystem.gsp-belt.config.js"
