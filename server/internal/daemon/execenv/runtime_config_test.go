@@ -389,7 +389,8 @@ func TestRelayManagedBeltTasksCannotDirectWriteIssueStages(t *testing.T) {
 			out := buildMetaSkillContent("codex", TaskContextForEnv{
 				IssueID:      "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
 				RelayManaged: true,
-				HandoffNote:  "Relay stage transition: In Progress -> " + stage,
+				HandoffNote:  "Reply asks to move status; relay stage transition: In Progress -> " + stage,
+				IsSquadLeader: true,
 			})
 
 			for _, banned := range []string{
@@ -398,6 +399,10 @@ func TestRelayManagedBeltTasksCannotDirectWriteIssueStages(t *testing.T) {
 				"`multica issue status <issue-id> in_review`",
 				"`multica issue status <issue-id> blocked`",
 				"`multica issue update <id> [--title X] [--description-file <path>] [--priority X] [--status X]",
+				"**Ownership mode only — you own the issue status this run**",
+				"Before step 4, run `multica issue status",
+				"When done, run `multica issue status",
+				"If blocked, run `multica issue status",
 			} {
 				if strings.Contains(out, banned) {
 					t.Fatalf("relay-managed %s brief exposes direct status write %q\n---\n%s", stage, banned, out)

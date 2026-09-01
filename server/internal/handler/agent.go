@@ -686,7 +686,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		MaxAttempts:         t.MaxAttempts,
 		ParentTaskID:        uuidToPtr(t.ParentTaskID),
 		IsLeaderTask:        t.IsLeaderTask,
-		RelayManaged:        relayManagedTask(t.Context),
+		RelayManaged:        relayManagedTask(t),
 		CreatedAt:           timestampToString(t.CreatedAt),
 		TriggerCommentID:    uuidToPtr(t.TriggerCommentID),
 		CoalescedCommentIDs: uuidsToStrings(t.CoalescedCommentIds),
@@ -707,11 +707,33 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 	}
 }
 
-func relayManagedTask(raw []byte) bool {
+func relayManagedTask(task db.AgentTaskQueue) bool {
+	// trigger_evidence_kind is persisted by the queue writer, unlike a handoff
+	// note, comment, assignee, or squad role. It is the authoritative provenance
+	// for the claimed envelope; relay transition and disposition work are both
+	// relay-owned and neither may self-transition.
+	if task.TriggerEvidenceKind.Valid {
+		switch task.TriggerEvidenceKind.String {
+		case "relay_stage_transition", "relay_disposition":
+			return true
+		}
+	}
+
+	// Older relay rows predate trigger_evidence_kind. Their complete persisted
+	// context still carries the source. Do not infer ownership from a comment,
+	// handoff note, assignment, or squad flag.
 	var context struct {
 		Source string `json:"source"`
 	}
-	return json.Unmarshal(raw, &context) == nil && context.Source == "relay-advance"
+	if json.Unmarshal(task.Context, &context) != nil {
+		return false
+	}
+	switch context.Source {
+	case "relay-advance", "relay-requeue", "relay-cold-start", "relay-spec-no-artifact", "relay-qc-no-verdict":
+		return true
+	default:
+		return false
+	}
 }
 
 // relativeWorkDir produces a privacy-safe display form of the daemon-reported
