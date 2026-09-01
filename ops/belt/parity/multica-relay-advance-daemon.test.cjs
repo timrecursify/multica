@@ -220,6 +220,42 @@ test('a 500 diagnosis release is retried on the next tick', async () => {
   assert.ok(queries.some(({ sql }) => sql.includes("- 'diagnosis_processed'")));
 });
 
+test('a thrown diagnosis release unsets processed and increments its retry count', async () => {
+  const task = { id: '123e4567-e89b-42d3-a456-426614174003', issue_id: '223e4567-e89b-42d3-a456-426614174003',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174003', number: 45, status: 'Parked', context: {},
+    result: 'outcome: fixable' };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM issue_spec')) return { rows: [{ id: 'spec-1' }] };
+    return { rows: [] };
+  }, release() {} };
+  await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+    relayPost: async () => { throw new Error('connection reset'); } });
+  const retry = queries.find(({ sql }) => sql.includes("- 'diagnosis_processed'"));
+  assert.deepEqual(retry.values, [task.id, 1]);
+});
+
+test('a 409 diagnosis release unsets processed and increments its retry count', async () => {
+  const task = { id: '123e4567-e89b-42d3-a456-426614174004', issue_id: '223e4567-e89b-42d3-a456-426614174004',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174004', number: 46, status: 'Parked', context: {},
+    result: 'outcome: fixable' };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM issue_spec')) return { rows: [{ id: 'spec-1' }] };
+    return { rows: [] };
+  }, release() {} };
+  await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+    relayPost: async () => ({ ok: false, status: 409, body: 'already advanced' }) });
+  const retry = queries.find(({ sql }) => sql.includes("- 'diagnosis_processed'"));
+  assert.deepEqual(retry.values, [task.id, 1]);
+});
+
 test('the fifth failed diagnosis release remains processed with its error', async () => {
   const task = { id: '123e4567-e89b-42d3-a456-426614174002', issue_id: '223e4567-e89b-42d3-a456-426614174002',
     workspace_id: '323e4567-e89b-42d3-a456-426614174002', number: 44,

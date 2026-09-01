@@ -537,6 +537,24 @@ test('pool selection applies to Queue and rotates equal-load agents', async () =
   assert.deepEqual(calls[2].values, ['workspace-1', 'Queue', 'builder-older']);
 });
 
+test('pool selection chooses the older Date-valued rotation timestamp', async () => {
+  const builders = [
+    scoper({ agent_id: 'builder-sunday', active_task_count: 0,
+      instructions: 'Own Queue tickets only.',
+      last_selected_at: new Date('2026-08-30T10:00:00Z') }),
+    scoper({ agent_id: 'builder-monday', active_task_count: 0,
+      instructions: 'Own Queue tickets only.',
+      last_selected_at: new Date('2026-08-31T09:00:00Z') })
+  ];
+  const client = { query: async (sql) => {
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: builders };
+    return { rows: [] };
+  } };
+  const selected = await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue');
+  assert.equal(selected.agent_id, 'builder-sunday');
+});
+
 test('nine one-slot builders fill fairly and a tenth waits until capacity frees', async () => {
   const agents = Array.from({ length: 9 }, (_, index) => ({
     agent_id: `builder-${index + 1}`,

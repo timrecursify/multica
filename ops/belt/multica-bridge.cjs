@@ -972,8 +972,9 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
     ["idle", "working"].includes(row.agent_status) && row.selected_runtime_id &&
     instructionCompatibility(row.instructions, toStage).ok);
   if (identityEligible.length === 0) throw new Error(`No eligible stage owner in pool: ${workspaceId}/${toStage}`);
+  const ts = (value) => (value === null || value === undefined) ? -Infinity : new Date(value).getTime();
   identityEligible.sort((left, right) => Number(left.active_task_count) - Number(right.active_task_count) ||
-    String(left.last_selected_at || '').localeCompare(String(right.last_selected_at || '')) ||
+    ts(left.last_selected_at) - ts(right.last_selected_at) ||
     String(left.agent_id).localeCompare(String(right.agent_id)));
   const eligible = identityEligible.filter((row) =>
     Number(row.active_task_count) < Number(row.max_concurrent_tasks));
