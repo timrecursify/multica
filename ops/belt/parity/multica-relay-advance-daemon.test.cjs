@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const { qcCompletionAdvance } = require('./multica-relay-advance-daemon.cjs');
 
 const QC_ROW = {
+  task_id: '11111111-1111-4111-8111-111111111111',
   to_stage: 'In Review',
   next_stage: 'CI/CD & Deploy',
   task_status: 'completed',
@@ -24,8 +25,29 @@ test('completed legacy Sol-low PASS replays its exact SHA and artifact MD5', () 
   assert.deepEqual(qcCompletionAdvance(QC_ROW), {
     ok: true,
     workProductMd5: '76becea4ab970644b7a21220665a1619',
-    boundSha: 'c909401ef7a4a438348eb5ceda33839211721524'
+    boundSha: 'c909401ef7a4a438348eb5ceda33839211721524',
+    evidenceTaskId: '11111111-1111-4111-8111-111111111111'
   });
+});
+
+test('legacy PASS binds to the completed Sol-low task that recorded the verdict', () => {
+  const row = { ...QC_ROW,
+    task_id: '22222222-2222-4222-8222-222222222222',
+    task_started_at: '2026-09-01T19:20:00Z',
+    task_completed_at: '2026-09-01T19:25:00Z',
+    task_result: { output: 'later QC did not record a verdict' },
+    qc_evidence_tasks: [{
+      task_id: QC_ROW.task_id,
+      task_status: 'completed',
+      task_agent_id: 'qc-agent',
+      task_agent_model: 'gpt-5.6-sol',
+      task_agent_effort: 'low',
+      task_started_at: QC_ROW.task_started_at,
+      task_completed_at: QC_ROW.task_completed_at,
+      task_result: QC_ROW.task_result
+    }]
+  };
+  assert.equal(qcCompletionAdvance(row).evidenceTaskId, QC_ROW.task_id);
 });
 
 test('strict relay attempt must bind PASS to one observed SHA and artifact MD5', () => {
@@ -35,14 +57,23 @@ test('strict relay attempt must bind PASS to one observed SHA and artifact MD5',
     qc_attempt_bound_sha: 'c909401ef7a4a438348eb5ceda33839211721524',
     qc_attempt_observed_sha: 'c909401ef7a4a438348eb5ceda33839211721524',
     qc_attempt_qualifying: true,
-    qc_attempt_model: 'gpt-5.6-sol',
-    qc_attempt_effort: 'low'
+    qc_attempt_evidence_task_id: '33333333-3333-4333-8333-333333333333',
+    qc_attempt_evidence_agent_id: 'qc-agent',
+    qc_attempt_evidence_agent_model: 'gpt-5.6-sol',
+    qc_attempt_evidence_agent_effort: 'low'
   };
   assert.equal(qcCompletionAdvance(row).ok, true);
+  assert.equal(qcCompletionAdvance(row).evidenceTaskId,
+    '33333333-3333-4333-8333-333333333333');
   assert.equal(qcCompletionAdvance({ ...row,
     qc_attempt_observed_sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }).ok, false);
   assert.equal(qcCompletionAdvance({ ...row,
     qc_verdict_checker_id: 'different-agent' }).ok, false);
+  assert.equal(qcCompletionAdvance({ ...row,
+    qc_attempt_model: 'gpt-5.6-sol',
+    qc_attempt_effort: 'low',
+    qc_attempt_evidence_agent_model: 'gpt-5.5',
+    qc_attempt_evidence_agent_effort: 'high' }).ok, false);
 });
 
 test('post-completion QC replay fails closed on stale, mismatched, or non-low evidence', () => {
@@ -65,6 +96,9 @@ test('relay daemon scopes stage configuration to each issue workspace', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /rsc\.workspace_id = i\.workspace_id/);
   assert.match(source, /a\.workspace_id = rsc\.workspace_id/);
+  assert.match(source, /evidence_agent\.workspace_id = i\.workspace_id/);
+  assert.match(source, /evidence_agent\.model AS evidence_agent_model/);
+  assert.match(source, /evidence_agent\.thinking_level AS evidence_agent_effort/);
 });
 
 test('routing recovery hold logs bounded routing details', () => {
