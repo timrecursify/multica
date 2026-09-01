@@ -6,7 +6,8 @@ const {
   spendPreflight,
   stageCycleAdmission,
   lifetimeTaskAdmission,
-  quotaCircuitAdmission
+  quotaCircuitAdmission,
+  crossStageExecutionAdmission
 } = require('../guardrails.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
@@ -79,7 +80,10 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
         SET status = 'cancelled', completed_at = NOW(),
             prepare_lease_expires_at = NULL, failure_reason = $2
       WHERE issue_id = $1
-        AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')`,
+        -- Never interrupt a paid task already executing. Cross-stage
+        -- admission defers successors until running predecessors are
+        -- terminal; only unstarted work may be retired by a disposition.
+        AND status IN ('queued','dispatched','waiting_local_directory','deferred')`,
     [row.issue_id, reason]
   );
   if (changed.rowCount > 0) {
@@ -248,6 +252,11 @@ async function findAndAdvanceTasks() {
         if (response.ok) {
           console.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})`);
           await markRelayLogCompletedById(client, row.log_id);
+        } else if (response.deferred) {
+          // Preserve the task-correlated pending log. The same advance becomes
+          // eligible once the predecessor is terminal; recording failure here
+          // would strand it permanently.
+          console.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
         } else {
           // The relay's own error text was parsed and then discarded, so 76 of every
           // 400 log lines were a bare `status 409` with no cause. Print the reason.
@@ -308,6 +317,8 @@ async function recoveryAdvanceTasks() {
         if (response.ok) {
           console.log(`${LOG_PREFIX} [recovery] Advanced Registered ticket ${row.issue_id} '${row.to_stage}' → '${row.next_stage}'`);
           await markRelayLogCompleted(client, row.issue_id);
+        } else if (response.deferred) {
+          console.log(`${LOG_PREFIX} [recovery] DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
         } else {
           console.log(`${LOG_PREFIX} [recovery] Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
           await markRelayLogFailed(client, row.issue_id);
@@ -337,8 +348,9 @@ function postToRelay(payload) {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          resolve({ ok: res.statusCode === 200, status: res.statusCode, error: parsed.error });
-        } catch { resolve({ ok: res.statusCode === 200, status: res.statusCode }); }
+          resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
+            status: res.statusCode, error: parsed.error });
+        } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202, status: res.statusCode }); }
       });
     });
 
@@ -664,17 +676,35 @@ async function requeueStrandedTasks() {
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
         await client.query('BEGIN');
-        await client.query(
-          `UPDATE agent_task_queue SET status = 'cancelled', completed_at = NOW(),
-                  prepare_lease_expires_at = NULL,
-                  failure_reason = 'relay_stage_transition_superseded'
-             WHERE issue_id = $1 AND status IN ('queued','dispatched','running')
-               AND COALESCE(context->>'to_stage','') IS DISTINCT FROM $2`,
-          [row.issue_id, row.stage]
-        );
-        // Serialize admission with the bridge and other recovery workers. The
-        // issue lock plus stage-scoped predicate prevents duplicate paid rows.
+        // Match the bridge's issue-scoped relay lock. This is intentionally
+        // narrower than a queue-wide unique constraint: manual tasks and
+        // terminal dispositions are outside execution admission.
+        await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [row.issue_id]);
+        // Serialize admission with the bridge and other recovery workers.
+        // The old code cancelled a live task for a *different* stage before it
+        // created this retry. That turns an active Spec -> Queue flight into a
+        // Queue -> In Progress task and loses the predecessor's work product.
         await client.query('SELECT id FROM issue WHERE id = $1 FOR UPDATE', [row.issue_id]);
+        const liveRows = await client.query(
+          `SELECT id, issue_id, status,
+                  jsonb_build_object(
+                    'source', context->>'source',
+                    'to_stage', context->>'to_stage'
+                  ) AS context
+             FROM agent_task_queue
+            WHERE issue_id = $1
+              AND status IN ('queued', 'dispatched', 'running',
+                             'waiting_local_directory', 'deferred')
+              AND context ? 'to_stage'
+            FOR UPDATE`,
+          [row.issue_id]
+        );
+        const crossStage = crossStageExecutionAdmission(liveRows.rows, row.issue_id);
+        if (!crossStage.ok) {
+          await client.query('ROLLBACK');
+          console.log(`${LOG_PREFIX} [requeue] DEFERRED #${row.number}: ${crossStage.reason} tasks=${crossStage.active_task_ids.join(',')} stages=${crossStage.active_stages.join(',')}`);
+          continue;
+        }
         if (quotaCircuitAdmission([row.failure_reason], 1).pause) {
           const recentFailures = await client.query(
             `SELECT failure_reason FROM agent_task_queue

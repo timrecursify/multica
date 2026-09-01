@@ -8,7 +8,9 @@ const STAGE_ALIASES = new Map([
   ['in_progress', 'In Progress'],
   ['in_review', 'In Review']
 ]);
-const NON_EXECUTION_STAGES = new Set(['Human Review', 'Parked', 'Rejected']);
+const NON_EXECUTION_STAGES = new Set([
+  'Human Review', 'Parked', 'Rejected', 'Done', 'Archived', 'Cancelled'
+]);
 const EXTERNAL_TRANSITION_STAGES = new Set(['Done']);
 
 function canonicalStage(stage) {
@@ -59,6 +61,33 @@ function hasActiveTaskForIssueStage(tasks, issueId, stage) {
     const taskStage = task.context && task.context.to_stage;
     return canonicalStage(taskStage) === wanted;
   });
+}
+
+// A relay execution task is work the belt itself created for a concrete stage.
+// Manual/operator tasks deliberately do not carry this marker and must not
+// prevent an operator moving a ticket through a manual or terminal stage.
+function isActiveExecutionTask(task, issueId) {
+  if (!task || task.issue_id !== issueId || !NONTERMINAL_TASK_STATES.has(task.status)) {
+    return false;
+  }
+  const context = task.context || {};
+  if (!context.to_stage || String(context.source || '').startsWith('manual')) return false;
+  return isExecutionStage(context.to_stage);
+}
+
+// Cross-stage admission is intentionally issue-wide. Stage-local duplicate
+// checks miss the dangerous shape: an active Spec -> Queue execution and a
+// concurrent Queue -> In Progress execution for the same issue.
+function crossStageExecutionAdmission(tasks, issueId) {
+  const active = (tasks || []).filter((task) => isActiveExecutionTask(task, issueId));
+  return active.length === 0
+    ? { ok: true }
+    : {
+        ok: false,
+        reason: 'prior_execution_active',
+        active_task_ids: active.map((task) => task.id).filter(Boolean),
+        active_stages: [...new Set(active.map((task) => canonicalStage(task.context.to_stage)))].sort()
+      };
 }
 
 function retryAdmission({ attempt, maxAttempts = 2, failureReason, queueAgeMinutes = 0,
@@ -172,6 +201,8 @@ module.exports = {
   instructionStages,
   instructionCompatibility,
   hasActiveTaskForIssueStage,
+  isActiveExecutionTask,
+  crossStageExecutionAdmission,
   retryAdmission,
   spendPreflight,
   stageCycleAdmission,
