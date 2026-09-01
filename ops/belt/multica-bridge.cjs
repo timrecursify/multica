@@ -528,6 +528,63 @@ async function ssoBridge(req, res) {
   }
 }
 
+async function canonicalStageOwner(client, workspaceId, ownerStage) {
+  const result = await client.query(
+    `SELECT rsc.agent_id, rsc.agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
+            a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
+            (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
+            COALESCE(a.runtime_id, (
+              SELECT ar.id FROM agent_runtime ar
+               WHERE ar.workspace_id = $1 AND ar.provider = 'codex' AND ar.status = 'online'
+               ORDER BY ar.updated_at DESC LIMIT 1
+            )) AS selected_runtime_id
+       FROM relay_stage_config rsc
+       LEFT JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id
+      WHERE rsc.workspace_id = $1 AND rsc.stage_name = $2`, [workspaceId, ownerStage]);
+  return result.rows[0] || null;
+}
+
+async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
+  if (toStage !== "Spec") return null;
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, ownerStage]);
+  const result = await client.query(
+    `SELECT p.agent_id, a.name AS agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
+            a.status AS agent_status, a.instructions, a.model, a.thinking_level,
+            a.max_concurrent_tasks, a.runtime_config,
+            COALESCE(own_runtime.provider, online_runtime.provider) AS selected_runtime_provider,
+            COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id,
+            COALESCE(active.task_count, 0)::int AS active_task_count
+       FROM relay_stage_agent_pool p
+       LEFT JOIN agent a ON a.id = p.agent_id AND a.workspace_id = p.workspace_id
+       LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
+        AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
+       LEFT JOIN LATERAL (
+         SELECT ar.id, ar.provider FROM agent_runtime ar
+          WHERE ar.workspace_id = p.workspace_id AND ar.provider = 'codex' AND ar.status = 'online'
+          ORDER BY ar.updated_at DESC LIMIT 1
+       ) online_runtime ON true
+       LEFT JOIN LATERAL (
+         SELECT count(*) AS task_count FROM agent_task_queue atq
+          WHERE atq.agent_id = p.agent_id
+            AND atq.status IN ('queued','dispatched','running','waiting_local_directory','deferred')
+       ) active ON true
+      WHERE p.workspace_id = $1 AND p.stage_name = $2 AND p.enabled = true
+      ORDER BY active_task_count, p.agent_id`, [workspaceId, ownerStage]);
+  if (result.rows.length === 0) return null;
+  const eligible = result.rows.filter((row) => row.archived_at === null &&
+    ["idle", "working"].includes(row.agent_status) && row.model === "gpt-5.6-sol" &&
+    row.thinking_level === "low" && row.selected_runtime_id &&
+    Number(row.active_task_count) < Number(row.max_concurrent_tasks) &&
+    instructionCompatibility(row.instructions, toStage).ok);
+  if (eligible.length === 0) throw new Error(`No eligible Sol-low scoper in pool: ${workspaceId}/${ownerStage}`);
+  return eligible[0];
+}
+
+async function selectStageOwner(client, workspaceId, ownerStage, toStage) {
+  const pooled = await selectScoperPoolOwner(client, workspaceId, ownerStage, toStage);
+  return pooled || canonicalStageOwner(client, workspaceId, ownerStage);
+}
+
 async function relayAdvance(req, res, body) {
   let client;
   try {
@@ -781,38 +838,11 @@ async function relayAdvance(req, res, body) {
     }
 
     const ownerStage = ownerStageForTransition(issue.status, to_stage);
-    const stageResult = await client.query(
-      `SELECT rsc.agent_id, rsc.agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
-              a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
-              (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
-              COALESCE(
-                a.runtime_id,
-                (
-                  SELECT ar.id
-                  FROM agent_runtime ar
-                  WHERE ar.workspace_id = $1
-                    AND ar.provider = 'codex'
-                    AND ar.status = 'online'
-                  ORDER BY ar.updated_at DESC
-                  LIMIT 1
-                )
-              ) AS selected_runtime_id
-       FROM relay_stage_config rsc
-       LEFT JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id
-       WHERE rsc.workspace_id = $1 AND rsc.stage_name = $2`,
-      // Stage owners are keyed by the stage being left: Spec -> Queue wakes
-      // the builder, and In Progress -> In Review wakes QC. Looking up the
-      // target stage would select the next lane's owner and can burn a paid
-      // call on an incompatible runbook. Backward branches are the exception:
-      // they deliberately select the canonical owner for the destination lane.
-      [issue.workspace_id, ownerStage]
-    );
+    const stage = await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage);
 
-    if (stageResult.rows.length === 0) {
+    if (!stage) {
       throw new Error(`Missing relay configuration for stage: ${to_stage}`);
     }
-
-    const stage = stageResult.rows[0];
     if (stage.agent_id && !stage.owner_id) {
       throw new Error(`Relay owner workspace mismatch: ${stage.agent_name} (${stage.agent_id}) for ${issue.workspace_id}`);
     }
@@ -1189,5 +1219,6 @@ module.exports = {
   recordBookkeepingHandoff,
   isCicdReturn,
   consumeCicdReturnAuthorization,
-  authorizeCicdReturnCapBypass
+  authorizeCicdReturnCapBypass,
+  selectStageOwner
 };
