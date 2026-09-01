@@ -4,6 +4,10 @@ This directory mirrors the current GSP belt runtime. The runtime paths below
 are authoritative today. Editing a repository copy does not change running
 behavior until it is deployed with `./deploy.sh --apply`.
 
+Explicit terminal exits require `RELAY_OPERATOR_SECRET` in the bridge
+environment and the matching `X-Relay-Operator-Secret` request header. If the
+environment variable is unset, those exceptional exits are refused.
+
 ## Runtime map
 
 | Repository file | Runtime path | Current runner |

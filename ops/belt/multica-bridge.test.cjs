@@ -4,7 +4,10 @@ const fs = require('node:fs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
-process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-secret';
+// This handler test sends fixed fixture credentials. Do not inherit a live
+// relay credential, which would make the expected 201 path return 403.
+process.env.RELAY_AGENT_SECRET = 'test-relay-secret';
+process.env.RELAY_OPERATOR_SECRET = 'test-operator-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
 const {
@@ -37,7 +40,8 @@ const {
   verifiedRetryEscalation,
   retryEscalationSourceTask,
   authorizeRelayStatusWrites,
-  rerunParkedDiagnosis
+  rerunParkedDiagnosis,
+  isTerminalStage
 } = require('./multica-bridge.cjs');
 
 test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', async () => {
@@ -341,6 +345,24 @@ test('verdict checker identity is selected from the completed same-workspace Sol
   assert.match(calls[0].sql, /ORDER BY t\.completed_at DESC NULLS LAST/);
 });
 
+test('completed In Review rerun task is admitted for the QC verdict', async () => {
+  const rerunTask = {
+    id: 'rerun-qc-task', agent_id: 'qc-agent', status: 'completed',
+    context: { to_stage: 'In Review' }, result: { output: 'QC VERDICT: PASS' },
+    agent_name: 'qc-sol-low'
+  };
+  const client = { query: async (sql, values) => {
+    assert.deepEqual(values, ['issue-in-review', 'workspace-for-issue']);
+    assert.match(sql, /i\.workspace_id = t\.workspace_id/);
+    assert.match(sql, /t\.context->>'to_stage' = 'In Review'/);
+    return { rows: [rerunTask] };
+  } };
+  assert.equal(
+    await latestCompletedSolLowQcTask(client, 'issue-in-review', 'workspace-for-issue'),
+    rerunTask
+  );
+});
+
 test('verdict route never trusts a caller supplied checker identity', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.doesNotMatch(source, /RELAY_QC_ACTOR_ID/);
@@ -469,11 +491,20 @@ test('configured stage pool fails closed when its members are incompatible', asy
     /No eligible stage owner in pool/);
 });
 
-test('configured stage pool does not overfill an agent concurrency limit', async () => {
-  const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
-    ? { rows: [] } : { rows: [scoper({ active_task_count: 1, max_concurrent_tasks: 1 })] } };
-  await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
-    /No eligible stage owner in pool/);
+test('configured stage pool queues on the least-loaded member when every member is at capacity', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    return { rows: [
+      scoper({ agent_id: 'more-loaded', active_task_count: 3, max_concurrent_tasks: 3 }),
+      scoper({ agent_id: 'least-loaded', active_task_count: 2, max_concurrent_tasks: 2,
+        last_selected_at: '2026-01-01T00:00:00Z' })
+    ] };
+  } };
+  const owner = await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec');
+  assert.equal(owner.agent_id, 'least-loaded');
+  assert.match(calls[2].sql, /SET last_selected_at = NOW/);
 });
 
 test('empty stage pool preserves the canonical relay owner fallback', async () => {
@@ -510,6 +541,24 @@ test('pool selection applies to Queue and rotates equal-load agents', async () =
   assert.deepEqual(calls[2].values, ['workspace-1', 'Queue', 'builder-older']);
 });
 
+test('pool selection chooses the older Date-valued rotation timestamp', async () => {
+  const builders = [
+    scoper({ agent_id: 'builder-sunday', active_task_count: 0,
+      instructions: 'Own Queue tickets only.',
+      last_selected_at: new Date('2026-08-30T10:00:00Z') }),
+    scoper({ agent_id: 'builder-monday', active_task_count: 0,
+      instructions: 'Own Queue tickets only.',
+      last_selected_at: new Date('2026-08-31T09:00:00Z') })
+  ];
+  const client = { query: async (sql) => {
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: builders };
+    return { rows: [] };
+  } };
+  const selected = await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue');
+  assert.equal(selected.agent_id, 'builder-sunday');
+});
+
 test('nine one-slot builders fill fairly and a tenth waits until capacity frees', async () => {
   const agents = Array.from({ length: 9 }, (_, index) => ({
     agent_id: `builder-${index + 1}`,
@@ -540,8 +589,7 @@ test('nine one-slot builders fill fairly and a tenth waits until capacity frees'
     selected.push((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id);
   }
   assert.equal(new Set(selected).size, 9);
-  await assert.rejects(selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue'),
-    /No eligible stage owner/);
+  assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
   active.delete(selected[0]);
   assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
 });
@@ -1022,10 +1070,48 @@ test('relay stage lookups bind configuration and owners to the issue workspace',
 
 test('terminal relay transitions are logged and Parked Done remains relay-only and PASS-gated', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /const terminalStages = new Set\(\["Done", "Cancelled", "Archived"\]\)/);
+  assert.equal(isTerminalStage('Done'), true);
+  assert.equal(isTerminalStage('Cancelled'), true);
+  assert.equal(isTerminalStage('Archived'), true);
   assert.match(source, /const parkedDiagnosisDone = issue\.status === "Parked" && to_stage === "Done"/);
   assert.match(source, /to_stage === "Done"/);
   assert.match(source, /work_product_mismatch/);
-  assert.match(source, /if \(terminalStages\.has\(to_stage\)\)/);
+  assert.match(source, /if \(isTerminalStage\(to_stage\)\)/);
   assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
+});
+
+test('Parked and In Review arrivals at Done return before task dispatch', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const terminalArrival = source.slice(source.indexOf('if (isTerminalStage(to_stage))'),
+    source.indexOf('// A bundled child'));
+  for (const fromStage of ['Parked', 'In Review']) {
+    assert.equal(isTerminalStage('Done'), true, `${fromStage} -> Done is terminal`);
+  }
+  assert.match(terminalArrival, /task_id: null/);
+  assert.match(terminalArrival, /relay_log_id: relayLogId/);
+  assert.match(terminalArrival, /return;/);
+  assert.doesNotMatch(terminalArrival, /replaceStageTask/);
+});
+
+test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const guard = source.slice(source.indexOf('const issue = issueResult.rows[0];'),
+    source.indexOf('const noArtifactRescope'));
+  assert.doesNotMatch(guard, /terminal_stage_relay_exit_forbidden/);
+  assert.match(source, /sourceStageResult\.rows\[0\]\?\.next_stage === to_stage/);
+  assert.match(source, /operator_terminal_exit === true/);
+  assert.match(source, /RELAY_OPERATOR_SECRET/);
+  assert.match(source, /x-relay-operator-secret/);
+  assert.match(source, /reason\.trim\(\) !== ""/);
+  assert.match(source, /terminal_stage_operator_marker_required/);
+  assert.match(source, /terminal_exit: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
+  assert.match(source, /parked_audit/);
+  assert.match(source, /terminalExit: explicitTerminalExit/);
+});
+
+test('identical relay and operator secrets disable explicit terminal exits', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /OPERATOR_SECRET_DISABLED/);
+  assert.match(source, /RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET/);
+  assert.match(source, /terminal_stage_operator_secret_conflict/);
 });

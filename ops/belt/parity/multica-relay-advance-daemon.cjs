@@ -22,6 +22,7 @@ const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
+const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
 const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
@@ -104,7 +105,7 @@ const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10
 // agent is declared by relay_stage_config row 1 (Registered -> Spec,
 // multica-qc-worker-2, the spec writer) -- the belt knew who owned them and
 // still dispatched nobody. Widen further only with the same kind of evidence.
-const REQUEUE_STAGES = (process.env.RELAY_REQUEUE_STAGES || 'Queue,Spec,In Review')
+const REQUEUE_STAGES = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec')
   .split(',').map(s => s.trim()).filter(Boolean);
 
 // Mirrors --max-concurrent-tasks in fleet/multica-daemon-wrapper.sh. Not a
@@ -341,6 +342,76 @@ async function cleanupStalePendingRows() {
   }
 }
 
+// A QC verdict can be recorded after the relay row that originally delivered
+// the issue to In Review was completed (for example, while this daemon was
+// down or by a QC rerun). findAndAdvanceTasks deliberately consumes only
+// pending, task-correlated rows, so create that missing row here and let its
+// normal QC admission path decide whether the evidence is sufficient.
+async function enqueuePassWithoutRelayRows({ dbPool = pool, logger = console } = {}) {
+  const client = await dbPool.connect();
+  try {
+    const result = await client.query(
+      `WITH candidates AS (
+         SELECT i.id AS issue_id, qc."checker_id", evidence_task.id AS task_id
+           FROM issue i
+           JOIN relay_stage_config rsc
+             ON rsc.workspace_id = i.workspace_id
+            AND rsc.stage_name = i.status
+           JOIN LATERAL (
+             SELECT "checker_id", "verdict", "created_at", "id"
+               FROM qc_verdict
+              WHERE "issue_id" = i.id
+              ORDER BY "created_at" DESC, "id" DESC
+              LIMIT 1
+           ) qc ON true
+           JOIN LATERAL (
+             SELECT id
+               FROM agent_task_queue
+              WHERE issue_id = i.id
+                AND agent_id = qc."checker_id"
+                AND status = 'completed'
+              ORDER BY completed_at DESC, id DESC
+              LIMIT 1
+          ) evidence_task ON true
+          WHERE i.status = 'In Review'
+            AND rsc.next_stage = 'CI/CD & Deploy'
+            AND qc."verdict" = 'PASS'
+            AND qc."created_at" > COALESCE((
+              SELECT MAX(created_at) FROM relay_run_log WHERE issue_id = i.id
+            ), '-infinity'::timestamptz)
+            AND NOT EXISTS (
+              SELECT 1 FROM relay_run_log pending
+               WHERE pending.issue_id = i.id AND pending.status = 'pending'
+            )
+          ORDER BY qc."created_at" ASC
+          LIMIT 20
+       )
+       INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
+       SELECT c.issue_id, 'In Review', 'In Review', c.checker_id, c.task_id, 'pending'
+         FROM candidates c
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log pending
+           WHERE pending.issue_id = c.issue_id AND pending.status = 'pending'
+        )
+       RETURNING id, issue_id`
+    );
+    if (result.rowCount > 0) {
+      logger.log(`${LOG_PREFIX} Enqueued ${result.rowCount} PASS verdict(s) missing relay rows`);
+    }
+    return result.rows;
+  } catch (err) {
+    logger.error(`${LOG_PREFIX} [pass-sweep] DB error: ${err.message}`);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
+async function advanceTick() {
+  await enqueuePassWithoutRelayRows();
+  await findAndAdvanceTasks();
+}
+
 async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   logger = console } = {}) {
   const client = await dbPool.connect();
@@ -458,6 +529,14 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
 
     for (const row of result.rows) {
       try {
+        // A completed terminal arrival is a final ledger entry, not an exit
+        // trigger. This also neutralizes old rows created before the bridge
+        // stopped terminal-stage dispatch.
+        if (TERMINAL_STAGES.has(row.to_stage)) {
+          await markRelayLogCompletedById(client, row.log_id);
+          logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
+          continue;
+        }
         const completion = completionAdmission(row.task_result ??
           (row.task_error ? { error: row.task_error } : null));
         if (!completion.ok) {
@@ -475,6 +554,10 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         // Sol-low task carries a SHA-bound PASS plus the current artifact MD5.
         const qcAdvance = qcCompletionAdvance(row);
         if (gatedStages.includes(row.next_stage) && !qcAdvance.ok) {
+          if (qcAdvance.reason === 'qc_work_product_md5_required') {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
+            continue;
+          }
           if (qcAdvance.reason === 'qc_attempt_mismatch' ||
               qcAdvance.reason === 'legacy_qc_evidence_mismatch') {
             const held = await holdQcEvidenceMismatch(client, row.log_id);
@@ -485,6 +568,18 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
           }
           logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
           continue;
+        }
+
+        if (qcAdvance.ok) {
+          const currentWorkProductMd5 = await currentPassWorkProductMD5(client, row.issue_id);
+          if (!currentWorkProductMd5) {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
+            continue;
+          }
+          if (currentWorkProductMd5.toLowerCase() !== qcAdvance.workProductMd5) {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=stale_pass_md5_mismatch`);
+            continue;
+          }
         }
 
         const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
@@ -611,8 +706,9 @@ function postToRelay(payload) {
         try {
           const parsed = JSON.parse(data);
           resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
-            status: res.statusCode, error: parsed.error });
-        } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202, status: res.statusCode }); }
+            status: res.statusCode, error: parsed.error, body: data });
+        } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
+          status: res.statusCode, body: data }); }
       });
     });
 
@@ -718,22 +814,12 @@ const INFRA_FAILURE_REASONS = [
 // agent forever (the agent_task_queue trigger rejects an archived assignee). The
 // stage contract is the authority on who owns a stage, so a re-owned stage heals
 // its own strays.
-async function requeueStrandedTasks() {
-  const client = await pool.connect();
+async function requeueStrandedTasks({ dbPool = pool } = {}) {
+  const client = await dbPool.connect();
   try {
     const candidates = await client.query(
-      // The outer wrapper ranks candidates per owning agent. A single global
-      // `ORDER BY updated_at ASC LIMIT n` let the oldest backlog monopolise
-      // every tick: ~300 Spec tickets are all older than any In Review one,
-      // so the In Review lane would never appear in a 3-row window and its
-      // tickets could not be recovered at all. Ranking per agent gives each
-      // owning lane its own oldest-first slice; the per-agent capacity check
-      // below is still what decides how many actually dispatch.
-      `SELECT * FROM (
-       SELECT c.*, ROW_NUMBER() OVER (
-                PARTITION BY c.agent_id ORDER BY c.updated_at ASC
-              ) AS rn FROM (
-       SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage, i.updated_at, i.metadata,
+      `SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage,
+              i.created_at AS issue_created_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason,
               t.result AS dead_task_result, t.error AS dead_task_error,
@@ -767,49 +853,17 @@ async function requeueStrandedTasks() {
               AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
             ORDER BY rsc.id LIMIT 1
          ) r ON true
-        WHERE i.status = ANY($3)
+        WHERE i.status = ANY($2::text[])
           -- t.id IS NULL is the cold start: a ticket that reached this stage
           -- and never had a first task. The lateral above used to be an inner
           -- join, so such a ticket produced no row and was invisible to the
           -- requeue forever -- no agent, no error, no alert. It is not a retry,
           -- so the attempt/max_attempts test cannot apply to it.
-          AND (t.id IS NULL
-               OR (t.status IN ('failed', 'cancelled')
-                   AND (t.attempt < t.max_attempts
-                        OR COALESCE(t.failure_reason, 'cancelled') = ANY($1)))
-               -- Third stranding case: the QC task ran to 'completed' but wrote
-               -- no verdict (QC-BLOCKED). It is not failed and not cancelled, so
-               -- neither of the branches above can see it, and a ticket with no
-               -- verdict can never advance -- 44 sat in In Review this way on
-               -- 2026-08-31 (GSP #761). Bounded by the task's own attempt
-               -- ceiling, so each ticket gets exactly one retry, never a loop.
-               OR (i.status = 'In Review'
-                   AND t.status = 'completed'
-                   AND t.attempt < t.max_attempts
-                   AND NOT EXISTS (
-                     SELECT 1 FROM qc_verdict v WHERE v.issue_id = i.id
-                   ))
-               -- Fourth stranding case, same shape one stage earlier. A spec
-               -- worker that posts a specification advances the flight to
-               -- 'Queue' in the same run, so a task that ran to 'completed'
-               -- and left the flight in 'Spec' produced no specification: the
-               -- SPEC-BLOCKED result. 36 sat this way on 2026-08-31 (GSP #775),
-               -- invisible to every branch above because the task did not fail.
-               -- The stage is the evidence, so no content test is needed.
-               OR (i.status = 'Spec'
-                   AND t.status = 'completed'
-                   AND t.attempt < t.max_attempts)
-               OR (t.id IS NOT NULL
-                   AND t.status IN ('queued', 'dispatched', 'running')
-                   AND ((t.context ? 'to_stage'
-                         AND t.context->>'to_stage' IS DISTINCT FROM i.status)
-                        OR (NOT (t.context ? 'to_stage')
-                            AND t.created_at < i.updated_at))))
+          AND (t.id IS NULL OR t.status IN ('failed', 'cancelled'))
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue q
              WHERE q.issue_id = i.id AND q.status IN
                ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
-               AND COALESCE(q.context->>'to_stage', '') = i.status
           )
           AND COALESCE(t.context->>'no_builder', 'false') <> 'true'
           -- A bundled child is never its own unit of work: its MEGA parent
@@ -823,11 +877,9 @@ async function requeueStrandedTasks() {
           -- of work, even after the parent has shipped and the child is still
           -- open for disposition.
           AND i.parent_issue_id IS NULL
-       ) c
-       ) ranked
-        WHERE ranked.rn <= $2
-        ORDER BY ranked.updated_at ASC`,
-      [INFRA_FAILURE_REASONS, REQUEUE_BATCH, REQUEUE_STAGES]
+        ORDER BY i.created_at ASC
+        LIMIT $1::int`,
+      [REQUEUE_BATCH, REQUEUE_STAGES]
     );
 
     if (candidates.rows.length === 0) return;
@@ -909,19 +961,6 @@ async function requeueStrandedTasks() {
       // A cold start has no prior task, so it is attempt 1 of the queue's own
       // default ceiling -- never row.attempt + 1 on a NULL.
       const coldStart = !row.dead_task_id;
-      if (row.dead_task_status === 'completed') {
-        const completion = completionAdmission(row.dead_task_result ??
-          (row.dead_task_error ? { error: row.dead_task_error } : null));
-        if (!completion.ok) {
-          // The predecessor reached process status=completed but did not
-          // produce admissible work. Re-dispatching it would buy a duplicate
-          // paid task (the GSP #1229 shape), so change hands to Sol-low re-spec
-          // instead of treating it as an ordinary missing artifact.
-          const escalation = await requestRetryEscalation(row, completion.reason);
-          console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: completed predecessor failed completion admission (${completion.reason}); relay=${escalation.status}`);
-          continue;
-        }
-      }
       const compatibility = instructionCompatibility(row.instructions, row.stage);
       if (!compatibility.ok) {
         console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: agent instructions do not authorize '${compatibility.stage}'`);
@@ -936,9 +975,6 @@ async function requeueStrandedTasks() {
           expected_effort: preflight.expected_effort }));
         continue;
       }
-      // A 'completed' predecessor means QC finished without writing a verdict.
-      // That is a real retry, not an infra replay, so it costs an attempt.
-      const noArtifact = row.dead_task_status === 'completed';
       const infra = INFRA_FAILURE_REASONS.includes(row.failure_reason || 'cancelled');
       if (infra) {
         const headroom = await client.query(
@@ -958,14 +994,8 @@ async function requeueStrandedTasks() {
           continue;
         }
       }
-      // noArtifact must be checked BEFORE infra: a completed task has a NULL
-      // failure_reason, which coalesces to 'cancelled' -- an INFRA reason --
-      // and infra replays reuse the same attempt number. Left in that order
-      // the retry would never consume an attempt and these tickets would
-      // requeue forever, which is the QC bounce loop that burned 134 paid
-      // calls on a single ticket. A missing verdict is a real failed try.
       const attempt = coldStart ? 1
-        : (noArtifact || !infra) ? row.attempt + 1
+        : !infra ? row.attempt + 1
         : row.attempt;
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
@@ -1052,9 +1082,7 @@ async function requeueStrandedTasks() {
         }
         const context = JSON.stringify({
           source: coldStart ? 'relay-cold-start'
-            : noArtifact
-              ? (row.stage === 'Spec' ? 'relay-spec-no-artifact' : 'relay-qc-no-verdict')
-              : 'relay-requeue',
+            : 'relay-requeue',
           from_stage: row.from_stage,
           to_stage: row.stage,
           requeue_of_task: row.dead_task_id,
@@ -1080,9 +1108,7 @@ async function requeueStrandedTasks() {
           [row.agent_id, row.issue_id, row.workspace_id, row.runtime_id, context,
            coldStart
              ? `Relay cold start: never dispatched in ${row.stage}`
-             : noArtifact
-               ? `Relay requeue: task completed in ${row.stage} without producing its artifact`
-               : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`,
+             : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`,
            attempt, maxAttempts, row.dead_task_id, row.stage]
         );
         if (task.rows.length === 0) {
@@ -1122,6 +1148,28 @@ function diagnosisText(result) {
   if (!result || typeof result !== 'object') return '';
   return [result.comment, result.output, result.text, result.error]
     .filter(Boolean).join('\n');
+}
+
+async function recordDiagnosisReleaseFailure(client, taskId, context, failure) {
+  const attempts = Number.parseInt(context?.diagnosis_release_attempts || '0', 10) || 0;
+  const nextAttempts = attempts + 1;
+  const error = String(failure).slice(0, 2000);
+  if (nextAttempts >= 5) {
+    await client.query(
+      `UPDATE agent_task_queue
+          SET context = COALESCE(context, '{}'::jsonb) ||
+                jsonb_build_object('diagnosis_processed', true,
+                  'diagnosis_release_attempts', $2::int,
+                  'diagnosis_release_error', $3::text)
+        WHERE id = $1::uuid`, [taskId, nextAttempts, error]);
+    return;
+  }
+  await client.query(
+    `UPDATE agent_task_queue
+        SET context = (COALESCE(context, '{}'::jsonb) - 'diagnosis_processed'
+              - 'runtime_evidence_recovery_v2_consumed') ||
+            jsonb_build_object('diagnosis_release_attempts', $2::int)
+      WHERE id = $1::uuid`, [taskId, nextAttempts]);
 }
 
 async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postToRelay } = {}) {
@@ -1266,20 +1314,21 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
       const nextStage = action.action === 'release' ? action.nextStage
         : action.action === 'close' ? action.status : null;
       if (nextStage) {
-        const response = await relayPost({ issue_id: task.issue_id, to_stage: nextStage,
-          agent_token: RELAY_AGENT_SECRET,
-          ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
-          ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
-        if (!response.ok && response.status === 409) {
-          // Keep the diagnosis retryable when the bridge is unavailable. The
-          // bridge owns terminal transitions and must record the gate result.
-          await client.query(
-            `UPDATE agent_task_queue
-                SET context = context - 'diagnosis_processed'
-                    - 'runtime_evidence_recovery_v2_consumed'
-              WHERE id = $1::uuid`, [task.id]);
+        try {
+          const response = await relayPost({ issue_id: task.issue_id, to_stage: nextStage,
+            agent_token: RELAY_AGENT_SECRET,
+            ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
+            ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
+          if (!response.ok) {
+            await recordDiagnosisReleaseFailure(client, task.id, task.context,
+              `status=${response.status}; body=${response.body || response.error || ''}`);
+          }
+          console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
+        } catch (err) {
+          await recordDiagnosisReleaseFailure(client, task.id, task.context,
+            `fetch_error=${err.message}`);
+          console.error(`${LOG_PREFIX} [diagnosis] #${task.number}: relay error: ${err.message}`);
         }
-        console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
       } else {
         console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome}`);
       }
@@ -1298,14 +1347,14 @@ function startDaemon() {
     process.exit(1);
   }
   console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
-  setInterval(findAndAdvanceTasks, 15000);
+  setInterval(advanceTick, 15000);
   setInterval(findAndAdvanceRegistered, 20000);
   setInterval(recoveryAdvanceTasks, 120000);
   setInterval(cleanupStalePendingRows, 300000);
   setInterval(requeueStrandedTasks, 60000);
   setInterval(processParkedDiagnoses, 30000);
   setInterval(reconcileQuotaPauses, 60000);
-  findAndAdvanceTasks().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
+  advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
   cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
@@ -1314,5 +1363,5 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
-  reconcileQuotaPauses, processParkedDiagnoses, startDaemon };
+module.exports = { advanceTick, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
+  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, startDaemon };

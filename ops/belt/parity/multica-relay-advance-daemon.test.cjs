@@ -1,7 +1,180 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
-const { qcCompletionAdvance, processParkedDiagnoses } = require('./multica-relay-advance-daemon.cjs');
+const { Client } = require('pg');
+const { qcCompletionAdvance, processParkedDiagnoses,
+  requeueStrandedTasks } = require('./multica-relay-advance-daemon.cjs');
+
+const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+
+test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const start = source.indexOf('`SELECT i.id AS issue_id');
+  const end = source.indexOf('`', start + 1);
+  assert.ok(start >= 0 && end > start, 'requeue candidate SQL must be present');
+  const sql = source.slice(start + 1, end);
+  assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
+  assert.match(sql, /LIMIT \$1::int/);
+  const params = [3, ['Queue', 'In Progress', 'Spec']];
+  const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
+  try {
+    await client.connect();
+    const result = await client.query(sql, params);
+    assert.ok(Array.isArray(result.rows));
+  } finally {
+    await client.end();
+  }
+});
+
+test('PASS sweep SQL plans against the PostgreSQL test schema when qc_verdict is available', async (t) => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const start = source.indexOf('`WITH candidates AS (');
+  const end = source.indexOf('`', start + 1);
+  assert.ok(start >= 0 && end > start, 'PASS sweep SQL must be present');
+  const sql = source.slice(start + 1, end);
+  assert.match(sql, /qc\."verdict" = 'PASS'/);
+  assert.match(sql, /qc\."checker_id"/);
+  const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
+  try {
+    await client.connect();
+    const relation = await client.query("SELECT to_regclass('public.qc_verdict') AS name");
+    if (!relation.rows[0].name) {
+      t.skip('test DB schema lacks public.qc_verdict; live-schema validation remains required');
+      return;
+    }
+    const result = await client.query(`EXPLAIN ${sql}`);
+    assert.ok(Array.isArray(result.rows));
+  } finally {
+    await client.end();
+  }
+});
+
+function strandedFixture(overrides = {}) {
+  return {
+    issue_id: '223e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000',
+    number: 159,
+    stage: 'Queue',
+    updated_at: '2026-09-01T21:46:00Z',
+    metadata: {},
+    dead_task_id: '123e4567-e89b-42d3-a456-426614174000',
+    dead_task_status: 'failed',
+    attempt: 1,
+    max_attempts: 2,
+    failure_reason: 'cancelled',
+    dead_task_result: null,
+    dead_task_error: 'task cancelled by server',
+    from_stage: 'Queue',
+    agent_id: '423e4567-e89b-42d3-a456-426614174000',
+    runtime_id: '523e4567-e89b-42d3-a456-426614174000',
+    runtime_provider: 'codex',
+    runtime_mode: 'cloud',
+    instructions: 'Queue',
+    model: 'deepseek/chat',
+    thinking_level: 'low',
+    max_concurrent_tasks: 1,
+    token_budget: 1,
+    runtime_config: {},
+    archived_at: null,
+    agent_name: 'builder',
+    ...overrides
+  };
+}
+
+function strandedHarness(fixtures) {
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('FROM issue i') && sql.includes('LIMIT $1')) {
+      return { rows: fixtures.filter((row) => row.eligible !== false)
+        .sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at))
+        .slice(0, values[0]) };
+    }
+    if (sql.includes('COALESCE(a.max_concurrent_tasks')) {
+      return { rows: fixtures.map((row) => ({ agent_id: row.agent_id, cap: 1, in_flight: 0 })) };
+    }
+    if (sql.includes('max(EXTRACT(epoch')) return { rows: [{ age: 0 }] };
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (sql.includes('pg_advisory_xact_lock') || sql.includes('FROM issue WHERE id')) return { rows: [] };
+    if (sql.includes('FROM agent_task_queue') && sql.includes('FOR UPDATE')) return { rows: [] };
+    if (sql.includes('count(*)::int AS n')) return { rows: [{ n: 1 }] };
+    if (sql.includes('INSERT INTO agent_task_queue')) {
+      return { rows: [{ id: '623e4567-e89b-42d3-a456-426614174000' }] };
+    }
+    if (sql.includes('INSERT INTO relay_run_log')) return { rows: [] };
+    throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
+  }, release() {} };
+  return { queries, run: () => requeueStrandedTasks({ dbPool: { connect: async () => client } }) };
+}
+
+test('stranded-task fixture redispatches a cancelled-only task', async () => {
+  const harness = strandedHarness([strandedFixture()]);
+  await harness.run();
+  const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.ok(insert);
+  assert.match(insert.values[3], /"source":"relay-requeue"/);
+  assert.match(insert.values[3], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
+});
+
+test('stranded-task fixtures leave running tasks and bundled children untouched', async () => {
+  for (const fixture of [
+    { ...strandedFixture({ dead_task_status: 'running', eligible: false }), label: 'running' },
+    { ...strandedFixture({ parent_issue_id: '723e4567-e89b-42d3-a456-426614174000', eligible: false }), label: 'bundled child' }
+  ]) {
+    const harness = strandedHarness([fixture]);
+    await harness.run();
+    assert.equal(harness.queries.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue')), false,
+      `${fixture.label} must not be redispatched`);
+    const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
+    assert.match(candidateQuery.sql, /t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)/);
+    assert.match(candidateQuery.sql, /i\.parent_issue_id IS NULL/);
+  }
+});
+
+test('In Review fixture is outside the exact requeue stage set', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const inReview = strandedFixture({ stage: 'In Review' });
+  assert.equal(inReview.stage, 'In Review');
+  assert.match(source, /RELAY_REQUEUE_STAGES \|\| 'Queue,In Progress,Spec'/);
+  assert.doesNotMatch(source, /RELAY_REQUEUE_STAGES \|\| '[^']*In Review/);
+});
+
+test('completed-latest fixture is excluded by the candidate predicate', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('function diagnosisText'));
+  const completed = strandedFixture({ dead_task_status: 'completed' });
+  assert.equal(completed.dead_task_status, 'completed');
+  assert.match(requeue, /AND \(t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)\)/);
+  assert.doesNotMatch(requeue, /t\.status = 'completed'/);
+});
+
+test('live task on another stage fixture is excluded for every stage', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const liveOtherStage = strandedFixture({ live_task_stage: 'Spec' });
+  assert.equal(liveOtherStage.live_task_stage, 'Spec');
+  assert.match(source, /WHERE q\.issue_id = i\.id AND q\.status IN/);
+  assert.doesNotMatch(source, /COALESCE\(q\.context->>'to_stage', ''\) = i\.status/);
+});
+
+test('five eligible fixtures dispatch exactly the three oldest globally', async () => {
+  const fixtures = [
+    strandedFixture({ number: 5, issue_id: '223e4567-e89b-42d3-a456-426614174005', agent_id: '423e4567-e89b-42d3-a456-426614174005', issue_created_at: '2026-09-01T00:05:00Z' }),
+    strandedFixture({ number: 1, issue_id: '223e4567-e89b-42d3-a456-426614174001', agent_id: '423e4567-e89b-42d3-a456-426614174001', issue_created_at: '2026-09-01T00:01:00Z' }),
+    strandedFixture({ number: 4, issue_id: '223e4567-e89b-42d3-a456-426614174004', agent_id: '423e4567-e89b-42d3-a456-426614174004', issue_created_at: '2026-09-01T00:04:00Z' }),
+    strandedFixture({ number: 2, issue_id: '223e4567-e89b-42d3-a456-426614174002', agent_id: '423e4567-e89b-42d3-a456-426614174002', issue_created_at: '2026-09-01T00:02:00Z' }),
+    strandedFixture({ number: 3, issue_id: '223e4567-e89b-42d3-a456-426614174003', agent_id: '423e4567-e89b-42d3-a456-426614174003', issue_created_at: '2026-09-01T00:03:00Z' })
+  ];
+  const harness = strandedHarness(fixtures);
+  await harness.run();
+  const dispatched = harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.equal(dispatched.length, 3);
+  assert.deepEqual(dispatched.map(({ values }) => values[1]), fixtures.slice(1, 2)
+    .concat(fixtures.slice(3, 5)).map((row) => row.issue_id));
+  const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
+  assert.match(candidateQuery.sql, /ORDER BY i\.created_at ASC\s+LIMIT \$1/);
+  assert.doesNotMatch(candidateQuery.sql, /ROW_NUMBER\(\) OVER/);
+});
 
 const QC_ROW = {
   task_id: '11111111-1111-4111-8111-111111111111',
@@ -155,11 +328,12 @@ test('stranded-task recovery propagates the issue workspace to its successor', (
   assert.match(requeue, /\[row\.agent_id, row\.issue_id, row\.workspace_id, row\.runtime_id/);
 });
 
-test('stranded-task recovery does not retry a semantically blocked completion', () => {
+test('stranded-task recovery excludes completed predecessors before admission', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  assert.match(source, /t\.result AS dead_task_result/);
-  assert.match(source, /row\.dead_task_status === 'completed'/);
-  assert.match(source, /completed predecessor failed completion admission/);
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('function diagnosisText'));
+  assert.match(requeue, /t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)/);
+  assert.doesNotMatch(requeue, /row\.dead_task_status === 'completed'/);
 });
 
 test('Registered recovery applies the same completion gate', () => {
@@ -188,10 +362,102 @@ test('runtime-evidence recovery is one-shot, typed, and stays on relay authority
   assert.doesNotMatch(diagnosis, /UPDATE issue SET status/);
 });
 
-test('evidence recovery replays only an unchanged 409 release rejection', () => {
+test('diagnosis release retries every non-2xx response and records the attempt', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  assert.match(source, /!response\.ok && response\.status === 409/);
-  assert.match(source, /context - 'diagnosis_processed'\s*- 'runtime_evidence_recovery_v2_consumed'/);
+  assert.match(source, /if \(!response\.ok\)/);
+  assert.match(source, /diagnosis_release_attempts/);
+  assert.match(source, /- 'diagnosis_processed'\s*- 'runtime_evidence_recovery_v2_consumed'/);
+});
+
+test('diagnosis release stops retrying at five failures and saves the relay error', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const releaseFailure = source.slice(source.indexOf('async function recordDiagnosisReleaseFailure'),
+    source.indexOf('async function processParkedDiagnoses'));
+  assert.match(source, /if \(nextAttempts >= 5\)/);
+  assert.match(releaseFailure, /WHERE id = \$1::uuid/);
+  assert.match(releaseFailure, /'diagnosis_release_attempts', \$2::int/);
+  assert.match(source, /'diagnosis_release_error', \$3::text/);
+  assert.match(source, /status=\$\{response\.status\}; body=\$\{response\.body/);
+  assert.match(source, /fetch_error=\$\{err\.message\}/);
+});
+
+test('a 500 diagnosis release is retried on the next tick', async () => {
+  const task = { id: '123e4567-e89b-42d3-a456-426614174001', issue_id: '223e4567-e89b-42d3-a456-426614174001',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174001', number: 43, status: 'Parked', context: {},
+    result: 'outcome: fixable' };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM issue_spec')) return { rows: [{ id: 'spec-1' }] };
+    if (sql.includes("'diagnosis_release_attempts'")) task.context.diagnosis_release_attempts = values[1];
+    return { rows: [] };
+  }, release() {} };
+  let posts = 0;
+  const options = { diagnosisPool: { connect: async () => client }, relayPost: async () => {
+    posts += 1;
+    return { ok: false, status: 500, body: 'bridge failed' };
+  } };
+  await processParkedDiagnoses(options);
+  await processParkedDiagnoses(options);
+  assert.equal(posts, 2);
+  assert.equal(task.context.diagnosis_release_attempts, 2);
+  assert.ok(queries.some(({ sql }) => sql.includes("- 'diagnosis_processed'")));
+});
+
+test('a thrown diagnosis release unsets processed and increments its retry count', async () => {
+  const task = { id: '123e4567-e89b-42d3-a456-426614174003', issue_id: '223e4567-e89b-42d3-a456-426614174003',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174003', number: 45, status: 'Parked', context: {},
+    result: 'outcome: fixable' };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM issue_spec')) return { rows: [{ id: 'spec-1' }] };
+    return { rows: [] };
+  }, release() {} };
+  await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+    relayPost: async () => { throw new Error('connection reset'); } });
+  const retry = queries.find(({ sql }) => sql.includes("- 'diagnosis_processed'"));
+  assert.deepEqual(retry.values, [task.id, 1]);
+});
+
+test('a 409 diagnosis release unsets processed and increments its retry count', async () => {
+  const task = { id: '123e4567-e89b-42d3-a456-426614174004', issue_id: '223e4567-e89b-42d3-a456-426614174004',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174004', number: 46, status: 'Parked', context: {},
+    result: 'outcome: fixable' };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM issue_spec')) return { rows: [{ id: 'spec-1' }] };
+    return { rows: [] };
+  }, release() {} };
+  await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+    relayPost: async () => ({ ok: false, status: 409, body: 'already advanced' }) });
+  const retry = queries.find(({ sql }) => sql.includes("- 'diagnosis_processed'"));
+  assert.deepEqual(retry.values, [task.id, 1]);
+});
+
+test('the fifth failed diagnosis release remains processed with its error', async () => {
+  const task = { id: '123e4567-e89b-42d3-a456-426614174002', issue_id: '223e4567-e89b-42d3-a456-426614174002',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174002', number: 44,
+    context: { diagnosis_release_attempts: 4 }, result: 'outcome: fixable' };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM issue_spec')) return { rows: [{ id: 'spec-1' }] };
+    return { rows: [] };
+  }, release() {} };
+  await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+    relayPost: async () => ({ ok: false, status: 502, body: 'bad gateway' }) });
+  const bounded = queries.find(({ sql }) => sql.includes("'diagnosis_release_error'"));
+  assert.deepEqual(bounded.values.slice(1), [5, 'status=502; body=bad gateway']);
 });
 
 test('canonical evidence rejects a parked-diagnosis citation', () => {
