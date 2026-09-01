@@ -7,7 +7,12 @@ process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
 process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
-const { existingStageTask, replaceStageTask, ownerStageForTransition } = require('./multica-bridge.cjs');
+const {
+  existingStageTask,
+  replaceStageTask,
+  ownerStageForTransition,
+  ensureCompletedRelayLog
+} = require('./multica-bridge.cjs');
 
 test('transition owner selection preserves forward lanes and routes backward branches to lane owners', () => {
   assert.equal(ownerStageForTransition('Spec', 'Queue'), 'Spec');
@@ -125,6 +130,47 @@ test('an already-applied transition locates its existing live successor task', a
   assert.match(calls[0].sql, /FOR UPDATE/);
   assert.deepEqual(calls[0].values, ['issue-1',
     ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred'], 'In Review']);
+});
+
+test('deploy close upgrades one oldest pending relay row', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return calls.length === 1 ? { rows: [{ id: 41 }, { id: 42 }] } : { rows: [] };
+  } };
+
+  const id = await ensureCompletedRelayLog(client, 'issue-1', 'CI/CD & Deploy', 'Done');
+
+  assert.equal(id, 41);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].sql, /ORDER BY created_at, id\s+LIMIT 1/);
+});
+
+test('deploy close inserts one completed relay row when no pending row exists', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return calls.length === 2 ? { rows: [{ id: 42 }] } : { rows: [] };
+  } };
+
+  const id = await ensureCompletedRelayLog(client, 'issue-2', 'CI/CD & Deploy', 'Done');
+
+  assert.equal(id, 42);
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].sql, /INSERT INTO relay_run_log/);
+});
+
+test('deploy close retry does not duplicate an existing completed row', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [] };
+  } };
+
+  const id = await ensureCompletedRelayLog(client, 'issue-3', 'CI/CD & Deploy', 'Done');
+
+  assert.equal(id, null);
+  assert.equal(calls.length, 2);
 });
 
 test('release admission is explicit, one-use, and resets task history by time', () => {
