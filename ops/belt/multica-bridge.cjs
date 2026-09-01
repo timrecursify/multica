@@ -229,7 +229,31 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
 
 function isCicdReturn(fromStage, toStage, reason) {
   return fromStage === "CI/CD & Deploy" && toStage === "In Progress" &&
-    typeof reason === "string" && reason.startsWith("RETURN:In Progress — ");
+    typeof reason === "string" &&
+    /^RETURN:In Progress — [^\s/]+\/[^\s#]+#[1-9][0-9]* (?:merge conflict; verify master\.\.merge diff after rebase|no CI runs after [1-9][0-9]* minutes)$/.test(reason);
+}
+
+// The CI/CD repair exception is intentionally per-issue, not per caller
+// reason.  This conditional update is performed in the relay transaction, so
+// the row lock and durable marker make the authorization single-use across a
+// complete return -> build -> QC -> deploy cycle.
+async function consumeCicdReturnAuthorization(client, issueId) {
+  const consumed = await client.query(
+    `UPDATE "issue"
+        SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                                 '{cicd_return_consumed_at}', to_jsonb(NOW()), true),
+            updated_at = NOW()
+      WHERE id = $1
+        AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'cicd_return_consumed_at')
+      RETURNING id`,
+    [issueId]
+  );
+  return consumed.rows.length === 1;
+}
+
+async function authorizeCicdReturnCapBypass(client, issueId, capBypass) {
+  if (!capBypass) return false;
+  return consumeCicdReturnAuthorization(client, issueId);
 }
 
 async function replaceStageTask(client, task) {
@@ -567,10 +591,13 @@ async function relayAdvance(req, res, body) {
     // below; the relay secret is the authority boundary for this exception.
     const parkedDiagnosisDone = issue.status === "Parked" && to_stage === "Done";
     // A deploy worker return is a bounded change-of-hands, not another blind
-    // retry. It admits exactly one repair task after a named terminal deploy
-    // blocker (merge conflict or absent CI), even when historical retry counts
-    // are exhausted. The next build/QC cycle remains subject to normal gates.
-    const cicdReturn = isCicdReturn(issue.status, to_stage, reason);
+    // retry. It admits one repair task after a named terminal deploy blocker
+    // (merge conflict or absent CI), even when historical retry counts are
+    // exhausted. Its durable authorization is consumed only after admission
+    // succeeds and only when it must bypass an execution cap.
+    const cicdReturn = isCicdReturn(issue.status, to_stage, reason) &&
+      !issue.metadata?.cicd_return_consumed_at;
+    let cicdReturnCapBypass = false;
     const releaseAt = issue.metadata?.parked_release_at || null;
     if (issue.status === to_stage) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
@@ -881,9 +908,8 @@ async function relayAdvance(req, res, body) {
             AND ($3::timestamptz IS NULL OR created_at >= $3)`,
         [issue.id, to_stage, releaseAt]
       );
-      const cycle = cicdReturn ? { ok: true } :
-        stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
-      if (!cycle.ok) {
+      const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
+      if (!cycle.ok && !cicdReturn) {
         const moved = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
           target_stage: to_stage, historical_tasks: history.rows[0]?.n || 0,
           ceiling: cycle.ceiling
@@ -916,9 +942,9 @@ async function relayAdvance(req, res, body) {
             AND ($2::timestamptz IS NULL OR created_at >= $2)`,
         [issue.id, releaseAt]
       );
-      const lifetime = cicdReturn ? { ok: true } :
-        lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
-      if (!lifetime.ok) {
+      const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
+      cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
+      if (!lifetime.ok && !cicdReturn) {
         const moved = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
           target_stage: to_stage, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
           ceiling: lifetime.ceiling
@@ -982,6 +1008,11 @@ async function relayAdvance(req, res, body) {
           ...admission
         }));
         return;
+      }
+      if (cicdReturnCapBypass && !await authorizeCicdReturnCapBypass(
+        client, issue.id, cicdReturnCapBypass
+      )) {
+        throw new Error(`CI/CD return authorization already consumed: ${issue.id}`);
       }
     }
 
@@ -1156,5 +1187,7 @@ module.exports = {
   completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff,
-  isCicdReturn
+  isCicdReturn,
+  consumeCicdReturnAuthorization,
+  authorizeCicdReturnCapBypass
 };

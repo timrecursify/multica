@@ -15,17 +15,45 @@ const {
   completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff,
-  isCicdReturn
+  isCicdReturn,
+  consumeCicdReturnAuthorization,
+  authorizeCicdReturnCapBypass
 } = require('./multica-bridge.cjs');
 
-test('only a named CI/CD return receives one bounded repair admission', () => {
+test('only a named CI/CD return is eligible for a repair authorization', () => {
   assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
-    'RETURN:In Progress — owner/repo#1 merge conflict'), true);
+    'RETURN:In Progress — owner/repo#1 merge conflict; verify master..merge diff after rebase'), true);
   assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress', ''), false);
   assert.equal(isCicdReturn('In Review', 'In Progress',
     'RETURN:In Progress — retry'), false);
   assert.equal(isCicdReturn('CI/CD & Deploy', 'Queue',
     'RETURN:Queue — retry'), false);
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
+    'RETURN:In Progress — arbitrary caller text'), false);
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
+    'RETURN:In Progress — owner/repo#8 no CI runs after 20 minutes'), true);
+});
+
+test('CI/CD return authorization is consumed only by a cap bypass after admission', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: calls.length === 1 ? [{ id: 'issue-1' }] : [] };
+  } };
+
+  assert.equal(await authorizeCicdReturnCapBypass(client, 'issue-1', false), false);
+  assert.equal(await authorizeCicdReturnCapBypass(client, 'issue-1', true), true);
+  assert.equal(await authorizeCicdReturnCapBypass(client, 'issue-1', true), false);
+  assert.equal(calls.length, 2);
+  assert.match(calls[0].sql, /cicd_return_consumed_at/);
+  assert.match(calls[0].sql, /NOT \(COALESCE\(metadata, '\{\}'::jsonb\) \? 'cicd_return_consumed_at'\)/);
+  assert.deepEqual(calls[0].values, ['issue-1']);
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const admission = source.indexOf('const admission = crossStageExecutionAdmission');
+  const authorization = source.indexOf('await authorizeCicdReturnCapBypass');
+  assert.ok(admission >= 0 && authorization > admission,
+    'the 202 cross-stage admission must precede authorization consumption');
+  assert.match(source, /!issue\.metadata\?\.cicd_return_consumed_at/);
 });
 
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
