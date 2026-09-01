@@ -269,6 +269,9 @@ jobs:
       - name: Test daemon deployment contract
         run: bash ops/belt/deploy.test.sh
 
+      - name: Test parked diagnosis backfill
+        run: node --test ops/belt/backfill-parked-diagnosis.test.cjs
+
   backend:
     runs-on: ubuntu-latest
     services:
