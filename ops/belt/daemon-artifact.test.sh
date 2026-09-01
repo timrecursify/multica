@@ -28,7 +28,7 @@ case "$1" in
     if [[ "${CORRUPT_BACKUP:-0}" == 1 && "$count" -eq 1 ]]; then for backup in "$(dirname "$TARGET")"/"$(basename "$TARGET")".bak-*; do printf corrupt >"$backup"; done; fi
     if [[ ( "${RELOAD_FAIL:-0}" == 1 && "$count" -eq 1 ) || ( "${ROLLBACK_RELOAD_FAIL:-0}" == 1 && "$count" -gt 1 ) ]]; then exit 1; fi
     cp "$TARGET" "$PROC_ROOT/77/exe"
-    if [[ "${WRONG_CAP:-0}" == 1 && "$count" -eq 1 ]]; then printf 'server\0daemon\0start\0--max-concurrent-tasks=320\0' >"$PROC_ROOT/77/cmdline"; else printf 'server\0daemon\0start\0--max-concurrent-tasks=32\0' >"$PROC_ROOT/77/cmdline"; fi;;
+    if [[ "${SINGLE_ARG:-0}" == 1 && "$count" -eq 1 ]]; then printf 'server daemon start\0--max-concurrent-tasks=32\0' >"$PROC_ROOT/77/cmdline"; elif [[ "${WRONG_CAP:-0}" == 1 && "$count" -eq 1 ]]; then printf 'server\0daemon\0start\0--max-concurrent-tasks=320\0' >"$PROC_ROOT/77/cmdline"; else printf 'server\0daemon\0start\0--max-concurrent-tasks=32\0' >"$PROC_ROOT/77/cmdline"; fi;;
 esac
 EOF
 chmod +x "$tmp/pm2"
@@ -39,6 +39,8 @@ run_case reload-failure 1 "$old_sum" RELOAD_FAIL=1
 run_case crash-loop 1 "$old_sum" CRASH_LOOP=1
 run_case wrong-pid 1 "$old_sum" WRONG_PID=1
 run_case wrong-cap 1 "$old_sum" WRONG_CAP=1
+run_case single-argv 1 "$old_sum" SINGLE_ARG=1
+reset; lock="$tmp/deploy.lock"; flock "$lock" -c 'sleep 2' & holder=$!; sleep .1; set +e; TEST_ROOT="$tmp" TARGET="$tmp/runtime/server" PROC_ROOT="$tmp/proc" MULTICA_DAEMON_TARGET="$tmp/runtime/server" MULTICA_DAEMON_DEPLOY_LOCK="$lock" PM2_BIN="$tmp/pm2" "$root/deploy-daemon-artifact.sh" --artifact-dir "$tmp/artifact" --source-sha "$sha" --apply >/dev/null 2>&1; rc=$?; set -e; wait "$holder"; [[ "$rc" == 78 && "$(sha256sum "$tmp/runtime/server"|awk '{print $1}')" == "$old_sum" ]]
 run_case corrupt-backup 79 "$sum" CORRUPT_BACKUP=1 WRONG_CAP=1
 run_case rollback-reload-failure 79 "$old_sum" ROLLBACK_RELOAD_FAIL=1 WRONG_CAP=1
 printf 'SOURCE_SHA=%s;touch pwned\nBINARY_SHA256=%s\nGOOS=linux\nGOARCH=amd64\n' "$sha" "$sum" >"$tmp/artifact/daemon-artifact.env"
