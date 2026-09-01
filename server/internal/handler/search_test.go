@@ -76,9 +76,14 @@ func TestBuildSearchQuery_MultiTerm(t *testing.T) {
 
 func TestBuildSearchQuery_MultiTermDoesNotRepeatPhrasePredicate(t *testing.T) {
 	query, _ := buildSearchQuery(linearTestContract, "task.list operation failed", []string{"task.list", "operation", "failed"}, 0, false, false)
-	whereStart := strings.Index(query, "WHERE ")
+	fromStart := strings.Index(query, "FROM issue i")
+	if fromStart == -1 {
+		t.Fatalf("query does not contain the issue source: %s", query)
+	}
+	whereOffset := strings.Index(query[fromStart:], "WHERE ")
+	whereStart := fromStart + whereOffset
 	orderStart := strings.LastIndex(query, "ORDER BY ")
-	if whereStart == -1 || orderStart <= whereStart {
+	if whereOffset == -1 || orderStart <= whereStart {
 		t.Fatalf("query does not contain a bounded WHERE clause: %s", query)
 	}
 	whereClause := query[whereStart:orderStart]
