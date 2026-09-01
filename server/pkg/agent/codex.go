@@ -2955,6 +2955,19 @@ func (c *codexClient) handleEvent(msg map[string]any) {
 			}
 		}
 		changes := codexNormalizeLegacyChanges(msg["changes"])
+		// Legacy patch_apply_end events can claim completion without any
+		// evidence that the requested patch reached the filesystem. Do not
+		// present that shape as a successful tool result: callers otherwise
+		// have no way to distinguish it from a patch that was actually applied.
+		if codexNormalizePatchStatus(status) == "completed" && len(changes) > 0 && strings.TrimSpace(stdout) == "" {
+			status = "failed"
+			const diagnostic = "patch_apply reported completion without application evidence"
+			if strings.TrimSpace(stderr) == "" {
+				stderr = diagnostic
+			} else {
+				stderr += "\n" + diagnostic
+			}
+		}
 		if c.onMessage != nil {
 			c.onMessage(Message{
 				Type:   MessageToolResult,
