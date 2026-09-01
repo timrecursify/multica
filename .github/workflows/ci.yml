@@ -251,6 +251,21 @@ jobs:
             exit 1
           fi
 
+  belt-runtime:
+    # Hermetic shell regressions for the daemon launch contract. Keep these
+    # independent of the backend services so every push and pull request
+    # validates the restart-critical wrapper and guard directly.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Test daemon wrapper launch contract
+        run: bash ops/belt/wrapper.test.sh
+
+      - name: Test daemon config guard contract
+        run: bash ops/belt/belt-config-guard.test.sh
+
   backend:
     runs-on: ubuntu-latest
     services:

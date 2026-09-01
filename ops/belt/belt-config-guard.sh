@@ -122,6 +122,14 @@ validate_daemon_launch_config() {
   [[ "$cap" =~ ^[1-9][0-9]*$ ]] && [[ -n "$root" && "$root" == /* ]]
 }
 
+wrapper_has_explicit_concurrency_flag() {
+  local wrapper_file="$1"
+  # Keep the runtime cap tied to the validated shell variable. A numeric
+  # literal would silently drift from the environment on a later restart.
+  grep -Fq -- '--max-concurrent-tasks="$cap_raw"' "$wrapper_file" &&
+    ! grep -Eq -- '--max-concurrent-tasks="?[0-9]' "$wrapper_file"
+}
+
 guard_wrapper() {
   if ! validate_daemon_launch_config; then
     unfixable+=("invalid PM2 daemon launch config: cap must be a positive integer and workspaces root an absolute path")
@@ -130,8 +138,8 @@ guard_wrapper() {
        ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp' "$WRAPPER" ||
        ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS' "$ECOSYSTEM" ||
        ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT' "$ECOSYSTEM" ||
-       grep -q -- '--max-concurrent-tasks=' "$WRAPPER"; then
-    unfixable+=("wrapper configuration drifted; expected env-resolved concurrency/root in $WRAPPER")
+       ! wrapper_has_explicit_concurrency_flag "$WRAPPER"; then
+    unfixable+=("wrapper configuration drifted; expected env-resolved concurrency/root and explicit cap flag in $WRAPPER")
   fi
 }
 
