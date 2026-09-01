@@ -412,6 +412,28 @@ func validateIssueStatus(status string) error {
 	return validateIssueEnum("status", status, validIssueStatuses)
 }
 
+// isTerminalIssueStatus reports status spellings that close an issue. The
+// terminal transition is owned by the relay, which records its gate decisions
+// and transition in relay_run_log. The generic CLI must not bypass that path.
+func isTerminalIssueStatus(status string) bool {
+	switch status {
+	case "done", "cancelled", "Done", "Cancelled", "Archived":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateDirectIssueStatusWrite(status string) error {
+	if err := validateIssueStatus(status); err != nil {
+		return err
+	}
+	if isTerminalIssueStatus(status) {
+		return fmt.Errorf("terminal status %q is relay-owned; use the relay transition path", status)
+	}
+	return nil
+}
+
 func validateIssuePriority(priority string) error {
 	return validateIssueEnum("priority", priority, validIssuePriorities)
 }
@@ -1078,7 +1100,7 @@ func runIssueCreate(cmd *cobra.Command, _ []string) error {
 	}
 	statusFlag, _ := cmd.Flags().GetString("status")
 	if statusFlag != "" {
-		if err := validateIssueStatus(statusFlag); err != nil {
+		if err := validateDirectIssueStatusWrite(statusFlag); err != nil {
 			return err
 		}
 	}
@@ -1252,7 +1274,7 @@ func runIssueUpdate(cmd *cobra.Command, args []string) error {
 	statusChanged := cmd.Flags().Changed("status")
 	statusFlag, _ := cmd.Flags().GetString("status")
 	if statusChanged {
-		if err := validateIssueStatus(statusFlag); err != nil {
+		if err := validateDirectIssueStatusWrite(statusFlag); err != nil {
 			return err
 		}
 	}
@@ -1446,7 +1468,7 @@ func runIssueStatus(cmd *cobra.Command, args []string) error {
 	id := args[0]
 	status := args[1]
 
-	if err := validateIssueStatus(status); err != nil {
+	if err := validateDirectIssueStatusWrite(status); err != nil {
 		return err
 	}
 
