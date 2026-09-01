@@ -47,6 +47,17 @@ test('stranded-task recovery does not retry a semantically blocked completion', 
   assert.match(source, /completed predecessor failed completion admission/);
 });
 
+test('stranded-task recovery orders each owner partition by immutable creation time', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('async function processParkedDiagnoses'));
+  assert.match(requeue, /PARTITION BY c\.agent_id ORDER BY c\.created_at ASC, c\.issue_id ASC/);
+  assert.match(requeue, /SELECT i\.id AS issue_id, i\.workspace_id, i\.number, i\.priority, i\.status AS stage, i\.created_at, i\.metadata,/);
+  assert.match(requeue, /ORDER BY ranked\.created_at ASC, ranked\.issue_id ASC/);
+  assert.doesNotMatch(requeue, /PARTITION BY c\.agent_id ORDER BY c\.updated_at/);
+  assert.doesNotMatch(requeue, /ORDER BY ranked\.updated_at/);
+});
+
 test('Registered recovery applies the same completion gate', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const recovery = source.slice(source.indexOf('async function recoveryAdvanceTasks'),

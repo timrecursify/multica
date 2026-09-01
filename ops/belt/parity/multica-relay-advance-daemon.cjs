@@ -586,17 +586,17 @@ async function requeueStrandedTasks() {
   try {
     const candidates = await client.query(
       // The outer wrapper ranks candidates per owning agent. A single global
-      // `ORDER BY updated_at ASC LIMIT n` let the oldest backlog monopolise
+      // oldest-created ordering without per-agent partitioning let the oldest backlog monopolise
       // every tick: ~300 Spec tickets are all older than any In Review one,
       // so the In Review lane would never appear in a 3-row window and its
       // tickets could not be recovered at all. Ranking per agent gives each
-      // owning lane its own oldest-first slice; the per-agent capacity check
+      // owning lane its own oldest-created-first slice; the per-agent capacity check
       // below is still what decides how many actually dispatch.
       `SELECT * FROM (
        SELECT c.*, ROW_NUMBER() OVER (
-                PARTITION BY c.agent_id ORDER BY c.updated_at ASC
+                PARTITION BY c.agent_id ORDER BY c.created_at ASC, c.issue_id ASC
               ) AS rn FROM (
-       SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage, i.updated_at, i.metadata,
+       SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage, i.created_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason,
               t.result AS dead_task_result, t.error AS dead_task_error,
@@ -689,7 +689,7 @@ async function requeueStrandedTasks() {
        ) c
        ) ranked
         WHERE ranked.rn <= $2
-        ORDER BY ranked.updated_at ASC`,
+        ORDER BY ranked.created_at ASC, ranked.issue_id ASC`,
       [INFRA_FAILURE_REASONS, REQUEUE_BATCH, REQUEUE_STAGES]
     );
 
