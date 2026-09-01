@@ -14,6 +14,7 @@ const {
   crossStageExecutionAdmission
 } = require("./guardrails.cjs");
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed } = require("./parked-diagnosis.cjs");
+const { completionAdmission } = require("./relay-completion-admission.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -298,18 +299,23 @@ async function replaceStageTask(client, task) {
 // before the issue status changes, so a manual shortcut cannot skip the build.
 async function recordBookkeepingHandoff(client, issueId) {
   const predecessor = await client.query(
-    `SELECT id, agent_id
+    `SELECT id, agent_id, status, result
        FROM agent_task_queue
       WHERE issue_id = $1
         AND context->>'to_stage' = 'Queue'
-        AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred', 'completed')
+        AND status = 'completed'
       ORDER BY created_at DESC
       LIMIT 1
       FOR UPDATE`,
     [issueId]
   );
   const task = predecessor.rows[0];
-  if (!task) return null;
+  // A terminal status alone is not a work-product proof. Keep this check
+  // aligned with the completion daemon so a handoff cannot race a failing
+  // builder or turn a missing result into a paid QC dispatch.
+  if (!task || task.status !== 'completed' || !completionAdmission(task.result).ok) {
+    return null;
+  }
 
   const log = await client.query(
     `WITH existing AS (
