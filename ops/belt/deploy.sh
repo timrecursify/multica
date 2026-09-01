@@ -44,6 +44,7 @@ declare -a sources=(
   "$root_dir/RUNBOOK_SPEC_WORKER.md"
   "$root_dir/RUNBOOK_BUILD_WORKER.md"
   "$root_dir/WORKER_COMMON.md"
+  "$root_dir/relay-completion-admission.cjs"
 )
 
 declare -a targets=(
@@ -59,6 +60,7 @@ declare -a targets=(
   "$runtime_root/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
   "$runtime_root/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
   "$runtime_root/multica-doctrine/WORKER_COMMON.md"
+  "$runtime_root/gsp-multica/relay-completion-admission.cjs"
 )
 
 selected() {
@@ -110,7 +112,8 @@ for index in "${!sources[@]}"; do
   selected "$index" || continue
   new_targets[$index]=0
   [[ "${targets[$index]}" == "$runtime_root/gsp-multica/guardrails.cjs" ||
-     "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ]] && new_targets[$index]=1
+     "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ||
+     "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
     invalid=1

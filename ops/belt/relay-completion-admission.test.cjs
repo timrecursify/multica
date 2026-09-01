@@ -11,27 +11,29 @@ test('admits a completed work-product result', () => {
 });
 
 test('holds explicit blocked completion evidence', () => {
-  assert.equal(completionAdmission({ output: 'Blocked on verification: no Go toolchain; no commit or PR' }).reason,
-    'completion_blocked');
+  assert.deepEqual(completionAdmission({ output: 'Blocked on verification: no Go toolchain; no commit or PR' }),
+    { ok: false, reason: 'completion_blocked', disposition: 'Parked' });
 });
 
 test('holds QC-BLOCKED completion evidence', () => {
-  assert.equal(completionAdmission({ output: 'QC-BLOCKED: checkout unavailable' }).reason,
-    'completion_qc_blocked');
-  assert.equal(completionAdmission({ output: 'QC-BLOCKED' }).reason,
-    'completion_qc_blocked');
+  for (const output of ['QC-BLOCKED: checkout unavailable', 'QC-BLOCKED']) {
+    assert.deepEqual(completionAdmission({ output }),
+      { ok: false, reason: 'completion_qc_blocked', disposition: 'Parked' });
+  }
 });
 
 test('holds explicit FAIL completion evidence', () => {
-  assert.equal(completionAdmission({ output: 'QC VERDICT: FAIL\nMissing required fixture.' }).reason,
-    'completion_failed');
-  assert.equal(completionAdmission({ output: 'FAIL' }).reason, 'completion_failed');
+  for (const output of ['QC VERDICT: FAIL\nMissing required fixture.', 'FAIL']) {
+    assert.deepEqual(completionAdmission({ output }),
+      { ok: false, reason: 'completion_failed', disposition: 'Parked' });
+  }
 });
 
 test('holds missing result and explicit no-work-product result', () => {
-  assert.equal(completionAdmission(null).reason, 'missing_result');
-  assert.equal(completionAdmission({ output: 'No work product' }).reason,
-    'completion_no_work_product');
+  assert.deepEqual(completionAdmission(null),
+    { ok: false, reason: 'missing_result', disposition: 'Parked' });
+  assert.deepEqual(completionAdmission({ output: 'No work product' }),
+    { ok: false, reason: 'completion_no_work_product', disposition: 'Parked' });
 });
 
 test('does not reject prose that mentions an earlier blocker', () => {
