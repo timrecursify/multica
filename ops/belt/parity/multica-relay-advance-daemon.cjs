@@ -858,6 +858,7 @@ async function processParkedDiagnoses() {
         const target = await client.query(
           `SELECT id FROM issue
             WHERE workspace_id = $1 AND id <> $2
+              AND status NOT IN ('Cancelled', 'Archived')
               AND (id::text = $3 OR number::text = $3)
             ORDER BY (status = 'Done') DESC, updated_at DESC
             LIMIT 1`, [task.workspace_id, task.issue_id, duplicate]);
