@@ -3,11 +3,14 @@
 // One-shot operator backfill. It is intentionally separate from the live
 // bridge: dry-run is read-only, apply is explicit, and each ticket is locked
 // before the shared parking contract is called.
-const { Pool } = require('pg');
 const { recordParkAndQueueDiagnosis, PARK_DIAGNOSIS_KIND } = require('./parked-diagnosis.cjs');
 
 const DEFAULT_BATCH = 25;
 const MAX_BATCH = 25;
+// The operator may inspect at most four batches per invocation. This keeps
+// stale/blocker rows from making the query unbounded while still allowing a
+// normal batch to be filled after skipped rows.
+const MAX_SCAN_WINDOW = MAX_BATCH * 4;
 const NONTERMINAL = ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred'];
 
 function parseArgs(argv) {
@@ -35,6 +38,25 @@ function usage() {
   return 'Usage: backfill-parked-diagnosis.cjs (--dry-run|--apply) [--batch-size N] [--workspace UUID]';
 }
 
+function interleaveByWorkspace(rows) {
+  const groups = new Map();
+  for (const row of rows) {
+    const key = String(row.workspace_id);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const ordered = [];
+  const keys = [...groups.keys()].sort();
+  for (let offset = 0; ; offset += 1) {
+    let added = false;
+    for (const key of keys) {
+      const row = groups.get(key)[offset];
+      if (row) { ordered.push(row); added = true; }
+    }
+    if (!added) return ordered;
+  }
+}
+
 async function inspect(client, issue) {
   const blocker = issue.metadata && typeof issue.metadata === 'object'
     ? issue.metadata.parked_blocker : null;
@@ -42,11 +64,20 @@ async function inspect(client, issue) {
   const task = await client.query(
     `SELECT id, status FROM agent_task_queue
       WHERE issue_id = $1 AND context->>'kind' = $2
-      ORDER BY created_at ASC`, [issue.id, PARK_DIAGNOSIS_KIND]);
+      ORDER BY created_at DESC, id DESC`, [issue.id, PARK_DIAGNOSIS_KIND]);
   if (task.rowCount) {
-    const status = task.rows.some((row) => row.status === 'completed') ? 'completed' : task.rows[0].status;
+    // Any historical diagnosis is a lifetime guard. The newest status is
+    // reported truthfully, including terminal failures/cancellations.
+    const status = task.rows[0].status == null
+      ? null : String(task.rows[0].status).toLowerCase();
+    const reason = status === 'completed' ? 'completed_parked_diagnosis'
+      : status === 'failed' ? 'failed_parked_diagnosis'
+        : status === 'cancelled' ? 'cancelled_parked_diagnosis'
+          : (status == null || NONTERMINAL.includes(status)) ? 'nonterminal_parked_diagnosis'
+            : 'existing_parked_diagnosis';
     return { kind: 'skip',
-      reason: status === 'completed' ? 'completed_parked_diagnosis' : 'nonterminal_parked_diagnosis',
+      reason,
+      status,
       task_id: task.rows[0].id };
   }
   const comment = await client.query(
@@ -57,30 +88,50 @@ async function inspect(client, issue) {
 
 async function run(pool, options) {
   const where = options.workspace ? 'AND workspace_id = $1' : '';
+  const values = options.workspace ? [options.workspace, MAX_SCAN_WINDOW] : [MAX_SCAN_WINDOW];
+  const limitParam = options.workspace ? '$2' : '$1';
   const listed = await pool.query(
-    `SELECT id, workspace_id, status, priority, metadata
-       FROM issue WHERE status = 'Parked' ${where}
-      ORDER BY workspace_id, id`, options.workspace ? [options.workspace] : []);
+    `WITH ranked AS (
+       SELECT id, workspace_id, status, priority, metadata,
+              ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY id) AS workspace_rank
+         FROM issue
+        WHERE status = 'Parked' ${where}
+     )
+     SELECT id, workspace_id, status, priority, metadata
+       FROM ranked
+      WHERE workspace_rank <= ${limitParam}
+      ORDER BY workspace_rank, workspace_id, id
+      LIMIT ${limitParam}`, values);
   const counts = { selected: 0, queued: 0, would_queue: 0, skipped_blocker: 0,
-    skipped_existing: 0, skipped_completed: 0, skipped_no_owner: 0,
-    stale: 0, failed: 0 };
+    skipped_existing: 0, skipped_completed: 0, skipped_failed: 0,
+    skipped_cancelled: 0, skipped_no_owner: 0, stale: 0, failed: 0,
+    scanned: 0, scan_limit: MAX_SCAN_WINDOW };
   const ids = { queued: [], would_queue: [], skipped: [], skipped_blocker: [],
-    skipped_existing: [], skipped_completed: [], skipped_no_owner: [], stale: [] };
-  for (const listedIssue of listed.rows) {
+    skipped_existing: [], skipped_completed: [], skipped_failed: [],
+    skipped_cancelled: [], skipped_no_owner: [], stale: [] };
+  for (const listedIssue of interleaveByWorkspace(listed.rows)) {
     if (counts.selected >= options.batch) break;
+    counts.scanned += 1;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
       const locked = await client.query(
         `SELECT id, workspace_id, status, priority, metadata FROM issue
           WHERE id = $1 AND status = 'Parked' FOR UPDATE`, [listedIssue.id]);
-      if (!locked.rowCount) { counts.stale += 1; await client.query('ROLLBACK'); continue; }
+      if (!locked.rowCount) {
+        counts.stale += 1;
+        ids.stale.push(listedIssue.id);
+        await client.query('ROLLBACK');
+        continue;
+      }
       const issue = locked.rows[0];
       const decision = await inspect(client, issue);
       if (decision.kind === 'skip') {
         const category = decision.reason === 'named_parked_blocker' ? 'skipped_blocker'
           : decision.reason === 'completed_parked_diagnosis' ? 'skipped_completed'
-            : 'skipped_existing';
+            : decision.reason === 'failed_parked_diagnosis' ? 'skipped_failed'
+              : decision.reason === 'cancelled_parked_diagnosis' ? 'skipped_cancelled'
+                : 'skipped_existing';
         counts[category] += 1;
         ids.skipped.push(issue.id);
         ids[category].push(issue.id);
@@ -117,9 +168,16 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) { console.log(usage()); return; }
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+  let Pool;
+  try { ({ Pool } = require('pg')); }
+  catch (error) {
+    throw new Error(`pg dependency is required to run the backfill: ${error.message}`);
+  }
   const pool = new Pool({ connectionString: process.env.DATABASE_URL });
   try { console.log(JSON.stringify(await run(pool, options))); } finally { await pool.end(); }
 }
 
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1; });
-module.exports = { MAX_BATCH, NONTERMINAL, parseArgs, inspect, run, usage };
+module.exports = {
+  MAX_BATCH, MAX_SCAN_WINDOW, NONTERMINAL, interleaveByWorkspace, parseArgs, inspect, run, usage
+};

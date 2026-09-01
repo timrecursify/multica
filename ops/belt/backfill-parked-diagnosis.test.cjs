@@ -1,7 +1,9 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
-const { MAX_BATCH, NONTERMINAL, parseArgs, inspect, run } = require('./backfill-parked-diagnosis.cjs');
+const {
+  MAX_BATCH, MAX_SCAN_WINDOW, NONTERMINAL, parseArgs, inspect, run
+} = require('./backfill-parked-diagnosis.cjs');
 
 test('batch size is bounded at 25 and mode is explicit', () => {
   assert.equal(parseArgs(['--dry-run']).batch, 25);
@@ -39,6 +41,74 @@ test('inspection skips blockers and nonterminal diagnosis tasks', async () => {
   assert.equal((await inspect(client, { id: 'i', metadata: {} })).reason,
     'nonterminal_parked_diagnosis');
   assert.deepEqual(NONTERMINAL, ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred']);
+});
+
+test('terminal failed and cancelled diagnosis history is reported truthfully', async () => {
+  for (const [status, reason] of [
+    ['failed', 'failed_parked_diagnosis'],
+    ['cancelled', 'cancelled_parked_diagnosis']
+  ]) {
+    const client = { query: async (sql) => sql.includes('agent_task_queue')
+      ? { rowCount: 1, rows: [{ id: `task-${status}`, status }] }
+      : { rowCount: 0, rows: [] } };
+    const decision = await inspect(client, { id: 'i', metadata: {} });
+    assert.equal(decision.reason, reason);
+    assert.equal(decision.status, status);
+  }
+});
+
+test('bounded selection interleaves 25+ rows from one workspace with another', async () => {
+  const listedRows = [
+    ...Array.from({ length: 30 }, (_, index) => ({
+      id: `w1-${index}`, workspace_id: 'w1', status: 'Parked', priority: 'low', metadata: {}
+    })),
+    { id: 'w2-0', workspace_id: 'w2', status: 'Parked', priority: 'low', metadata: {} }
+  ];
+  const pool = {
+    query: async (sql, values) => {
+      assert.match(sql, /ROW_NUMBER\(\) OVER \(PARTITION BY workspace_id/);
+      assert.match(sql, /LIMIT \$1/);
+      assert.equal(values[0], MAX_SCAN_WINDOW);
+      return { rows: listedRows, rowCount: listedRows.length };
+    },
+    connect: async () => ({
+      query: async (sql, values) => sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT'
+        ? { rowCount: 0, rows: [] }
+        : sql.includes('FROM issue')
+          ? { rowCount: 1, rows: listedRows.filter((row) => row.id === values[0]) }
+          : { rowCount: 0, rows: [] },
+      release() {}
+    })
+  };
+  const result = await run(pool, parseArgs(['--dry-run']));
+  assert.equal(result.counts.would_queue, 25);
+  assert.ok(result.ids.would_queue.includes('w2-0'));
+  assert.ok(result.ids.would_queue.some((id) => id.startsWith('w1-')));
+  assert.ok(result.counts.scanned <= MAX_SCAN_WINDOW);
+});
+
+test('stale locked rows are recorded while scanning the bounded window', async () => {
+  const rows = [
+    { id: 'stale', workspace_id: 'w1', status: 'Parked', priority: 'low', metadata: {} },
+    { id: 'live', workspace_id: 'w2', status: 'Parked', priority: 'low', metadata: {} }
+  ];
+  const pool = {
+    query: async () => ({ rows, rowCount: rows.length }),
+    connect: async () => ({
+      query: async (sql, values) => {
+        if (sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT') return { rowCount: 0, rows: [] };
+        if (sql.includes('FROM issue')) return values[0] === 'stale'
+          ? { rowCount: 0, rows: [] }
+          : { rowCount: 1, rows: [rows[1]] };
+        return { rowCount: 0, rows: [] };
+      },
+      release() {}
+    })
+  };
+  const result = await run(pool, parseArgs(['--dry-run', '--batch-size', '1']));
+  assert.deepEqual(result.ids.stale, ['stale']);
+  assert.equal(result.counts.stale, 1);
+  assert.deepEqual(result.ids.would_queue, ['live']);
 });
 
 test('default selection covers both workspaces and emits stable dry-run IDs', async () => {
