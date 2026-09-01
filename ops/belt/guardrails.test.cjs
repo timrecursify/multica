@@ -109,9 +109,11 @@ test('startup rejects routable stages without an owner', () => {
     { stage_name: 'Done', next_stage: 'Archived', agent_id: null },
     { stage_name: 'Archived', next_stage: null, agent_id: null }
   ];
-  assert.deepEqual(routableOwnerDefects(rows), ['Parked:missing_owner']);
-  assert.throws(() => assertRoutableStageOwners(rows), /Parked:missing_owner/);
-  assert.doesNotThrow(() => assertRoutableStageOwners([rows[0], rows[2], rows[3], rows[4]]));
+  assert.deepEqual(routableOwnerDefects(rows), [
+    'Human Review:missing_owner', 'Parked:missing_owner'
+  ]);
+  assert.throws(() => assertRoutableStageOwners(rows), /Human Review:missing_owner/);
+  assert.doesNotThrow(() => assertRoutableStageOwners([rows[0], rows[3], rows[4]]));
 });
 
 test('startup rejects archived, inactive, and instruction-incompatible owners', () => {

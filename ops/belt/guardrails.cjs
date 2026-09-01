@@ -9,7 +9,7 @@ const STAGE_ALIASES = new Map([
   ['in_review', 'In Review']
 ]);
 const NON_EXECUTION_STAGES = new Set(['Human Review', 'Parked', 'Rejected']);
-const EXTERNAL_TRANSITION_STAGES = new Set(['Human Review', 'Done']);
+const EXTERNAL_TRANSITION_STAGES = new Set(['Done']);
 
 function canonicalStage(stage) {
   return STAGE_ALIASES.get(stage) || stage;
