@@ -705,18 +705,30 @@ async function replaceStageTask(client, task) {
     throw new Error(`relay successor task was not created for issue ${task.issueId} stage ${task.toStage}`);
   }
 
-  const log = await client.query(
-    `INSERT INTO relay_run_log (
-       issue_id, from_stage, to_stage, agent_id, task_id, status
-     )
-     SELECT $1, $2, $3, $4, $5, 'pending'
-      WHERE NOT EXISTS (
-        SELECT 1 FROM relay_run_log
-         WHERE issue_id = $1 AND task_id = $5
-      )
-     RETURNING id`,
-    [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
-  );
+  const log = task.relayContext
+    ? await client.query(
+      `INSERT INTO relay_run_log (
+         issue_id, from_stage, to_stage, agent_id, task_id, status, context
+       )
+       SELECT $1, $2, $3, $4, $5, 'pending', $6::jsonb
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log
+           WHERE issue_id = $1 AND task_id = $5
+        )
+       RETURNING id`,
+      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId, task.relayContext]
+    ) : await client.query(
+      `INSERT INTO relay_run_log (
+         issue_id, from_stage, to_stage, agent_id, task_id, status
+       )
+       SELECT $1, $2, $3, $4, $5, 'pending'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log
+           WHERE issue_id = $1 AND task_id = $5
+        )
+       RETURNING id`,
+      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
+    );
   return { taskId, relayLogId: log.rows[0]?.id || null };
 }
 
@@ -1105,7 +1117,7 @@ async function relayAdvance(req, res, body) {
   let client;
   try {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
-      operator_rescope_issue_id } = body;
+      operator_rescope_issue_id, operator_terminal_exit } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -1150,19 +1162,6 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
-    // The relay credential is held by belt automation. A terminal ticket may
-    // be moved only by an explicit operator path that records its reason, not
-    // by this automated endpoint. In particular, do not let Done's optional
-    // CI/CD successor re-enter the belt.
-    if (isTerminalStage(issue.status)) {
-      await client.query("ROLLBACK");
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        error: "terminal_stage_relay_exit_forbidden",
-        message: "terminal tickets cannot be advanced by relay automation"
-      }));
-      return;
-    }
     const noArtifactRescope = await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
@@ -1199,6 +1198,23 @@ async function relayAdvance(req, res, body) {
     if (targetStageResult.rows.length === 0 && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayStage(res, to_stage);
+      return;
+    }
+    const sourceStageResult = await client.query(
+      "SELECT next_stage FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
+      [issue.workspace_id, issue.status]
+    );
+    const configuredTerminalExit = isTerminalStage(issue.status) &&
+      sourceStageResult.rows[0]?.next_stage === to_stage;
+    const explicitTerminalExit = isTerminalStage(issue.status) &&
+      operator_terminal_exit === true && typeof reason === "string" && reason.trim() !== "";
+    if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_operator_marker_required",
+        message: "terminal exits require the configured successor or an explicit operator marker and reason"
+      }));
       return;
     }
     const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
@@ -1793,6 +1809,9 @@ async function relayAdvance(req, res, body) {
           rescope_reason: "qc_blocked_no_artifact",
           operator_rescope_issue_id: issue.id
         } : {}),
+        ...(explicitTerminalExit ? {
+          terminal_exit: { operator_marker: true, reason: reason.trim() }
+        } : {}),
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
@@ -1806,6 +1825,9 @@ async function relayAdvance(req, res, body) {
         priority: taskPriority,
         runtimeId: stage.selected_runtime_id,
         context,
+        relayContext: explicitTerminalExit ? JSON.stringify({
+          terminal_exit: { operator_marker: true, reason: reason.trim() }
+        }) : null,
         triggerSummary: retryEscalation
           ? `Sol-low re-spec escalation: ${retryEscalation.reason}`
           : `Relay stage transition: ${issue.status} -> ${to_stage}`

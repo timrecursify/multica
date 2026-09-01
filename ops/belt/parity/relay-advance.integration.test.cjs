@@ -91,8 +91,8 @@ test('PASS written after its completed relay row is enqueued for normal admissio
   });
   assert.deepEqual(rows, [{ id: 'relay-log-new', issue_id: 'issue-1' }]);
   assert.match(queries[0], /i\.status = 'In Review'/);
-  assert.match(queries[0], /verdict\.verdict = 'PASS'/);
-  assert.match(queries[0], /verdict\.created_at > COALESCE/);
+  assert.match(queries[0], /qc\."verdict" = 'PASS'/);
+  assert.match(queries[0], /qc\."created_at" > COALESCE/);
   assert.match(queries[0], /pending\.status = 'pending'/);
   assert.match(queries[0], /LIMIT 20/);
 });
@@ -139,6 +139,15 @@ test('dispatch-on-exit closes terminal arrivals without a follow-on relay', asyn
   assert.deepEqual(harness.payloads, []);
   assert.ok(harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'")));
   assert.ok(harness.logs.some((line) => line.includes('TERMINAL:') && line.includes("stage='Done'")));
+});
+
+test('terminal-source relay logs are completed without requesting a successor', async () => {
+  const terminal = { ...advanceRow(), to_stage: 'Done', next_stage: 'CI/CD & Deploy' };
+  const harness = advanceHarness(terminal);
+  await harness.run();
+  assert.deepEqual(harness.payloads, []);
+  assert.ok(harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'")));
+  assert.ok(harness.logs.some((line) => line.includes('TERMINAL:')));
 });
 
 test('permanently mismatched evidence is held after the bounded retry limit', async () => {

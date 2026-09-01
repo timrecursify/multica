@@ -1090,10 +1090,14 @@ test('Parked and In Review arrivals at Done return before task dispatch', () => 
   assert.doesNotMatch(terminalArrival, /replaceStageTask/);
 });
 
-test('relay automation cannot advance a terminal ticket', () => {
+test('terminal exits preserve the configured archiver path and require an explicit operator marker otherwise', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const guard = source.slice(source.indexOf('const issue = issueResult.rows[0];'),
     source.indexOf('const noArtifactRescope'));
-  assert.match(guard, /if \(isTerminalStage\(issue\.status\)\)/);
-  assert.match(guard, /terminal_stage_relay_exit_forbidden/);
+  assert.doesNotMatch(guard, /terminal_stage/);
+  assert.match(source, /sourceStageResult\.rows\[0\]\?\.next_stage === to_stage/);
+  assert.match(source, /operator_terminal_exit === true/);
+  assert.match(source, /reason\.trim\(\) !== ""/);
+  assert.match(source, /terminal_stage_operator_marker_required/);
+  assert.match(source, /terminal_exit: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
 });
