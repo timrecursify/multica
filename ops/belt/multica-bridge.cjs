@@ -312,35 +312,22 @@ async function recordBookkeepingHandoff(client, issueId) {
   if (!task) return null;
 
   const log = await client.query(
-    `INSERT INTO relay_run_log (
-       issue_id, from_stage, to_stage, agent_id, task_id, status
+    `WITH existing AS (
+       SELECT id FROM relay_run_log
+        WHERE issue_id = $1 AND from_stage = 'Queue'
+          AND to_stage = 'In Progress' AND task_id = $3
+        ORDER BY created_at DESC LIMIT 1 FOR UPDATE
+     ), inserted AS (
+       INSERT INTO relay_run_log
+         (issue_id, from_stage, to_stage, agent_id, task_id, status)
+       SELECT $1, 'Queue', 'In Progress', $2, $3, 'pending'
+        WHERE NOT EXISTS (SELECT 1 FROM existing)
+       RETURNING id
      )
-     SELECT $1, 'Queue', 'In Progress', $2, $3, 'pending'
-      WHERE NOT EXISTS (
-        SELECT 1 FROM relay_run_log
-         WHERE issue_id = $1
-           AND from_stage = 'Queue'
-           AND to_stage = 'In Progress'
-           AND task_id = $3
-      )
-     RETURNING id`,
+     SELECT id FROM inserted UNION ALL SELECT id FROM existing LIMIT 1`,
     [issueId, task.agent_id, task.id]
   );
-  if (log.rows[0]?.id) return { taskId: task.id, relayLogId: log.rows[0].id };
-
-  const existing = await client.query(
-    `SELECT id
-       FROM relay_run_log
-      WHERE issue_id = $1
-        AND from_stage = 'Queue'
-        AND to_stage = 'In Progress'
-        AND task_id = $2
-      ORDER BY created_at DESC
-      LIMIT 1
-      FOR UPDATE`,
-    [issueId, task.id]
-  );
-  return { taskId: task.id, relayLogId: existing.rows[0]?.id || null };
+  return { taskId: task.id, relayLogId: log.rows[0]?.id || null };
 }
 
 // Terminal transitions do not create a successor task, so they cannot use the
