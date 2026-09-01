@@ -64,6 +64,10 @@ var preMigrationHooks = map[string]preMigrationHook{
 	"198_agent_task_attribution_strict_constraint_validate": runAttributionStrictHook,
 	"257_agent_task_queue_channel_media_pending_unique_v2":  cleanupInvalidConcurrentIndexHook("idx_one_pending_task_per_issue_agent_v2"),
 	"261_agent_task_queue_terminal_completed_at_v2":         cleanupInvalidConcurrentIndexHook("idx_agent_task_queue_terminal_completed_at_v2"),
+	"286_build_budget_scope_workspace": exactConcurrentIndexHook(
+		"uq_build_budget_scope_workspace",
+		"CREATE UNIQUE INDEX uq_build_budget_scope_workspace ON public.build_budget USING btree (workspace_id, scope, scope_ref)",
+	),
 }
 
 // cleanupInvalidConcurrentIndexHook removes an INVALID index left by an
@@ -92,6 +96,46 @@ func cleanupInvalidConcurrentIndexHook(indexRegclass string) preMigrationHook {
 			return fmt.Errorf("relation %q exists but is not an index", indexRegclass)
 		}
 		if isValid {
+			return nil
+		}
+
+		qualifiedName := pgx.Identifier{schemaName, relationName}.Sanitize()
+		if _, err := pool.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+qualifiedName); err != nil {
+			return fmt.Errorf("drop invalid concurrent index %s: %w", qualifiedName, err)
+		}
+		slog.Warn("removed invalid index before migration retry", "index", qualifiedName)
+		return nil
+	}
+}
+
+// exactConcurrentIndexHook makes a concurrent-index retry safe. An absent
+// relation lets the migration create the index; an INVALID leftover is removed
+// concurrently; and a valid relation must be the exact expected index rather
+// than an unrelated object reusing the migration's name.
+func exactConcurrentIndexHook(indexRegclass, expectedDefinition string) preMigrationHook {
+	return func(ctx context.Context, pool *pgxpool.Pool) error {
+		var schemaName, relationName, definition string
+		var isIndex, isValid bool
+		err := pool.QueryRow(ctx, `
+			SELECT n.nspname, c.relname, c.relkind = 'i', COALESCE(i.indisvalid, FALSE), pg_get_indexdef(c.oid)
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			LEFT JOIN pg_index i ON i.indexrelid = c.oid
+			WHERE c.oid = to_regclass($1)
+		`, indexRegclass).Scan(&schemaName, &relationName, &isIndex, &isValid, &definition)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("inspect concurrent index %q: %w", indexRegclass, err)
+		}
+		if !isIndex {
+			return fmt.Errorf("relation %q exists but is not an index", indexRegclass)
+		}
+		if isValid {
+			if definition != expectedDefinition {
+				return fmt.Errorf("valid index %q has unexpected definition %q", indexRegclass, definition)
+			}
 			return nil
 		}
 
