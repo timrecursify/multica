@@ -355,16 +355,6 @@ async function relayAdvance(req, res, body) {
     await client.query("BEGIN");
 
     const dispositionStages = new Set(["Parked", "Rejected"]);
-    const targetStageResult = await client.query(
-      "SELECT stage_name FROM relay_stage_config WHERE stage_name = $1",
-      [to_stage]
-    );
-    if (targetStageResult.rows.length === 0 && !dispositionStages.has(to_stage)) {
-      await client.query("ROLLBACK");
-      rejectInvalidRelayStage(res, to_stage);
-      return;
-    }
-
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -381,6 +371,15 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    const targetStageResult = await client.query(
+      "SELECT stage_name FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
+      [issue.workspace_id, to_stage]
+    );
+    if (targetStageResult.rows.length === 0 && !dispositionStages.has(to_stage)) {
+      await client.query("ROLLBACK");
+      rejectInvalidRelayStage(res, to_stage);
+      return;
+    }
     const parkedRelease = issue.status === "Parked" && to_stage === "Queue" &&
       issue.metadata?.parked_release_once === true;
     const releaseAt = issue.metadata?.parked_release_at || null;
@@ -400,8 +399,8 @@ async function relayAdvance(req, res, body) {
     const transitionResult = await client.query(
       `SELECT next_stage, alt_next_stages
        FROM relay_stage_config
-       WHERE stage_name = $1`,
-      [issue.status]
+       WHERE workspace_id = $1 AND stage_name = $2`,
+      [issue.workspace_id, issue.status]
     );
     // A stage may have more than one legal successor. QC decides whether a
     // passed ticket needs a deploy (CI/CD & Deploy), a human (Human Review,
@@ -541,7 +540,7 @@ async function relayAdvance(req, res, body) {
     }
 
     const stageResult = await client.query(
-      `SELECT rsc.agent_id, rsc.agent_name, a.runtime_id, a.archived_at,
+      `SELECT rsc.agent_id, rsc.agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
               a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
               (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
               COALESCE(
@@ -557,8 +556,8 @@ async function relayAdvance(req, res, body) {
                 )
               ) AS selected_runtime_id
        FROM relay_stage_config rsc
-       LEFT JOIN agent a ON a.id = rsc.agent_id
-       WHERE rsc.stage_name = $2`,
+       LEFT JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id
+       WHERE rsc.workspace_id = $1 AND rsc.stage_name = $2`,
       // Stage owners are keyed by the stage being left: Spec -> Queue wakes
       // the builder, and In Progress -> In Review wakes QC. Looking up the
       // target stage would select the next lane's owner and can burn a paid
@@ -571,6 +570,9 @@ async function relayAdvance(req, res, body) {
     }
 
     const stage = stageResult.rows[0];
+    if (stage.agent_id && !stage.owner_id) {
+      throw new Error(`Relay owner workspace mismatch: ${stage.agent_name} (${stage.agent_id}) for ${issue.workspace_id}`);
+    }
     if (stage.agent_id && isExecutionStage(to_stage) && stage.archived_at) {
       throw new Error(`Relay owner is archived: ${stage.agent_name} (${stage.agent_id}) for ${issue.status} -> ${to_stage}`);
     }
@@ -849,8 +851,9 @@ async function assertRoutableStagesHaveOwners() {
               a.archived_at AS owner_archived_at,
               a.instructions AS owner_instructions
          FROM relay_stage_config rsc
-         LEFT JOIN agent a ON a.id = rsc.agent_id
-        ORDER BY rsc.id`
+         LEFT JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id
+        WHERE rsc.workspace_id = $1
+        ORDER BY rsc.id`, [SSO_WORKSPACE_ID]
     );
     assertRoutableStageOwners(result.rows);
   } finally {

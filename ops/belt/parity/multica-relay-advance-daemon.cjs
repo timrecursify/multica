@@ -174,6 +174,7 @@ async function cleanupStalePendingRows() {
        FROM issue i, relay_stage_config rsc
        WHERE rrl.status = 'pending'
          AND i.id = rrl.issue_id
+         AND rsc.workspace_id = i.workspace_id
          AND rsc.stage_name = rrl.to_stage
          AND i.status = rsc.next_stage`
     );
@@ -201,8 +202,8 @@ async function findAndAdvanceTasks() {
              rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
-      INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name
       INNER JOIN issue i ON atq.issue_id = i.id
+      INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name AND rsc.workspace_id = i.workspace_id
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
@@ -276,7 +277,7 @@ async function recoveryAdvanceTasks() {
     const query = `SELECT DISTINCT atq.issue_id, atq.status as task_status, i.status as to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN issue i ON atq.issue_id = i.id
-      INNER JOIN relay_stage_config rsc ON i.status = rsc.stage_name
+      INNER JOIN relay_stage_config rsc ON i.status = rsc.stage_name AND rsc.workspace_id = i.workspace_id
       LEFT JOIN LATERAL (
         SELECT * FROM relay_run_log WHERE issue_id = atq.issue_id ORDER BY created_at DESC LIMIT 1
       ) rrl ON true
@@ -355,7 +356,8 @@ async function findAndAdvanceRegistered() {
     const query = `SELECT i.id, i.number
       FROM issue i
       WHERE i.status = $1
-        AND i.workspace_id = $2
+        AND EXISTS (SELECT 1 FROM relay_stage_config rsc
+                    WHERE rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status)
         AND (
           (
             NOT EXISTS (
@@ -379,7 +381,7 @@ async function findAndAdvanceRegistered() {
         )
       LIMIT 10`;
 
-    const result = await client.query(query, ['Registered', WORKSPACE_ID, STAGE_CYCLE_LIMIT]);
+    const result = await client.query(query, ['Registered', STAGE_CYCLE_LIMIT]);
 
     if (result.rows.length === 0) return;
 
@@ -472,8 +474,8 @@ async function requeueStrandedTasks() {
                   COALESCE(a.runtime_mode, 'local') AS runtime_mode,
                   a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config, a.archived_at
              FROM relay_stage_config rsc
-             JOIN agent a ON a.id = rsc.agent_id AND a.archived_at IS NULL
-            WHERE rsc.next_stage = i.status
+             JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id AND a.archived_at IS NULL
+            WHERE rsc.workspace_id = i.workspace_id AND rsc.next_stage = i.status
               AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
             ORDER BY rsc.id LIMIT 1
          ) r ON true
