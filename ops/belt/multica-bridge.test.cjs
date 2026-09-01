@@ -42,6 +42,18 @@ test('bookkeeping handoff links the existing builder task to the QC trigger', as
   assert.doesNotMatch(calls.map(({ sql }) => sql).join('\n'), /INSERT INTO agent_task_queue/);
 });
 
+test('bookkeeping handoff refuses a Queue shortcut without a builder predecessor', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [] };
+  } };
+
+  assert.equal(await recordBookkeepingHandoff(client, 'issue-without-build'), null);
+  assert.equal(calls.length, 1);
+  assert.doesNotMatch(calls[0].sql, /INSERT INTO relay_run_log/);
+});
+
 test('relay dispatch gates bypass paid admission only for the bookkeeping hop', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /isExecutionStage\(to_stage\) && !parkedRelease && !bookkeepingTransition/);
