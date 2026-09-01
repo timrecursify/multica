@@ -94,7 +94,7 @@ async function returnToBuild(issue, pr, reason) {
 
 function countCiFailure(issue, pr, sha, ci) {
   const key = `${issue.id}:${pr.repo}#${pr.num}:${sha}`;
-  if (ci !== 'red' && ci !== 'unknown') {
+  if (ci !== 'red' && ci !== 'unknown' && ci !== 'mixed') {
     ciFailureCounts.delete(key);
     return 0;
   }
