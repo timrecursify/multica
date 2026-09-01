@@ -2291,7 +2291,14 @@ func runIssueCancelTask(cmd *cobra.Command, args []string) error {
 	}
 
 	var result map[string]any
+	// Keep the bare task endpoint for a canonical UUID with no --issue: it
+	// avoids the task-runs listing race. When a caller supplied --issue,
+	// however, use the issue-scoped endpoint so the server atomically verifies
+	// that this exact task belongs to that issue before it is cancelled.
 	path := "/api/tasks/" + url.PathEscape(taskRef.ID) + "/cancel"
+	if issueScope != "" {
+		path = "/api/issues/" + url.PathEscape(issueScope) + "/tasks/" + url.PathEscape(taskRef.ID) + "/cancel"
+	}
 	if err := client.PostJSON(ctx, path, map[string]any{}, &result); err != nil {
 		return fmt.Errorf("cancel task: %w", err)
 	}
