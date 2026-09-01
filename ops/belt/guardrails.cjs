@@ -12,6 +12,7 @@ const NON_EXECUTION_STAGES = new Set([
   'Human Review', 'Parked', 'Rejected', 'Done', 'Archived', 'Cancelled'
 ]);
 const EXTERNAL_TRANSITION_STAGES = new Set(['Done']);
+const QUOTA_PAUSE_MAX_AGE_MS = 15 * 60 * 1000;
 
 function canonicalStage(stage) {
   return STAGE_ALIASES.get(stage) || stage;
@@ -116,7 +117,7 @@ function spendPreflight(agent, selectedRuntime = {}) {
   if (!String(agent.instructions || '').trim()) return { ok: false, reason: 'missing_instructions' };
   if (agent.archived_at) return { ok: false, reason: 'agent_archived' };
   if (agent.runtime_config && agent.runtime_config.quota_paused === true) {
-    return { ok: false, reason: 'provider_quota_paused' };
+    return { ok: false, reason: `provider_quota_paused:${agent.name || agent.agent_name || agent.id || 'unknown_agent'}` };
   }
   const model = String(selectedRuntime.model || agent.model || '').trim();
   const provider = String(selectedRuntime.provider || '').toLowerCase();
@@ -132,6 +133,20 @@ function spendPreflight(agent, selectedRuntime = {}) {
     return { ok: false, reason: 'missing_paid_token_budget' };
   }
   return { ok: true, cap };
+}
+
+function quotaPauseClearance({ pausedAt, fallbackAt, budgetExhausted, now = Date.now(),
+  maxAgeMs = QUOTA_PAUSE_MAX_AGE_MS }) {
+  const timestamp = Date.parse(pausedAt || fallbackAt || '');
+  if (!Number.isFinite(timestamp)) return { clear: true, reason: 'invalid_pause_timestamp' };
+  if (now - timestamp <= maxAgeMs) return { clear: false, reason: 'pause_within_grace_period' };
+  return budgetExhausted === true
+    ? { clear: false, reason: 'build_budget_exhausted' }
+    : { clear: true, reason: 'build_budget_not_exhausted' };
+}
+
+function quotaPauseFlipLogLine(agentName, timestamp, paused) {
+  return `quota_paused flip agent="${agentName}" timestamp=${timestamp} value=${paused}`;
 }
 
 function stageCycleAdmission(taskCount, limit = 2) {
@@ -205,6 +220,9 @@ module.exports = {
   crossStageExecutionAdmission,
   retryAdmission,
   spendPreflight,
+  QUOTA_PAUSE_MAX_AGE_MS,
+  quotaPauseClearance,
+  quotaPauseFlipLogLine,
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,
