@@ -89,7 +89,8 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
         SET status = 'cancelled', completed_at = NOW(),
             prepare_lease_expires_at = NULL, failure_reason = $2
       WHERE issue_id = $1
-        AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')`,
+        AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')
+        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'`,
     [row.issue_id, reason]
   );
   if (changed.rowCount > 0) {
