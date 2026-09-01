@@ -36,13 +36,16 @@ function strandedFixture(overrides = {}) {
   };
 }
 
-function strandedHarness(candidates) {
+function strandedHarness(fixtures) {
   const queries = [];
   const client = { query: async (sql, values = []) => {
     queries.push({ sql, values });
-    if (sql.includes('ROW_NUMBER() OVER')) return { rows: candidates };
+    if (sql.includes('ROW_NUMBER() OVER')) {
+      return { rows: fixtures.filter((row) =>
+        !row.parent_issue_id && ['failed', 'cancelled'].includes(row.dead_task_status)) };
+    }
     if (sql.includes('COALESCE(a.max_concurrent_tasks')) {
-      return { rows: candidates.map((row) => ({ agent_id: row.agent_id, cap: 1, in_flight: 0 })) };
+      return { rows: fixtures.map((row) => ({ agent_id: row.agent_id, cap: 1, in_flight: 0 })) };
     }
     if (sql.includes('max(EXTRACT(epoch')) return { rows: [{ age: 0 }] };
     if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
@@ -72,12 +75,13 @@ test('stranded-task fixtures leave running tasks and bundled children untouched'
     { ...strandedFixture({ dead_task_status: 'running' }), label: 'running' },
     { ...strandedFixture({ parent_issue_id: '723e4567-e89b-42d3-a456-426614174000' }), label: 'bundled child' }
   ]) {
-    // The candidate-query fixture models rows after the daemon's SQL predicate:
-    // neither a running task nor a child (`i.parent_issue_id IS NULL`) qualifies.
-    const harness = strandedHarness([]);
+    const harness = strandedHarness([fixture]);
     await harness.run();
     assert.equal(harness.queries.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue')), false,
       `${fixture.label} must not be redispatched`);
+    const candidateQuery = harness.queries.find(({ sql }) => sql.includes('ROW_NUMBER() OVER'));
+    assert.match(candidateQuery.sql, /t\.status IN \('failed', 'cancelled'\)/);
+    assert.match(candidateQuery.sql, /i\.parent_issue_id IS NULL/);
   }
 });
 
