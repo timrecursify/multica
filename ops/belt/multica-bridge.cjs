@@ -252,21 +252,21 @@ async function replaceStageTask(client, task) {
 
   const inserted = await client.query(
     `INSERT INTO agent_task_queue (
-       agent_id, issue_id, status, priority, runtime_id, context,
+       agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
        trigger_summary, force_fresh_session, originator_source,
        trigger_evidence_kind
      )
-     SELECT $1, $2, 'queued', $3, $4, $5::jsonb, $6, TRUE,
+     SELECT $1, $2, $3, 'queued', $4, $5, $6::jsonb, $7, TRUE,
             'unattributed', 'relay_stage_transition'
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue active
          WHERE active.issue_id = $2
-           AND active.status::text = ANY($7::text[])
-           AND active.context->>'to_stage' = $8
+           AND active.status::text = ANY($8::text[])
+           AND active.context->>'to_stage' = $9
       )
        ON CONFLICT DO NOTHING
        RETURNING id`,
-    [task.agentId, task.issueId, task.priority, task.runtimeId, task.context,
+    [task.agentId, task.issueId, task.workspaceId, task.priority, task.runtimeId, task.context,
       task.triggerSummary, LIVE_TASK_STATUSES, task.toStage]
   );
 
@@ -1011,6 +1011,7 @@ async function relayAdvance(req, res, body) {
       });
       const successor = await replaceStageTask(client, {
         issueId: issue_id,
+        workspaceId: issue.workspace_id,
         fromStage: issue.status,
         toStage: to_stage,
         agentId: stage.agent_id,
