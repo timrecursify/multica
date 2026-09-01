@@ -306,7 +306,9 @@ async function recoveryAdvanceTasks() {
   try {
 
     // Get the latest relay_run_log per issue using LATERAL subquery
-    const query = `SELECT DISTINCT atq.issue_id, atq.status as task_status, i.status as to_stage, rsc.next_stage
+    const query = `SELECT DISTINCT atq.issue_id, atq.status as task_status,
+             atq.result AS task_result, atq.error AS task_error,
+             i.status as to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN issue i ON atq.issue_id = i.id
       INNER JOIN relay_stage_config rsc ON i.status = rsc.stage_name AND rsc.workspace_id = i.workspace_id
@@ -327,6 +329,18 @@ async function recoveryAdvanceTasks() {
 
     for (const row of result.rows) {
       try {
+        if (row.task_status !== 'completed') {
+          console.log(`${LOG_PREFIX} [recovery] HOLD: issue=${row.issue_id}, status=${row.task_status}, reason=task_not_completed`);
+          await markRelayLogFailed(client, row.issue_id);
+          continue;
+        }
+        const completion = completionAdmission(row.task_result ??
+          (row.task_error ? { error: row.task_error } : null));
+        if (!completion.ok) {
+          console.log(`${LOG_PREFIX} [recovery] HOLD: issue=${row.issue_id}, reason=${completion.reason}`);
+          await markRelayLogFailed(client, row.issue_id);
+          continue;
+        }
         // Check if next stage is gated; skip auto-advance if it is
         if (gatedStages.includes(row.next_stage)) {
           console.log(`${LOG_PREFIX} [recovery] SKIPPED: issue=${row.issue_id}, from_stage='${row.to_stage}', to_stage='${row.next_stage}', reason=gated stage requires manual approval`);

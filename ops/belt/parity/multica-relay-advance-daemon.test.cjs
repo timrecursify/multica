@@ -38,3 +38,12 @@ test('stranded-task recovery does not retry a semantically blocked completion', 
   assert.match(source, /row\.dead_task_status === 'completed'/);
   assert.match(source, /completed predecessor failed completion admission/);
 });
+
+test('Registered recovery applies the same completion gate', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const recovery = source.slice(source.indexOf('async function recoveryAdvanceTasks'),
+    source.indexOf('function postToRelay'));
+  assert.match(recovery, /atq\.result AS task_result/);
+  assert.match(recovery, /completionAdmission\(row\.task_result/);
+  assert.match(recovery, /reason=task_not_completed/);
+});
