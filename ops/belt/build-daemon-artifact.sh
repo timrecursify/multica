@@ -4,11 +4,16 @@
 set -euo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-output_dir="${1:?usage: $0 OUTPUT_DIR}"
+output_arg="${1:?usage: $0 OUTPUT_DIR}"
+case "$output_arg" in
+  /*) output_dir="$output_arg" ;;
+  *) output_dir="$(pwd -P)/$output_arg" ;;
+esac
 source_sha="$(git -C "$root_dir" rev-parse HEAD)"
 case "$source_sha" in [0-9a-f][0-9a-f]*) ;; *) exit 64 ;; esac
 
 mkdir -p -- "$output_dir"
+output_dir="$(cd -- "$output_dir" && pwd -P)"
 binary="$output_dir/multica-linux-amd64"
 build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 (cd "$root_dir/server" && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
