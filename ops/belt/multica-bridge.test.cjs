@@ -27,6 +27,17 @@ const {
   applyDisposition
 } = require('./multica-bridge.cjs');
 
+test('Parked evidence QC return is a canonical consumed-release-only edge', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /function verifiedParkedEvidenceRelease/);
+  assert.match(source, /\^runtime_evidence_verified:/);
+  assert.match(source, /parseRuntimeEvidenceReference/);
+  assert.match(source, /parked_release_once !== true/);
+  assert.match(source, /parkedEvidenceQcRelease/);
+  assert.match(source, /parkedRelease \|\| parkedEvidenceQcRelease/);
+  assert.match(source, /context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
+});
+
 const validVerdict = Object.freeze({
   issue_id: '123e4567-e89b-42d3-a456-426614174000', checker: 'BRAVO-000517',
   verdict: 'PASS', work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e',
@@ -494,7 +505,7 @@ test('release admission is explicit, one-use, and resets task history by time', 
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /parked_release_once === true/);
-  assert.match(source, /if \(!parkedRelease && !parkedDiagnosisDone && !allowedStages\.includes/);
+  assert.match(source, /if \(!parkedRelease && !parkedEvidenceQcRelease && !parkedDiagnosisDone && !allowedStages\.includes/);
   assert.match(source, /reason: "parked_release_required"/);
   assert.match(source, /created_at >= \$3/);
   assert.match(source, /created_at >= \$2/);
