@@ -594,6 +594,15 @@ async function authorizeCicdReturnCapBypass(client, issueId, capBypass) {
 }
 
 async function replaceStageTask(client, task) {
+  // The issue row lock normally serializes relayAdvance callers. Keep the
+  // enqueue primitive safe for recovery/replay callers too: the predicate and
+  // insert must share a stage-specific transaction lock or simultaneous
+  // retries can both observe no active successor.
+  if (task.serialize) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+      task.issueId, task.toStage
+    ]);
+  }
   const context = typeof task.context === 'string' ? JSON.parse(task.context) : task.context;
   if (!isBuilderDispatchAllowed(context)) {
     throw new Error('builder dispatcher rejected a no_builder diagnosis task');
