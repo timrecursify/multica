@@ -13,6 +13,17 @@ test('DB gate is exact and has no direct issue status mutation', async () => {
   let writes = 0; const client = { query: async (sql) => { if (/^UPDATE issue/.test(sql.trim())) writes++; return { rows: [], rowCount: 0 }; } };
   assert.equal(await reserveRecovery(client, issue, task, async () => true), null); assert.equal(writes, 0);
 });
+test('DB-shaped diagnosis result object supplies only the canonical evidence reference', async () => {
+  let n = 0; const seen = [];
+  const client = { query: async () => {
+    n += 1;
+    return n === 1 ? { rows: [{ id: issue, diagnosis_id: task,
+      diagnosis_result: { output: 'outcome: already_fixed\nruntime_evidence: task:323e4567-e89b-12d3-a456-426614174000\nevidence: ok' } }], rowCount: 1 } : { rows: [{ id: issue }], rowCount: 1 };
+  } };
+  const result = await reserveRecovery(client, issue, task, async (_client, _issue, evidence) => { seen.push(evidence); return true; });
+  assert.equal(result.evidence, 'task:323e4567-e89b-12d3-a456-426614174000');
+  assert.deepEqual(seen, ['task:323e4567-e89b-12d3-a456-426614174000']);
+});
 test('relay failure clears release flag but retains recovery marker', async () => {
   const calls = []; let read = true;
   const client = { query: async (sql) => { calls.push(sql); if (read) { read = false; return { rows: [{ id: issue, diagnosis_id: task, diagnosis_result: 'runtime_evidence: task:323e4567-e89b-12d3-a456-426614174000' }], rowCount: 1 }; } return { rows: [{ id: issue }], rowCount: 1 }; } };

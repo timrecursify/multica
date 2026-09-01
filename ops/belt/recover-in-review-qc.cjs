@@ -4,6 +4,12 @@ const { diagnosisEvidence, verifyRuntimeEvidence } = require('./parked-diagnosis
 const UUID = /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i;
 const RECOVERY_MARKER = 'parked_qc_recovery';
 
+function diagnosisText(result) {
+  if (typeof result === 'string') return result;
+  if (!result || typeof result !== 'object') return '';
+  return [result.comment, result.output, result.text, result.error].filter(Boolean).join('\n');
+}
+
 function parseArgs(argv) {
   const out = { apply: false, issueId: null, failedTaskId: null };
   for (let i = 0; i < argv.length; i += 1) {
@@ -41,7 +47,7 @@ async function reserveRecovery(client, issueId, failedTaskId, verify = verifyRun
         AND NOT EXISTS (SELECT 1 FROM agent_task_queue live WHERE live.issue_id = i.id AND live.context->>'to_stage' = 'In Review' AND live.status IN ('queued','dispatched','running','waiting_local_directory','deferred'))
       FOR UPDATE OF i, failed, d`, [issueId, failedTaskId]);
   const row = candidate.rows[0]; if (!row) return null;
-  const evidence = diagnosisEvidence(typeof row.diagnosis_result === 'string' ? row.diagnosis_result : JSON.stringify(row.diagnosis_result));
+  const evidence = diagnosisEvidence(diagnosisText(row.diagnosis_result));
   if (!evidence || !await verify(client, row.id, evidence, row.diagnosis_id)) return null;
   const marker = JSON.stringify({ failed_task_id: failedTaskId, canonical_evidence: evidence });
   const reserved = await client.query(
@@ -82,4 +88,4 @@ async function main() {
   } finally { await pool.end(); }
 }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1; });
-module.exports = { parseArgs, relayAdvance, reserveRecovery, recover, RECOVERY_MARKER };
+module.exports = { parseArgs, diagnosisText, relayAdvance, reserveRecovery, recover, RECOVERY_MARKER };
