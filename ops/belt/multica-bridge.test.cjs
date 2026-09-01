@@ -458,7 +458,7 @@ test('scoper pool selects the least-loaded eligible Sol-low owner', async () => 
   assert.equal(owner.agent_id, 'agent-b');
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
   assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
-  assert.deepEqual(calls[0].values, ['workspace-1', 'Registered']);
+  assert.deepEqual(calls[0].values, ['workspace-1', 'Spec']);
   assert.deepEqual(calls[1].values, ['workspace-1', 'Spec']);
 });
 
@@ -595,6 +595,68 @@ test('twenty concurrent stage retries create one active successor task', async (
     const { rows } = await admin.query(`SELECT count(*)::int AS count
       FROM agent_task_queue WHERE issue_id=$1::uuid AND status='queued'`, [issueId]);
     assert.equal(rows[0].count, 1);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
+test('twenty concurrent Queue entries through both routes rotate across equal-load pool agents', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') {
+    return t.skip('integration test requires a real DATABASE_URL');
+  }
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  await admin.connect();
+  const schema = `relay_pool_queue_${Date.now()}`;
+  const workspaceId = '33333333-3333-3333-3333-333333333333';
+  const runtimeId = '44444444-4444-4444-4444-444444444444';
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`SET search_path TO ${schema}`);
+    await admin.query(`CREATE TABLE relay_stage_pool (
+      workspace_id uuid NOT NULL, stage_name text NOT NULL, enabled boolean NOT NULL
+    ); CREATE TABLE relay_stage_agent_pool (
+      workspace_id uuid NOT NULL, stage_name text NOT NULL, agent_id uuid NOT NULL,
+      enabled boolean NOT NULL, last_selected_at timestamptz
+    ); CREATE TABLE agent (
+      id uuid PRIMARY KEY, workspace_id uuid NOT NULL, name text NOT NULL, runtime_id uuid,
+      archived_at timestamptz, status text NOT NULL, instructions text, model text,
+      thinking_level text, max_concurrent_tasks integer NOT NULL, runtime_config jsonb
+    ); CREATE TABLE agent_runtime (
+      id uuid PRIMARY KEY, workspace_id uuid NOT NULL, provider text NOT NULL, status text NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    ); CREATE TABLE agent_task_queue (agent_id uuid NOT NULL, status text NOT NULL)`);
+    await admin.query(`INSERT INTO relay_stage_pool (workspace_id, stage_name, enabled)
+      VALUES ($1::uuid, 'Queue', true)`, [workspaceId]);
+    await admin.query(`INSERT INTO agent_runtime (id, workspace_id, provider, status)
+      VALUES ($1::uuid, $2::uuid, 'codex', 'online')`, [runtimeId, workspaceId]);
+    for (let index = 1; index <= 20; index += 1) {
+      const agentId = `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      await admin.query(`INSERT INTO agent
+        (id, workspace_id, name, runtime_id, status, instructions, max_concurrent_tasks)
+        VALUES ($1::uuid, $2::uuid, $3, $4::uuid, 'idle', 'read RUNBOOK_BUILD_WORKER.md', 1)`,
+      [agentId, workspaceId, `builder-${index}`, runtimeId]);
+      await admin.query(`INSERT INTO relay_stage_agent_pool
+        (workspace_id, stage_name, agent_id, enabled) VALUES ($1::uuid, 'Queue', $2::uuid, true)`,
+      [workspaceId, agentId]);
+    }
+    const select = async (fromStage) => {
+      const client = new Client({ connectionString: databaseUrl });
+      await client.connect();
+      try {
+        await client.query(`SET search_path TO ${schema}`);
+        await client.query('BEGIN');
+        const selected = await selectStageOwner(client, workspaceId,
+          ownerStageForTransition(fromStage, 'Queue'), 'Queue');
+        await client.query('COMMIT');
+        return selected.agent_id;
+      } finally { await client.end(); }
+    };
+    const selected = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+      select(index % 2 === 0 ? 'Spec' : 'In Progress')));
+    assert.equal(new Set(selected).size, 20);
   } finally {
     await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
     await admin.end();

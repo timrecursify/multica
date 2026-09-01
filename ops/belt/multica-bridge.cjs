@@ -920,8 +920,8 @@ async function canonicalStageOwner(client, workspaceId, ownerStage) {
 
 async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
   // Selection and the rotation update share the relay transaction. The advisory
-  // lock makes equal-load choices stable under concurrent advances.
-  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, ownerStage]);
+  // lock makes equal-load choices stable under concurrent advances into this pool.
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, toStage]);
   const result = await client.query(
     `SELECT p.agent_id, a.name AS agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
             a.status AS agent_status, a.instructions, a.model, a.thinking_level,
