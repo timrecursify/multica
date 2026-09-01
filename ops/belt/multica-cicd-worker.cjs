@@ -4,8 +4,8 @@
 // Nothing owned this stage, so tickets whose PR had already merged sat in it
 // forever and Done stayed flat while the belt kept running. This worker closes
 // the loop: it reads each ticket's work product, finds its PR, and finishes the
-// ticket when the PR is merged, merges it when CI is green, or leaves it in
-// place with a note when CI is red.
+// ticket when the PR is merged, merges it when CI is green, or returns it to
+// build with the exact blocking reason when deploy cannot finish.
 const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
@@ -69,9 +69,7 @@ async function latestVerdict(issueId) {
 async function routeFinishedPR(issue, note) {
   const latest = await latestVerdict(issue.id);
   if (!latest || latest.verdict !== 'PASS' || !latest.work_product_md5) {
-    await relay(issue.id, 'Parked');
-    await closePendingTask(issue.id);
-    log(`PARKED #${issue.number} — ${note}; latest QC is ${latest?.verdict || 'missing'}`);
+    await returnIssueToBuild(issue, `${note}; latest QC is ${latest?.verdict || 'missing'}`);
     return;
   }
   await relay(issue.id, 'Done', latest.work_product_md5);
@@ -80,21 +78,23 @@ async function routeFinishedPR(issue, note) {
 }
 
 async function escalateCi(issue, pr, ci) {
-  await relay(issue.id, 'Parked');
+  await returnToBuild(issue, pr, `ci=${ci} for ${CI_FAILURE_POLLS} consecutive polls`);
+}
+
+async function returnIssueToBuild(issue, reason) {
+  await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${reason}`);
   await closePendingTask(issue.id);
-  log(`PARKED #${issue.number} ${pr.repo}#${pr.num}: ci=${ci} for ${CI_FAILURE_POLLS} consecutive polls`);
+  log(`RETURN #${issue.number} ${reason}`);
 }
 
 async function returnToBuild(issue, pr, reason) {
   const detail = `${pr.repo}#${pr.num} ${reason}`;
-  await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${detail}`);
-  await closePendingTask(issue.id);
-  log(`RETURN #${issue.number} ${detail}`);
+  await returnIssueToBuild(issue, detail);
 }
 
 function countCiFailure(issue, pr, sha, ci) {
   const key = `${issue.id}:${pr.repo}#${pr.num}:${sha}`;
-  if (ci !== 'red' && ci !== 'unknown' && ci !== 'mixed') {
+  if (!['red', 'unknown', 'mixed', 'pending'].includes(ci)) {
     ciFailureCounts.delete(key);
     return 0;
   }
@@ -141,7 +141,7 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
     if (!(runs.workflow_runs || []).length) {
       const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
-      return Number.isFinite(ageMinutes) && ageMinutes >= CI_ABSENT_MINUTES ? 'absent' : 'pending';
+      return Number.isFinite(ageMinutes) && ageMinutes >= CI_ABSENT_MINUTES ? 'absent' : 'no_checks';
     }
     if ((runs.workflow_runs || []).some(r => r.status !== 'completed')) return 'pending';
     if (!done.length) return 'pending';
