@@ -78,7 +78,7 @@ var preMigrationHooks = map[string]preMigrationHook{
 // relation as success and allow a later migration to drop the still-valid old
 // index. Non-index relations fail closed instead of being dropped implicitly.
 func cleanupInvalidConcurrentIndexHook(indexRegclass string) preMigrationHook {
-	return func(ctx context.Context, pool *pgxpool.Pool) error {
+	return func(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 		var schemaName, relationName string
 		var isIndex, isValid bool
 		err := pool.QueryRow(ctx, `
@@ -115,7 +115,7 @@ func cleanupInvalidConcurrentIndexHook(indexRegclass string) preMigrationHook {
 // concurrently; and a valid relation must be the exact expected index rather
 // than an unrelated object reusing the migration's name.
 func exactConcurrentIndexHook(indexRegclass, expectedDefinition string) preMigrationHook {
-	return func(ctx context.Context, pool *pgxpool.Pool) error {
+	return func(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 		var schemaName, relationName, definition string
 		var isIndex, isValid bool
 		err := pool.QueryRow(ctx, `

@@ -13,6 +13,16 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// Keep the hook-result contract compile-checked. A stale `func(...) error`
+// closure must fail the package build before any migration can ship.
+var (
+	_ preMigrationHook = cleanupInvalidConcurrentIndexHook("compile_check")
+	_ preMigrationHook = exactConcurrentIndexHook("compile_check", "compile_check")
+	_ preMigrationHook = buildBudgetWorkspaceIndexHook("compile_check", "compile_check")
+	_ preMigrationHook = runTaskUsageHourlyHook
+	_ preMigrationHook = runAttributionStrictHook
+)
+
 func TestExactConcurrentIndexHook(t *testing.T) {
 	pool := openTestPool(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -31,7 +41,9 @@ func TestExactConcurrentIndexHook(t *testing.T) {
 	})
 
 	table := pgx.Identifier{schema, "build_budget"}.Sanitize()
-	index := pgx.Identifier{schema, "uq_build_budget_scope_workspace"}.Sanitize()
+	indexName := "uq_build_budget_scope_workspace_" + suffix
+	index := pgx.Identifier{schema, indexName}.Sanitize()
+	createIndex := pgx.Identifier{indexName}.Sanitize()
 	if _, err := pool.Exec(ctx, "CREATE TABLE "+table+" (workspace_id uuid, scope text, scope_ref text)"); err != nil {
 		t.Fatalf("create build_budget: %v", err)
 	}
@@ -42,7 +54,7 @@ func TestExactConcurrentIndexHook(t *testing.T) {
 		t.Fatalf("absent index: %v", err)
 	}
 
-	if _, err := pool.Exec(ctx, "CREATE UNIQUE INDEX CONCURRENTLY "+index+" ON "+table+" (workspace_id, scope, scope_ref)"); err != nil {
+	if _, err := pool.Exec(ctx, "CREATE UNIQUE INDEX CONCURRENTLY "+createIndex+" ON "+table+" (workspace_id, scope, scope_ref)"); err != nil {
 		t.Fatalf("create expected index: %v", err)
 	}
 	var definition string
@@ -68,7 +80,7 @@ func TestExactConcurrentIndexHook(t *testing.T) {
 	if _, err := pool.Exec(ctx, "INSERT INTO "+table+" VALUES (NULL, 'workspace', 'same'), (NULL, 'workspace', 'same')"); err != nil {
 		t.Fatalf("seed duplicate values: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "CREATE UNIQUE INDEX CONCURRENTLY "+index+" ON "+table+" (workspace_id, scope, scope_ref) NULLS NOT DISTINCT"); err == nil {
+	if _, err := pool.Exec(ctx, "CREATE UNIQUE INDEX CONCURRENTLY "+createIndex+" ON "+table+" (workspace_id, scope, scope_ref) NULLS NOT DISTINCT"); err == nil {
 		t.Fatal("invalid-index setup unexpectedly succeeded")
 	}
 	if _, err := exactConcurrentIndexHook(index, definition)(ctx, pool); err != nil {
