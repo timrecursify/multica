@@ -36,7 +36,7 @@ async function reserveRecovery(client, issueId, failedTaskId, verify = verifyRun
   const candidate = await client.query(
     `SELECT i.id, d.id AS diagnosis_id, d.result AS diagnosis_result
        FROM issue i JOIN agent_task_queue failed ON failed.id = $2::uuid AND failed.issue_id = i.id
-       JOIN agent_task_queue original ON original.id = (failed.context->>'requeue_of_task')::uuid AND original.issue_id = i.id
+       JOIN agent_task_queue original ON original.id = CASE WHEN failed.context->>'requeue_of_task' ~* '^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$' THEN (failed.context->>'requeue_of_task')::uuid END AND original.issue_id = i.id
        JOIN agent a ON a.id = failed.agent_id AND a.workspace_id = i.workspace_id
        JOIN relay_stage_config cfg ON cfg.workspace_id = i.workspace_id AND cfg.stage_name = 'In Progress' AND cfg.next_stage = 'In Review' AND cfg.agent_id = failed.agent_id
        JOIN LATERAL (SELECT id, result FROM agent_task_queue d WHERE d.issue_id = i.id AND d.status = 'completed' AND d.context->>'kind' = 'parked_diagnosis' AND d.context->>'evidence_correction_retry' = 'true' ORDER BY d.completed_at DESC NULLS LAST, d.created_at DESC, d.id DESC LIMIT 1) d ON true
