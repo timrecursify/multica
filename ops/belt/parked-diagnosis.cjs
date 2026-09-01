@@ -121,7 +121,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   });
   // System comments use the documented zero UUID (migration 107). The marker
   // makes a repeated rejection idempotent without hiding the first diagnosis.
-  await client.query(
+  if (!evidence.skip_reason_comment) await client.query(
     `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
      SELECT $1, $2, 'system', $3, $4, 'system'
       WHERE NOT EXISTS (
@@ -183,8 +183,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
             'unattributed', 'relay_disposition', 1, 1
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue
-         WHERE issue_id = $2 AND context->>'kind' = $6
-           AND status IN ('queued', 'dispatched', 'running', 'completed')
+        WHERE issue_id = $2 AND context->>'kind' = $6
       )
       ON CONFLICT DO NOTHING
       RETURNING id`,

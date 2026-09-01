@@ -51,3 +51,22 @@ that command restores the matching backup set. No process is restarted.
 
 `./verify.sh` compares every repository copy with its runtime path and exits
 non-zero when any file is missing or differs.
+
+## Parked-ticket diagnosis backfill
+
+Run from a checkout with `DATABASE_URL` set. Preview first, then choose an
+explicit apply run; each invocation handles at most 25 eligible tickets and
+examines at most 100 candidates in workspace-round-robin order:
+
+```bash
+node ops/belt/backfill-parked-diagnosis.cjs --dry-run
+node ops/belt/backfill-parked-diagnosis.cjs --apply --batch-size 25
+```
+
+Add `--workspace <UUID>` to constrain a run. The script locks each still-Parked
+issue, skips named blockers and all prior diagnosis tasks (reporting completed,
+failed, and cancelled statuses), and emits stable JSON counts and IDs,
+including stale rows that changed before the lock. It is an operator one-shot
+and is not part of the runtime deploy manifest; rollback is a no-op because
+dry-run performs no writes and apply writes only the ticket comment, blocker
+metadata, and diagnosis task.
