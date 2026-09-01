@@ -69,7 +69,8 @@ test('diagnosis evidence and owner validation fail closed', () => {
   assert.equal(diagnosisEvidence('outcome: already_fixed\nruntime_evidence: task:' + uuid), 'task:' + uuid);
   assert.equal(namedBlocker('outcome: genuinely_blocked\nblocker: billing hold'), 'billing hold');
   assert.equal(isConcreteRuntimeEvidence('task:' + uuid), true);
-  assert.equal(isConcreteRuntimeEvidence('QC:' + uuid.toUpperCase()), true);
+  assert.equal(isConcreteRuntimeEvidence('QC:21235'), true);
+  assert.equal(isConcreteRuntimeEvidence('QC:' + uuid.toUpperCase()), false);
   assert.equal(isConcreteRuntimeEvidence('activity:' + uuid), true);
   assert.equal(isConcreteRuntimeEvidence('relay.log:42'), false);
   assert.equal(isConcreteRuntimeEvidence('looks good'), false);
@@ -148,12 +149,23 @@ test('runtime evidence must resolve to an issue-scoped durable row', async () =>
   assert.match(queries[0].sql, /t\.issue_id = \$2/);
 });
 
+test('integer QC verdict evidence is verified with the live serial-id type', async () => {
+  const queries = [];
+  const client = { query: async (sql, values) => {
+    queries.push({ sql, values });
+    return { rowCount: 1 };
+  } };
+  assert.equal(await verifyRuntimeEvidence(client, 'issue-1', 'qc:21235'), true);
+  assert.match(queries[0].sql, /v\.id = \$1::integer/);
+  assert.deepEqual(queries[0].values, [21235, 'issue-1']);
+});
+
 test('runtime evidence accepts only canonical durable-reference grammar', () => {
   const uuid = '123e4567-e89b-12d3-a456-426614174000';
   assert.deepEqual(parseRuntimeEvidenceReference(`task:${uuid}`), { kind: 'task', id: uuid });
-  assert.deepEqual(parseRuntimeEvidenceReference(`QC:${uuid.toUpperCase()}`), { kind: 'qc', id: uuid });
+  assert.deepEqual(parseRuntimeEvidenceReference('QC:21235'), { kind: 'qc', id: 21235 });
   for (const invalid of ['task:deadbeef', `task:${uuid} trailing`, `runtime_evidence: task:${uuid}`,
-    `note task:${uuid}`, `task:${uuid.replace(/-/g, '')}`, 'relay.log:42']) {
+    `note task:${uuid}`, `task:${uuid.replace(/-/g, '')}`, `qc:${uuid}`, 'qc:2147483648', 'relay.log:42']) {
     assert.equal(parseRuntimeEvidenceReference(invalid), null, invalid);
   }
 });

@@ -1,7 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
-const { qcCompletionAdvance } = require('./multica-relay-advance-daemon.cjs');
+const { qcCompletionAdvance, processParkedDiagnoses } = require('./multica-relay-advance-daemon.cjs');
 
 const QC_ROW = {
   task_id: '11111111-1111-4111-8111-111111111111',
@@ -173,7 +173,7 @@ test('runtime-evidence recovery is one-shot, typed, and stays on relay authority
   assert.match(diagnosis, /t\.id = \$1::uuid/);
   assert.match(diagnosis, /t\.context->>'kind' = \$2::text/);
   assert.match(diagnosis, /i\.workspace_id = \$3::uuid/);
-  assert.match(diagnosis, /postToRelay\(\{ issue_id: task\.issue_id, to_stage: nextStage/);
+  assert.match(diagnosis, /relayPost\(\{ issue_id: task\.issue_id, to_stage: nextStage/);
   assert.match(diagnosis, /const needsQC = outcome === 'already_fixed' && evidenceVerified && !completionMD5/);
   assert.match(diagnosis, /runtime_evidence_verified:\$\{evidence\}/);
   assert.match(diagnosis, /WHERE id = \$1::uuid/);
@@ -190,6 +190,35 @@ test('canonical evidence rejects a parked-diagnosis citation', () => {
   const contract = fs.readFileSync(require.resolve('../parked-diagnosis.cjs'), 'utf8');
   assert.match(contract, /t\.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
   assert.match(contract, /t\.id = \$1::uuid AND t\.issue_id = \$2::uuid/);
+});
+
+test('completed parked diagnosis consumes integer QC evidence and marks itself processed', async () => {
+  const task = {
+    id: '123e4567-e89b-42d3-a456-426614174000',
+    issue_id: '223e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000',
+    number: 42, status: 'Parked', context: {},
+    result: 'outcome: already_fixed\nruntime_evidence: qc:21235'
+  };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('FROM agent_task_queue t') && sql.includes('LIMIT 25')) {
+      return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    }
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM qc_verdict v')) return { rowCount: 1, rows: [] };
+    if (sql.includes('SELECT verdict, work_product_md5')) {
+      return { rows: [{ verdict: 'PASS', work_product_md5: 'a1b2c3' }] };
+    }
+    return { rowCount: 1, rows: [] };
+  }, release() {} };
+  await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+    relayPost: async () => ({ ok: true, status: 200 }) });
+  const evidenceQuery = queries.find(({ sql }) => sql.includes('FROM qc_verdict v'));
+  assert.match(evidenceQuery.sql, /v\.id = \$1::integer/);
+  assert.deepEqual(evidenceQuery.values, [21235, task.issue_id]);
+  assert.ok(queries.some(({ sql }) => sql.includes("'{\"diagnosis_processed\":true}'::jsonb")));
 });
 
 test('quota pause flips are timestamped and stale unbudgeted pauses self-clear', () => {

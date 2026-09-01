@@ -1124,8 +1124,8 @@ function diagnosisText(result) {
     .filter(Boolean).join('\n');
 }
 
-async function processParkedDiagnoses() {
-  const client = await pool.connect();
+async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postToRelay } = {}) {
+  const client = await diagnosisPool.connect();
   try {
     const { rows: candidates } = await client.query(
       `SELECT t.id, i.workspace_id
@@ -1266,7 +1266,7 @@ async function processParkedDiagnoses() {
       const nextStage = action.action === 'release' ? action.nextStage
         : action.action === 'close' ? action.status : null;
       if (nextStage) {
-        const response = await postToRelay({ issue_id: task.issue_id, to_stage: nextStage,
+        const response = await relayPost({ issue_id: task.issue_id, to_stage: nextStage,
           agent_token: RELAY_AGENT_SECRET,
           ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
           ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
@@ -1315,4 +1315,4 @@ function startDaemon() {
 if (require.main === module) startDaemon();
 
 module.exports = { findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
-  reconcileQuotaPauses, startDaemon };
+  reconcileQuotaPauses, processParkedDiagnoses, startDaemon };
