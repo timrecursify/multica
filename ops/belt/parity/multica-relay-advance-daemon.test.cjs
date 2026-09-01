@@ -1,6 +1,65 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
+const { qcCompletionAdvance } = require('./multica-relay-advance-daemon.cjs');
+
+const QC_ROW = {
+  to_stage: 'In Review',
+  next_stage: 'CI/CD & Deploy',
+  task_status: 'completed',
+  task_agent_id: 'qc-agent',
+  task_agent_model: 'gpt-5.6-sol',
+  task_agent_effort: 'low',
+  task_started_at: '2026-09-01T19:05:39Z',
+  task_completed_at: '2026-09-01T19:08:18Z',
+  task_result: { output: 'QC PASS exact SHA c909401ef7a4a438348eb5ceda33839211721524' },
+  qc_verdict_checker_id: 'qc-agent',
+  qc_verdict: 'PASS',
+  qc_verdict_work_product_md5: '76becea4ab970644b7a21220665a1619',
+  qc_verdict_notes: 'Native Sol-low QC PASS; observed SHA c909401ef7a4a438348eb5ceda33839211721524',
+  qc_verdict_created_at: '2026-09-01T19:07:38Z'
+};
+
+test('completed legacy Sol-low PASS replays its exact SHA and artifact MD5', () => {
+  assert.deepEqual(qcCompletionAdvance(QC_ROW), {
+    ok: true,
+    workProductMd5: '76becea4ab970644b7a21220665a1619',
+    boundSha: 'c909401ef7a4a438348eb5ceda33839211721524'
+  });
+});
+
+test('strict relay attempt must bind PASS to one observed SHA and artifact MD5', () => {
+  const row = { ...QC_ROW,
+    qc_attempt_verdict: 'PASS',
+    qc_attempt_work_product_md5: QC_ROW.qc_verdict_work_product_md5,
+    qc_attempt_bound_sha: 'c909401ef7a4a438348eb5ceda33839211721524',
+    qc_attempt_observed_sha: 'c909401ef7a4a438348eb5ceda33839211721524',
+    qc_attempt_qualifying: true,
+    qc_attempt_model: 'gpt-5.6-sol',
+    qc_attempt_effort: 'low'
+  };
+  assert.equal(qcCompletionAdvance(row).ok, true);
+  assert.equal(qcCompletionAdvance({ ...row,
+    qc_attempt_observed_sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }).ok, false);
+  assert.equal(qcCompletionAdvance({ ...row,
+    qc_verdict_checker_id: 'different-agent' }).ok, false);
+});
+
+test('post-completion QC replay fails closed on stale, mismatched, or non-low evidence', () => {
+  assert.equal(qcCompletionAdvance({ ...QC_ROW,
+    qc_verdict_created_at: '2026-09-01T18:00:00Z' }).ok, false);
+  assert.equal(qcCompletionAdvance({ ...QC_ROW,
+    qc_verdict_notes: 'QC PASS SHA aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }).ok, false);
+  assert.equal(qcCompletionAdvance({ ...QC_ROW,
+    qc_verdict_work_product_md5: 'not-an-md5' }).ok, false);
+  assert.equal(qcCompletionAdvance({ ...QC_ROW, task_agent_effort: 'high' }).ok, false);
+  assert.equal(qcCompletionAdvance({ ...QC_ROW, qc_verdict: 'FAIL' }).ok, false);
+});
+
+test('non-QC gated stages remain manual', () => {
+  assert.deepEqual(qcCompletionAdvance({ ...QC_ROW, next_stage: 'Done' }),
+    { ok: false, reason: 'manual_gated_stage' });
+});
 
 test('relay daemon scopes stage configuration to each issue workspace', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');

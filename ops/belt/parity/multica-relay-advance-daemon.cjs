@@ -22,6 +22,56 @@ const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
+const MD5_RE = /^[0-9a-f]{32}$/i;
+const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
+
+function uniqueFullSha(value) {
+  const matches = [...String(value || '').matchAll(FULL_SHA_RE)]
+    .map((match) => match[2].toLowerCase());
+  const unique = [...new Set(matches)];
+  return unique.length === 1 ? unique[0] : null;
+}
+
+function strictQcAttempt(row, verdictMd5) {
+  if (!row.qc_attempt_bound_sha && !row.qc_attempt_observed_sha) return null;
+  const bound = String(row.qc_attempt_bound_sha || '').toLowerCase();
+  const observed = String(row.qc_attempt_observed_sha || '').toLowerCase();
+  const md5 = String(row.qc_attempt_work_product_md5 || '').toLowerCase();
+  const ok = row.qc_attempt_verdict === 'PASS' && row.qc_attempt_qualifying === true &&
+    row.qc_attempt_model === 'gpt-5.6-sol' && row.qc_attempt_effort === 'low' &&
+    row.qc_verdict_checker_id === row.task_agent_id &&
+    /^[0-9a-f]{40}$/.test(bound) && bound === observed && md5 === verdictMd5;
+  return ok ? { ok: true, boundSha: bound } : { ok: false, reason: 'qc_attempt_mismatch' };
+}
+
+function legacyQcVerdict(row, verdictMd5) {
+  const taskSha = uniqueFullSha(JSON.stringify(row.task_result || ''));
+  const verdictSha = uniqueFullSha(row.qc_verdict_notes);
+  const started = Date.parse(row.task_started_at || '');
+  const completed = Date.parse(row.task_completed_at || '');
+  const recorded = Date.parse(row.qc_verdict_created_at || '');
+  const inWindow = Number.isFinite(started) && Number.isFinite(completed) &&
+    Number.isFinite(recorded) && recorded >= started && recorded <= completed + 30000;
+  const ok = row.qc_verdict_checker_id === row.task_agent_id && inWindow &&
+    taskSha && taskSha === verdictSha && MD5_RE.test(verdictMd5);
+  return ok ? { ok: true, boundSha: taskSha } : { ok: false, reason: 'legacy_qc_evidence_mismatch' };
+}
+
+function qcCompletionAdvance(row) {
+  if (row.to_stage !== 'In Review' || row.next_stage !== 'CI/CD & Deploy') {
+    return { ok: false, reason: 'manual_gated_stage' };
+  }
+  if (row.task_status !== 'completed' || row.task_agent_model !== 'gpt-5.6-sol' ||
+      row.task_agent_effort !== 'low' || row.qc_verdict !== 'PASS') {
+    return { ok: false, reason: 'completed_sol_low_pass_required' };
+  }
+  const md5 = String(row.qc_verdict_work_product_md5 || '').toLowerCase();
+  if (!MD5_RE.test(md5)) return { ok: false, reason: 'qc_work_product_md5_required' };
+  const strict = strictQcAttempt(row, md5);
+  const evidence = strict || legacyQcVerdict(row, md5);
+  return evidence.ok ? { ok: true, workProductMd5: md5, boundSha: evidence.boundSha }
+    : evidence;
+}
 
 // Deliberately small: the DeepSeek build lane is paid, so a backlog drains at a
 // steady trickle rather than firing every stranded ticket at the vendor at once.
@@ -311,11 +361,41 @@ async function findAndAdvanceTasks() {
     // daemon outage delays an advance instead of stranding it forever.
     const query = `SELECT rrl.id AS log_id, atq.issue_id, atq.status AS task_status,
              atq.result AS task_result, atq.error AS task_error,
+             atq.agent_id AS task_agent_id, atq.started_at AS task_started_at,
+             atq.completed_at AS task_completed_at,
+             task_agent.model AS task_agent_model,
+             task_agent.thinking_level AS task_agent_effort,
+             verdict.checker_id AS qc_verdict_checker_id,
+             verdict.verdict AS qc_verdict,
+             verdict.work_product_md5 AS qc_verdict_work_product_md5,
+             verdict.notes AS qc_verdict_notes,
+             verdict.created_at AS qc_verdict_created_at,
+             attempt.verdict AS qc_attempt_verdict,
+             attempt.work_product_md5 AS qc_attempt_work_product_md5,
+             attempt.bound_sha AS qc_attempt_bound_sha,
+             attempt.observed_head AS qc_attempt_observed_sha,
+             attempt.qualifying AS qc_attempt_qualifying,
+             attempt.model AS qc_attempt_model,
+             attempt.effort AS qc_attempt_effort,
              i.workspace_id, i.priority, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
       INNER JOIN issue i ON atq.issue_id = i.id
+      LEFT JOIN agent task_agent ON task_agent.id = atq.agent_id
       INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name AND rsc.workspace_id = i.workspace_id
+      LEFT JOIN LATERAL (
+        SELECT checker_id, verdict, work_product_md5, notes, created_at
+          FROM qc_verdict WHERE issue_id = atq.issue_id
+         ORDER BY created_at DESC LIMIT 1
+      ) verdict ON true
+      LEFT JOIN LATERAL (
+        SELECT verdict, work_product_md5, bound_sha, observed_head,
+               qualifying, model, effort
+          FROM qc_attempt
+         WHERE issue_id = atq.issue_id
+           AND notes LIKE '%relay_task_id=' || atq.id::text || '%'
+         ORDER BY created_at DESC LIMIT 1
+      ) attempt ON true
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
@@ -360,18 +440,25 @@ async function findAndAdvanceTasks() {
           await markRelayLogFailedById(client, row.log_id);
           continue;
         }
-        // Check if next stage is gated; skip auto-advance if it is
-        if (gatedStages.includes(row.next_stage)) {
+        // A QC worker records its verdict before its own execution row becomes
+        // terminal. The bridge correctly defers its in-task advance, so replay
+        // that exact handoff here only after completion and only when the same
+        // Sol-low task carries a SHA-bound PASS plus the current artifact MD5.
+        const qcAdvance = qcCompletionAdvance(row);
+        if (gatedStages.includes(row.next_stage) && !qcAdvance.ok) {
           console.log(`${LOG_PREFIX} SKIPPED: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=stage requires manual QC approval`);
           await markRelayLogCompletedById(client, row.log_id);
           continue;
         }
 
-        const payload = { issue_id: row.issue_id, to_stage: row.next_stage, agent_token: RELAY_AGENT_SECRET };
+        const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
+          agent_token: RELAY_AGENT_SECRET,
+          ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
         const response = await postToRelay(payload);
 
         if (response.ok) {
-          console.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})`);
+          const proof = qcAdvance.ok ? ` sha=${qcAdvance.boundSha} md5=${qcAdvance.workProductMd5}` : '';
+          console.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})${proof}`);
           await markRelayLogCompletedById(client, row.log_id);
         } else if (response.deferred) {
           // Preserve the task-correlated pending log. The same advance becomes
@@ -1185,4 +1272,4 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { pauseQuotaLane, reconcileQuotaPauses, startDaemon };
+module.exports = { pauseQuotaLane, qcCompletionAdvance, reconcileQuotaPauses, startDaemon };
