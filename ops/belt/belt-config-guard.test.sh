@@ -10,6 +10,10 @@ MULTICA_DAEMON_MAX_CONCURRENT_TASKS=bad MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS= MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces assert_invalid
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT=relative assert_invalid
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT= assert_invalid
+[[ "$(tower_concurrency_state 'multica-daemon/server daemon start')" == missing ]]
+[[ "$(tower_concurrency_state 'multica-daemon/server daemon start --max-concurrent-tasks=10')" == correct ]]
+[[ "$(tower_concurrency_state 'multica-daemon/server daemon start --max-concurrent-tasks=8')" == mismatched ]]
+[[ "$(tower_concurrency_state 'multica-daemon/server daemon start --max-concurrent-tasks=100')" == mismatched ]]
 wrapper_fixture="$(mktemp)"
 trap 'rm -f -- "$wrapper_fixture"' EXIT
 printf '%s\n' '  --max-concurrent-tasks="$cap_raw"' >"$wrapper_fixture"
