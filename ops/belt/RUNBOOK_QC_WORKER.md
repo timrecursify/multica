@@ -11,7 +11,7 @@ The required lane is `gpt-5.6-sol` with `low` effort.
    "$BOUND_SHA"`. Its JSON `.path` is `CHECKOUT` and `.sha` must equal
    `BOUND_SHA`; otherwise use the BLOCKED procedure.
 3. Run the smallest check that can prove or disprove each criterion.
-4. Compute the exact MD5 of the current `## What changed` work-product comment.
+4. Compute the exact MD5 of the complete tracked-tree manifest at `BOUND_SHA`.
 5. Use the verdict procedure below. Do not write `qc_verdict` with SQL.
 
 The managed workdir is not a repository. If no pull request, repository,
@@ -28,13 +28,11 @@ verdict` and `sk multica advance` for state changes: never curl, use a secret,
 or write SQL.
 
 ```bash
-READBACK="$(sk multica readback "$NUMBER" --board "$BOARD")"
-WORK_PRODUCT="$(jq -r '[.comments[] | select(.content | startswith("## What changed"))] | last.content' <<<"$READBACK")"
-WORK_PRODUCT_MD5="$(printf '%s' "$WORK_PRODUCT" | md5sum | cut -d' ' -f1)"
 CHECKOUT_RESULT="$(sk multica qc-checkout "$REPO" --ref "$BOUND_SHA")"
 CHECKOUT="$(jq -r '.path' <<<"$CHECKOUT_RESULT")"
 OBSERVED_SHA="$(jq -r '.sha' <<<"$CHECKOUT_RESULT")"
 test "$OBSERVED_SHA" = "$BOUND_SHA"
+WORK_PRODUCT_MD5="$(git -C "$CHECKOUT" ls-tree -r --full-tree "$BOUND_SHA" | LC_ALL=C sort | md5sum | cut -d' ' -f1)"
 FAILURE_CLASS=none; QUALIFYING=true
 # For a defect: FAILURE_CLASS=implementation; QUALIFYING=false.
 # For an unavailable prerequisite: FAILURE_CLASS=evidence|tool|access;

@@ -1142,7 +1142,7 @@ async function relayAdvance(req, res, body) {
       return;
     }
     
-    client = new Client({ connectionString: MULTICA_DB });
+    client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
     await client.connect();
     await client.query("BEGIN");
     await authorizeRelayStatusWrites(client);
@@ -2001,6 +2001,7 @@ module.exports = {
   latestCompletedSolLowQcTask,
   qcTaskEvidenceMismatch,
   relayVerdict,
+  relayAdvance,
   setTestClientFactory(factory) { testClientFactory = factory; },
   isCicdReturn,
   consumeCicdReturnAuthorization,

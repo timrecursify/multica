@@ -23,6 +23,7 @@ const {
   latestCompletedSolLowQcTask,
   qcTaskEvidenceMismatch,
   relayVerdict,
+  relayAdvance,
   setTestClientFactory,
   isCicdReturn,
   consumeCicdReturnAuthorization,
@@ -424,18 +425,31 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   }
 });
 
-test('runbook-shaped PASS and BLOCKED verdicts bridge into daemon dispositions', async () => {
+test('runbook-shaped verdicts advance through the relay handler', async () => {
   const attempts = [];
   const verdicts = [];
   const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'qc-agent',
     agent_name: 'qc-sol-low', context: {}, result: qcResult() };
   const client = { async connect() {}, async end() {}, async query(sql, values = []) {
     if (/FROM qc_attempt/.test(sql)) return { rows: [] };
-    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql) || /FROM "issue"\s+WHERE id = \$1\s+FOR UPDATE/.test(sql)) {
+      return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1', status: 'In Review',
+        description: '', parent_issue_id: null, title: 'QC fixture', priority: 'none', metadata: {} }] };
+    }
     if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
+    if (/SELECT verdict, work_product_md5 FROM qc_verdict/.test(sql)) {
+      const latest = verdicts.at(-1);
+      return { rows: latest ? [{ verdict: latest[3], work_product_md5: latest[4] }] : [] };
+    }
     if (/FROM qc_verdict/.test(sql)) return { rows: [] };
     if (/INSERT INTO qc_attempt/.test(sql)) attempts.push(values);
     if (/INSERT INTO qc_verdict/.test(sql)) verdicts.push(values);
+    if (/SELECT stage_name FROM relay_stage_config/.test(sql)) return { rows: [{ stage_name: values[1] }] };
+    if (/SELECT next_stage, alt_next_stages/.test(sql)) return { rows: [{ next_stage: 'CI/CD & Deploy', alt_next_stages: ['In Progress'] }] };
+    if (/SELECT t\.result, c\.content/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_config rsc/.test(sql)) return { rows: [{ agent_id: null, agent_name: null, owner_id: null }] };
+    if (/UPDATE "issue"\s+SET status/.test(sql)) return { rowCount: 1, rows: [{ id: validVerdict.issue_id, status: values[0] }] };
     return { rows: [] };
   } };
   const post = async (payload) => {
@@ -455,14 +469,20 @@ test('runbook-shaped PASS and BLOCKED verdicts bridge into daemon dispositions',
       qc_attempt_verdict: values[2], qc_attempt_work_product_md5: values[3], qc_attempt_bound_sha: values[4],
       qc_attempt_observed_sha: values[5], qc_attempt_qualifying: values[7], qc_attempt_evidence_task_id: task.id,
       qc_attempt_evidence_agent_id: task.agent_id, qc_attempt_evidence_agent_model: 'gpt-5.6-sol', qc_attempt_evidence_agent_effort: 'low' };
-    assert.equal(qcCompletionAdvance(row).ok, true);
+    const advance = async (to_stage) => {
+      const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+      await relayAdvance({}, res, { issue_id: validVerdict.issue_id, to_stage,
+        agent_token: 'test-relay-secret', current_work_product_md5: pass.work_product_md5 });
+      return { ...res, json: JSON.parse(res.body) };
+    };
+    assert.equal((await advance('CI/CD & Deploy')).json.issue.status, 'CI/CD & Deploy');
     const blocked = { ...pass, verdict: 'FAIL', failure_class: 'evidence', qualifying: false,
       idem_key: 'qc-runbook-blocked-0001', notes: 'BLOCKED: add the pull request and full SHA.' };
     task.result = qcResult(blocked);
     assert.equal((await post(blocked)).status, 201);
     assert.equal(verdicts[1][3], 'FAIL');
     assert.match(verdicts[1][5], /BLOCKED: add the pull request and full SHA\./);
-    assert.equal(qcCompletionAdvance({ ...row, qc_verdict: 'FAIL' }).reason, 'completed_sol_low_pass_required');
+    assert.equal((await advance('In Progress')).json.issue.status, 'In Progress');
   } finally { setTestClientFactory(null); }
 });
 
@@ -476,6 +496,8 @@ test('QC runbook emits bridge evidence and advances both verdict dispositions', 
   assert.match(runbook, /--to "CI\/CD & Deploy" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
   assert.match(runbook, /--to "In Progress" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
   assert.match(runbook, /BLOCKED: <reason>/);
+  assert.match(runbook, /git -C "\$CHECKOUT" ls-tree -r --full-tree "\$BOUND_SHA" \| LC_ALL=C sort \| md5sum/);
+  assert.doesNotMatch(runbook, /What changed.*md5sum|WORK_PRODUCT="\$\(jq/);
   assert.doesNotMatch(runbook, /curl --|RELAY_URL|RELAY_AGENT_SECRET/);
 });
 
