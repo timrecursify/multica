@@ -10,6 +10,7 @@ const {
   isConcreteRuntimeEvidence,
   verifyRuntimeEvidence,
   recordParkAndQueueDiagnosis,
+  diagnosisOutcomeAction,
   isSolLowDiagnosisAgent,
   PARK_REASON_MARKER,
   PARK_DIAGNOSIS_KIND
@@ -42,13 +43,28 @@ test('diagnosis parser accepts only the four bounded outcomes', () => {
   assert.equal(parseDiagnosisOutcome('outcome: retry'), null);
 });
 
+test('validated Parked outcomes map to bounded state actions', () => {
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'fixable' }),
+    { action: 'release', status: 'Parked', nextStage: 'Queue' });
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'already_fixed', evidenceVerified: true }),
+    { action: 'close', status: 'Done' });
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'duplicate', duplicateIssueId: 'survivor' }),
+    { action: 'close', status: 'Cancelled', duplicateIssueId: 'survivor' });
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'genuinely_blocked', blocker: 'billing' }),
+    { action: 'hold', status: 'Parked', blocker: 'Sol-low diagnosis: billing' });
+  assert.equal(diagnosisOutcomeAction({ outcome: 'fixable' }).action, 'release');
+  assert.equal(diagnosisOutcomeAction({ outcome: 'fixable' }).status, 'Parked');
+});
+
 test('diagnosis evidence and owner validation fail closed', () => {
   assert.equal(diagnosisEvidence('outcome: already_fixed\nruntime_evidence: relay.log:42'), 'relay.log:42');
   assert.equal(namedBlocker('outcome: genuinely_blocked\nblocker: billing hold'), 'billing hold');
   assert.equal(isConcreteRuntimeEvidence('relay.log:42'), true);
   assert.equal(isConcreteRuntimeEvidence('looks good'), false);
-  assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.6-sol', runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'qc' } }), true);
-  assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.6-sol', runtime_config: {} }), true);
+  const parkedInstructions = 'Parked diagnosis role: classify fixable, already_fixed, duplicate, or genuinely_blocked outcomes.';
+  assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol', instructions: parkedInstructions, runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } }), true);
+  assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.6-sol', instructions: parkedInstructions, runtime_config: {} }), false);
+  assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol', instructions: 'diagnosis only', runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-1', model: 'gpt-5.6-sol', runtime_config: {} }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'fake-qc-sol-low-01', model: 'gpt-5.6-sol', runtime_config: {} }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.5', runtime_config: { reasoning_effort: 'low', role: 'qc' } }), false);
@@ -62,6 +78,10 @@ test('diagnosis processing is workspace-scoped and serializes concurrent ticks',
   assert.match(source, /WHERE workspace_id = \$1 AND id <> \$2/);
   assert.match(source, /t\.context->>'kind' = \$2/);
   assert.match(source, /context->>'no_builder'/);
+  assert.match(source, /diagnosisOutcomeAction\(\{ outcome/);
+  assert.match(source, /action\.status === 'Done'/);
+  assert.match(source, /action\.status === 'Cancelled'/);
+  assert.match(source, /action\.action === 'release'/);
 });
 
 test('runtime evidence must resolve to an issue-scoped durable row', async () => {

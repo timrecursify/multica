@@ -11,7 +11,7 @@ const {
 } = require('../guardrails.cjs');
 const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
   namedBlocker, isConcreteRuntimeEvidence, verifyRuntimeEvidence,
-  PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
+  diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -903,6 +903,8 @@ async function processParkedDiagnoses() {
         duplicateIssueId = target.rows[0]?.id || null;
       }
       const invalidDuplicate = outcome === 'duplicate' && !duplicateIssueId;
+      const action = diagnosisOutcomeAction({ outcome, evidenceVerified, duplicateIssueId,
+        blocker, missingOutcome, invalidAlreadyFixed, invalidDuplicate });
       const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${missingOutcome ? 'blocker: diagnosis response omitted an explicit outcome.\n' : ''}${invalidAlreadyFixed ? 'blocker: already_fixed requires concrete runtime_evidence.\n' : ''}${invalidBlocked ? 'blocker: genuinely_blocked requires a named blocker.\n' : ''}${invalidDuplicate ? 'blocker: duplicate requires an existing same-workspace duplicate_of target.\n' : ''}${evidence ? `runtime_evidence: ${evidence}\n` : ''}${blocker ? `blocker: ${blocker}\n` : ''}${text.slice(0, 2000)}`;
       await client.query(
         `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
@@ -915,7 +917,7 @@ async function processParkedDiagnoses() {
         [task.issue_id, task.workspace_id, '00000000-0000-0000-0000-000000000000',
           content, `%outcome: ${outcome}.%`]
       );
-      if (outcome === 'fixable') {
+      if (action.action === 'release') {
         await client.query(
           `UPDATE issue SET metadata = jsonb_set(
                     jsonb_set(COALESCE(metadata, '{}'::jsonb),
@@ -923,33 +925,23 @@ async function processParkedDiagnoses() {
                     '{parked_release_at}', to_jsonb(NOW()), true),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
-      } else if (outcome === 'already_fixed' && evidenceVerified) {
+      } else if (action.action === 'close' && action.status === 'Done') {
         await client.query(
           `UPDATE issue SET status = 'Done', updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
-      } else if (outcome === 'duplicate' && duplicateIssueId) {
+      } else if (action.action === 'close' && action.status === 'Cancelled') {
         await client.query(
           `UPDATE issue SET status = 'Cancelled',
                   metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id, duplicateIssueId]);
-      } else if (outcome === 'duplicate') {
-        await client.query(
-          `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
-                    jsonb_build_object('parked_blocker', 'duplicate outcome missing duplicate_of target'),
-                  updated_at = NOW()
-             WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
       } else {
         await client.query(
           `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
                     jsonb_build_object('parked_blocker', $2),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id,
-            missingOutcome ? 'Sol-low diagnosis response omitted an explicit outcome'
-              : invalidAlreadyFixed ? 'runtime_evidence_unverified'
-              : invalidBlocked ? 'genuinely_blocked response omitted a named blocker'
-              : invalidDuplicate ? 'duplicate response did not resolve a same-workspace duplicate_of target'
-              : `Sol-low diagnosis: ${blocker}`]);
+            action.blocker]);
       }
       await client.query(
         `UPDATE agent_task_queue
