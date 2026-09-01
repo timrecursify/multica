@@ -379,6 +379,55 @@ func TestIssueWorkflowHonorsAgentIdentity(t *testing.T) {
 	}
 }
 
+func TestRelayManagedBeltTasksCannotDirectWriteIssueStages(t *testing.T) {
+	t.Parallel()
+
+	for _, stage := range []string{"Queue", "In Review", "CI/CD & Deploy"} {
+		stage := stage
+		t.Run(stage, func(t *testing.T) {
+			t.Parallel()
+			out := buildMetaSkillContent("codex", TaskContextForEnv{
+				IssueID:      "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
+				RelayManaged: true,
+				HandoffNote:  "Relay stage transition: In Progress -> " + stage,
+			})
+
+			for _, banned := range []string{
+				"`multica issue status <id> <status>`",
+				"`multica issue status <issue-id> in_progress`",
+				"`multica issue status <issue-id> in_review`",
+				"`multica issue status <issue-id> blocked`",
+				"`multica issue update <id> [--title X] [--description-file <path>] [--priority X] [--status X]",
+			} {
+				if strings.Contains(out, banned) {
+					t.Fatalf("relay-managed %s brief exposes direct status write %q\n---\n%s", stage, banned, out)
+				}
+			}
+			if !strings.Contains(out, "the belt owns the issue stage") ||
+				!strings.Contains(out, "Do not call `multica issue status` or `multica issue update --status`") {
+				t.Fatalf("relay-managed %s brief lacks explicit relay ownership guard\n---\n%s", stage, out)
+			}
+		})
+	}
+}
+
+func TestOrdinaryIssueTaskKeepsDirectStatusWorkflow(t *testing.T) {
+	t.Parallel()
+	out := buildMetaSkillContent("codex", TaskContextForEnv{
+		IssueID: "77777777-8888-9999-aaaa-bbbbbbbbbbbb",
+	})
+	for _, want := range []string{
+		"`multica issue status <id> <status>`",
+		"`multica issue status <issue-id> in_progress`",
+		"`multica issue status <issue-id> in_review`",
+		"[--status X]",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("ordinary issue brief lost direct status workflow %q\n---\n%s", want, out)
+		}
+	}
+}
+
 // Squad-leader briefs must open the parent with in_progress, but must not
 // treat the first dispatch turn as completion (no unconditional in_review).
 func TestSquadLeaderIssueWorkflowKeepsParentInProgress(t *testing.T) {

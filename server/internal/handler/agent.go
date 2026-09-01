@@ -319,6 +319,7 @@ type AgentTaskResponse struct {
 	ParentTaskID       *string               `json:"parent_task_id,omitempty"`
 	IsLeaderTask       bool                  `json:"is_leader_task,omitempty"`
 	LeaderRoleResolved bool                  `json:"leader_role_resolved,omitempty"` // claim-only capability, always true here: IsLeaderTask/SquadID authoritatively answer "is this a leader run", so the daemon must not infer the role from briefing text. Servers predating it make no such promise — before #4951 they sent no is_leader_task at all, after it they sent the flag without guaranteeing a briefing — so a daemon seeing no capability keeps the legacy inference. Never rendered into a prompt; see daemon.taskIsSquadLeader (MUL-5811). Mirror field: internal/daemon/types.go, same JSON name
+	RelayManaged       bool                  `json:"relay_managed,omitempty"`        // relay-created belt task; issue stage remains relay-owned
 	Agent              *TaskAgentData        `json:"agent,omitempty"`
 	ConnectedApps      []ConnectedAppData    `json:"connected_apps,omitempty"` // daemon-claim only: per-run app capabilities mounted through runtime MCP overlays
 	Repos              []RepoData            `json:"repos,omitempty"`
@@ -685,6 +686,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		MaxAttempts:         t.MaxAttempts,
 		ParentTaskID:        uuidToPtr(t.ParentTaskID),
 		IsLeaderTask:        t.IsLeaderTask,
+		RelayManaged:        relayManagedTask(t.Context),
 		CreatedAt:           timestampToString(t.CreatedAt),
 		TriggerCommentID:    uuidToPtr(t.TriggerCommentID),
 		CoalescedCommentIDs: uuidsToStrings(t.CoalescedCommentIds),
@@ -703,6 +705,13 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		// hydrated separately on user-facing surfaces (MUL-4302 §9).
 		Attribution: taskAttributionBase(t),
 	}
+}
+
+func relayManagedTask(raw []byte) bool {
+	var context struct {
+		Source string `json:"source"`
+	}
+	return json.Unmarshal(raw, &context) == nil && context.Source == "relay-advance"
 }
 
 // relativeWorkDir produces a privacy-safe display form of the daemon-reported

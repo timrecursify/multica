@@ -260,8 +260,12 @@ func writeAvailableCommands(b *strings.Builder, ctx TaskContextForEnv) {
 	b.WriteString("- `multica issue get <id> --output json` — full issue.\n")
 	b.WriteString("- `multica issue comment list <issue-id> [--roots-only] [--summary] [--thread <comment-id> [--tail N] | --recent N] [--since <RFC3339>] --output json` — thread-aware comment reads. Bound a wide read with `--roots-only --summary` (roots plus `reply_count` / `last_activity_at`, clipped bodies); bound a deep one with `--thread <id> --tail N`; add `--compact` to any JSON read to drop echoed/null/bookkeeping fields. Careful with `--recent N`: it caps THREADS, not comments, and can return the whole history on a small issue. Resolved-thread folding, paging cursors, and full flag semantics: `--help`.\n")
 	b.WriteString("- `multica issue create --title \"...\" [--description-file <path>] [--priority X] [--status X] [--assignee X | --assignee-id <uuid>] [--parent <issue-id>] [--stage N] [--project <project-id>] [--due-date <YYYY-MM-DD>] [--attachment <path>]` — create an issue. For agent-authored long descriptions prefer `--description-file <path>` (heredoc stdin can swallow trailing flags, #4182). Write that file inside your working directory (e.g. `./description.md`), never `/tmp` or shared paths — same workdir rule as `## Comment Formatting`.\n")
-	b.WriteString("- `multica issue update <id> [--title X] [--description-file <path>] [--priority X] [--status X] [--assignee X] [--parent <issue-id>] [--stage N] [--project <project-id>] [--due-date <YYYY-MM-DD>]` — update fields; pass `--parent \"\"` to clear parent.\n")
-	b.WriteString("- `multica issue status <id> <status>` — flip status. Accepted spellings are the union of both vocabularies we historically shipped (legacy: todo / in_progress / in_review / done / blocked / backlog / cancelled; canonical: Spec / Queue / In Progress / In Review / Human Review / Done / Cancelled / Archived); the server canonicalizes onto the board's own vocabulary, so either spelling works.\n")
+	if ctx.RelayManaged {
+		b.WriteString("- `multica issue update <id> [--title X] [--description-file <path>] [--priority X] [--assignee X] [--parent <issue-id>] [--stage N] [--project <project-id>] [--due-date <YYYY-MM-DD>]` — update non-status fields; pass `--parent \"\"` to clear parent. The relay owns this issue's stage.\n")
+	} else {
+		b.WriteString("- `multica issue update <id> [--title X] [--description-file <path>] [--priority X] [--status X] [--assignee X] [--parent <issue-id>] [--stage N] [--project <project-id>] [--due-date <YYYY-MM-DD>]` — update fields; pass `--parent \"\"` to clear parent.\n")
+		b.WriteString("- `multica issue status <id> <status>` — flip status. Accepted spellings are the union of both vocabularies we historically shipped (legacy: todo / in_progress / in_review / done / blocked / backlog / cancelled; canonical: Spec / Queue / In Progress / In Review / Human Review / Done / Cancelled / Archived); the server canonicalizes onto the board's own vocabulary, so either spelling works.\n")
+	}
 
 	b.WriteString("- `multica issue children <id> [--output json]` — list a parent's sub-issues grouped by stage.\n")
 	b.WriteString("- `multica issue comment add <issue-id> [--content \"...\" | --content-file <path> | --content-stdin] [--parent <comment-id>] [--attachment <path>]` — post a comment. Agent-authored bodies MUST use `--content-file`; see `## Comment Formatting` for why. `multica issue comment add --help` for full flags.\n")
@@ -559,14 +563,19 @@ func writeWorkflowIssue(b *strings.Builder, ctx TaskContextForEnv) {
 	}
 	b.WriteString("6. Before exiting, pin or clear a metadata key via `multica issue metadata set`/`delete` only if it clears the bar in `## Issue Metadata`. Most runs write nothing here — that is the expected outcome, not a gap. When in doubt, do not write.\n\n")
 
-	b.WriteString("**Ownership mode only — you own the issue status this run** (skip any status call below that your Agent Identity forbids)\n\n")
-	b.WriteString("- Before step 4, run `multica issue status <issue-id> in_progress`.\n")
-	if ctx.IsSquadLeader {
-		b.WriteString("- After this initial dispatch, leave the parent issue `in_progress` — do NOT move it to `in_review` or `done` on this turn. Dispatching members is not completion. You will be re-triggered when members post updates or a stage closes; only then, if the overall goal is met, move the parent to `in_review`.\n")
+	if ctx.RelayManaged {
+		b.WriteString("**Relay-managed ownership mode — the belt owns the issue stage**\n\n")
+		b.WriteString("- Do not call `multica issue status` or `multica issue update --status`. Do not move the issue before, during, or after this task. Report the verified outcome in your final comment; the relay or orchestrator performs the next stage transition.\n\n")
 	} else {
-		b.WriteString("- When done, run `multica issue status <issue-id> in_review`.\n")
+		b.WriteString("**Ownership mode only — you own the issue status this run** (skip any status call below that your Agent Identity forbids)\n\n")
+		b.WriteString("- Before step 4, run `multica issue status <issue-id> in_progress`.\n")
+		if ctx.IsSquadLeader {
+			b.WriteString("- After this initial dispatch, leave the parent issue `in_progress` — do NOT move it to `in_review` or `done` on this turn. Dispatching members is not completion. You will be re-triggered when members post updates or a stage closes; only then, if the overall goal is met, move the parent to `in_review`.\n")
+		} else {
+			b.WriteString("- When done, run `multica issue status <issue-id> in_review`.\n")
+		}
+		b.WriteString("- If blocked, run `multica issue status <issue-id> blocked`, and post a comment explaining the blocker unless your Agent Identity forbids issue comments.\n\n")
 	}
-	b.WriteString("- If blocked, run `multica issue status <issue-id> blocked`, and post a comment explaining the blocker unless your Agent Identity forbids issue comments.\n\n")
 
 	b.WriteString("**Reply mode only — respond to the comment in the user message**\n\n")
 	b.WriteString("- Respond to THAT specific comment; take its id from the user message, never from this file or from an earlier turn.\n")
