@@ -12,6 +12,7 @@ const {
   replaceStageTask,
   ownerStageForTransition,
   ensureCompletedRelayLog,
+  completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff
 } = require('./multica-bridge.cjs');
@@ -260,17 +261,23 @@ test('deploy close inserts one completed relay row when no pending row exists', 
   assert.match(calls[1].sql, /INSERT INTO relay_run_log/);
 });
 
-test('deploy close retry does not duplicate an existing completed row', async () => {
+test('terminal close retry reuses the existing completed row', async () => {
   const calls = [];
   const client = { query: async (sql, values) => {
     calls.push({ sql, values });
-    return { rows: [] };
+    return calls.length === 3 ? { rows: [{ id: 43 }] } : { rows: [] };
   } };
 
   const id = await ensureCompletedRelayLog(client, 'issue-3', 'CI/CD & Deploy', 'Done');
 
-  assert.equal(id, null);
-  assert.equal(calls.length, 2);
+  assert.equal(id, 43);
+  assert.equal(calls.length, 3);
+  assert.match(calls[2].sql, /status = 'completed'/);
+});
+
+test('terminal already-applied replay returns its completed relay log ID', async () => {
+  const client = { query: async () => ({ rows: [{ id: 44 }] }) };
+  assert.equal(await completedTerminalRelayLog(client, 'issue-4', 'Cancelled'), 44);
 });
 
 test('release admission is explicit, one-use, and resets task history by time', () => {
