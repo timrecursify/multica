@@ -7,6 +7,7 @@ const {
   formatParkReason,
   parseDiagnosisOutcome,
   diagnosisEvidence,
+  parseRuntimeEvidenceReference,
   namedBlocker,
   isConcreteRuntimeEvidence,
   currentPassWorkProductMD5,
@@ -133,12 +134,22 @@ test('runtime evidence must resolve to an issue-scoped durable row', async () =>
   const queries = [];
   const client = { query: async (sql, values) => {
     queries.push({ sql, values });
-    return { rowCount: values[0] === 'deadbeef' ? 1 : 0 };
+    return { rowCount: values[0] === '123e4567-e89b-12d3-a456-426614174000' ? 1 : 0 };
   } };
-  assert.equal(await verifyRuntimeEvidence(client, 'issue-1', 'task:deadbeef'), true);
+  assert.equal(await verifyRuntimeEvidence(client, 'issue-1', 'task:123e4567-e89b-12d3-a456-426614174000'), true);
   assert.equal(await verifyRuntimeEvidence(client, 'issue-1', 'relay.log:42'), false);
   assert.equal(queries.length, 1);
   assert.match(queries[0].sql, /t\.issue_id = \$2/);
+});
+
+test('runtime evidence accepts only canonical durable-reference grammar', () => {
+  const uuid = '123e4567-e89b-12d3-a456-426614174000';
+  assert.deepEqual(parseRuntimeEvidenceReference(`task:${uuid}`), { kind: 'task', id: uuid });
+  assert.deepEqual(parseRuntimeEvidenceReference(`QC:${uuid.toUpperCase()}`), { kind: 'qc', id: uuid });
+  for (const invalid of ['task:deadbeef', `task:${uuid} trailing`, `runtime_evidence: task:${uuid}`,
+    `note task:${uuid}`, `task:${uuid.replace(/-/g, '')}`, 'relay.log:42']) {
+    assert.equal(parseRuntimeEvidenceReference(invalid), null, invalid);
+  }
 });
 
 test('missing Sol-low owner persists a named blocker instead of parking silently', async () => {

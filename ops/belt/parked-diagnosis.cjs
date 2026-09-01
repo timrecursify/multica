@@ -48,6 +48,11 @@ function diagnosisEvidence(text) {
   return match && match[1].trim() ? match[1].trim() : null;
 }
 
+function parseRuntimeEvidenceReference(value) {
+  const match = String(value || '').trim().match(/^(task|qc|activity):([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i);
+  return match ? { kind: match[1].toLowerCase(), id: match[2].toLowerCase() } : null;
+}
+
 function isConcreteRuntimeEvidence(value) {
   const evidence = String(value || '').trim();
   return evidence.length >= 8 && (
@@ -121,11 +126,9 @@ function diagnosisOutcomeAction({ outcome, evidenceVerified = false, duplicateIs
 }
 
 async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = null) {
-  const text = String(evidence || '').trim();
-  const match = text.match(/\b(task|qc|activity):([0-9a-f-]{8,})\b/i);
-  if (!match) return false;
-  const kind = match[1].toLowerCase();
-  const id = match[2];
+  const reference = parseRuntimeEvidenceReference(evidence);
+  if (!reference) return false;
+  const { kind, id } = reference;
   const queries = {
     task: `SELECT 1 FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id
              WHERE t.id = $1 AND t.issue_id = $2 AND t.id IS DISTINCT FROM $3
@@ -240,6 +243,10 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
       stage: issue.status, attempts, ceiling: evidence.ceiling }),
     owner_selection: ownerRow.is_original_scoper === true ? 'original_scoper' : 'dedicated_sol_low'
   };
+  if (evidence.evidence_correction_retry === true) {
+    context.evidence_correction_retry = true;
+    context.retry_of_task_id = evidence.retry_of_task_id;
+  }
   const task = await client.query(
     `INSERT INTO agent_task_queue (
        agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
@@ -247,19 +254,28 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
        trigger_evidence_kind, attempt, max_attempts
      )
      SELECT $1::uuid, $2::uuid, $3::uuid, 'queued', $4::integer, $5::uuid, $6::jsonb,
-            'Sol-low parked-ticket diagnosis (no builder dispatch)', TRUE,
+            $8::text, TRUE,
             'unattributed', 'relay_disposition', 1, 1
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue
         WHERE issue_id = $2::uuid AND context->>'kind' = $7::text
-          AND COALESCE(LOWER(status), '') NOT IN ('failed', 'cancelled')
+          AND (
+            (COALESCE($9::boolean, FALSE) = FALSE
+              AND COALESCE(LOWER(status), '') NOT IN ('failed', 'cancelled'))
+            OR (COALESCE($9::boolean, FALSE) = TRUE
+              AND context->>'evidence_correction_retry' = 'true')
+          )
       )
       ON CONFLICT DO NOTHING
       RETURNING id`,
     [ownerRow.id, issue.id, issue.workspace_id,
       PRIORITY[String(issue.priority || 'none').toLowerCase()] ?? (Number(issue.priority) || 0),
       ownerRow.runtime_id,
-      JSON.stringify(context), PARK_DIAGNOSIS_KIND]
+      JSON.stringify(context), PARK_DIAGNOSIS_KIND,
+      evidence.evidence_correction_retry === true
+        ? 'Sol-low parked-ticket evidence correction diagnosis; use runtime_evidence: task:<uuid>, qc:<uuid>, or activity:<uuid>.'
+        : 'Sol-low parked-ticket diagnosis (no builder dispatch)',
+      evidence.evidence_correction_retry === true]
   );
   return task.rows[0]?.id || null;
 }
@@ -280,6 +296,7 @@ module.exports = {
   currentPassWorkProductMD5,
   namedBlocker,
   parseDiagnosisOutcome,
+  parseRuntimeEvidenceReference,
   recordParkAndQueueDiagnosis,
   verifyRuntimeEvidence
 };

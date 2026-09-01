@@ -15,7 +15,7 @@ const MAX_SCAN_WINDOW = MAX_BATCH;
 const NONTERMINAL = ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred'];
 
 function parseArgs(argv) {
-  const out = { batch: DEFAULT_BATCH, workspace: null, mode: null };
+  const out = { batch: DEFAULT_BATCH, workspace: null, mode: null, retryRuntimeEvidence: false };
   let modeCount = 0;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -25,6 +25,7 @@ function parseArgs(argv) {
     }
     else if (arg === '--batch-size') out.batch = Number(argv[++i]);
     else if (arg === '--workspace') out.workspace = argv[++i];
+    else if (arg === '--retry-runtime-evidence') out.retryRuntimeEvidence = true;
     else if (arg === '--help') return { help: true };
     else throw new Error(`unknown option: ${arg}`);
   }
@@ -32,11 +33,14 @@ function parseArgs(argv) {
   if (!Number.isInteger(out.batch) || out.batch < 1 || out.batch > MAX_BATCH) {
     throw new Error(`--batch-size must be an integer from 1 to ${MAX_BATCH}`);
   }
+  if (out.retryRuntimeEvidence && out.mode !== 'apply') {
+    throw new Error('--retry-runtime-evidence requires --apply');
+  }
   return out;
 }
 
 function usage() {
-  return 'Usage: backfill-parked-diagnosis.cjs (--dry-run|--apply) [--batch-size N] [--workspace UUID]';
+  return 'Usage: backfill-parked-diagnosis.cjs (--dry-run|--apply) [--batch-size N] [--workspace UUID] [--retry-runtime-evidence]';
 }
 
 function interleaveByWorkspace(rows) {
@@ -58,7 +62,7 @@ function interleaveByWorkspace(rows) {
   }
 }
 
-async function inspect(client, issue) {
+async function inspect(client, issue, options = {}) {
   const blocker = issue.metadata && typeof issue.metadata === 'object'
     ? issue.metadata.parked_blocker : null;
   const task = await client.query(
@@ -77,6 +81,22 @@ async function inspect(client, issue) {
             : 'existing_parked_diagnosis';
     // Failed/cancelled diagnosis attempts are explicitly retryable. Completed
     // and nonterminal attempts stay protected from duplicate dispatch.
+    const evidenceRetry = options.retryRuntimeEvidence === true &&
+      blocker === 'runtime_evidence_unverified' && status === 'completed';
+    if (evidenceRetry) {
+      const priorRetry = await client.query(
+        `SELECT 1 FROM agent_task_queue
+          WHERE issue_id = $1 AND context->>'kind' = $2
+            AND context->>'evidence_correction_retry' = 'true' LIMIT 1`,
+        [issue.id, PARK_DIAGNOSIS_KIND]);
+      if (!priorRetry.rowCount) {
+        return { kind: 'eligible', has_reason_comment: true,
+          retrying: 'runtime_evidence_correction', status, prior_task_id: task.rows[0].id,
+          previous_blocker: blocker };
+      }
+      return { kind: 'skip', reason: 'completed_runtime_evidence_correction_retry', status,
+        task_id: task.rows[0].id };
+    }
     if (status === 'failed' || status === 'cancelled') {
       return { kind: 'eligible', has_reason_comment: true, retrying: reason, status,
         prior_task_id: task.rows[0].id, previous_blocker: blocker };
@@ -97,6 +117,23 @@ async function run(pool, options) {
   const values = options.workspace
     ? [options.workspace, PARK_DIAGNOSIS_KIND, options.batch]
     : [PARK_DIAGNOSIS_KIND, options.batch];
+  const retryPredicate = options.retryRuntimeEvidence
+    ? `AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified'
+          AND EXISTS (
+            SELECT 1 FROM agent_task_queue completed
+             WHERE completed.issue_id = i.id AND completed.context->>'kind' = ${kindParam}
+               AND LOWER(completed.status) = 'completed'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM agent_task_queue retried
+             WHERE retried.issue_id = i.id AND retried.context->>'kind' = ${kindParam}
+               AND retried.context->>'evidence_correction_retry' = 'true'
+          )`
+    : `AND NOT EXISTS (
+            SELECT 1 FROM agent_task_queue d
+             WHERE d.issue_id = i.id AND d.context->>'kind' = ${kindParam}
+               AND COALESCE(LOWER(d.status), '') NOT IN ('failed', 'cancelled')
+          )`;
   const candidateSql =
     `WITH ranked AS (
        SELECT i.id, i.workspace_id,
@@ -112,11 +149,7 @@ async function run(pool, options) {
                AND mega.title LIKE 'MEGA%'
                AND mega.status NOT IN ('Done', 'Archived', 'Cancelled')
           )
-          AND NOT EXISTS (
-            SELECT 1 FROM agent_task_queue d
-             WHERE d.issue_id = i.id AND d.context->>'kind' = ${kindParam}
-               AND COALESCE(LOWER(d.status), '') NOT IN ('failed', 'cancelled')
-          )
+          ${retryPredicate}
      )
      SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata
        FROM issue i JOIN ranked r ON r.id = i.id
@@ -151,7 +184,7 @@ async function run(pool, options) {
     for (const issue of rows) {
       counts.scanned += 1;
       counts.selected += 1;
-      const decision = await inspect(client, issue);
+      const decision = await inspect(client, issue, options);
       if (decision.kind === 'skip') {
         // A race can create a task after selection only when a non-cooperating
         // writer bypasses the issue lock. Record it but never create a second.
@@ -162,7 +195,9 @@ async function run(pool, options) {
       }
       const taskId = await recordParkAndQueueDiagnosis(client, issue, {
         reason: decision.has_reason_comment ? 'backfill_existing_reason' : 'backfill_reason_not_recoverable',
-        skip_reason_comment: decision.has_reason_comment
+        skip_reason_comment: decision.has_reason_comment,
+        evidence_correction_retry: decision.retrying === 'runtime_evidence_correction',
+        retry_of_task_id: decision.prior_task_id
       });
       if (taskId) { counts.queued += 1; ids.queued.push(`${issue.id}:${taskId}`); }
       else {

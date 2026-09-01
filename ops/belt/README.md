@@ -63,6 +63,17 @@ node ops/belt/backfill-parked-diagnosis.cjs --dry-run
 node ops/belt/backfill-parked-diagnosis.cjs --apply --batch-size 25
 ```
 
+An operator may make one explicit correction retry only for a completed
+diagnosis held with `parked_blocker: runtime_evidence_unverified`:
+
+```bash
+node ops/belt/backfill-parked-diagnosis.cjs --apply --retry-runtime-evidence
+```
+
+The correction task must cite one exact durable reference as
+`runtime_evidence: task:<uuid>`, `qc:<uuid>`, or `activity:<uuid>`. The retry
+is recorded in task context and is never automatically repeated.
+
 Add `--workspace <UUID>` to constrain a run. The script locks each still-Parked
 issue, skips named blockers and all prior diagnosis tasks (reporting completed,
 failed, and cancelled statuses), and emits stable JSON counts and IDs,

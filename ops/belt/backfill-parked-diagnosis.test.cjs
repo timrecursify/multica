@@ -11,7 +11,44 @@ test('batch size is bounded at 25 and mode is explicit', () => {
   assert.throws(() => parseArgs(['--apply', '--batch-size', '26']), /1 to 25/);
   assert.throws(() => parseArgs(['--batch-size', '1']), /exactly one/);
   assert.throws(() => parseArgs(['--dry-run', '--apply']), /exactly one/);
+  assert.throws(() => parseArgs(['--dry-run', '--retry-runtime-evidence']), /requires --apply/);
+  assert.equal(parseArgs(['--apply', '--retry-runtime-evidence']).retryRuntimeEvidence, true);
   assert.equal(MAX_BATCH, 25);
+});
+
+test('runtime-evidence correction retry admits exactly the completed held class', async () => {
+  const classes = [
+    [{ parked_blocker: 'runtime_evidence_unverified' }, 'completed', false, 'eligible'],
+    [{ parked_blocker: 'other' }, 'completed', false, 'skip'],
+    [{ parked_blocker: 'runtime_evidence_unverified' }, 'running', false, 'skip'],
+    [{ parked_blocker: 'runtime_evidence_unverified' }, 'failed', false, 'eligible'],
+    [{ parked_blocker: 'runtime_evidence_unverified' }, 'cancelled', false, 'eligible'],
+    [{ parked_blocker: 'runtime_evidence_unverified' }, 'completed', true, 'skip'],
+    [{}, 'completed', false, 'skip'],
+    [{ parked_blocker: 'runtime_evidence_unverified' }, null, false, 'eligible']
+  ];
+  for (const [metadata, status, priorRetry, expected] of classes) {
+    const client = { query: async (sql) => {
+      if (sql.includes("evidence_correction_retry")) return { rowCount: priorRetry ? 1 : 0, rows: [] };
+      if (sql.includes('agent_task_queue')) return status == null
+        ? { rowCount: 0, rows: [] } : { rowCount: 1, rows: [{ id: 'prior', status }] };
+      return { rowCount: 0, rows: [] };
+    } };
+    const decision = await inspect(client, { id: 'issue', metadata }, { retryRuntimeEvidence: true });
+    assert.equal(decision.kind, expected, `${JSON.stringify({ metadata, status, priorRetry })}`);
+  }
+});
+
+test('correction mode has an explicit held-completed candidate predicate and one-shot guard', async () => {
+  const seen = [];
+  await run({ connect: async () => ({ query: async (sql) => {
+    seen.push(sql); return { rows: [], rowCount: 0 };
+  }, release() {} }) },
+    parseArgs(['--apply', '--retry-runtime-evidence']));
+  const sql = seen.find((statement) => statement.includes('WITH ranked AS'));
+  assert.match(sql, /i\.metadata->>'parked_blocker' = 'runtime_evidence_unverified'/);
+  assert.match(sql, /LOWER\(completed\.status\) = 'completed'/);
+  assert.match(sql, /retried\.context->>'evidence_correction_retry' = 'true'/);
 });
 
 test('selection allows temporary blockers and retryable diagnoses before the batch limit', async () => {
