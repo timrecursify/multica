@@ -12,12 +12,17 @@ export CODEX_BIN="$requested_codex_bin"
 
 cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-32}"
 root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
+help_timeout="${MULTICA_DAEMON_HELP_TIMEOUT_SECONDS:-5}"
 if [[ ! "$cap_raw" =~ ^[1-9][0-9]*$ ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer" >&2
   exit 64
 fi
 if [[ -z "$root" || "$root" != /* ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path" >&2
+  exit 64
+fi
+if [[ ! "$help_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "multica-daemon-wrapper: MULTICA_DAEMON_HELP_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 64
 fi
 export MULTICA_DAEMON_MAX_CONCURRENT_TASKS="$cap_raw"
@@ -42,10 +47,18 @@ if [[ -z "$daemon_cwd" || "$daemon_cwd" != /* || ! -d "$daemon_cwd" ]]; then
 fi
 export MULTICA_DAEMON_PORT="${MULTICA_DAEMON_PORT:-20464}"
 cd -- "$daemon_cwd"
-daemon_help="$($daemon_bin daemon start --help 2>&1)" || {
-  echo "multica-daemon-wrapper: unable to inspect daemon start capabilities" >&2
+set +e
+daemon_help="$(timeout --kill-after=1s "${help_timeout}s" "$daemon_bin" daemon start --help 2>&1)"
+help_status=$?
+set -e
+if [[ $help_status -eq 124 ]]; then
+  echo "multica-daemon-wrapper: daemon start capability probe timed out" >&2
   exit 64
-}
+fi
+if [[ $help_status -ne 0 ]]; then
+  echo "multica-daemon-wrapper: daemon start capability probe failed (exit $help_status)" >&2
+  exit 64
+fi
 daemon_args=(daemon start --foreground --daemon-id=gsp-multica-worker
   --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks="$cap_raw")
 # `--workspaces-root` was removed from a short-lived daemon release. The

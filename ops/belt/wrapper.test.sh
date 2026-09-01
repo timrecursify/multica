@@ -5,6 +5,8 @@ fake="$(mktemp -d)"; trap 'rm -rf "$fake"' EXIT
 cat >"$fake/daemon" <<'EOF'
 #!/usr/bin/env bash
 if [[ "$*" == 'daemon start --help' ]]; then
+  if [[ "${HANG_HELP:-0}" == 1 ]]; then sleep 3; fi
+  if [[ "${FAIL_HELP:-0}" == 1 ]]; then exit 17; fi
   if [[ "${DAEMON_SUPPORTS_WORKSPACES_FLAG:-1}" == 1 ]]; then
     printf '%s\n' '      --workspaces-root string Base directory for task workspaces'
   else
@@ -64,4 +66,14 @@ assert_wrapper_rejects cwd-relative \
 assert_wrapper_rejects cwd-missing \
   'multica-daemon-wrapper: MULTICA_DAEMON_CWD must be an existing absolute directory' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$fake/missing" CAPTURE_FILE="$capture"
+rm -f -- "$capture"
+assert_wrapper_rejects help-nonzero \
+  'multica-daemon-wrapper: daemon start capability probe failed (exit 17)' \
+  MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" FAIL_HELP=1
+[[ ! -e "$capture" ]]
+start="$(date +%s)"
+assert_wrapper_rejects help-timeout \
+  'multica-daemon-wrapper: daemon start capability probe timed out' \
+  MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" HANG_HELP=1 MULTICA_DAEMON_HELP_TIMEOUT_SECONDS=1
+[[ $(( $(date +%s) - start )) -lt 3 && ! -e "$capture" ]]
 echo 'wrapper launch regression passed'
