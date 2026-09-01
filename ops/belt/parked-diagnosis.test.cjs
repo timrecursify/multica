@@ -117,10 +117,35 @@ test('missing Sol-low owner persists a named blocker instead of parking silently
   assert.match(trace, /multica-park-diagnosis-blocker/);
 });
 
+test('queued diagnosis task is scoped to the issue workspace', async () => {
+  const queries = [];
+  const client = { query: async (sql, values) => {
+    queries.push({ sql, values });
+    if (/SELECT failure_reason, error/.test(sql)) return { rows: [] };
+    if (/SELECT verdict FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/SELECT a\.id, a\.name/.test(sql)) return { rows: [{
+      id: 'agent-1', name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol',
+      runtime_id: 'runtime-1', instructions: 'Parked diagnosis: fixable, already_fixed, duplicate, genuinely_blocked.',
+      runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' }
+    }] };
+    if (/INSERT INTO agent_task_queue/.test(sql)) return { rows: [{ id: 'task-1' }] };
+    return { rowCount: 0, rows: [] };
+  } };
+  const taskId = await recordParkAndQueueDiagnosis(client, {
+    id: 'issue-1', workspace_id: 'workspace-1', status: 'Parked', priority: 'medium'
+  }, { reason: 'stage_cycle_limit', attempts: 2, ceiling: 2 });
+  assert.equal(taskId, 'task-1');
+  const insert = queries.find(({ sql }) => /INSERT INTO agent_task_queue/.test(sql));
+  assert.ok(insert, 'diagnosis INSERT was executed');
+  assert.match(insert.sql, /agent_id, issue_id, workspace_id, status/);
+  assert.equal(insert.values[2], 'workspace-1');
+});
+
 test('INSERT SELECT parameters carry explicit PostgreSQL types', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./parked-diagnosis.cjs'), 'utf8');
   assert.match(source, /SELECT \$1::uuid, \$2::uuid, 'system', \$3::uuid, \$4::text, 'system'/);
-  assert.match(source, /SELECT \$1::uuid, \$2::uuid, 'queued', \$3::integer, \$4::uuid, \$5::jsonb/);
-  assert.match(source, /issue_id = \$2::uuid AND context->>'kind' = \$6::text/);
+  assert.match(source, /agent_id, issue_id, workspace_id, status, priority, runtime_id, context/);
+  assert.match(source, /SELECT \$1::uuid, \$2::uuid, \$3::uuid, 'queued', \$4::integer, \$5::uuid, \$6::jsonb/);
+  assert.match(source, /issue_id = \$2::uuid AND context->>'kind' = \$7::text/);
 });
