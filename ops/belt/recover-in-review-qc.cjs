@@ -40,4 +40,18 @@ async function recover(client, issueId) {
     triggerSummary: 'Operator recovery: cancelled unstarted Parked -> In Review successor' });
 }
 
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+  const { Pool } = require('pg');
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+  try {
+    for (const issueId of options.issueIds) {
+      const client = await pool.connect();
+      try { await client.query('BEGIN'); const task = await recover(client, issueId); await client.query('COMMIT'); console.log(JSON.stringify({ issue_id: issueId, task_id: task?.taskId || null })); }
+      catch (error) { await client.query('ROLLBACK').catch(() => {}); throw error; } finally { client.release(); }
+    }
+  } finally { await pool.end(); }
+}
+if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1; });
 module.exports = { parseArgs, recover };
