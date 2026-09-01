@@ -513,6 +513,7 @@ async function relayAdvance(req, res, body) {
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [issue_id]);
 
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
+    const terminalStages = new Set(["Done", "Cancelled", "Archived"]);
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -540,6 +541,10 @@ async function relayAdvance(req, res, body) {
     }
     const parkedRelease = issue.status === "Parked" && to_stage === "Queue" &&
       issue.metadata?.parked_release_once === true;
+    // Parked -> Done is reserved for the relay's already-fixed diagnosis
+    // outcome. It still reaches the current PASS + work-product-hash gate
+    // below; the relay secret is the authority boundary for this exception.
+    const parkedDiagnosisDone = issue.status === "Parked" && to_stage === "Done";
     const releaseAt = issue.metadata?.parked_release_at || null;
     if (issue.status === to_stage) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
@@ -594,7 +599,7 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    if (!parkedRelease && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
+    if (!parkedRelease && !parkedDiagnosisDone && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
@@ -969,7 +974,7 @@ async function relayAdvance(req, res, body) {
     let taskId = null;
     let relayLogId = null;
 
-    if (issue.status === 'CI/CD & Deploy' && to_stage === 'Done') {
+    if (terminalStages.has(to_stage)) {
       relayLogId = await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
