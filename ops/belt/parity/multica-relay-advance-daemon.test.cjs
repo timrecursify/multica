@@ -4,7 +4,8 @@ const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const { Client } = require('pg');
 const { qcCompletionAdvance, processParkedDiagnoses,
-  adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary } = require('./multica-relay-advance-daemon.cjs');
+  adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
+  isInfrastructureFailure, selectReplayAttempt } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
@@ -69,6 +70,27 @@ test('assignment adoption inserts only the assigned configured QC task once and 
     try { await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); } catch (_) {}
     await admin.end();
   }
+});
+
+test('infrastructure failures replay at the same attempt, including exhausted rows', () => {
+  for (const reason of INFRA_FAILURE_REASONS) {
+    assert.equal(isInfrastructureFailure(reason), true, reason);
+    assert.equal(selectReplayAttempt({
+      dead_task_id: 'dead-task', dead_task_status: 'failed', failure_reason: reason,
+      attempt: 2, max_attempts: 2
+    }), 2, reason);
+  }
+});
+
+test('genuine failures and completed tasks without artifacts consume an attempt', () => {
+  assert.equal(selectReplayAttempt({
+    dead_task_id: 'dead-task', dead_task_status: 'failed', failure_reason: 'failed_implementation',
+    attempt: 1, max_attempts: 2
+  }), 2);
+  assert.equal(selectReplayAttempt({
+    dead_task_id: 'dead-task', dead_task_status: 'completed', failure_reason: null,
+    attempt: 1, max_attempts: 2
+  }), 2);
 });
 
 test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async (t) => {
