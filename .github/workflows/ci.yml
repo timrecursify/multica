@@ -266,6 +266,9 @@ jobs:
       - name: Test daemon config guard contract
         run: bash ops/belt/belt-config-guard.test.sh
 
+      - name: Test daemon deployment contract
+        run: bash ops/belt/deploy.test.sh
+
   backend:
     runs-on: ubuntu-latest
     services:
