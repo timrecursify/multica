@@ -34,8 +34,31 @@ const {
   latestQcNoArtifactSignal,
   retryEscalationReason,
   verifiedRetryEscalation,
-  retryEscalationSourceTask
+  retryEscalationSourceTask,
+  authorizeRelayStatusWrites
 } = require('./multica-bridge.cjs');
+
+test('relay status authority is transaction-local', async () => {
+  const calls = [];
+  await authorizeRelayStatusWrites({ query: async (sql) => calls.push(sql) });
+  assert.deepEqual(calls, ["SELECT set_config('multica.relay_authorized', 'on', true)"]);
+});
+
+test('relay advance authorizes status writes after beginning its transaction', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const relay = source.slice(source.indexOf('async function relayAdvance'));
+  assert.match(relay, /await client\.query\("BEGIN"\);\s+await authorizeRelayStatusWrites\(client\);/);
+});
+
+test('status authority migration rejects non-relay changes and is reversible', () => {
+  const up = fs.readFileSync(require.resolve('../../server/migrations/297_relay_status_authority.up.sql'), 'utf8');
+  const down = fs.readFileSync(require.resolve('../../server/migrations/297_relay_status_authority.down.sql'), 'utf8');
+  assert.match(up, /BEFORE UPDATE OF status ON issue/);
+  assert.match(up, /current_setting\('multica\.relay_authorized', true\) IS DISTINCT FROM 'on'/);
+  assert.match(up, /ERRCODE = '42501'/);
+  assert.match(down, /DROP TRIGGER IF EXISTS issue_status_relay_authority ON issue/);
+  assert.match(down, /DROP FUNCTION IF EXISTS require_relay_status_authority/);
+});
 
 test('retry escalation accepts only named bounded triggers', () => {
   assert.equal(retryEscalationReason('retry_escalation:completion_failed'), 'completion_failed');

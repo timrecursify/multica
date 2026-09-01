@@ -82,12 +82,11 @@ test('Registered discovery covers every configured workspace', () => {
   assert.match(source, /client\.query\(query, \['Registered', STAGE_CYCLE_LIMIT\]\)/);
 });
 
-test('dispositions do not cancel paid tasks that already started', () => {
+test('all parity dispositions use relay authority rather than direct issue status writes', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  const disposition = source.slice(source.indexOf('async function applyDisposition'),
-    source.indexOf('const configuredPoolMax'));
-  assert.doesNotMatch(disposition, /status IN \([^)]*running/);
-  assert.match(disposition, /status IN \('queued','dispatched','waiting_local_directory','deferred'\)/);
+  assert.doesNotMatch(source, /UPDATE issue SET status/);
+  assert.match(source, /postToRelay\(\{ issue_id: row\.issue_id, to_stage: 'Human Review'/);
+  assert.match(source, /reason: 'payment_required_402'/);
 });
 
 test('relay advancement admits task results before creating a successor', () => {

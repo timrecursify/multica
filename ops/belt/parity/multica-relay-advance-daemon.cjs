@@ -210,51 +210,6 @@ async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () =
   }
 }
 
-async function applyDisposition(client, row, disposition, reason, evidence = {}) {
-  const changed = await client.query(
-    `UPDATE issue SET status = $1, updated_at = NOW()
-      WHERE id = $2 AND status <> $1 RETURNING id`,
-    [disposition, row.issue_id]
-  );
-  if (changed.rowCount > 0 && disposition === 'Parked') {
-    await recordParkedEntry(client, {
-      issueId: row.issue_id,
-      fromStage: row.stage,
-      trigger: reason,
-      intendedStage: evidence.target_stage || null,
-      attempts: evidence.historical_tasks || 0,
-      taskCount: evidence.task_count || evidence.historical_tasks || 0
-    });
-    const diagnosisTaskId = await recordParkAndQueueDiagnosis(client,
-      { id: row.issue_id, workspace_id: row.workspace_id, status: row.stage,
-        priority: row.priority }, { ...evidence, reason,
-        failure_reason: row.failure_reason });
-    if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
-  }
-  await client.query(
-    `UPDATE agent_task_queue
-        SET status = 'cancelled', completed_at = NOW(),
-            prepare_lease_expires_at = NULL, failure_reason = $2
-      WHERE issue_id = $1
-        -- Never interrupt a paid task already executing. Cross-stage
-        -- admission defers successors until running predecessors are
-        -- terminal; only unstarted work may be retired by a disposition.
-        AND status IN ('queued','dispatched','waiting_local_directory','deferred')
-        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'`,
-    [row.issue_id, reason]
-  );
-  if (changed.rowCount > 0) {
-    await client.query(
-      `INSERT INTO activity_log
-         (workspace_id, issue_id, actor_type, action, details)
-       SELECT workspace_id, id, 'system', 'relay_disposition_applied', $2::jsonb
-         FROM issue WHERE id = $1`,
-      [row.issue_id, JSON.stringify({ from: row.stage, to: disposition, reason, ...evidence })]
-    );
-  }
-  return changed.rowCount > 0;
-}
-
 const configuredPoolMax = Number.parseInt(process.env.RELAY_PG_POOL_MAX || '2', 10);
 const poolMax = Number.isInteger(configuredPoolMax) && configuredPoolMax > 0
   ? Math.min(configuredPoolMax, 4)
@@ -974,16 +929,14 @@ async function requeueStrandedTasks() {
           const quotaPause = circuit.pause
             ? await pauseQuotaLane(client, row, circuit.consecutive)
             : null;
-          const moved = await applyDisposition(client, row, 'Human Review', 'payment_required_402', {
-            dead_task_id: row.dead_task_id, consecutive_failures: circuit.consecutive,
-            lane_paused: Boolean(quotaPause)
-          });
           await client.query('COMMIT');
+          const moved = await postToRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
+            agent_token: RELAY_AGENT_SECRET, reason: 'payment_required_402' });
           if (quotaPause) {
             logQuotaPauseFlip({ agent_name: quotaPause.agent_name,
               timestamp: quotaPause.paused_at, paused: true });
           }
-          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}; lane_paused=${Boolean(quotaPause)}`);
+          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; relay=${moved.status}; lane_paused=${Boolean(quotaPause)}`);
           continue;
         }
         const releaseAt = row.metadata?.parked_release_at ||

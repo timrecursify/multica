@@ -103,6 +103,10 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
+
+async function authorizeRelayStatusWrites(client) {
+  await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
+}
 const IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "access"]);
 const RETRY_ESCALATION_REASONS = new Set([
@@ -1043,6 +1047,7 @@ async function relayAdvance(req, res, body) {
     client = new Client({ connectionString: MULTICA_DB });
     await client.connect();
     await client.query("BEGIN");
+    await authorizeRelayStatusWrites(client);
     // Every relay execution admission for an issue takes this transaction lock,
     // including the recovery daemon. A partial unique index would either miss
     // waiting/deferred tasks or incorrectly constrain manual tasks; this lock
@@ -1797,5 +1802,6 @@ module.exports = {
   latestQcNoArtifactSignal,
   retryEscalationReason,
   verifiedRetryEscalation,
-  retryEscalationSourceTask
+  retryEscalationSourceTask,
+  authorizeRelayStatusWrites
 };
