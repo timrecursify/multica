@@ -381,7 +381,23 @@ async function ensureCompletedRelayLog(client, issueId, fromStage, toStage) {
      RETURNING id`,
     [issueId, fromStage, toStage]
   );
-  return inserted.rows[0]?.id || null;
+  if (inserted.rows[0]?.id) return inserted.rows[0].id;
+  const existing = await client.query(
+    `SELECT id FROM relay_run_log
+      WHERE issue_id = $1 AND from_stage = $2 AND to_stage = $3
+        AND status = 'completed'
+      ORDER BY created_at DESC, id DESC LIMIT 1`,
+    [issueId, fromStage, toStage]
+  );
+  return existing.rows[0]?.id || null;
+}
+
+async function completedTerminalRelayLog(client, issueId, toStage) {
+  const existing = await client.query(
+    `SELECT id FROM relay_run_log
+      WHERE issue_id = $1 AND to_stage = $2 AND status = 'completed'
+      ORDER BY created_at DESC, id DESC LIMIT 1`, [issueId, toStage]);
+  return existing.rows[0]?.id || null;
 }
 
 async function existingStageTask(client, issueId, toStage) {
@@ -548,13 +564,16 @@ async function relayAdvance(req, res, body) {
     const releaseAt = issue.metadata?.parked_release_at || null;
     if (issue.status === to_stage) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
+      const relayLogId = terminalStages.has(to_stage)
+        ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
         issue: { id: issue.id, status: issue.status },
         transition: "already_applied",
-        task_id: taskId
+        task_id: taskId,
+        relay_log_id: relayLogId
       }));
       return;
     }
@@ -1121,6 +1140,7 @@ module.exports = {
   replaceStageTask,
   ownerStageForTransition,
   ensureCompletedRelayLog,
+  completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff
 };
