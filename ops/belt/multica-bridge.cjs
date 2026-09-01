@@ -10,7 +10,7 @@ const {
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,
-  routableOwnerGaps
+  assertRoutableStageOwners
 } = require("./guardrails.cjs");
 
 // Relay configuration is supplied by the host environment.
@@ -766,14 +766,15 @@ async function assertRoutableStagesHaveOwners() {
   await client.connect();
   try {
     const result = await client.query(
-      `SELECT stage_name, next_stage, agent_id
-         FROM relay_stage_config
-        ORDER BY id`
+      `SELECT rsc.stage_name, rsc.next_stage, rsc.agent_id,
+              a.id AS owner_id, a.status AS owner_status,
+              a.archived_at AS owner_archived_at,
+              a.instructions AS owner_instructions
+         FROM relay_stage_config rsc
+         LEFT JOIN agent a ON a.id = rsc.agent_id
+        ORDER BY rsc.id`
     );
-    const gaps = routableOwnerGaps(result.rows);
-    if (gaps.length > 0) {
-      throw new Error(`Routable relay stages missing owners: ${gaps.join(', ')}`);
-    }
+    assertRoutableStageOwners(result.rows);
   } finally {
     await client.end();
   }
