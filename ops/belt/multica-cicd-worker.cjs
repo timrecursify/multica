@@ -9,6 +9,8 @@
 const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
+const { deployed } = require('./cicd-deploy-evidence.cjs');
+let deployEvidence = deployed;
 let pool;
 let relayToken;
 
@@ -27,6 +29,7 @@ const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
 const ciFailureCounts = new Map();
+const deployWaitCounts = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -76,6 +79,22 @@ async function routeFinishedPR(issue, note) {
   await relay(issue.id, 'Done', latest.work_product_md5);
   await closePendingTask(issue.id);
   log(`DONE #${issue.number} — ${note}`);
+}
+
+async function park(issue, reason) {
+  await relay(issue.id, 'Parked', null, reason, { cicd_worker: reason });
+  await closePendingTask(issue.id);
+  log(`PARKED #${issue.number} — ${reason}`);
+}
+
+async function deployPending(issue, reason) {
+  const key = issue.id;
+  const count = (deployWaitCounts.get(key) || 0) + 1;
+  deployWaitCounts.set(key, count);
+  if (count >= CI_FAILURE_POLLS) return park(issue, `${reason}; deploy evidence retry ceiling ${CI_FAILURE_POLLS}`);
+  await pool.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+    VALUES ($1, $2, 'agent', $3, $4, 'comment')`, [issue.id, issue.workspace_id, BOT, `${reason}; retry ${count}/${CI_FAILURE_POLLS}`]);
+  log(`HOLD #${issue.number} ${reason}; retry ${count}/${CI_FAILURE_POLLS}`);
 }
 
 async function escalateCi(issue, pr, ci) {
@@ -195,7 +214,7 @@ async function mirrorVerdictToPR(issue, pr, headSha) {
 
 async function sweep() {
   const { rows } = await pool.query(
-    `SELECT id, number, title FROM issue WHERE status='CI/CD & Deploy' ORDER BY number`);
+    `SELECT id, number, title, workspace_id FROM issue WHERE status='CI/CD & Deploy' ORDER BY number`);
   if (!rows.length) { log('[poll] CI/CD & Deploy is empty'); return; }
   log(`[poll] ${rows.length} ticket(s) in CI/CD & Deploy`);
   for (const issue of rows) {
@@ -219,17 +238,29 @@ async function sweep() {
           if (!seenPR.has(k)) { seenPR.add(k); prs.push(cand); }
         }
       }
-      if (!prs.length) { await routeFinishedPR(issue, 'no PR referenced; nothing to deploy'); continue; }
+      if (!prs.length) { await park(issue, 'no PR referenced'); continue; }
 
       // Resolve every referenced PR first, then decide once.
       const states = [];
       for (const cand of prs) {
         states.push({ pr: cand,
-          info: JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt'])) });
+          info: JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit'])) });
       }
-      const openStates = states.filter(s2 => s2.info.state !== 'MERGED' && s2.info.state !== 'CLOSED');
+      const closed = states.filter(s2 => s2.info.state === 'CLOSED');
+      if (closed.length) {
+        await park(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '));
+        continue;
+      }
+      const openStates = states.filter(s2 => s2.info.state !== 'MERGED');
       if (!openStates.length) {
-        await routeFinishedPR(issue, states.map(s2 => `${s2.pr.repo}#${s2.pr.num} ${s2.info.state.toLowerCase()}`).join(', '));
+        const missing = states.filter(s2 => !deployEvidence({ ...s2.pr, ...s2.info }));
+        if (!missing.length) { await routeFinishedPR(issue, 'all referenced PRs merged and deployed'); continue; }
+        const reason = `deploy evidence pending for ${missing.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', ')}`;
+        if (missing.some(s2 => s2.pr.repo === 'timrecursify/ppp')) {
+          const exit = await pool.query(`SELECT 1 FROM relay_stage_config WHERE workspace_id=$1 AND stage_name='Deploy pending'`, [issue.workspace_id]);
+          if (exit.rows.length) { await relay(issue.id, 'Deploy pending', null, reason); await closePendingTask(issue.id); }
+          else await deployPending(issue, reason);
+        } else log(`HOLD #${issue.number} ${reason}`);
         continue;
       }
       if (openStates.length > 1) {
@@ -293,7 +324,8 @@ function setTestDependencies(dependencies) {
   if (dependencies.pool) pool = dependencies.pool;
   if (dependencies.relay) relay = dependencies.relay;
   if (dependencies.gh) gh = dependencies.gh;
+  if (dependencies.deployed) deployEvidence = dependencies.deployed;
 }
 
-module.exports = { ciState, countCiFailure, escalateCi, returnToBuild,
-  routeFinishedPR, setTestDependencies, sweep };
+module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, park,
+  routeFinishedPR, setTestDependencies, sweep, deployPending };
