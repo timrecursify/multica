@@ -10,6 +10,10 @@ if [[ "$requested_codex_bin" == "/home/newadmin/tools/codex-openrouter" && "$MUL
 fi
 export CODEX_BIN="$requested_codex_bin"
 
+# The belt executes repository build commands through this process. Keep the
+# system Go toolchain ahead of inherited user paths for every task.
+export PATH="/usr/local/go/bin:${PATH}"
+
 cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-32}"
 root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
 help_timeout="${MULTICA_DAEMON_HELP_TIMEOUT_SECONDS:-5}"
