@@ -66,6 +66,12 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
+// A stage transition may retire work that has not started. Running paid work
+// is never cancelled here: crossStageExecutionAdmission defers the successor
+// until it becomes terminal, preserving the predecessor's work product.
+const REPLACEABLE_TASK_STATUSES = [
+  "queued", "dispatched", "waiting_local_directory", "deferred"
+];
 
 async function applyDisposition(client, issue, disposition, reason, evidence = {}) {
   const changed = await client.query(
@@ -78,7 +84,10 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
         SET status = 'cancelled', completed_at = NOW(),
             prepare_lease_expires_at = NULL, failure_reason = $2
       WHERE issue_id = $1
-        AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')`,
+        -- A disposition must not interrupt a paid task that already started.
+        -- Running predecessors are handled by cross-stage admission and are
+        -- allowed to reach a terminal state before any successor is created.
+        AND status IN ('queued','dispatched','waiting_local_directory','deferred')`,
     [issue.id, reason]
   );
   if (changed.rowCount > 0) {
@@ -176,9 +185,9 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
 }
 
 async function replaceStageTask(client, task) {
-  // The issue row is locked by relayAdvance.  Cancel every live task that was
-  // created for another stage before making the successor visible, so a flight
-  // cannot retain work from its previous stage after this transaction commits.
+  // The issue row is locked by relayAdvance. Cancel only unstarted relay work
+  // for another execution stage before making the successor visible. Running
+  // paid work and manual/disposition tasks are deliberately preserved.
   await client.query(
     `UPDATE agent_task_queue
         SET status = 'cancelled', completed_at = NOW(),
@@ -186,8 +195,12 @@ async function replaceStageTask(client, task) {
             failure_reason = 'relay_stage_transition_superseded'
       WHERE issue_id = $1
         AND status::text = ANY($2::text[])
+        AND context ? 'to_stage'
+        AND COALESCE(context->>'source', '') NOT LIKE 'manual%'
+        AND context->>'to_stage' NOT IN
+            ('Human Review', 'Parked', 'Rejected', 'Done', 'Archived', 'Cancelled')
         AND COALESCE(context->>'to_stage', '') IS DISTINCT FROM $3`,
-    [task.issueId, LIVE_TASK_STATUSES, task.toStage]
+    [task.issueId, REPLACEABLE_TASK_STATUSES, task.toStage]
   );
 
   const inserted = await client.query(

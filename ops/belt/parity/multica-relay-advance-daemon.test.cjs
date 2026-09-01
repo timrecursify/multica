@@ -15,3 +15,11 @@ test('Registered discovery covers every configured workspace', () => {
   assert.doesNotMatch(source, /\) < \$3/);
   assert.match(source, /client\.query\(query, \['Registered', STAGE_CYCLE_LIMIT\]\)/);
 });
+
+test('dispositions do not cancel paid tasks that already started', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const disposition = source.slice(source.indexOf('async function applyDisposition'),
+    source.indexOf('const configuredPoolMax'));
+  assert.doesNotMatch(disposition, /status IN \([^)]*running/);
+  assert.match(disposition, /status IN \('queued','dispatched','waiting_local_directory','deferred'\)/);
+});

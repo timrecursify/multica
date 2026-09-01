@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const fs = require('node:fs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
@@ -30,10 +31,34 @@ test('stage transition supersedes stale work before enqueuing and logging its su
   assert.deepEqual(result, { taskId: 'task-new', relayLogId: 'log-new' });
   assert.match(calls[0].sql, /failure_reason = 'relay_stage_transition_superseded'/);
   assert.deepEqual(calls[0].values, ['issue-1',
-    ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred'], 'In Review']);
+    ['queued', 'dispatched', 'waiting_local_directory', 'deferred'], 'In Review']);
+  assert.match(calls[0].sql, /context \? 'to_stage'/);
+  assert.match(calls[0].sql, /NOT LIKE 'manual%'/);
+  assert.match(calls[0].sql, /'Human Review', 'Parked', 'Rejected'/);
   assert.match(calls[1].sql, /WHERE NOT EXISTS/);
   assert.match(calls[2].sql, /INSERT INTO relay_run_log/);
   assert.deepEqual(calls[2].values, ['issue-1', 'In Progress', 'In Review', 'agent-1', 'task-new']);
+});
+
+test('stage transition never cancels an active paid predecessor', async () => {
+  const calls = [];
+  const replies = [{ rows: [] }, { rows: [{ id: 'task-new' }] }, { rows: [{ id: 'log-new' }] }];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return replies.shift();
+  } };
+  await replaceStageTask(client, transition());
+  assert.doesNotMatch(calls[0].sql, /status IN \([^)]*'running'/);
+  assert.deepEqual(calls[0].values[1],
+    ['queued', 'dispatched', 'waiting_local_directory', 'deferred']);
+});
+
+test('relay dispositions preserve already-running paid work', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const disposition = source.slice(source.indexOf('async function applyDisposition'),
+    source.indexOf('// The spec agent'));
+  assert.doesNotMatch(disposition, /status IN \([^)]*'running'/);
+  assert.match(disposition, /status IN \('queued','dispatched','waiting_local_directory','deferred'\)/);
 });
 
 test('stage transition fails before commit when no successor task exists', async () => {
