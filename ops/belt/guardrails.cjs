@@ -9,6 +9,7 @@ const STAGE_ALIASES = new Map([
   ['in_review', 'In Review']
 ]);
 const NON_EXECUTION_STAGES = new Set(['Human Review', 'Parked', 'Rejected']);
+const EXTERNAL_TRANSITION_STAGES = new Set(['Human Review', 'Done']);
 
 function canonicalStage(stage) {
   return STAGE_ALIASES.get(stage) || stage;
@@ -122,6 +123,29 @@ function isExecutionStage(stage) {
   return !NON_EXECUTION_STAGES.has(canonicalStage(stage));
 }
 
+function routableOwnerDefects(rows) {
+  const defects = [];
+  for (const row of rows || []) {
+    if (!row.next_stage || EXTERNAL_TRANSITION_STAGES.has(row.stage_name)) continue;
+    let reason = null;
+    if (!row.agent_id || !row.owner_id) reason = 'missing_owner';
+    else if (row.owner_archived_at) reason = 'owner_archived';
+    else if (!['idle', 'working'].includes(row.owner_status)) reason = 'owner_inactive';
+    else if (!instructionCompatibility(row.owner_instructions, row.next_stage).ok) {
+      reason = 'instruction_incompatible';
+    }
+    if (reason) defects.push(`${row.stage_name}:${reason}`);
+  }
+  return defects.sort();
+}
+
+function assertRoutableStageOwners(rows) {
+  const defects = routableOwnerDefects(rows);
+  if (defects.length > 0) {
+    throw new Error(`Routable relay stage owner defects: ${defects.join(', ')}`);
+  }
+}
+
 function quotaCircuitAdmission(failureReasons, limit = 3) {
   const ceiling = Number(limit);
   if (!Number.isInteger(ceiling) || ceiling < 1) {
@@ -147,5 +171,7 @@ module.exports = {
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,
+  routableOwnerDefects,
+  assertRoutableStageOwners,
   quotaCircuitAdmission
 };

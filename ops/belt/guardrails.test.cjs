@@ -3,7 +3,8 @@ const test = require('node:test');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
   retryAdmission, spendPreflight, stageCycleAdmission, lifetimeTaskAdmission,
-  isExecutionStage, quotaCircuitAdmission
+  isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
+  quotaCircuitAdmission
 } = require('./guardrails.cjs');
 
 test('any bundled child is withheld, regardless of parent state', () => {
@@ -74,6 +75,36 @@ test('human and disposition stages never execute tasks', () => {
   assert.equal(isExecutionStage('Human Review'), false);
   assert.equal(isExecutionStage('Parked'), false);
   assert.equal(isExecutionStage('Rejected'), false);
+});
+
+test('startup rejects routable stages without an owner', () => {
+  const rows = [
+    { stage_name: 'Queue', next_stage: 'In Progress', agent_id: 'builder',
+      owner_id: 'builder', owner_status: 'working', owner_archived_at: null,
+      owner_instructions: 'Own Queue and In Progress build stages' },
+    { stage_name: 'Parked', next_stage: 'Queue', agent_id: null },
+    { stage_name: 'Human Review', next_stage: 'CI/CD & Deploy', agent_id: null },
+    { stage_name: 'Done', next_stage: 'Archived', agent_id: null },
+    { stage_name: 'Archived', next_stage: null, agent_id: null }
+  ];
+  assert.deepEqual(routableOwnerDefects(rows), ['Parked:missing_owner']);
+  assert.throws(() => assertRoutableStageOwners(rows), /Parked:missing_owner/);
+  assert.doesNotThrow(() => assertRoutableStageOwners([rows[0], rows[2], rows[3], rows[4]]));
+});
+
+test('startup rejects archived, inactive, and instruction-incompatible owners', () => {
+  const owner = { agent_id: 'agent', owner_id: 'agent', owner_status: 'idle',
+    owner_archived_at: null, owner_instructions: 'Own Queue and In Progress build stages' };
+  const rows = [
+    { stage_name: 'Spec', next_stage: 'Queue', ...owner, owner_archived_at: '2026-09-01' },
+    { stage_name: 'Queue', next_stage: 'In Progress', ...owner, owner_status: 'offline' },
+    { stage_name: 'In Progress', next_stage: 'In Review', ...owner }
+  ];
+  assert.deepEqual(routableOwnerDefects(rows), [
+    'In Progress:instruction_incompatible',
+    'Queue:owner_inactive',
+    'Spec:owner_archived'
+  ]);
 });
 
 test('quota circuit pauses only after consecutive money failures', () => {

@@ -9,7 +9,8 @@ const {
   spendPreflight,
   stageCycleAdmission,
   lifetimeTaskAdmission,
-  isExecutionStage
+  isExecutionStage,
+  assertRoutableStageOwners
 } = require("./guardrails.cjs");
 
 // Relay configuration is supplied by the host environment.
@@ -736,7 +737,7 @@ async function relayAdvance(req, res, body) {
   }
 }
 
-http.createServer(async (req, res) => {
+const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/relay/advance") {
     let body = "";
     req.on("data", chunk => body += chunk);
@@ -758,9 +759,38 @@ http.createServer(async (req, res) => {
     res.writeHead(404);
     res.end("Not found");
   }
-}).listen(PORT, "127.0.0.1", () => {
+});
+
+async function assertRoutableStagesHaveOwners() {
+  const client = new Client({ connectionString: MULTICA_DB });
+  await client.connect();
+  try {
+    const result = await client.query(
+      `SELECT rsc.stage_name, rsc.next_stage, rsc.agent_id,
+              a.id AS owner_id, a.status AS owner_status,
+              a.archived_at AS owner_archived_at,
+              a.instructions AS owner_instructions
+         FROM relay_stage_config rsc
+         LEFT JOIN agent a ON a.id = rsc.agent_id
+        ORDER BY rsc.id`
+    );
+    assertRoutableStageOwners(result.rows);
+  } finally {
+    await client.end();
+  }
+}
+
+async function start() {
+  await assertRoutableStagesHaveOwners();
+  server.listen(PORT, "127.0.0.1", () => {
   console.log(`GSP Multica relay bridge listening on 127.0.0.1:${PORT}`);
   console.log(`SSO workspace: ${SSO_WORKSPACE_ID}`);
   console.log(`SSO Bridge: /sso/bridge (CF Access)`);
   console.log(`Relay: /relay/advance (ticket updates)`);
+  });
+}
+
+start().catch((err) => {
+  console.error(`Relay bridge startup refused: ${err.message}`);
+  process.exitCode = 1;
 });
