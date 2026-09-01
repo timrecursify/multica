@@ -19,8 +19,8 @@ grep -q -- "--max-concurrent-tasks=2" "$capture"
 grep -q 'cap=2 root=' "$capture"
 grep -q "cwd=$daemon_cwd" "$capture"
 env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh"
-grep -q "cap=10 root=/home/newadmin/multica-workspaces-gsp" "$capture"
-grep -q -- "--max-concurrent-tasks=10" "$capture"
+grep -q "cap=32 root=/home/newadmin/multica-workspaces-gsp" "$capture"
+grep -q -- "--max-concurrent-tasks=32" "$capture"
 HOLD_DAEMON=1 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh" &
 pid=$!; sleep 0.1
 if MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh"; then exit 1; fi

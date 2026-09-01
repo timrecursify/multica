@@ -10,7 +10,7 @@ if [[ "$requested_codex_bin" == "/home/newadmin/tools/codex-openrouter" && "$MUL
 fi
 export CODEX_BIN="$requested_codex_bin"
 
-cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-10}"
+cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-32}"
 root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
 if [[ ! "$cap_raw" =~ ^[1-9][0-9]*$ ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer" >&2

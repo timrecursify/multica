@@ -5,6 +5,6 @@ module.exports = {
     { name: 'multica-cicd-worker', script: '/home/newadmin/multica-cicd-worker.cjs', ...guardrails },
     { name: 'multica-archiver', script: '/home/newadmin/multica-archiver.cjs', ...guardrails },
     { name: 'gsp-multica-worker', script: '/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh', ...guardrails, kill_timeout: 30000,
-      env: { MULTICA_DAEMON_MAX_CONCURRENT_TASKS: process.env.MULTICA_DAEMON_MAX_CONCURRENT_TASKS ?? '10', MULTICA_DAEMON_WORKSPACES_ROOT: process.env.MULTICA_DAEMON_WORKSPACES_ROOT ?? '/home/newadmin/multica-workspaces-gsp' } },
+      env: { MULTICA_DAEMON_MAX_CONCURRENT_TASKS: process.env.MULTICA_DAEMON_MAX_CONCURRENT_TASKS ?? '32', MULTICA_DAEMON_WORKSPACES_ROOT: process.env.MULTICA_DAEMON_WORKSPACES_ROOT ?? '/home/newadmin/multica-workspaces-gsp' } },
   ],
 };
