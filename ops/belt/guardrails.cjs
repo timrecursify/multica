@@ -66,7 +66,13 @@ function retryAdmission({ attempt, maxAttempts = 2, failureReason, queueAgeMinut
   const infra = infraReasons.includes(failureReason);
   const age = Number(queueAgeMinutes);
   const ttl = Number(queueTtlMinutes);
-  if (!Number.isInteger(attempt) || !Number.isInteger(maxAttempts) || attempt >= maxAttempts) {
+  if (!Number.isInteger(attempt) || !Number.isInteger(maxAttempts)) {
+    return { ok: false, reason: 'attempt_budget_exhausted' };
+  }
+  // Infrastructure recovery replays the same attempt number. Its ceiling is
+  // enforced by the relay's stage-cycle disposition, not by a budget it never
+  // consumes. Rejecting it here strands a task selected by the recovery query.
+  if (!infra && attempt >= maxAttempts) {
     return { ok: false, reason: 'attempt_budget_exhausted' };
   }
   if (!infra && failureReason) return { ok: true, consumesAttempt: true };

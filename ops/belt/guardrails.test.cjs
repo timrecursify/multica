@@ -43,6 +43,15 @@ test('infra retry stops when queue loses headroom and never spends attempt', () 
     infraReasons: ['timeout'] }), { ok: true, consumesAttempt: true });
 });
 
+test('infrastructure recovery remains admissible at the attempt ceiling', () => {
+  const args = { attempt: 2, maxAttempts: 2, failureReason: 'timeout',
+    queueAgeMinutes: 5, queueTtlMinutes: 120, infraReasons: ['timeout'] };
+  assert.deepEqual(retryAdmission(args), { ok: true, consumesAttempt: false });
+  assert.deepEqual(retryAdmission({ ...args, failureReason: 'implementation' }), {
+    ok: false, reason: 'attempt_budget_exhausted'
+  });
+});
+
 test('paid dispatch requires a live configured agent', () => {
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter', token_budget: 1000 }).ok, true);
   assert.equal(spendPreflight({ max_concurrent_tasks: 0, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter', token_budget: 1000 }).ok, false);
