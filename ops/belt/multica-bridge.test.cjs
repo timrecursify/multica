@@ -99,3 +99,12 @@ test('relay request maps snake-case stage into successor task input', () => {
   assert.match(source, /replaceStageTask\(client, \{[\s\S]*toStage: to_stage,/);
   assert.doesNotMatch(source, /\n\s*toStage,\n/);
 });
+
+test('relay stage lookups bind configuration and owners to the issue workspace', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /workspace_id = \$1 AND stage_name = \$2/);
+  assert.match(source, /a\.workspace_id = rsc\.workspace_id/);
+  assert.match(source, /Relay owner workspace mismatch/);
+  assert.match(source, /ORDER BY rsc\.workspace_id, rsc\.id/);
+});

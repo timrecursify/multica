@@ -367,6 +367,7 @@ guard_stale_stage_tasks() {
     WITH stale AS (
       SELECT t.id FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id
        WHERE t.status = 'queued'
+         AND i.workspace_id = '${GSP_WS}'::uuid
          AND t.context->>'to_stage' IS NOT NULL
          AND t.context->>'to_stage' <> i.status)
     UPDATE agent_task_queue SET status='cancelled',
@@ -384,7 +385,8 @@ guard_relay_config() {
              "7:gsp-deploy-sol-low-1" "11:gsp-build-terra-low-02"; do
     expected="${row#*:}"
     actual=$("${PSQL[@]}" -c "SELECT coalesce(a.name,'(none)') FROM relay_stage_config r
-       LEFT JOIN agent a ON a.id=r.agent_id WHERE r.id=${row%%:*};" 2>/dev/null)
+       LEFT JOIN agent a ON a.id=r.agent_id
+       WHERE r.id=${row%%:*} AND r.workspace_id='${GSP_WS}'::uuid;" 2>/dev/null)
     [[ "$actual" == "$expected" ]] && continue
     # '(none)' is a real desired state here, not a missing lookup: rows 5 and 6
     # must dispatch nobody. Restoring them by name would re-create the halt-only
@@ -395,7 +397,8 @@ guard_relay_config() {
     else
       set_clause="agent_id=(SELECT id FROM agent WHERE name='${expected}'), agent_name='${expected}'"
     fi
-    if "${PSQL[@]}" -c "UPDATE relay_stage_config SET ${set_clause} WHERE id=${row%%:*};" >/dev/null 2>&1; then
+    if "${PSQL[@]}" -c "UPDATE relay_stage_config SET ${set_clause}
+         WHERE id=${row%%:*} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1; then
       fixed+=("relay row ${row%%:*} owner restored to ${expected} (was ${actual:-unset})")
     else
       unfixable+=("relay row ${row%%:*} has owner ${actual:-unset}, expected ${expected}")
@@ -411,12 +414,12 @@ guard_relay_config() {
     case "$id" in
       7) want="In Progress,Queue,Spec"
        why="a flight whose PR is open and CONFLICTING can never reach Done, and row 7 had no agent and no alternates at all, so it sat forever; Queue returns it to the builder, Spec covers the legacy flights the spec gate refuses to send straight to a builder, and In Progress is the only route to a reviewer because the review task fires on the row 4 In Progress->In Review exit, which is what a flight with a MERGED pull request but no PASS verdict needs" ;;
-    3) want="Human Review"
-       why="a queued flight with no implementable outcome must park; the bridge logged invalid_transition Queue->Human Review on 2026-08-31 because row 3 had no alternates at all" ;;
-    2) want="Human Review,Cancelled"
-         why="a Spec flight with no implementable outcome must park, not retry forever; Cancelled is the terminal for a flight bundled under a mega parent, which PPP Production already uses (32 cancelled children) while GSP had no route at all and the spec worker was rejected with invalid_to_stage" ;;
-      4) want="Human Review,Queue"
-         why="a builder that finds no implementable outcome must park, not push unbuildable work into review" ;;
+    3) want=""
+       why="Human Review is money-only; ordinary build failures park instead of escaping from Queue" ;;
+    2) want="Cancelled"
+         why="Human Review is money-only; a bundled Spec flight may still be cancelled explicitly" ;;
+      4) want="Queue"
+         why="Human Review is money-only; a failed build may take only the bounded rebuild route" ;;
       5) want="Human Review,In Progress"
          why="QC FAIL must reach the builder and Done must stay unreachable from review" ;;
       # 2026-08-31 09:2x. Two changes, both from measuring how the relay picks
@@ -449,10 +452,12 @@ guard_relay_config() {
       8|9) want="CI/CD & Deploy"
          why="a flight closed without shipping needs a route back to the deploy stage" ;;
     esac
-    actual=$("${PSQL[@]}" -c "SELECT array_to_string(alt_next_stages,',') FROM relay_stage_config WHERE id=${id};" 2>/dev/null)
+    actual=$("${PSQL[@]}" -c "SELECT array_to_string(alt_next_stages,',') FROM relay_stage_config
+      WHERE id=${id} AND workspace_id='${GSP_WS}'::uuid;" 2>/dev/null)
     [[ "$actual" == "$want" ]] && continue
     if "${PSQL[@]}" -c "UPDATE relay_stage_config
-         SET alt_next_stages=string_to_array('${want}', ',') WHERE id=${id};" >/dev/null 2>&1; then
+         SET alt_next_stages=CASE WHEN '${want}' = '' THEN NULL ELSE string_to_array('${want}', ',') END
+       WHERE id=${id} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1; then
       fixed+=("relay row ${id} successors restored to [${want}] (was [${actual:-unset}]): ${why}")
     else
       unfixable+=("relay row ${id} has successors [${actual:-unset}], expected [${want}]: ${why}")
