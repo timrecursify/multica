@@ -227,6 +227,14 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
       workspace_id: issue.workspace_id, blocker }));
     return null;
   }
+  // A previous no-owner hold is temporary once a qualifying diagnosis seat is
+  // available. Keep genuinely-blocked tickets protected by their completed
+  // diagnosis task, not by a stale metadata flag.
+  await client.query(
+    `UPDATE issue
+        SET metadata = COALESCE(metadata, '{}'::jsonb) - 'parked_blocker',
+            updated_at = NOW()
+      WHERE id = $1::uuid AND status = 'Parked'`, [issue.id]);
   const context = {
     ...diagnosisContext({ reason: evidence.reason || evidence.reason_code,
       stage: issue.status, attempts, ceiling: evidence.ceiling }),
@@ -244,6 +252,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue
         WHERE issue_id = $2::uuid AND context->>'kind' = $7::text
+          AND COALESCE(LOWER(status), '') NOT IN ('failed', 'cancelled')
       )
       ON CONFLICT DO NOTHING
       RETURNING id`,

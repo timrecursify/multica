@@ -7,10 +7,11 @@ const { recordParkAndQueueDiagnosis, PARK_DIAGNOSIS_KIND } = require('./parked-d
 
 const DEFAULT_BATCH = 25;
 const MAX_BATCH = 25;
-// The operator may inspect at most four batches per invocation. This keeps
-// stale/blocker rows from making the query unbounded while still allowing a
-// normal batch to be filled after skipped rows.
-const MAX_SCAN_WINDOW = MAX_BATCH * 4;
+// Candidate eligibility is applied in SQL. A ticket that has already received
+// a diagnosis task (or a named blocker) is not a candidate, so successive
+// invocations advance through the backlog instead of re-scanning its first
+// blocked rows.
+const MAX_SCAN_WINDOW = MAX_BATCH;
 const NONTERMINAL = ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred'];
 
 function parseArgs(argv) {
@@ -60,7 +61,6 @@ function interleaveByWorkspace(rows) {
 async function inspect(client, issue) {
   const blocker = issue.metadata && typeof issue.metadata === 'object'
     ? issue.metadata.parked_blocker : null;
-  if (blocker) return { kind: 'skip', reason: 'named_parked_blocker' };
   const task = await client.query(
     `SELECT id, status FROM agent_task_queue
       WHERE issue_id = $1 AND context->>'kind' = $2
@@ -75,73 +75,80 @@ async function inspect(client, issue) {
         : status === 'cancelled' ? 'cancelled_parked_diagnosis'
           : (status == null || NONTERMINAL.includes(status)) ? 'nonterminal_parked_diagnosis'
             : 'existing_parked_diagnosis';
-    return { kind: 'skip',
-      reason,
-      status,
-      task_id: task.rows[0].id };
+    // Failed/cancelled diagnosis attempts are explicitly retryable. Completed
+    // and nonterminal attempts stay protected from duplicate dispatch.
+    if (status === 'failed' || status === 'cancelled') {
+      return { kind: 'eligible', has_reason_comment: true, retrying: reason, status,
+        prior_task_id: task.rows[0].id, previous_blocker: blocker };
+    }
+    return { kind: 'skip', reason, status, task_id: task.rows[0].id };
   }
   const comment = await client.query(
     `SELECT 1 FROM comment WHERE issue_id = $1
       AND content LIKE '<!-- multica-park-reason -->%' LIMIT 1`, [issue.id]);
-  return { kind: 'eligible', has_reason_comment: comment.rowCount > 0 };
+  return { kind: 'eligible', has_reason_comment: comment.rowCount > 0,
+    previous_blocker: blocker };
 }
 
 async function run(pool, options) {
-  const where = options.workspace ? 'AND workspace_id = $1' : '';
-  const values = options.workspace ? [options.workspace, MAX_SCAN_WINDOW] : [MAX_SCAN_WINDOW];
-  const limitParam = options.workspace ? '$2' : '$1';
-  const listed = await pool.query(
+  const where = options.workspace ? 'AND i.workspace_id = $1' : '';
+  const kindParam = options.workspace ? '$2' : '$1';
+  const limitParam = options.workspace ? '$3' : '$2';
+  const values = options.workspace
+    ? [options.workspace, PARK_DIAGNOSIS_KIND, options.batch]
+    : [PARK_DIAGNOSIS_KIND, options.batch];
+  const candidateSql =
     `WITH ranked AS (
-       SELECT id, workspace_id, status, priority, metadata,
-              ROW_NUMBER() OVER (PARTITION BY workspace_id ORDER BY id) AS workspace_rank
-         FROM issue
-        WHERE status = 'Parked' ${where}
+       SELECT i.id, i.workspace_id,
+              ROW_NUMBER() OVER (PARTITION BY i.workspace_id ORDER BY i.id) AS workspace_rank
+         FROM issue i
+        WHERE i.status = 'Parked' ${where}
+          AND NOT EXISTS (
+            SELECT 1 FROM agent_task_queue d
+             WHERE d.issue_id = i.id AND d.context->>'kind' = ${kindParam}
+               AND COALESCE(LOWER(d.status), '') NOT IN ('failed', 'cancelled')
+          )
      )
-     SELECT id, workspace_id, status, priority, metadata
-       FROM ranked
-      WHERE workspace_rank <= ${limitParam}
-      ORDER BY workspace_rank, workspace_id, id
-      LIMIT ${limitParam}`, values);
+     SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata
+       FROM issue i JOIN ranked r ON r.id = i.id
+      ORDER BY r.workspace_rank, r.workspace_id, i.id
+      LIMIT ${limitParam}`;
   const counts = { selected: 0, queued: 0, would_queue: 0, skipped_blocker: 0,
     skipped_existing: 0, skipped_completed: 0, skipped_failed: 0,
     skipped_cancelled: 0, skipped_no_owner: 0, stale: 0, failed: 0,
-    scanned: 0, scan_limit: MAX_SCAN_WINDOW };
+    scanned: 0, scan_limit: options.batch };
   const ids = { queued: [], would_queue: [], skipped: [], skipped_blocker: [],
     skipped_existing: [], skipped_completed: [], skipped_failed: [],
     skipped_cancelled: [], skipped_no_owner: [], stale: [] };
-  for (const listedIssue of interleaveByWorkspace(listed.rows)) {
-    if (counts.selected >= options.batch) break;
-    counts.scanned += 1;
-    const client = await pool.connect();
-    try {
-      await client.query('BEGIN');
-      const locked = await client.query(
-        `SELECT id, workspace_id, status, priority, metadata FROM issue
-          WHERE id = $1 AND status = 'Parked' FOR UPDATE`, [listedIssue.id]);
-      if (!locked.rowCount) {
-        counts.stale += 1;
-        ids.stale.push(listedIssue.id);
-        await client.query('ROLLBACK');
-        continue;
-      }
-      const issue = locked.rows[0];
+  if (options.mode === 'dry-run') {
+    const listed = await pool.query(candidateSql, values);
+    const rows = interleaveByWorkspace(listed.rows).slice(0, options.batch);
+    counts.selected = rows.length;
+    counts.scanned = rows.length;
+    counts.would_queue = rows.length;
+    ids.would_queue.push(...rows.map((row) => row.id));
+    return { mode: options.mode, batch_size: options.batch, workspace: options.workspace, counts, ids };
+  }
+
+  // The complete batch shares one transaction: an error rolls back every
+  // comment, blocker, and task insert from this invocation. SKIP LOCKED lets
+  // concurrent operators take distinct tickets without waiting or duplicating.
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const lockedSql = `${candidateSql} FOR UPDATE OF i SKIP LOCKED`;
+    const listed = await client.query(lockedSql, values);
+    const rows = interleaveByWorkspace(listed.rows).slice(0, options.batch);
+    for (const issue of rows) {
+      counts.scanned += 1;
+      counts.selected += 1;
       const decision = await inspect(client, issue);
       if (decision.kind === 'skip') {
-        const category = decision.reason === 'named_parked_blocker' ? 'skipped_blocker'
-          : decision.reason === 'completed_parked_diagnosis' ? 'skipped_completed'
-            : decision.reason === 'failed_parked_diagnosis' ? 'skipped_failed'
-              : decision.reason === 'cancelled_parked_diagnosis' ? 'skipped_cancelled'
-                : 'skipped_existing';
-        counts[category] += 1;
+        // A race can create a task after selection only when a non-cooperating
+        // writer bypasses the issue lock. Record it but never create a second.
+        counts.skipped_existing += 1;
         ids.skipped.push(issue.id);
-        ids[category].push(issue.id);
-        await client.query('COMMIT');
-        continue;
-      }
-      counts.selected += 1;
-      if (options.mode === 'dry-run') {
-        counts.would_queue += 1; ids.would_queue.push(issue.id);
-        await client.query('ROLLBACK');
+        ids.skipped_existing.push(issue.id);
         continue;
       }
       const taskId = await recordParkAndQueueDiagnosis(client, issue, {
@@ -153,12 +160,14 @@ async function run(pool, options) {
         counts.skipped_no_owner += 1;
         ids.skipped_no_owner.push(issue.id);
       }
-      await client.query('COMMIT');
-    } catch (error) {
-      counts.failed += 1;
-      await client.query('ROLLBACK').catch(() => {});
-      throw error;
-    } finally { client.release(); }
+    }
+    await client.query('COMMIT');
+  } catch (error) {
+    counts.failed += 1;
+    await client.query('ROLLBACK').catch(() => {});
+    throw error;
+  } finally {
+    client.release();
   }
   return { mode: options.mode, batch_size: options.batch, workspace: options.workspace,
     counts, ids };
