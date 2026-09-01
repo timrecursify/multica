@@ -1086,15 +1086,115 @@ test('release admission is explicit, one-use, and resets task history by time', 
   assert.match(source, /if \(!bindingSpec && parkedRelease\) \{[\s\S]*?to_stage = "Spec"/);
 });
 
-test('authenticated Human Review release resets both retry windows and stamps its reason', () => {
-  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /operator_release === true/);
-  assert.match(source, /explicitHumanReviewReleaseRequested && !explicitHumanReviewRelease/);
-  assert.match(source, /error: "terminal_stage_operator_secret_conflict"/);
-  assert.match(source, /human_review_release_at/);
-  assert.match(source, /human_review_release_reason/);
-  assert.match(source, /issue\.metadata\?\.human_review_release_at \|\|\s+issue\.metadata\?\.parked_release_at/);
-  assert.match(source, /WHEN \$4 THEN COALESCE\(metadata, '\{\}'::jsonb\) \|\| jsonb_build_object/);
+test('operator Human Review release is authenticated, bounded, and auditable', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') return t.skip('integration test requires a real DATABASE_URL');
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  const schema = `relay_human_review_release_${Date.now()}`;
+  const workspaceId = '11111111-1111-1111-1111-111111111111';
+  const agentId = '22222222-2222-2222-2222-222222222222';
+  const runtimeId = '33333333-3333-3333-3333-333333333333';
+  const response = () => ({ status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } });
+  const invoke = async (body, headers = {}) => {
+    setTestClientFactory(() => {
+      const client = new Client({ connectionString: databaseUrl });
+      const connect = client.connect.bind(client);
+      client.connect = async () => { await connect(); await client.query(`SET search_path TO ${schema}`); };
+      return client;
+    });
+    const res = response();
+    try { await relayAdvance({ headers }, res, { agent_token: 'test-relay-secret', ...body }); }
+    finally { setTestClientFactory(null); }
+    return res;
+  };
+  const insertIssue = async (id, status = 'Human Review') => admin.query(
+    `INSERT INTO "${schema}".issue (id, workspace_id, status, title, priority, metadata)
+     VALUES ($1, $2, $3, 'release test', 'medium', '{}'::jsonb)`, [id, workspaceId, status]);
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`CREATE TABLE "${schema}".issue (id uuid PRIMARY KEY, workspace_id uuid NOT NULL,
+      status text NOT NULL, description text DEFAULT '', parent_issue_id uuid, title text NOT NULL,
+      priority text NOT NULL, metadata jsonb, updated_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".relay_stage_config (id bigserial PRIMARY KEY, workspace_id uuid NOT NULL,
+      stage_name text NOT NULL, next_stage text, alt_next_stages text[], agent_id uuid, agent_name text);
+      CREATE TABLE "${schema}".agent (id uuid PRIMARY KEY, workspace_id uuid NOT NULL, name text NOT NULL,
+      runtime_id uuid, archived_at timestamptz, status text NOT NULL, instructions text, model text,
+      thinking_level text, max_concurrent_tasks integer, runtime_config jsonb);
+      CREATE TABLE "${schema}".agent_runtime (id uuid PRIMARY KEY, workspace_id uuid NOT NULL,
+      provider text NOT NULL, status text NOT NULL, updated_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".relay_stage_pool (workspace_id uuid NOT NULL, stage_name text NOT NULL, enabled boolean NOT NULL);
+      CREATE TABLE "${schema}".relay_stage_agent_pool (workspace_id uuid NOT NULL, stage_name text NOT NULL,
+      agent_id uuid NOT NULL, enabled boolean NOT NULL, last_selected_at timestamptz);
+      CREATE TABLE "${schema}".agent_task_queue (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), agent_id uuid NOT NULL,
+      issue_id uuid NOT NULL, workspace_id uuid NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0,
+      runtime_id uuid, context jsonb NOT NULL DEFAULT '{}'::jsonb, trigger_summary text, force_fresh_session boolean,
+      originator_source text, trigger_evidence_kind text, result jsonb, error text, completed_at timestamptz,
+      prepare_lease_expires_at timestamptz, failure_reason text, created_at timestamptz NOT NULL DEFAULT now());
+      CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
+      to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
+      CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
+      author_type text, author_id uuid, content text, type text, created_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, verdict text,
+      work_product_md5 text, created_at timestamptz DEFAULT now());`);
+    await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
+    await admin.query(`INSERT INTO "${schema}".agent (id, workspace_id, name, runtime_id, status, instructions, model, thinking_level, max_concurrent_tasks)
+      VALUES ($1, $2, 'builder', $3, 'idle', 'In Progress', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_pool VALUES ($1, 'In Progress', true)`, [workspaceId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_agent_pool VALUES ($1, 'In Progress', $2, true, NULL)`, [workspaceId, agentId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage) VALUES
+      ($1, 'Human Review', 'In Progress'), ($1, 'In Progress', 'In Review'),
+      ($1, 'Parked', 'Queue'), ($1, 'Queue', 'In Progress')`, [workspaceId]);
+
+    await t.test('releases at the cycle limit, enqueues work, persists metadata, and logs', async () => {
+      const issueId = '44444444-4444-4444-4444-444444444444';
+      await insertIssue(issueId);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
+        VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'),
+               ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved by operator' },
+        { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      const task = await admin.query(`SELECT context->>'to_stage' AS stage FROM "${schema}".agent_task_queue WHERE issue_id = $1 AND status = 'queued'`, [issueId]);
+      const issue = await admin.query(`SELECT status, metadata FROM "${schema}".issue WHERE id = $1`, [issueId]);
+      const log = await admin.query(`SELECT status FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
+      assert.deepEqual(task.rows, [{ stage: 'In Progress' }]);
+      assert.equal(issue.rows[0].status, 'In Progress');
+      assert.equal(issue.rows[0].metadata.human_review_release_reason, 'approved by operator');
+      assert.ok(issue.rows[0].metadata.human_review_release_at);
+      assert.equal(log.rows.length, 1);
+    });
+    await t.test('rejects a missing operator header without a task', async () => {
+      const issueId = '55555555-5555-5555-5555-555555555555'; await insertIssue(issueId);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved' });
+      assert.equal(res.status, 403); assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
+      assert.equal((await admin.query(`SELECT count(*)::int AS n FROM "${schema}".agent_task_queue WHERE issue_id = $1`, [issueId])).rows[0].n, 0);
+    });
+    await t.test('requires retry escalation source evidence without the marker', async () => {
+      const issueId = '66666666-6666-6666-6666-666666666666'; await insertIssue(issueId);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context) VALUES
+        ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'), ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Progress' });
+      assert.equal(res.status, 409); assert.equal(JSON.parse(res.body).error, 'retry_escalation_source_task_required');
+    });
+    await t.test('rejects the relay secret as an operator header', async () => {
+      const issueId = '77777777-7777-7777-7777-777777777777'; await insertIssue(issueId);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved' },
+        { 'x-relay-operator-secret': 'test-relay-secret' });
+      assert.equal(res.status, 403); assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
+    });
+    await t.test('ignores operator_release outside Human Review', async () => {
+      const issueId = '88888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
+      const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true, reason: 'approved' },
+        { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 409); assert.equal(JSON.parse(res.body).error, 'parked_release_required');
+    });
+  } finally {
+    setTestClientFactory(null);
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+    await admin.end();
+  }
 });
 
 test('lifetime ceiling emits a named, deadline-bound re-spec escalation', () => {
