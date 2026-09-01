@@ -20,11 +20,6 @@ const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
-if (!MULTICA_DB || !RELAY_AGENT_SECRET || !WORKSPACE_ID) {
-  console.error('[relay-advance-daemon] FATAL: env vars missing');
-  process.exit(1);
-}
-
 const LOG_PREFIX = '[relay-advance-daemon]';
 
 // Deliberately small: the DeepSeek build lane is paid, so a backlog drains at a
@@ -77,13 +72,20 @@ async function pauseQuotaLane(client, row, consecutiveFailures) {
         reason: 'provider_quota_limit', consecutive_failures: consecutiveFailures,
         ceiling: QUOTA_FAILURE_LIMIT })]
     );
-    console.warn(`${LOG_PREFIX} ${quotaPauseFlipLogLine(pause.agent_name, pause.paused_at, true)}`);
+    return pause;
   }
-  return paused.rowCount > 0;
+  return null;
 }
 
-async function reconcileQuotaPauses() {
-  const client = await pool.connect();
+function logQuotaPauseFlip({ agent_name: agentName, timestamp, paused }) {
+  console.warn(`${LOG_PREFIX} ${quotaPauseFlipLogLine(agentName, timestamp, paused)}`);
+}
+
+async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () => Date.now(),
+  onFlip = logQuotaPauseFlip,
+  onError = (err) => console.error(`${LOG_PREFIX} [quota-pause] reconciliation error: ${err.message}`) } = {}) {
+  const client = await connect();
+  const committedFlips = [];
   try {
     await client.query('BEGIN');
     // Lock each paused agent before deciding whether to clear it. This makes a
@@ -107,7 +109,8 @@ async function reconcileQuotaPauses() {
       const clearance = quotaPauseClearance({
         pausedAt: agent.paused_at,
         fallbackAt: agent.updated_at,
-        budgetExhausted: agent.budget_exhausted
+        budgetExhausted: agent.budget_exhausted,
+        now: now()
       });
       if (!clearance.clear) continue;
       const cleared = await client.query(
@@ -132,12 +135,13 @@ async function reconcileQuotaPauses() {
         [agent.workspace_id, JSON.stringify({ agent_id: agent.id, agent_name: agent.agent_name,
           timestamp, paused_at: agent.paused_at, reason: clearance.reason })]
       );
-      console.warn(`${LOG_PREFIX} ${quotaPauseFlipLogLine(agent.agent_name, timestamp, false)}`);
+      committedFlips.push({ agent_name: agent.agent_name, timestamp, paused: false });
     }
     await client.query('COMMIT');
+    for (const flip of committedFlips) onFlip(flip);
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
-    console.error(`${LOG_PREFIX} [quota-pause] reconciliation error: ${err.message}`);
+    onError(err);
   } finally {
     client.release();
   }
@@ -845,15 +849,19 @@ async function requeueStrandedTasks() {
           const circuit = quotaCircuitAdmission(
             recentFailures.rows.map((failure) => failure.failure_reason), QUOTA_FAILURE_LIMIT
           );
-          const lanePaused = circuit.pause
+          const quotaPause = circuit.pause
             ? await pauseQuotaLane(client, row, circuit.consecutive)
-            : false;
+            : null;
           const moved = await applyDisposition(client, row, 'Human Review', 'payment_required_402', {
             dead_task_id: row.dead_task_id, consecutive_failures: circuit.consecutive,
-            lane_paused: lanePaused
+            lane_paused: Boolean(quotaPause)
           });
           await client.query('COMMIT');
-          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}; lane_paused=${lanePaused}`);
+          if (quotaPause) {
+            logQuotaPauseFlip({ agent_name: quotaPause.agent_name,
+              timestamp: quotaPause.paused_at, paused: true });
+          }
+          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}; lane_paused=${Boolean(quotaPause)}`);
           continue;
         }
         const releaseAt = row.metadata?.parked_release_at || null;
@@ -1090,16 +1098,26 @@ async function processParkedDiagnoses() {
   }
 }
 
-console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
-setInterval(findAndAdvanceTasks, 15000);
-setInterval(findAndAdvanceRegistered, 20000);
-setInterval(recoveryAdvanceTasks, 120000);
-setInterval(cleanupStalePendingRows, 300000);
-setInterval(requeueStrandedTasks, 60000);
-setInterval(processParkedDiagnoses, 30000);
-setInterval(reconcileQuotaPauses, 60000);
-findAndAdvanceTasks().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
-findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
-cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
-processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
-reconcileQuotaPauses().catch(err => console.error(`${LOG_PREFIX} Error in quota-pause reconciliation: ${err.message}`));
+function startDaemon() {
+  if (!MULTICA_DB || !RELAY_AGENT_SECRET || !WORKSPACE_ID) {
+    console.error('[relay-advance-daemon] FATAL: env vars missing');
+    process.exit(1);
+  }
+  console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
+  setInterval(findAndAdvanceTasks, 15000);
+  setInterval(findAndAdvanceRegistered, 20000);
+  setInterval(recoveryAdvanceTasks, 120000);
+  setInterval(cleanupStalePendingRows, 300000);
+  setInterval(requeueStrandedTasks, 60000);
+  setInterval(processParkedDiagnoses, 30000);
+  setInterval(reconcileQuotaPauses, 60000);
+  findAndAdvanceTasks().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
+  findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
+  cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
+  processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
+  reconcileQuotaPauses().catch(err => console.error(`${LOG_PREFIX} Error in quota-pause reconciliation: ${err.message}`));
+}
+
+if (require.main === module) startDaemon();
+
+module.exports = { pauseQuotaLane, reconcileQuotaPauses, startDaemon };
