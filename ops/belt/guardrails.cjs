@@ -9,6 +9,7 @@ const STAGE_ALIASES = new Map([
   ['in_review', 'In Review']
 ]);
 const NON_EXECUTION_STAGES = new Set(['Human Review', 'Parked', 'Rejected']);
+const EXTERNAL_TRANSITION_STAGES = new Set(['Human Review', 'Done']);
 
 function canonicalStage(stage) {
   return STAGE_ALIASES.get(stage) || stage;
@@ -122,6 +123,13 @@ function isExecutionStage(stage) {
   return !NON_EXECUTION_STAGES.has(canonicalStage(stage));
 }
 
+function routableOwnerGaps(rows) {
+  return (rows || [])
+    .filter((row) => row.next_stage && !row.agent_id && !EXTERNAL_TRANSITION_STAGES.has(row.stage_name))
+    .map((row) => row.stage_name)
+    .sort();
+}
+
 function quotaCircuitAdmission(failureReasons, limit = 3) {
   const ceiling = Number(limit);
   if (!Number.isInteger(ceiling) || ceiling < 1) {
@@ -147,5 +155,6 @@ module.exports = {
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,
+  routableOwnerGaps,
   quotaCircuitAdmission
 };

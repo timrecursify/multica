@@ -3,7 +3,7 @@ const test = require('node:test');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
   retryAdmission, spendPreflight, stageCycleAdmission, lifetimeTaskAdmission,
-  isExecutionStage, quotaCircuitAdmission
+  isExecutionStage, routableOwnerGaps, quotaCircuitAdmission
 } = require('./guardrails.cjs');
 
 test('any bundled child is withheld, regardless of parent state', () => {
@@ -74,6 +74,18 @@ test('human and disposition stages never execute tasks', () => {
   assert.equal(isExecutionStage('Human Review'), false);
   assert.equal(isExecutionStage('Parked'), false);
   assert.equal(isExecutionStage('Rejected'), false);
+});
+
+test('startup rejects routable stages without an owner', () => {
+  const rows = [
+    { stage_name: 'Queue', next_stage: 'In Progress', agent_id: 'builder' },
+    { stage_name: 'Parked', next_stage: 'Queue', agent_id: null },
+    { stage_name: 'Human Review', next_stage: 'CI/CD & Deploy', agent_id: null },
+    { stage_name: 'Done', next_stage: 'Archived', agent_id: null },
+    { stage_name: 'Archived', next_stage: null, agent_id: null }
+  ];
+  assert.deepEqual(routableOwnerGaps(rows), ['Parked']);
+  assert.deepEqual(routableOwnerGaps([{ ...rows[1], agent_id: 'builder' }]), []);
 });
 
 test('quota circuit pauses only after consecutive money failures', () => {

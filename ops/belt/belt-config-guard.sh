@@ -361,8 +361,10 @@ guard_stale_stage_tasks() {
 
 guard_relay_config() {
   local row expected actual
-  for row in "1:multica-qc-worker-2" "2:gsp-build-deepseek-flash-1" \
-             "4:multica-qc-worker-1" "5:(none)" "6:(none)"; do
+  for row in "1:gsp-spec-sol-low-public" "2:gsp-build-terra-low-02" \
+             "3:gsp-build-terra-low-02" "4:gsp-qc-sol-low-1" \
+             "5:gsp-deploy-sol-low-1" "6:(none)" \
+             "7:gsp-deploy-sol-low-1" "11:gsp-build-terra-low-02"; do
     expected="${row#*:}"
     actual=$("${PSQL[@]}" -c "SELECT coalesce(a.name,'(none)') FROM relay_stage_config r
        LEFT JOIN agent a ON a.id=r.agent_id WHERE r.id=${row%%:*};" 2>/dev/null)
