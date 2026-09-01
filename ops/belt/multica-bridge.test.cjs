@@ -496,6 +496,42 @@ test('pool selection applies to Queue and rotates equal-load agents', async () =
   assert.deepEqual(calls[2].values, ['workspace-1', 'Queue', 'builder-older']);
 });
 
+test('nine one-slot builders fill fairly and a tenth waits until capacity frees', async () => {
+  const agents = Array.from({ length: 9 }, (_, index) => ({
+    agent_id: `builder-${index + 1}`,
+    agent_name: `gsp-build-terra-low-${String(index + 1).padStart(2, '0')}`,
+    owner_id: `builder-${index + 1}`,
+    agent_status: 'idle', archived_at: null, instructions: 'Queue allowed',
+    max_concurrent_tasks: 1, active_task_count: 0,
+    selected_runtime_id: 'runtime-1', selected_runtime_provider: 'codex',
+    last_selected_at: null
+  }));
+  const active = new Set();
+  const client = { query: async (sql, values = []) => {
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool p/.test(sql)) {
+      return { rows: agents.map((agent) => ({ ...agent,
+        active_task_count: active.has(agent.agent_id) ? 1 : 0,
+        last_selected_at: active.has(agent.agent_id) ? new Date().toISOString() : null
+      })) };
+    }
+    if (/UPDATE relay_stage_agent_pool SET last_selected_at/.test(sql)) {
+      active.add(values[2]);
+      return { rows: [] };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  }};
+  const selected = [];
+  for (let index = 0; index < 9; index += 1) {
+    selected.push((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id);
+  }
+  assert.equal(new Set(selected).size, 9);
+  await assert.rejects(selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue'),
+    /No eligible stage owner/);
+  active.delete(selected[0]);
+  assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
+});
+
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
   assert.equal(isBookkeepingTransition('Queue', 'In Progress'), true);
   assert.equal(isBookkeepingTransition('Spec', 'Queue'), false);
