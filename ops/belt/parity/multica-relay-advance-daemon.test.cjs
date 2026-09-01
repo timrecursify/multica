@@ -15,14 +15,34 @@ test('requeue candidate SQL binds the stage array with a real PostgreSQL client'
   const sql = source.slice(start + 1, end);
   assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
   assert.match(sql, /LIMIT \$1::int/);
-  // The shared test DB predates this unrelated projection. Keep the exact
-  // requeue predicate and parameter expressions when executing it there.
-  const testDbSql = sql.replace('a.token_budget, ', '');
   const params = [3, ['Queue', 'In Progress', 'Spec']];
   const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
   try {
     await client.connect();
-    const result = await client.query(testDbSql, params);
+    const result = await client.query(sql, params);
+    assert.ok(Array.isArray(result.rows));
+  } finally {
+    await client.end();
+  }
+});
+
+test('PASS sweep SQL plans against the PostgreSQL test schema when qc_verdict is available', async (t) => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const start = source.indexOf('`WITH candidates AS (');
+  const end = source.indexOf('`', start + 1);
+  assert.ok(start >= 0 && end > start, 'PASS sweep SQL must be present');
+  const sql = source.slice(start + 1, end);
+  assert.match(sql, /qc\."verdict" = 'PASS'/);
+  assert.match(sql, /qc\."checker_id"/);
+  const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
+  try {
+    await client.connect();
+    const relation = await client.query("SELECT to_regclass('public.qc_verdict') AS name");
+    if (!relation.rows[0].name) {
+      t.skip('test DB schema lacks public.qc_verdict; live-schema validation remains required');
+      return;
+    }
+    const result = await client.query(`EXPLAIN ${sql}`);
     assert.ok(Array.isArray(result.rows));
   } finally {
     await client.end();

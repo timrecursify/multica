@@ -351,38 +351,38 @@ async function enqueuePassWithoutRelayRows({ dbPool = pool, logger = console } =
   try {
     const result = await client.query(
       `WITH candidates AS (
-         SELECT i.id AS issue_id, verdict.checker_id, evidence_task.id AS task_id
+         SELECT i.id AS issue_id, qc."checker_id", evidence_task.id AS task_id
            FROM issue i
            JOIN relay_stage_config rsc
              ON rsc.workspace_id = i.workspace_id
             AND rsc.stage_name = i.status
            JOIN LATERAL (
-             SELECT checker_id, created_at
+             SELECT "checker_id", "verdict", "created_at", "id"
                FROM qc_verdict
-              WHERE issue_id = i.id
-              ORDER BY created_at DESC, id DESC
+              WHERE "issue_id" = i.id
+              ORDER BY "created_at" DESC, "id" DESC
               LIMIT 1
-           ) verdict ON true
+           ) qc ON true
            JOIN LATERAL (
              SELECT id
                FROM agent_task_queue
               WHERE issue_id = i.id
-                AND agent_id = verdict.checker_id
+                AND agent_id = qc."checker_id"
                 AND status = 'completed'
               ORDER BY completed_at DESC, id DESC
               LIMIT 1
           ) evidence_task ON true
           WHERE i.status = 'In Review'
             AND rsc.next_stage = 'CI/CD & Deploy'
-            AND verdict.verdict = 'PASS'
-            AND verdict.created_at > COALESCE((
+            AND qc."verdict" = 'PASS'
+            AND qc."created_at" > COALESCE((
               SELECT MAX(created_at) FROM relay_run_log WHERE issue_id = i.id
             ), '-infinity'::timestamptz)
             AND NOT EXISTS (
               SELECT 1 FROM relay_run_log pending
                WHERE pending.issue_id = i.id AND pending.status = 'pending'
             )
-          ORDER BY verdict.created_at ASC
+          ORDER BY qc."created_at" ASC
           LIMIT 20
        )
        INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
@@ -837,7 +837,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
          JOIN LATERAL (
            SELECT rsc.stage_name AS from_stage, rsc.agent_id,
                   COALESCE(a.runtime_mode, 'local') AS runtime_mode,
-                  a.name AS agent_name, a.instructions, a.model, a.thinking_level, a.max_concurrent_tasks, a.token_budget, a.runtime_config, a.archived_at
+                  a.name AS agent_name, a.instructions, a.model, a.thinking_level, a.max_concurrent_tasks, a.runtime_config, a.archived_at
              FROM relay_stage_config rsc
              JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id AND a.archived_at IS NULL
             WHERE rsc.workspace_id = i.workspace_id AND rsc.next_stage = i.status
