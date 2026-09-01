@@ -1010,6 +1010,12 @@ async function processParkedDiagnoses() {
                 AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
                 AND COALESCE(t.context->>'runtime_evidence_recovery_consumed', 'false') <> 'true'
                 AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
+            OR (t.context->>'evidence_correction_retry' = 'true'
+                AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
+                AND t.context->>'runtime_evidence_recovery_consumed' = 'true'
+                AND t.context->>'runtime_evidence_recovery_v2_requested' = 'true'
+                AND COALESCE(t.context->>'runtime_evidence_recovery_v2_consumed', 'false') <> 'true'
+                AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
           )
           AND i.workspace_id IS NOT NULL
         ORDER BY t.completed_at ASC
@@ -1032,6 +1038,12 @@ async function processParkedDiagnoses() {
               OR (t.context->>'evidence_correction_retry' = 'true'
                   AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
                   AND COALESCE(t.context->>'runtime_evidence_recovery_consumed', 'false') <> 'true'
+                  AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
+              OR (t.context->>'evidence_correction_retry' = 'true'
+                  AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
+                  AND t.context->>'runtime_evidence_recovery_consumed' = 'true'
+                  AND t.context->>'runtime_evidence_recovery_v2_requested' = 'true'
+                  AND COALESCE(t.context->>'runtime_evidence_recovery_v2_consumed', 'false') <> 'true'
                   AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
             )
           FOR UPDATE OF t SKIP LOCKED`, [candidate.id, PARK_DIAGNOSIS_KIND, candidate.workspace_id]);
@@ -1112,6 +1124,11 @@ async function processParkedDiagnoses() {
         `UPDATE agent_task_queue
             SET context = COALESCE(context, '{}'::jsonb) ||
                   CASE WHEN context->>'evidence_correction_retry' = 'true'
+                       AND context->>'diagnosis_processed' = 'true'
+                       AND context->>'runtime_evidence_recovery_consumed' = 'true'
+                       AND context->>'runtime_evidence_recovery_v2_requested' = 'true'
+                    THEN '{"runtime_evidence_recovery_v2_consumed":true}'::jsonb
+                  WHEN context->>'evidence_correction_retry' = 'true'
                        AND context->>'diagnosis_processed' = 'true'
                     THEN '{"runtime_evidence_recovery_consumed":true}'::jsonb
                     ELSE '{"diagnosis_processed":true}'::jsonb END
