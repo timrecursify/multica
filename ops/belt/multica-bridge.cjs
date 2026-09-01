@@ -209,20 +209,9 @@ async function replaceStageTask(client, task) {
       task.triggerSummary, LIVE_TASK_STATUSES, task.toStage]
   );
 
-  let taskId = inserted.rows[0]?.id;
-  if (!taskId) {
-    const existing = await client.query(
-      `SELECT id FROM agent_task_queue
-        WHERE issue_id = $1
-          AND status::text = ANY($2::text[])
-          AND context->>'to_stage' = $3
-        ORDER BY created_at DESC
-        LIMIT 1
-        FOR UPDATE`,
-      [task.issueId, LIVE_TASK_STATUSES, task.toStage]
-    );
-    taskId = existing.rows[0]?.id;
-  }
+  const taskId = inserted.rows[0]?.id || await existingStageTask(
+    client, task.issueId, task.toStage
+  );
   if (!taskId) {
     throw new Error(`relay successor task was not created for issue ${task.issueId} stage ${task.toStage}`);
   }
@@ -240,6 +229,20 @@ async function replaceStageTask(client, task) {
     [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
   );
   return { taskId, relayLogId: log.rows[0]?.id || null };
+}
+
+async function existingStageTask(client, issueId, toStage) {
+  const existing = await client.query(
+    `SELECT id FROM agent_task_queue
+      WHERE issue_id = $1
+        AND status::text = ANY($2::text[])
+        AND context->>'to_stage' = $3
+      ORDER BY created_at DESC
+      LIMIT 1
+      FOR UPDATE`,
+    [issueId, LIVE_TASK_STATUSES, toStage]
+  );
+  return existing.rows[0]?.id || null;
 }
 
 async function ssoBridge(req, res) {
@@ -379,12 +382,14 @@ async function relayAdvance(req, res, body) {
 
     const issue = issueResult.rows[0];
     if (issue.status === to_stage) {
+      const taskId = await existingStageTask(client, issue.id, to_stage);
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
         issue: { id: issue.id, status: issue.status },
-        transition: "already_applied"
+        transition: "already_applied",
+        task_id: taskId
       }));
       return;
     }
@@ -836,4 +841,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { replaceStageTask };
+module.exports = { existingStageTask, replaceStageTask };

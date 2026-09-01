@@ -6,7 +6,7 @@ process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
 process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
-const { replaceStageTask } = require('./multica-bridge.cjs');
+const { existingStageTask, replaceStageTask } = require('./multica-bridge.cjs');
 
 function transition() {
   return {
@@ -57,4 +57,20 @@ test('an already-created matching successor is linked instead of permitting a ta
   const result = await replaceStageTask(client, transition());
 
   assert.deepEqual(result, { taskId: 'task-existing', relayLogId: null });
+});
+
+test('an already-applied transition locates its existing live successor task', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ id: 'task-existing' }] };
+  } };
+
+  const taskId = await existingStageTask(client, 'issue-1', 'In Review');
+
+  assert.equal(taskId, 'task-existing');
+  assert.match(calls[0].sql, /status::text = ANY/);
+  assert.match(calls[0].sql, /FOR UPDATE/);
+  assert.deepEqual(calls[0].values, ['issue-1',
+    ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred'], 'In Review']);
 });
