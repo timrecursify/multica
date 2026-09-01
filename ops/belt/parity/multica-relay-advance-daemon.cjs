@@ -24,6 +24,7 @@ const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 const LOG_PREFIX = '[relay-advance-daemon]';
 const MD5_RE = /^[0-9a-f]{32}$/i;
 const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
+const QC_EVIDENCE_MISMATCH_LIMIT = 3;
 
 function uniqueFullSha(value) {
   const matches = [...String(value || '').matchAll(FULL_SHA_RE)]
@@ -39,7 +40,8 @@ function strictQcAttempt(row, verdictMd5) {
   const md5 = String(row.qc_attempt_work_product_md5 || '').toLowerCase();
   const evidenceAgentId = row.qc_attempt_evidence_agent_id || row.task_agent_id;
   const ok = row.qc_attempt_verdict === 'PASS' && row.qc_attempt_qualifying === true &&
-    row.qc_attempt_model === 'gpt-5.6-sol' && row.qc_attempt_effort === 'low' &&
+    row.qc_attempt_evidence_agent_model === 'gpt-5.6-sol' &&
+    row.qc_attempt_evidence_agent_effort === 'low' &&
     row.qc_verdict_checker_id === evidenceAgentId &&
     /^[0-9a-f]{40}$/.test(bound) && bound === observed && md5 === verdictMd5;
   return ok ? { ok: true, boundSha: bound,
@@ -291,6 +293,24 @@ async function markRelayLogFailedById(client, logId) {
   }
 }
 
+async function holdQcEvidenceMismatch(client, logId) {
+  return client.query(
+    `UPDATE relay_run_log
+        SET parked_audit = jsonb_set(
+              COALESCE(parked_audit, '{}'::jsonb),
+              '{qc_evidence_mismatch_count}',
+              to_jsonb(COALESCE((parked_audit->>'qc_evidence_mismatch_count')::int, 0) + 1)),
+            status = CASE
+              WHEN COALESCE((parked_audit->>'qc_evidence_mismatch_count')::int, 0) + 1 >= $2
+                THEN 'rejected'
+              ELSE status
+            END
+      WHERE id = $1 AND status = 'pending'
+      RETURNING status, parked_audit->>'qc_evidence_mismatch_count' AS mismatch_count`,
+    [logId, QC_EVIDENCE_MISMATCH_LIMIT]
+  );
+}
+
 async function cleanupStalePendingRows() {
   const client = await pool.connect();
   try {
@@ -348,10 +368,10 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
              attempt.bound_sha AS qc_attempt_bound_sha,
              attempt.observed_head AS qc_attempt_observed_sha,
              attempt.qualifying AS qc_attempt_qualifying,
-             attempt.model AS qc_attempt_model,
-             attempt.effort AS qc_attempt_effort,
              attempt.evidence_task_id AS qc_attempt_evidence_task_id,
              attempt.evidence_agent_id AS qc_attempt_evidence_agent_id,
+             attempt.evidence_agent_model AS qc_attempt_evidence_agent_model,
+             attempt.evidence_agent_effort AS qc_attempt_evidence_agent_effort,
              evidence.tasks AS qc_evidence_tasks,
              i.workspace_id, i.priority, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
@@ -366,14 +386,19 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       ) verdict ON true
       LEFT JOIN LATERAL (
         SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
-               qa.qualifying, qa.model, qa.effort,
+               qa.qualifying,
                evidence_task.id AS evidence_task_id,
-               evidence_task.agent_id AS evidence_agent_id
+               evidence_task.agent_id AS evidence_agent_id,
+               evidence_agent.model AS evidence_agent_model,
+               evidence_agent.thinking_level AS evidence_agent_effort
           FROM qc_attempt qa
           INNER JOIN agent_task_queue evidence_task
                   ON evidence_task.issue_id = qa.issue_id
                  AND evidence_task.id::text = substring(
                        qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+          INNER JOIN agent evidence_agent
+                  ON evidence_agent.id = evidence_task.agent_id
+                 AND evidence_agent.workspace_id = i.workspace_id
          WHERE qa.issue_id = atq.issue_id
            AND evidence_task.agent_id = verdict.checker_id
            AND qa.work_product_md5 = verdict.work_product_md5
@@ -450,6 +475,14 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         // Sol-low task carries a SHA-bound PASS plus the current artifact MD5.
         const qcAdvance = qcCompletionAdvance(row);
         if (gatedStages.includes(row.next_stage) && !qcAdvance.ok) {
+          if (qcAdvance.reason === 'qc_attempt_mismatch' ||
+              qcAdvance.reason === 'legacy_qc_evidence_mismatch') {
+            const held = await holdQcEvidenceMismatch(client, row.log_id);
+            const state = held.rows[0];
+            logger.log(`${LOG_PREFIX} QC evidence mismatch: issue=${row.issue_id}, ` +
+              `relay=${row.log_id}, attempt=${state?.mismatch_count || 'unknown'}, ` +
+              `status=${state?.status || 'unknown'}`);
+          }
           logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
           continue;
         }

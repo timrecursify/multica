@@ -57,10 +57,10 @@ test('strict relay attempt must bind PASS to one observed SHA and artifact MD5',
     qc_attempt_bound_sha: 'c909401ef7a4a438348eb5ceda33839211721524',
     qc_attempt_observed_sha: 'c909401ef7a4a438348eb5ceda33839211721524',
     qc_attempt_qualifying: true,
-    qc_attempt_model: 'gpt-5.6-sol',
-    qc_attempt_effort: 'low',
     qc_attempt_evidence_task_id: '33333333-3333-4333-8333-333333333333',
-    qc_attempt_evidence_agent_id: 'qc-agent'
+    qc_attempt_evidence_agent_id: 'qc-agent',
+    qc_attempt_evidence_agent_model: 'gpt-5.6-sol',
+    qc_attempt_evidence_agent_effort: 'low'
   };
   assert.equal(qcCompletionAdvance(row).ok, true);
   assert.equal(qcCompletionAdvance(row).evidenceTaskId,
@@ -69,6 +69,11 @@ test('strict relay attempt must bind PASS to one observed SHA and artifact MD5',
     qc_attempt_observed_sha: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }).ok, false);
   assert.equal(qcCompletionAdvance({ ...row,
     qc_verdict_checker_id: 'different-agent' }).ok, false);
+  assert.equal(qcCompletionAdvance({ ...row,
+    qc_attempt_model: 'gpt-5.6-sol',
+    qc_attempt_effort: 'low',
+    qc_attempt_evidence_agent_model: 'gpt-5.5',
+    qc_attempt_evidence_agent_effort: 'high' }).ok, false);
 });
 
 test('post-completion QC replay fails closed on stale, mismatched, or non-low evidence', () => {
@@ -91,6 +96,9 @@ test('relay daemon scopes stage configuration to each issue workspace', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /rsc\.workspace_id = i\.workspace_id/);
   assert.match(source, /a\.workspace_id = rsc\.workspace_id/);
+  assert.match(source, /evidence_agent\.workspace_id = i\.workspace_id/);
+  assert.match(source, /evidence_agent\.model AS evidence_agent_model/);
+  assert.match(source, /evidence_agent\.thinking_level AS evidence_agent_effort/);
 });
 
 test('routing recovery hold logs bounded routing details', () => {

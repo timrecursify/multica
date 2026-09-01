@@ -55,6 +55,9 @@ function advanceHarness(row) {
       if (sql.includes("atq.status IN ('failed', 'cancelled')")) {
         return { rowCount: 0, rows: [] };
       }
+      if (sql.includes('qc_evidence_mismatch_count')) {
+        return { rows: [{ status: 'rejected', mismatch_count: '3' }] };
+      }
       if (sql.includes("SET status = 'completed'")) return { rowCount: 1, rows: [] };
       throw new Error(`unexpected query: ${sql.slice(0, 60)}`);
     },
@@ -79,12 +82,16 @@ test('older verdict-recording Sol-low task advances the latest PASS to deploy', 
   assert.ok(harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'")));
 });
 
-test('evidence mismatch logs a reason and preserves the pending relay row', async () => {
+test('permanently mismatched evidence is held after the bounded retry limit', async () => {
   const harness = advanceHarness(advanceRow('QC result contains no bound SHA'));
   await harness.run();
   assert.equal(harness.payloads.length, 0);
   assert.ok(harness.logs.some((line) => line.includes('PENDING:') &&
-    line.includes('legacy_qc_evidence_mismatch')));
+    line.includes('legacy_qc_evidence_mismatch')), JSON.stringify(harness.logs));
+  const hold = harness.queries.find(({ sql }) => sql.includes('qc_evidence_mismatch_count'));
+  assert.ok(hold);
+  assert.match(hold.sql, /THEN 'rejected'/);
+  assert.deepEqual(hold.values, ['relay-log-1', 3]);
   assert.ok(!harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'")));
 });
 
