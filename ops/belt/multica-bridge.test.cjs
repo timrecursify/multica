@@ -25,7 +25,13 @@ const {
   authorizeCicdReturnCapBypass,
   selectStageOwner,
   applyDisposition,
-  consumeParkedQcRecovery
+  consumeParkedQcRecovery,
+  isNoArtifactQcBlock,
+  operatorRescopeIssueId,
+  issueImplementationArtifact,
+  noArtifactRescopeAdmission,
+  consumeNoArtifactRescope,
+  latestQcNoArtifactSignal
 } = require('./multica-bridge.cjs');
 
 test('Parked evidence QC return is a canonical consumed-release-only edge', () => {
@@ -64,6 +70,117 @@ test('ordinary capped Parked to In Review has no recovery bypass', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /!cycle\.ok && !cicdReturn && !parkedQcRecovery/);
   assert.match(source, /consumeParkedQcRecovery\(\s*client, issue, to_stage, reason, parkedEvidenceQcRelease/);
+});
+
+test('NO-SHA QC block recognises only an artifact-free blocked result', () => {
+  assert.equal(isNoArtifactQcBlock(
+    'QC-BLOCKED: no implementation SHA or linked PR exists; no immutable tracked-tree artifact is available.'), true);
+  assert.equal(isNoArtifactQcBlock('QC-BLOCKED\nNO-SHA: no code change applies.'), true);
+  assert.equal(isNoArtifactQcBlock('QC VERDICT: PASS\nNO-SHA'), false);
+  assert.equal(isNoArtifactQcBlock('QC-BLOCKED: no implementation SHA\nQC_EVIDENCE_JSON={}'), false);
+  assert.equal(isNoArtifactQcBlock(
+    'QC-BLOCKED: inspect https://github.com/acme/repo/pull/42 before continuing'), false);
+  assert.equal(isNoArtifactQcBlock(
+    'QC-BLOCKED: bound SHA 0123456789012345678901234567890123456789 is unavailable'), false);
+});
+
+test('operator re-scope request is explicit and bound to one UUID', () => {
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  assert.equal(operatorRescopeIssueId(id, null), id);
+  assert.equal(operatorRescopeIssueId(null,
+    `RETURN:Spec — QC-BLOCKED NO-SHA operator re-scope ${id}`), id);
+  assert.equal(operatorRescopeIssueId(null, 'RETURN:Spec — retry this ticket'), null);
+});
+
+test('artifact lookup rejects any verdict, builder work product, or issue PR/SHA', async () => {
+  for (const field of ['has_qc_verdict', 'has_builder_artifact', 'has_comment_artifact']) {
+    const client = { query: async (sql, values) => {
+      assert.match(sql, /FROM qc_verdict/);
+      assert.match(sql, /context->>'to_stage' = 'Queue'/);
+      assert.match(sql, /FROM comment/);
+      assert.deepEqual(values, ['issue-1']);
+      return { rows: [{ has_qc_verdict: false, has_builder_artifact: false,
+        has_comment_artifact: false, [field]: true }] };
+    } };
+    assert.equal(await issueImplementationArtifact(client, 'issue-1'), true);
+  }
+});
+
+test('operator re-scope admits only the exact issue UUID and completed Sol-low NO-SHA block', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
+    status: 'In Review', metadata: {} };
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM agent_task_queue t')) return { rows: [{ id: 'qc-task', status: 'completed',
+      result: { output: 'QC-BLOCKED: no implementation SHA or PR exists.' } }] };
+    return { rows: [{ has_qc_verdict: false, has_builder_artifact: false,
+      has_comment_artifact: false }] };
+  } };
+  assert.equal(await noArtifactRescopeAdmission(client, issue, 'Spec', issue.id), true);
+  assert.equal(calls.length, 2);
+  assert.equal(await noArtifactRescopeAdmission(client, issue, 'Spec',
+    '223e4567-e89b-42d3-a456-426614174000'), false);
+  assert.equal(await noArtifactRescopeAdmission(client, issue, 'In Progress', issue.id), false);
+  assert.equal(calls.length, 2, 'invalid operator requests must do no evidence queries');
+  assert.equal(await noArtifactRescopeAdmission(client, { ...issue, status: 'Human Review' },
+    'Spec', issue.id), true);
+});
+
+test('operator re-scope rejects consumed, artifact-bearing, and PASS/FAIL flights', async () => {
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  const issue = { id, workspace_id: 'workspace-1', status: 'In Review', metadata: {} };
+  assert.equal(await noArtifactRescopeAdmission({ query: async () => { throw new Error('queried'); } },
+    { ...issue, metadata: { no_artifact_rescope_consumed_at: '2026-09-01T19:00:00Z' } },
+    'Spec', id), false);
+  const taskClient = (output, artifact = false) => ({ query: async (sql) =>
+    sql.includes('FROM agent_task_queue t')
+      ? { rows: [{ status: 'completed', result: { output } }] }
+      : { rows: [{ has_qc_verdict: artifact, has_builder_artifact: false,
+          has_comment_artifact: false }] } });
+  assert.equal(await noArtifactRescopeAdmission(taskClient('QC VERDICT: PASS'), issue, 'Spec', id), false);
+  assert.equal(await noArtifactRescopeAdmission(
+    taskClient('QC-BLOCKED: no implementation SHA exists.', true), issue, 'Spec', id), false);
+});
+
+test('operator re-scope authorization is consumed once in issue metadata', async () => {
+  let calls = 0;
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000' };
+  const client = { query: async (sql, values) => {
+    calls += 1;
+    assert.match(sql, /no_artifact_rescope_consumed_at/);
+    assert.match(sql, /status IN \('In Review', 'Human Review'\)/);
+    assert.deepEqual(values, [issue.id]);
+    return { rowCount: calls === 1 ? 1 : 0 };
+  } };
+  assert.equal(await consumeNoArtifactRescope(client, issue), true);
+  assert.equal(await consumeNoArtifactRescope(client, issue), false);
+});
+
+test('Human Review guard reads only the latest active-or-completed Sol-low QC flight', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ result: null,
+      content: 'QC-BLOCKED: no implementation SHA or linked PR exists.' }] };
+  } };
+  const issue = { id: 'issue-1', workspace_id: 'workspace-1' };
+  assert.equal(await latestQcNoArtifactSignal(client, issue), true);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].sql, /t\.status IN \('queued','dispatched','running'/);
+  assert.match(calls[0].sql, /LEFT JOIN LATERAL/);
+  assert.match(calls[0].sql, /ORDER BY t\.created_at DESC, t\.id DESC LIMIT 1/);
+  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1']);
+});
+
+test('technical QC block cannot route to Human Review and exact re-scope bypasses configured edge and caps', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /technical_human_review_forbidden/);
+  assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
+  assert.match(source, /!cycle\.ok && !cicdReturn && !parkedQcRecovery && !noArtifactRescope/);
+  assert.match(source, /!lifetime\.ok && !cicdReturn && !noArtifactRescope/);
+  assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
+  assert.match(source, /operator_rescope_issue_id: issue\.id/);
 });
 
 const validVerdict = Object.freeze({
@@ -533,7 +650,7 @@ test('release admission is explicit, one-use, and resets task history by time', 
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /parked_release_once === true/);
-  assert.match(source, /if \(!parkedRelease && !parkedEvidenceQcRelease && !parkedDiagnosisDone && !allowedStages\.includes/);
+  assert.match(source, /if \(!parkedRelease && !parkedEvidenceQcRelease && !parkedDiagnosisDone &&\s+!noArtifactRescope && !allowedStages\.includes/);
   assert.match(source, /reason: "parked_release_required"/);
   assert.match(source, /created_at >= \$3/);
   assert.match(source, /created_at >= \$2/);
