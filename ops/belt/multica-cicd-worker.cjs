@@ -29,7 +29,6 @@ const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
 const ciFailureCounts = new Map();
-const deployWaitCounts = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
