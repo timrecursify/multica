@@ -182,8 +182,8 @@ const CostUSDTicksPerUSD = 10_000_000_000
 
 // Result is the final outcome after an agent session completes.
 type Result struct {
-	Status     string // "completed", "failed", "aborted", "timeout", "cancelled"
-	Output     string // final user-facing output selected by the backend
+	Status string // "completed", "failed", "aborted", "timeout", "cancelled"
+	Output string // final user-facing output selected by the backend
 	// PRURL is the URL returned by a structured pull-request creation result.
 	// It is empty when the task did not open a pull request.
 	PRURL      string
