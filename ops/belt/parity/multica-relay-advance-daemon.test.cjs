@@ -1,6 +1,32 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
+const {
+  INFRA_FAILURE_REASONS,
+  isInfrastructureFailure,
+  selectReplayAttempt
+} = require('./multica-relay-advance-daemon.cjs');
+
+test('infrastructure failures replay at the same attempt, including exhausted rows', () => {
+  for (const reason of INFRA_FAILURE_REASONS) {
+    assert.equal(isInfrastructureFailure(reason), true, reason);
+    assert.equal(selectReplayAttempt({
+      dead_task_id: 'dead-task', dead_task_status: 'failed', failure_reason: reason,
+      attempt: 2, max_attempts: 2
+    }), 2, reason);
+  }
+});
+
+test('genuine failures and completed tasks without artifacts consume an attempt', () => {
+  assert.equal(selectReplayAttempt({
+    dead_task_id: 'dead-task', dead_task_status: 'failed', failure_reason: 'failed_implementation',
+    attempt: 1, max_attempts: 2
+  }), 2);
+  assert.equal(selectReplayAttempt({
+    dead_task_id: 'dead-task', dead_task_status: 'completed', failure_reason: null,
+    attempt: 1, max_attempts: 2
+  }), 2);
+});
 
 test('relay daemon scopes stage configuration to each issue workspace', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
