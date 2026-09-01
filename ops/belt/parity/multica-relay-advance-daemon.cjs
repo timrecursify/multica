@@ -601,7 +601,7 @@ async function requeueStrandedTasks() {
               t.attempt, t.max_attempts, t.failure_reason,
               t.result AS dead_task_result, t.error AS dead_task_error,
               r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
-              r.model, r.max_concurrent_tasks, r.runtime_config, r.archived_at, r.agent_name,
+              r.model, r.thinking_level, r.max_concurrent_tasks, r.runtime_config, r.archived_at, r.agent_name,
               COALESCE(
                 (SELECT ar.id FROM agent_runtime ar
                   WHERE ar.workspace_id = i.workspace_id
@@ -623,7 +623,7 @@ async function requeueStrandedTasks() {
          JOIN LATERAL (
            SELECT rsc.stage_name AS from_stage, rsc.agent_id,
                   COALESCE(a.runtime_mode, 'local') AS runtime_mode,
-                  a.name AS agent_name, a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config, a.archived_at
+                  a.name AS agent_name, a.instructions, a.model, a.thinking_level, a.max_concurrent_tasks, a.runtime_config, a.archived_at
              FROM relay_stage_config rsc
              JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id AND a.archived_at IS NULL
             WHERE rsc.workspace_id = i.workspace_id AND rsc.next_stage = i.status

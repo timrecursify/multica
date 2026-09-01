@@ -119,6 +119,8 @@ function spendPreflight(agent, selectedRuntime = {}) {
   if (agent.runtime_config && agent.runtime_config.quota_paused === true) {
     return { ok: false, reason: `provider_quota_paused:${agent.name || agent.agent_name || agent.id || 'unknown_agent'}` };
   }
+  const routing = beltRoutingAdmission(agent, selectedRuntime);
+  if (!routing.ok) return routing;
   const model = String(selectedRuntime.model || agent.model || '').trim();
   const provider = String(selectedRuntime.provider || '').toLowerCase();
   const paid = selectedRuntime.paid === true || provider === 'openrouter' || /^deepseek[/:]/i.test(model);
@@ -133,6 +135,21 @@ function spendPreflight(agent, selectedRuntime = {}) {
     return { ok: false, reason: 'missing_paid_token_budget' };
   }
   return { ok: true, cap };
+}
+
+function beltRoutingAdmission(agent, selectedRuntime = {}) {
+  const cfg = agent?.runtime_config && typeof agent.runtime_config === 'object' ? agent.runtime_config : {};
+  const name = String(agent?.name || agent?.agent_name || '').toLowerCase();
+  const role = String(cfg.role || '').toLowerCase();
+  const model = String(selectedRuntime.model || agent?.model || cfg.model || '').toLowerCase();
+  const effort = String(agent?.thinking_level || cfg.reasoning_effort || '').toLowerCase();
+  const build = role === 'build' || name.includes('build');
+  const qcOrSpec = role === 'qc' || role === 'spec' || name.includes('qc') || name.includes('spec');
+  if (!build && !qcOrSpec) return { ok: true };
+  if (effort !== 'low') return { ok: false, reason: 'belt_low_reasoning_effort_required' };
+  if (build && !(/^deepseek[/:]/.test(model) || model === 'gpt-5.6-terra')) return { ok: false, reason: 'builder_requires_deepseek_or_terra' };
+  if (qcOrSpec && model !== 'gpt-5.6-sol') return { ok: false, reason: 'qc_spec_requires_sol_low' };
+  return { ok: true };
 }
 
 function quotaPauseClearance({ pausedAt, fallbackAt, budgetExhausted, now = Date.now(),
@@ -220,6 +237,7 @@ module.exports = {
   crossStageExecutionAdmission,
   retryAdmission,
   spendPreflight,
+  beltRoutingAdmission,
   QUOTA_PAUSE_MAX_AGE_MS,
   quotaPauseClearance,
   quotaPauseFlipLogLine,
