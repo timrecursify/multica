@@ -73,6 +73,8 @@ const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 const IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
+const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "access"]);
+let testClientFactory = null;
 // A stage transition may retire work that has not started. Running paid work
 // is never cancelled here: crossStageExecutionAdmission defers the successor
 // until it becomes terminal, preserving the predecessor's work product.
@@ -122,16 +124,16 @@ function relayVerdictError(res, status, error) {
 
 function validateRelayVerdict(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "invalid_payload";
-  const required = ["issue_id", "callsign", "verdict", "work_product_md5", "bound_sha", "observed_sha", "failure_class", "qualifying", "model", "effort", "idem_key"];
+  const required = ["issue_id", "checker", "verdict", "work_product_md5", "bound_sha", "observed_sha", "failure_class", "qualifying", "model", "effort", "idem_key"];
   if (required.some((key) => !(key in payload))) return "missing_fields";
   if (!UUID_RE.test(payload.issue_id)) return "invalid_issue_id";
-  if (typeof payload.callsign !== "string" || !IDENTITY_RE.test(payload.callsign)) return "invalid_callsign";
+  if (typeof payload.checker !== "string" || !IDENTITY_RE.test(payload.checker)) return "invalid_checker";
   if (payload.verdict !== "PASS" && payload.verdict !== "FAIL") return "invalid_verdict";
   if (typeof payload.work_product_md5 !== "string" || !MD5_RE.test(payload.work_product_md5)) return "invalid_work_product_md5";
   if (typeof payload.bound_sha !== "string" || !SHA_RE.test(payload.bound_sha)) return "invalid_bound_sha";
   if (typeof payload.observed_sha !== "string" || !SHA_RE.test(payload.observed_sha)) return "invalid_observed_sha";
   if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
-  if (typeof payload.failure_class !== "string" || !IDENTITY_RE.test(payload.failure_class)) return "invalid_failure_class";
+  if (!FAILURE_CLASSES.has(payload.failure_class)) return "invalid_failure_class";
   if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
   if (payload.model !== "gpt-5.6-sol" || payload.effort !== "low") return "invalid_qc_lane";
   if (typeof payload.idem_key !== "string" || !IDEM_KEY_RE.test(payload.idem_key)) return "invalid_idem_key";
@@ -140,7 +142,7 @@ function validateRelayVerdict(payload) {
 
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
   const result = await client.query(
-    `SELECT t.id, t.agent_id, t.context, a.name AS agent_name
+    `SELECT t.id, t.agent_id, t.context, t.result, a.name AS agent_name
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
@@ -153,6 +155,18 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
     [issueId, workspaceId]
   );
   return result.rows[0] || null;
+}
+
+function qcTaskEvidenceMismatch(task, payload) {
+  const evidence = task.result;
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return "qc_task_evidence_required";
+  if (evidence.verdict !== payload.verdict) return "qc_task_verdict_mismatch";
+  if (String(evidence.work_product_md5 || "").toLowerCase() !== payload.work_product_md5.toLowerCase()) return "qc_task_work_product_mismatch";
+  if (String(evidence.bound_sha || "").toLowerCase() !== payload.bound_sha.toLowerCase() ||
+      String(evidence.observed_sha || "").toLowerCase() !== payload.observed_sha.toLowerCase()) return "qc_task_sha_mismatch";
+  if (evidence.failure_class !== payload.failure_class || evidence.qualifying !== payload.qualifying ||
+      evidence.model !== payload.model || evidence.effort !== payload.effort) return "qc_task_evidence_mismatch";
+  return null;
 }
 
 async function applyDisposition(client, issue, disposition, reason, evidence = {}) {
@@ -640,7 +654,7 @@ async function relayVerdict(req, res, payload) {
     relayVerdictError(res, 400, invalid);
     return;
   }
-  const client = new Client({ connectionString: MULTICA_DB });
+  const client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
   try {
     await client.connect();
     await client.query("BEGIN");
@@ -652,8 +666,7 @@ async function relayVerdict(req, res, payload) {
     );
     if (prior.rows.length > 0) {
       const existing = prior.rows[0];
-      const same = existing.issue_id === payload.issue_id &&
-        existing.checker_name === payload.callsign && existing.verdict === payload.verdict &&
+      const same = existing.issue_id === payload.issue_id && existing.verdict === payload.verdict &&
         String(existing.work_product_md5).toLowerCase() === payload.work_product_md5.toLowerCase() &&
         String(existing.bound_sha).toLowerCase() === payload.bound_sha.toLowerCase() &&
         String(existing.observed_head).toLowerCase() === payload.observed_sha.toLowerCase() &&
@@ -684,6 +697,11 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "qc_task_sha_mismatch");
     }
+    const evidenceMismatch = qcTaskEvidenceMismatch(qcTask, payload);
+    if (evidenceMismatch) {
+      await client.query("ROLLBACK");
+      return relayVerdictError(res, 409, evidenceMismatch);
+    }
     const notes = [
       `relay_task_id=${qcTask.id}`,
       `relay_agent_id=${qcTask.agent_id}`,
@@ -698,7 +716,7 @@ async function relayVerdict(req, res, payload) {
          (issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head,
           failure_class, qualifying, model, effort, idem_key, notes)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [payload.issue_id, payload.callsign, payload.verdict, payload.work_product_md5,
+      [payload.issue_id, qcTask.agent_name, payload.verdict, payload.work_product_md5,
         payload.bound_sha, payload.observed_sha, payload.failure_class, payload.qualifying,
         payload.model, payload.effort, payload.idem_key, notes]
     );
@@ -707,7 +725,7 @@ async function relayVerdict(req, res, payload) {
         `UPDATE qc_verdict SET checker_id = $2, checker_name = $3, verdict = $4,
                 work_product_md5 = $5, notes = $6, created_at = NOW()
           WHERE issue_id = $1`,
-        [payload.issue_id, qcTask.agent_id, payload.callsign, payload.verdict,
+        [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
           payload.work_product_md5, notes]
       );
     } else {
@@ -715,7 +733,7 @@ async function relayVerdict(req, res, payload) {
         `INSERT INTO qc_verdict
            (issue_id, checker_id, checker_name, verdict, work_product_md5, notes)
          VALUES ($1, $2, $3, $4, $5, $6)`,
-        [payload.issue_id, qcTask.agent_id, payload.callsign, payload.verdict,
+        [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
           payload.work_product_md5, notes]
       );
     }
@@ -1377,6 +1395,9 @@ module.exports = {
   recordBookkeepingHandoff,
   validateRelayVerdict,
   latestCompletedSolLowQcTask,
+  qcTaskEvidenceMismatch,
+  relayVerdict,
+  setTestClientFactory(factory) { testClientFactory = factory; },
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,

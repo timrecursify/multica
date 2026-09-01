@@ -17,6 +17,8 @@ const {
   recordBookkeepingHandoff,
   validateRelayVerdict,
   latestCompletedSolLowQcTask,
+  relayVerdict,
+  setTestClientFactory,
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
@@ -24,20 +26,21 @@ const {
 } = require('./multica-bridge.cjs');
 
 const validVerdict = Object.freeze({
-  issue_id: '123e4567-e89b-42d3-a456-426614174000', callsign: 'BRAVO-000517',
+  issue_id: '123e4567-e89b-42d3-a456-426614174000', checker: 'BRAVO-000517',
   verdict: 'PASS', work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e',
   bound_sha: '0123456789012345678901234567890123456789',
   observed_sha: '0123456789012345678901234567890123456789', failure_class: 'none',
   qualifying: true, model: 'gpt-5.6-sol', effort: 'low', idem_key: 'qc-verdict-000517'
 });
 
-test('verdict validation requires a callsign and rejects forged lane metadata', () => {
+test('verdict validation accepts the sanctioned CLI checker field and rejects forged lane metadata', () => {
   assert.equal(validateRelayVerdict(validVerdict), null);
-  assert.equal(validateRelayVerdict({ ...validVerdict, callsign: undefined }), 'invalid_callsign');
+  assert.equal(validateRelayVerdict({ ...validVerdict, checker: undefined }), 'invalid_checker');
   assert.equal(validateRelayVerdict({ ...validVerdict, observed_sha: 'f123456789012345678901234567890123456789' }), 'sha_binding_mismatch');
   assert.equal(validateRelayVerdict({ ...validVerdict, work_product_md5: 'not-an-md5' }), 'invalid_work_product_md5');
   assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
+  assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
 });
 
 test('verdict checker identity is selected from the completed same-workspace Sol-low QC task', async () => {
@@ -57,13 +60,64 @@ test('verdict checker identity is selected from the completed same-workspace Sol
   assert.match(calls[0].sql, /ORDER BY t\.completed_at DESC NULLS LAST/);
 });
 
-test('verdict route never uses deployment-configured checker identity', () => {
+test('verdict route never trusts a caller supplied checker identity', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.doesNotMatch(source, /RELAY_QC_ACTOR_ID/);
   assert.match(source, /checker_id: qcTask\.agent_id/);
-  assert.match(source, /payload\.callsign/);
+  assert.match(source, /payload\.checker/);
+  assert.match(source, /qcTask\.agent_name/);
   assert.match(source, /qc_task_sha_mismatch/);
   assert.match(source, /idempotency_conflict/);
+});
+
+test('verdict handler binds all evidence to the completed QC task and resists forgery', async () => {
+  const attempts = new Map();
+  const writes = [];
+  let task = {
+    id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1',
+    context: { head_sha: validVerdict.bound_sha }, result: { ...validVerdict }
+  };
+  const client = {
+    async connect() {}, async end() {},
+    async query(sql, values = []) {
+      if (/FROM qc_attempt/.test(sql)) return { rows: attempts.has(values[0]) ? [attempts.get(values[0])] : [] };
+      if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+      if (/FROM agent_task_queue t/.test(sql)) return { rows: task ? [task] : [] };
+      if (/FROM qc_verdict/.test(sql)) return { rows: [] };
+      if (/INSERT INTO qc_attempt/.test(sql)) {
+        const [issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head, failure_class, qualifying, model, effort, idem_key] = values;
+        attempts.set(idem_key, { issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head, failure_class, qualifying, model, effort });
+      }
+      if (/INSERT INTO qc_verdict/.test(sql)) writes.push(values);
+      return { rows: [] };
+    }
+  };
+  setTestClientFactory(() => client);
+  const call = async (payload) => {
+    const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
+    return { ...res, json: JSON.parse(res.body) };
+  };
+  try {
+    let result = await call({ ...validVerdict, checker: 'forged-human-name' });
+    assert.equal(result.status, 201);
+    assert.equal(writes[0][2], 'qc-sol-low-1', 'checker_name must come from QC agent, not CLI checker');
+    result = await call({ ...validVerdict, idem_key: 'qc-verdict-wrong-md5', work_product_md5: 'a41d8cd98f00b204e9800998ecf8427e' });
+    assert.equal(result.json.error, 'qc_task_work_product_mismatch');
+    task = { ...task, result: { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false } };
+    result = await call({ ...validVerdict, idem_key: 'qc-verdict-fail-pass' });
+    assert.equal(result.json.error, 'qc_task_verdict_mismatch');
+    task = null;
+    result = await call({ ...validVerdict, idem_key: 'qc-verdict-cross-workspace' });
+    assert.equal(result.json.error, 'completed_sol_low_qc_required');
+    task = { id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1', context: { head_sha: validVerdict.bound_sha }, result: { ...validVerdict } };
+    result = await call({ ...validVerdict, checker: 'replay-forgery' });
+    assert.equal(result.status, 200, 'same immutable evidence must replay despite a forged checker string');
+    result = await call({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false });
+    assert.equal(result.json.error, 'idempotency_conflict');
+  } finally {
+    setTestClientFactory(null);
+  }
 });
 
 test('only a named CI/CD return is eligible for a repair authorization', () => {
