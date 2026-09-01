@@ -13,7 +13,7 @@ const {
   assertRoutableStageOwners,
   crossStageExecutionAdmission
 } = require("./guardrails.cjs");
-const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed } = require("./parked-diagnosis.cjs");
+const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvidenceReference } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 
@@ -69,6 +69,19 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
+
+async function verifiedParkedEvidenceRelease(client, issue, toStage, reason) {
+  if (issue.status !== 'Parked' || toStage !== 'In Review' || issue.metadata?.parked_release_once !== true) return false;
+  const match = String(reason || '').match(/^runtime_evidence_verified:(.+)$/);
+  const reference = match && parseRuntimeEvidenceReference(match[1]);
+  if (!reference) return false;
+  const sql = {
+    task: `SELECT 1 FROM agent_task_queue WHERE id = $1::uuid AND issue_id = $2::uuid AND status = 'completed' AND context->>'kind' IS DISTINCT FROM 'parked_diagnosis'`,
+    qc: `SELECT 1 FROM qc_verdict WHERE id = $1::uuid AND issue_id = $2::uuid`,
+    activity: `SELECT 1 FROM activity_log WHERE id = $1::uuid AND issue_id = $2::uuid`
+  };
+  return (await client.query(sql[reference.kind], [reference.id, issue.id])).rowCount === 1;
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
@@ -822,6 +835,7 @@ async function relayAdvance(req, res, body) {
     }
     const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
       issue.metadata?.parked_release_once === true;
+    const parkedEvidenceQcRelease = await verifiedParkedEvidenceRelease(client, issue, to_stage, reason);
     // Parked -> Done is reserved for the relay's already-fixed diagnosis
     // outcome. It still reaches the current PASS + work-product-hash gate
     // below; the relay secret is the authority boundary for this exception.
@@ -891,7 +905,7 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    if (!parkedRelease && !parkedDiagnosisDone && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
+    if (!parkedRelease && !parkedEvidenceQcRelease && !parkedDiagnosisDone && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
@@ -1253,9 +1267,9 @@ async function relayAdvance(req, res, body) {
            updated_at = NOW()
        WHERE id = $2
        RETURNING id, status`,
-      [to_stage, issue_id, parkedRelease]
+      [to_stage, issue_id, parkedRelease || parkedEvidenceQcRelease]
     );
-    if (parkedRelease) {
+    if (parkedRelease || parkedEvidenceQcRelease) {
       console.warn(JSON.stringify({ event: "parked_release_consumed",
         issue_id: issue.id, from_stage: issue.status, to_stage }));
     }

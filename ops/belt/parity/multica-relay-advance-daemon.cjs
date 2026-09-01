@@ -1141,12 +1141,13 @@ async function processParkedDiagnoses() {
           agent_token: RELAY_AGENT_SECRET,
           ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
           ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
-        if (!response.ok) {
+        if (!response.ok && response.status === 409) {
           // Keep the diagnosis retryable when the bridge is unavailable. The
           // bridge owns terminal transitions and must record the gate result.
           await client.query(
             `UPDATE agent_task_queue
                 SET context = context - 'diagnosis_processed'
+                    - 'runtime_evidence_recovery_v2_consumed'
               WHERE id = $1::uuid`, [task.id]);
         }
         console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);

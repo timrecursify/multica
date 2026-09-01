@@ -73,6 +73,12 @@ test('runtime-evidence recovery is one-shot, typed, and stays on relay authority
   assert.doesNotMatch(diagnosis, /UPDATE issue SET status/);
 });
 
+test('evidence recovery replays only an unchanged 409 release rejection', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /!response\.ok && response\.status === 409/);
+  assert.match(source, /context - 'diagnosis_processed'\s*- 'runtime_evidence_recovery_v2_consumed'/);
+});
+
 test('canonical evidence rejects a parked-diagnosis citation', () => {
   const contract = fs.readFileSync(require.resolve('../parked-diagnosis.cjs'), 'utf8');
   assert.match(contract, /t\.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
