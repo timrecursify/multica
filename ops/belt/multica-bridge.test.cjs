@@ -5,6 +5,7 @@ const fs = require('node:fs');
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
 process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-secret';
+process.env.RELAY_OPERATOR_SECRET = process.env.RELAY_OPERATOR_SECRET || 'test-operator-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
 const {
@@ -1090,14 +1091,17 @@ test('Parked and In Review arrivals at Done return before task dispatch', () => 
   assert.doesNotMatch(terminalArrival, /replaceStageTask/);
 });
 
-test('terminal exits preserve the configured archiver path and require an explicit operator marker otherwise', () => {
+test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const guard = source.slice(source.indexOf('const issue = issueResult.rows[0];'),
     source.indexOf('const noArtifactRescope'));
   assert.doesNotMatch(guard, /terminal_stage/);
   assert.match(source, /sourceStageResult\.rows\[0\]\?\.next_stage === to_stage/);
   assert.match(source, /operator_terminal_exit === true/);
+  assert.match(source, /RELAY_OPERATOR_SECRET/);
+  assert.match(source, /x-relay-operator-secret/);
   assert.match(source, /reason\.trim\(\) !== ""/);
   assert.match(source, /terminal_stage_operator_marker_required/);
   assert.match(source, /terminal_exit: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
+  assert.match(source, /parked_audit/);
 });

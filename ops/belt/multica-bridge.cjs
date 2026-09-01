@@ -21,6 +21,9 @@ const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const JWT_SECRET = process.env.JWT_SECRET;
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
+// Optional at process start, but mandatory for an explicit operator terminal
+// exit. Leaving it unset therefore fails that exceptional path closed.
+const RELAY_OPERATOR_SECRET = process.env.RELAY_OPERATOR_SECRET;
 const SSO_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID;
 
 // One canonical login (Cloudflare Access) serving several isolated client
@@ -705,10 +708,10 @@ async function replaceStageTask(client, task) {
     throw new Error(`relay successor task was not created for issue ${task.issueId} stage ${task.toStage}`);
   }
 
-  const log = task.relayContext
+  const log = task.relayAudit
     ? await client.query(
       `INSERT INTO relay_run_log (
-         issue_id, from_stage, to_stage, agent_id, task_id, status, context
+         issue_id, from_stage, to_stage, agent_id, task_id, status, parked_audit
        )
        SELECT $1, $2, $3, $4, $5, 'pending', $6::jsonb
         WHERE NOT EXISTS (
@@ -716,7 +719,7 @@ async function replaceStageTask(client, task) {
            WHERE issue_id = $1 AND task_id = $5
         )
        RETURNING id`,
-      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId, task.relayContext]
+      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId, task.relayAudit]
     ) : await client.query(
       `INSERT INTO relay_run_log (
          issue_id, from_stage, to_stage, agent_id, task_id, status
@@ -1204,16 +1207,22 @@ async function relayAdvance(req, res, body) {
       "SELECT next_stage FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
       [issue.workspace_id, issue.status]
     );
+    // Done -> Archived remains an automation path: it is the configured,
+    // terminal-to-terminal successor and terminal arrivals return before any
+    // task dispatch. Other terminal exits require operator-only credentials.
     const configuredTerminalExit = isTerminalStage(issue.status) &&
       sourceStageResult.rows[0]?.next_stage === to_stage;
-    const explicitTerminalExit = isTerminalStage(issue.status) &&
+    const explicitTerminalExitRequested = isTerminalStage(issue.status) &&
       operator_terminal_exit === true && typeof reason === "string" && reason.trim() !== "";
+    const explicitTerminalExit = explicitTerminalExitRequested &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
     if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit) {
       await client.query("ROLLBACK");
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         error: "terminal_stage_operator_marker_required",
-        message: "terminal exits require the configured successor or an explicit operator marker and reason"
+        message: "terminal exits require the configured successor or an authenticated operator marker and reason"
       }));
       return;
     }
@@ -1825,7 +1834,7 @@ async function relayAdvance(req, res, body) {
         priority: taskPriority,
         runtimeId: stage.selected_runtime_id,
         context,
-        relayContext: explicitTerminalExit ? JSON.stringify({
+        relayAudit: explicitTerminalExit ? JSON.stringify({
           terminal_exit: { operator_marker: true, reason: reason.trim() }
         }) : null,
         triggerSummary: retryEscalation
