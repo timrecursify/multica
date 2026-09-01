@@ -112,8 +112,9 @@ test('stranded-task fixture redispatches a cancelled-only task', async () => {
   await harness.run();
   const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
   assert.ok(insert);
-  assert.match(insert.values[3], /"source":"relay-requeue"/);
-  assert.match(insert.values[3], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
+  assert.equal(insert.values[2], '323e4567-e89b-42d3-a456-426614174000');
+  assert.match(insert.values[4], /"source":"relay-requeue"/);
+  assert.match(insert.values[4], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
 });
 
 test('stranded-task fixtures leave running tasks and bundled children untouched', async () => {
