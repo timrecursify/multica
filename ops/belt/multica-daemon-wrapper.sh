@@ -35,4 +35,5 @@ daemon_bin="${MULTICA_DAEMON_BIN:-/home/newadmin/multica-daemon/server}"
 export MULTICA_DAEMON_PORT="${MULTICA_DAEMON_PORT:-20464}"
 cd /home/newadmin/multica-daemon
 exec "$daemon_bin" daemon start --foreground --daemon-id=gsp-multica-worker \
-  --heartbeat-interval=30s --poll-interval=2s --workspaces-root="$root"
+  --heartbeat-interval=30s --poll-interval=2s --workspaces-root="$root" \
+  --max-concurrent-tasks="$cap_raw"
