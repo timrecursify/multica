@@ -21,6 +21,11 @@ const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const JWT_SECRET = process.env.JWT_SECRET;
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
+// Optional at process start, but mandatory for an explicit operator terminal
+// exit. Leaving it unset therefore fails that exceptional path closed.
+const RELAY_OPERATOR_SECRET = process.env.RELAY_OPERATOR_SECRET;
+const OPERATOR_SECRET_DISABLED = typeof RELAY_OPERATOR_SECRET === "string" &&
+  RELAY_OPERATOR_SECRET.length > 0 && RELAY_OPERATOR_SECRET === RELAY_AGENT_SECRET;
 const SSO_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID;
 
 // One canonical login (Cloudflare Access) serving several isolated client
@@ -48,6 +53,9 @@ for (const [name, value] of Object.entries({
 })) {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
 }
+if (OPERATOR_SECRET_DISABLED) {
+  console.error("[relay] RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET; operator terminal exits disabled");
+}
 
 const PORT = Number(process.env.PORT || 5005);
 
@@ -69,6 +77,11 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
+const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived"]);
+
+function isTerminalStage(stage) {
+  return TERMINAL_STAGES.has(stage);
+}
 
 async function verifiedParkedEvidenceRelease(client, issue, toStage, reason) {
   if (issue.status !== 'Parked' || toStage !== 'In Review' || issue.metadata?.parked_release_once !== true) return false;
@@ -700,18 +713,30 @@ async function replaceStageTask(client, task) {
     throw new Error(`relay successor task was not created for issue ${task.issueId} stage ${task.toStage}`);
   }
 
-  const log = await client.query(
-    `INSERT INTO relay_run_log (
-       issue_id, from_stage, to_stage, agent_id, task_id, status
-     )
-     SELECT $1, $2, $3, $4, $5, 'pending'
-      WHERE NOT EXISTS (
-        SELECT 1 FROM relay_run_log
-         WHERE issue_id = $1 AND task_id = $5
-      )
-     RETURNING id`,
-    [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
-  );
+  const log = task.relayAudit
+    ? await client.query(
+      `INSERT INTO relay_run_log (
+         issue_id, from_stage, to_stage, agent_id, task_id, status, parked_audit
+       )
+       SELECT $1, $2, $3, $4, $5, 'pending', $6::jsonb
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log
+           WHERE issue_id = $1 AND task_id = $5
+        )
+       RETURNING id`,
+      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId, task.relayAudit]
+    ) : await client.query(
+      `INSERT INTO relay_run_log (
+         issue_id, from_stage, to_stage, agent_id, task_id, status
+       )
+       SELECT $1, $2, $3, $4, $5, 'pending'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log
+           WHERE issue_id = $1 AND task_id = $5
+        )
+       RETURNING id`,
+      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
+    );
   return { taskId, relayLogId: log.rows[0]?.id || null };
 }
 
@@ -1100,7 +1125,7 @@ async function relayAdvance(req, res, body) {
   let client;
   try {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
-      operator_rescope_issue_id } = body;
+      operator_rescope_issue_id, operator_terminal_exit } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -1129,7 +1154,6 @@ async function relayAdvance(req, res, body) {
 
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
-    const terminalStages = new Set(["Done", "Cancelled", "Archived"]);
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -1184,6 +1208,40 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayStage(res, to_stage);
       return;
     }
+    const sourceStageResult = await client.query(
+      "SELECT next_stage FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
+      [issue.workspace_id, issue.status]
+    );
+    // Done -> Archived remains an automation path: it is the configured,
+    // terminal-to-terminal successor and terminal arrivals return before any
+    // task dispatch. Other terminal exits require operator-only credentials.
+    const configuredTerminalExit = isTerminalStage(issue.status) &&
+      sourceStageResult.rows[0]?.next_stage === to_stage;
+    const explicitTerminalExitRequested = isTerminalStage(issue.status) &&
+      operator_terminal_exit === true && typeof reason === "string" && reason.trim() !== "";
+    const explicitTerminalExit = explicitTerminalExitRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
+        OPERATOR_SECRET_DISABLED) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_operator_secret_conflict",
+        message: "operator terminal exits are disabled because relay secrets are identical"
+      }));
+      return;
+    }
+    if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_operator_marker_required",
+        message: "terminal exits require the configured successor or an authenticated operator marker and reason"
+      }));
+      return;
+    }
     const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
       issue.metadata?.parked_release_once === true;
     const parkedEvidenceQcRelease = await verifiedParkedEvidenceRelease(client, issue, to_stage, reason);
@@ -1203,7 +1261,7 @@ async function relayAdvance(req, res, body) {
       issue.metadata?.retry_escalation_at || null;
     if (issue.status === to_stage && !retryEscalation) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
-      const relayLogId = terminalStages.has(to_stage)
+      const relayLogId = isTerminalStage(to_stage)
         ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1711,14 +1769,29 @@ async function relayAdvance(req, res, body) {
         trigger: parkedAudit?.trigger || "relay_advance",
         intendedStage: parkedAudit?.intendedStage || null,
         attempts: parkedAudit?.attempts || 0,
-        taskCount: parkedAudit?.taskCount || 0
+        taskCount: parkedAudit?.taskCount || 0,
+        terminalExit: explicitTerminalExit
+          ? { operator_marker: true, reason: reason.trim() }
+          : null
       });
     }
 
-    if (terminalStages.has(to_stage)) {
+    if (isTerminalStage(to_stage)) {
       relayLogId = await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
+      // A terminal arrival has no stage owner, task, or successor relay. Keep
+      // this return before every dispatch path so future owner configuration
+      // cannot accidentally put a completed ticket back on the belt.
+      await client.query("COMMIT");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        issue: result.rows[0],
+        task_id: null,
+        relay_log_id: relayLogId
+      }));
+      return;
     }
 
     // A bundled child must never be dispatched on its own. Its MEGA parent IS
@@ -1764,6 +1837,9 @@ async function relayAdvance(req, res, body) {
           rescope_reason: "qc_blocked_no_artifact",
           operator_rescope_issue_id: issue.id
         } : {}),
+        ...(explicitTerminalExit ? {
+          terminal_exit: { operator_marker: true, reason: reason.trim() }
+        } : {}),
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
@@ -1777,6 +1853,9 @@ async function relayAdvance(req, res, body) {
         priority: taskPriority,
         runtimeId: stage.selected_runtime_id,
         context,
+        relayAudit: explicitTerminalExit ? JSON.stringify({
+          terminal_exit: { operator_marker: true, reason: reason.trim() }
+        }) : null,
         triggerSummary: retryEscalation
           ? `Sol-low re-spec escalation: ${retryEscalation.reason}`
           : `Relay stage transition: ${issue.status} -> ${to_stage}`
@@ -1937,6 +2016,7 @@ module.exports = {
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
+  isTerminalStage,
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,

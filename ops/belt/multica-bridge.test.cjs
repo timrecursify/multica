@@ -4,7 +4,10 @@ const fs = require('node:fs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
-process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-secret';
+// This handler test sends fixed fixture credentials. Do not inherit a live
+// relay credential, which would make the expected 201 path return 403.
+process.env.RELAY_AGENT_SECRET = 'test-relay-secret';
+process.env.RELAY_OPERATOR_SECRET = 'test-operator-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
 const {
@@ -37,7 +40,8 @@ const {
   verifiedRetryEscalation,
   retryEscalationSourceTask,
   authorizeRelayStatusWrites,
-  rerunParkedDiagnosis
+  rerunParkedDiagnosis,
+  isTerminalStage
 } = require('./multica-bridge.cjs');
 
 test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', async () => {
@@ -1066,10 +1070,48 @@ test('relay stage lookups bind configuration and owners to the issue workspace',
 
 test('terminal relay transitions are logged and Parked Done remains relay-only and PASS-gated', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /const terminalStages = new Set\(\["Done", "Cancelled", "Archived"\]\)/);
+  assert.equal(isTerminalStage('Done'), true);
+  assert.equal(isTerminalStage('Cancelled'), true);
+  assert.equal(isTerminalStage('Archived'), true);
   assert.match(source, /const parkedDiagnosisDone = issue\.status === "Parked" && to_stage === "Done"/);
   assert.match(source, /to_stage === "Done"/);
   assert.match(source, /work_product_mismatch/);
-  assert.match(source, /if \(terminalStages\.has\(to_stage\)\)/);
+  assert.match(source, /if \(isTerminalStage\(to_stage\)\)/);
   assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
+});
+
+test('Parked and In Review arrivals at Done return before task dispatch', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const terminalArrival = source.slice(source.indexOf('if (isTerminalStage(to_stage))'),
+    source.indexOf('// A bundled child'));
+  for (const fromStage of ['Parked', 'In Review']) {
+    assert.equal(isTerminalStage('Done'), true, `${fromStage} -> Done is terminal`);
+  }
+  assert.match(terminalArrival, /task_id: null/);
+  assert.match(terminalArrival, /relay_log_id: relayLogId/);
+  assert.match(terminalArrival, /return;/);
+  assert.doesNotMatch(terminalArrival, /replaceStageTask/);
+});
+
+test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const guard = source.slice(source.indexOf('const issue = issueResult.rows[0];'),
+    source.indexOf('const noArtifactRescope'));
+  assert.doesNotMatch(guard, /terminal_stage_relay_exit_forbidden/);
+  assert.match(source, /sourceStageResult\.rows\[0\]\?\.next_stage === to_stage/);
+  assert.match(source, /operator_terminal_exit === true/);
+  assert.match(source, /RELAY_OPERATOR_SECRET/);
+  assert.match(source, /x-relay-operator-secret/);
+  assert.match(source, /reason\.trim\(\) !== ""/);
+  assert.match(source, /terminal_stage_operator_marker_required/);
+  assert.match(source, /terminal_exit: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
+  assert.match(source, /parked_audit/);
+  assert.match(source, /terminalExit: explicitTerminalExit/);
+});
+
+test('identical relay and operator secrets disable explicit terminal exits', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /OPERATOR_SECRET_DISABLED/);
+  assert.match(source, /RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET/);
+  assert.match(source, /terminal_stage_operator_secret_conflict/);
 });
