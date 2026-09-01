@@ -183,8 +183,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
             'unattributed', 'relay_disposition', 1, 1
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue
-         WHERE issue_id = $2 AND context->>'kind' = $6
-           AND status IN ('queued', 'dispatched', 'running', 'completed')
+        WHERE issue_id = $2 AND context->>'kind' = $6
       )
       ON CONFLICT DO NOTHING
       RETURNING id`,

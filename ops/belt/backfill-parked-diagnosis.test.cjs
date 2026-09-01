@@ -8,7 +8,27 @@ test('batch size is bounded at 25 and mode is explicit', () => {
   assert.equal(parseArgs(['--apply', '--batch-size', '25']).batch, 25);
   assert.throws(() => parseArgs(['--apply', '--batch-size', '26']), /1 to 25/);
   assert.throws(() => parseArgs(['--batch-size', '1']), /exactly one/);
+  assert.throws(() => parseArgs(['--dry-run', '--apply']), /exactly one/);
   assert.equal(MAX_BATCH, 25);
+});
+
+test('selection scans blockers and existing diagnoses before filling the batch', async () => {
+  const ids = ['blocked', 'existing', 'eligible'];
+  const pool = {
+    query: async () => ({ rows: ids.map((id) => ({ id, workspace_id: 'w', status: 'Parked', priority: 'low',
+      metadata: id === 'blocked' ? { parked_blocker: 'owner' } : {} })), rowCount: ids.length }),
+    connect: async () => ({ query: async (sql, values) => {
+      if (sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT') return { rowCount: 0, rows: [] };
+      if (sql.includes('FROM issue')) return { rowCount: 1, rows: [{ id: values[0], workspace_id: 'w', status: 'Parked', priority: 'low',
+        metadata: values[0] === 'blocked' ? { parked_blocker: 'owner' } : {} }] };
+      if (sql.includes('agent_task_queue')) return values[0] === 'existing' ? { rowCount: 1, rows: [{ id: 't', status: 'completed' }] } : { rowCount: 0, rows: [] };
+      return { rowCount: 0, rows: [] };
+    }, release() {} })
+  };
+  const result = await run(pool, parseArgs(['--dry-run', '--batch-size', '1']));
+  assert.deepEqual(result.ids.would_queue, ['eligible']);
+  assert.deepEqual(result.ids.skipped_blocker, ['blocked']);
+  assert.deepEqual(result.ids.skipped_completed, ['existing']);
 });
 
 test('inspection skips blockers and nonterminal diagnosis tasks', async () => {

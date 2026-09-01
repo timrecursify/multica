@@ -12,15 +12,19 @@ const NONTERMINAL = ['queued', 'dispatched', 'running', 'waiting_local_directory
 
 function parseArgs(argv) {
   const out = { batch: DEFAULT_BATCH, workspace: null, mode: null };
+  let modeCount = 0;
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === '--dry-run' || arg === '--apply') out.mode = arg.slice(2);
+    if (arg === '--dry-run' || arg === '--apply') {
+      out.mode = arg.slice(2);
+      modeCount += 1;
+    }
     else if (arg === '--batch-size') out.batch = Number(argv[++i]);
     else if (arg === '--workspace') out.workspace = argv[++i];
     else if (arg === '--help') return { help: true };
     else throw new Error(`unknown option: ${arg}`);
   }
-  if (!out.mode) throw new Error('exactly one of --dry-run or --apply is required');
+  if (modeCount !== 1) throw new Error('exactly one of --dry-run or --apply is required');
   if (!Number.isInteger(out.batch) || out.batch < 1 || out.batch > MAX_BATCH) {
     throw new Error(`--batch-size must be an integer from 1 to ${MAX_BATCH}`);
   }
@@ -36,10 +40,15 @@ async function inspect(client, issue) {
     ? issue.metadata.parked_blocker : null;
   if (blocker) return { kind: 'skip', reason: 'named_parked_blocker' };
   const task = await client.query(
-    `SELECT id FROM agent_task_queue
-      WHERE issue_id = $1 AND status = ANY($2::text[])
-        AND context->>'kind' = $3 LIMIT 1`, [issue.id, NONTERMINAL, PARK_DIAGNOSIS_KIND]);
-  if (task.rowCount) return { kind: 'skip', reason: 'nonterminal_parked_diagnosis', task_id: task.rows[0].id };
+    `SELECT id, status FROM agent_task_queue
+      WHERE issue_id = $1 AND context->>'kind' = $2
+      ORDER BY created_at ASC LIMIT 1`, [issue.id, PARK_DIAGNOSIS_KIND]);
+  if (task.rowCount) {
+    const status = task.rows[0].status;
+    return { kind: 'skip',
+      reason: status === 'completed' ? 'completed_parked_diagnosis' : 'nonterminal_parked_diagnosis',
+      task_id: task.rows[0].id };
+  }
   const comment = await client.query(
     `SELECT 1 FROM comment WHERE issue_id = $1
       AND content LIKE '<!-- multica-park-reason -->%' LIMIT 1`, [issue.id]);
@@ -47,16 +56,18 @@ async function inspect(client, issue) {
 }
 
 async function run(pool, options) {
-  const where = options.workspace ? 'AND workspace_id = $2' : '';
-  const params = options.workspace ? [options.batch, options.workspace] : [options.batch];
+  const where = options.workspace ? 'AND workspace_id = $1' : '';
   const listed = await pool.query(
     `SELECT id, workspace_id, status, priority, metadata
        FROM issue WHERE status = 'Parked' ${where}
-      ORDER BY workspace_id, id LIMIT $1`, params);
+      ORDER BY workspace_id, id`, options.workspace ? [options.workspace] : []);
   const counts = { selected: 0, queued: 0, would_queue: 0, skipped_blocker: 0,
-    skipped_existing: 0, stale: 0, failed: 0 };
-  const ids = { queued: [], would_queue: [], skipped: [] };
+    skipped_existing: 0, skipped_completed: 0, skipped_no_owner: 0,
+    stale: 0, failed: 0 };
+  const ids = { queued: [], would_queue: [], skipped: [], skipped_blocker: [],
+    skipped_existing: [], skipped_completed: [], skipped_no_owner: [], stale: [] };
   for (const listedIssue of listed.rows) {
+    if (counts.selected >= options.batch) break;
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
@@ -67,8 +78,12 @@ async function run(pool, options) {
       const issue = locked.rows[0];
       const decision = await inspect(client, issue);
       if (decision.kind === 'skip') {
-        counts[decision.reason === 'named_parked_blocker' ? 'skipped_blocker' : 'skipped_existing'] += 1;
+        const category = decision.reason === 'named_parked_blocker' ? 'skipped_blocker'
+          : decision.reason === 'completed_parked_diagnosis' ? 'skipped_completed'
+            : 'skipped_existing';
+        counts[category] += 1;
         ids.skipped.push(issue.id);
+        ids[category].push(issue.id);
         await client.query('COMMIT');
         continue;
       }
@@ -83,7 +98,10 @@ async function run(pool, options) {
         skip_reason_comment: decision.has_reason_comment
       });
       if (taskId) { counts.queued += 1; ids.queued.push(`${issue.id}:${taskId}`); }
-      else counts.skipped_blocker += 1;
+      else {
+        counts.skipped_no_owner += 1;
+        ids.skipped_no_owner.push(issue.id);
+      }
       await client.query('COMMIT');
     } catch (error) {
       counts.failed += 1;
