@@ -223,6 +223,14 @@ test('queued diagnosis task is scoped to the issue workspace', async () => {
   assert.match(insert.values[5], /"owner_selection":"dedicated_sol_low"/);
 });
 
+test('diagnosis owner selection respects an active-task concurrency cap', () => {
+  const row = { id: 'agent-1', name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol',
+    instructions: 'Parked diagnosis: fixable, already_fixed, duplicate, genuinely_blocked.',
+    runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' },
+    max_concurrent_tasks: 1, active_task_count: 1 };
+  assert.equal(selectDiagnosisOwner([row]), null);
+});
+
 test('INSERT SELECT parameters carry explicit PostgreSQL types', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./parked-diagnosis.cjs'), 'utf8');

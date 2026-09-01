@@ -103,9 +103,37 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
+const RERUN_IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 
 async function authorizeRelayStatusWrites(client) {
   await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
+}
+
+async function rerunParkedDiagnosis(client, payload) {
+  if (!UUID_RE.test(String(payload.issue_id || '')) || !RERUN_IDEM_KEY_RE.test(String(payload.idempotency_key || ''))) {
+    return { ok: false, error: 'invalid_request' };
+  }
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 805))", [payload.issue_id]);
+  const issue = await client.query(
+    `SELECT id, workspace_id, status, priority FROM issue WHERE id = $1::uuid AND status = 'Parked' FOR UPDATE`,
+    [payload.issue_id]);
+  if (issue.rowCount === 0) return { ok: false, error: 'parked_issue_required' };
+  const prior = await client.query(
+    `SELECT id FROM agent_task_queue
+      WHERE issue_id = $1::uuid AND context->>'kind' = 'parked_diagnosis'
+        AND context->>'operator_rerun_idem_key' = $2::text
+      ORDER BY created_at DESC LIMIT 1`, [payload.issue_id, payload.idempotency_key]);
+  if (prior.rowCount > 0) return { ok: true, replay: true, task_id: prior.rows[0].id };
+  const active = await client.query(
+    `SELECT id FROM agent_task_queue WHERE issue_id = $1::uuid
+      AND context->>'kind' = 'parked_diagnosis'
+      AND status IN ('queued','dispatched','running','waiting_local_directory','deferred') LIMIT 1`, [payload.issue_id]);
+  if (active.rowCount > 0) return { ok: true, replay: true, task_id: active.rows[0].id };
+  const taskId = await recordParkAndQueueDiagnosis(client, issue.rows[0], {
+    reason: 'operator_parked_diagnosis_rerun', operator_rerun_idem_key: payload.idempotency_key,
+    skip_reason_comment: false
+  });
+  return taskId ? { ok: true, replay: false, task_id: taskId } : { ok: false, error: 'diagnosis_owner_or_capacity_unavailable' };
 }
 const IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "access"]);
@@ -1703,6 +1731,26 @@ async function relayAdvance(req, res, body) {
   }
 }
 
+async function relayDiagnosisRerun(req, res, payload) {
+  if (!RELAY_AGENT_SECRET || payload.agent_token !== RELAY_AGENT_SECRET) return relayVerdictError(res, 403, 'invalid_token');
+  const client = new Client({ connectionString: MULTICA_DB });
+  try {
+    await client.connect();
+    await client.query('BEGIN');
+    const result = await rerunParkedDiagnosis(client, payload);
+    if (!result.ok) {
+      await client.query('ROLLBACK');
+      return relayVerdictError(res, 409, result.error);
+    }
+    await client.query('COMMIT');
+    res.writeHead(result.replay ? 200 : 202, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    relayVerdictError(res, 500, 'internal_error');
+  } finally { await client.end().catch(() => {}); }
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.url === "/relay/verdict") {
     if (req.method !== "POST") return relayVerdictError(res, 405, "method_not_allowed");
@@ -1726,6 +1774,12 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400);
         res.end("Invalid JSON");
       }
+    });
+  } else if (req.method === "POST" && req.url === "/relay/parked-diagnosis-rerun") {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", () => {
+      try { relayDiagnosisRerun(req, res, JSON.parse(body)); } catch { relayVerdictError(res, 400, 'invalid_json'); }
     });
   } else if (req.method === "GET" && req.url === "/sso/bridge") {
     ssoBridge(req, res);
@@ -1803,5 +1857,6 @@ module.exports = {
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
-  authorizeRelayStatusWrites
+  authorizeRelayStatusWrites,
+  rerunParkedDiagnosis
 };
