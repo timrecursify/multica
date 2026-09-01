@@ -24,6 +24,8 @@ const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 // Optional at process start, but mandatory for an explicit operator terminal
 // exit. Leaving it unset therefore fails that exceptional path closed.
 const RELAY_OPERATOR_SECRET = process.env.RELAY_OPERATOR_SECRET;
+const OPERATOR_SECRET_DISABLED = typeof RELAY_OPERATOR_SECRET === "string" &&
+  RELAY_OPERATOR_SECRET.length > 0 && RELAY_OPERATOR_SECRET === RELAY_AGENT_SECRET;
 const SSO_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID;
 
 // One canonical login (Cloudflare Access) serving several isolated client
@@ -50,6 +52,9 @@ for (const [name, value] of Object.entries({
   MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID
 })) {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
+}
+if (OPERATOR_SECRET_DISABLED) {
+  console.error("[relay] RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET; operator terminal exits disabled");
 }
 
 const PORT = Number(process.env.PORT || 5005);
@@ -1215,8 +1220,19 @@ async function relayAdvance(req, res, body) {
     const explicitTerminalExitRequested = isTerminalStage(issue.status) &&
       operator_terminal_exit === true && typeof reason === "string" && reason.trim() !== "";
     const explicitTerminalExit = explicitTerminalExitRequested &&
+      !OPERATOR_SECRET_DISABLED &&
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
+        OPERATOR_SECRET_DISABLED) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_operator_secret_conflict",
+        message: "operator terminal exits are disabled because relay secrets are identical"
+      }));
+      return;
+    }
     if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit) {
       await client.query("ROLLBACK");
       res.writeHead(409, { "Content-Type": "application/json" });
@@ -1753,7 +1769,10 @@ async function relayAdvance(req, res, body) {
         trigger: parkedAudit?.trigger || "relay_advance",
         intendedStage: parkedAudit?.intendedStage || null,
         attempts: parkedAudit?.attempts || 0,
-        taskCount: parkedAudit?.taskCount || 0
+        taskCount: parkedAudit?.taskCount || 0,
+        terminalExit: explicitTerminalExit
+          ? { operator_marker: true, reason: reason.trim() }
+          : null
       });
     }
 

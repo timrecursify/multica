@@ -1097,7 +1097,7 @@ test('terminal exits preserve the configured archiver path and require an authen
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const guard = source.slice(source.indexOf('const issue = issueResult.rows[0];'),
     source.indexOf('const noArtifactRescope'));
-  assert.doesNotMatch(guard, /terminal_stage/);
+  assert.doesNotMatch(guard, /terminal_stage_relay_exit_forbidden/);
   assert.match(source, /sourceStageResult\.rows\[0\]\?\.next_stage === to_stage/);
   assert.match(source, /operator_terminal_exit === true/);
   assert.match(source, /RELAY_OPERATOR_SECRET/);
@@ -1106,4 +1106,12 @@ test('terminal exits preserve the configured archiver path and require an authen
   assert.match(source, /terminal_stage_operator_marker_required/);
   assert.match(source, /terminal_exit: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
   assert.match(source, /parked_audit/);
+  assert.match(source, /terminalExit: explicitTerminalExit/);
+});
+
+test('identical relay and operator secrets disable explicit terminal exits', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /OPERATOR_SECRET_DISABLED/);
+  assert.match(source, /RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET/);
+  assert.match(source, /terminal_stage_operator_secret_conflict/);
 });

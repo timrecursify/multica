@@ -13,13 +13,15 @@ const PARKED_FLOW_PER_HOUR_SQL = `SELECT date_trunc('hour', created_at) AS hour,
  GROUP BY 1
  ORDER BY 1`;
 
-function parkedEntryAudit({ trigger, intendedStage = null, attempts = 0, taskCount = 0 }) {
-  return {
+function parkedEntryAudit({ trigger, intendedStage = null, attempts = 0, taskCount = 0,
+  terminalExit = null }) {
+  const audit = {
     trigger,
     intended_stage: intendedStage,
     attempts: Number(attempts) || 0,
     task_count: Number(taskCount) || 0
   };
+  return terminalExit ? { ...audit, terminal_exit: terminalExit } : audit;
 }
 
 async function recordParkedEntry(client, { issueId, fromStage, ...audit }) {
