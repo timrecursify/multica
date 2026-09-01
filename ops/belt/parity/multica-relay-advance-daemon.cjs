@@ -451,7 +451,7 @@ async function findAndAdvanceTasks() {
         }
 
         const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
-          agent_token: RELAY_AGENT_SECRET,
+          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
           ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
         const response = await postToRelay(payload);
 
@@ -534,7 +534,8 @@ async function recoveryAdvanceTasks() {
           continue;
         }
 
-        const payload = { issue_id: row.issue_id, to_stage: row.next_stage, agent_token: RELAY_AGENT_SECRET };
+        const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
+          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id };
         const response = await postToRelay(payload);
 
         if (response.ok) {

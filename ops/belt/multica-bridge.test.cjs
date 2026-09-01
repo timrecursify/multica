@@ -33,7 +33,8 @@ const {
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
   retryEscalationReason,
-  verifiedRetryEscalation
+  verifiedRetryEscalation,
+  retryEscalationSourceTask
 } = require('./multica-bridge.cjs');
 
 test('retry escalation accepts only named bounded triggers', () => {
@@ -71,6 +72,33 @@ test('retry escalation refuses a consumed source task', async () => {
     to_stage: 'Spec', reason: 'retry_escalation:completion_failed',
     retry_escalation_task_id: taskId, retry_escalation_stage: issue.status
   }), false);
+});
+
+test('cap escalation binds one exact active source task in the current stage', async () => {
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
+  const client = { query: async (sql, values) => {
+    assert.match(sql, /t\.status IN \('queued','dispatched','running','waiting_local_directory','deferred'\)/);
+    assert.match(sql, /t\.context->>'to_stage' = \$3::text/);
+    assert.match(sql, /LIMIT 2 FOR UPDATE OF t/);
+    assert.deepEqual(values, [issue.id, issue.workspace_id, issue.status, taskId]);
+    return { rows: [{ id: taskId }] };
+  } };
+  assert.equal(await retryEscalationSourceTask(client, issue, taskId), taskId);
+});
+
+test('cap escalation fails closed when source lineage is ambiguous or invalid', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
+  let queries = 0;
+  const client = { query: async () => {
+    queries += 1;
+    return { rows: [{ id: 'one' }, { id: 'two' }] };
+  } };
+  assert.equal(await retryEscalationSourceTask(client, issue), null);
+  assert.equal(await retryEscalationSourceTask(client, issue, 'not-a-uuid'), null);
+  assert.equal(queries, 1);
 });
 
 test('Parked evidence QC return is a canonical consumed-release-only edge', () => {
@@ -745,7 +773,23 @@ test('every direct Parked transition is routed through the dedicated audit write
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /if \(to_stage === "Parked" && result\.rowCount > 0\)/);
   assert.match(source, /trigger: parkedAudit\?\.trigger \|\| "relay_advance"/);
-  assert.match(source, /trigger: "qc_bounce_ceiling"/);
+});
+
+test('QC bounce ceiling changes hands to an exact Sol-low Spec task, never Parked', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const bounce = source.slice(source.indexOf('// A QC FAIL sends the ticket back'),
+    source.indexOf('// Enforcement point: no deploy, no Done.'));
+  assert.match(bounce, /reason: "qc_bounce_ceiling"/);
+  assert.match(bounce, /source_task_id: sourceTaskId/);
+  assert.match(bounce, /to_stage = "Spec"/);
+  assert.match(bounce, /retry_escalation_source_task_required/);
+  assert.doesNotMatch(bounce, /to_stage = "Parked"/);
+});
+
+test('retry escalation requires an explicit Sol-low owner and never stores null lineage', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /owner\.model !== "gpt-5\.6-sol" \|\| owner\.thinking_level !== "low"/);
+  assert.doesNotMatch(source, /source_task_id: null/);
 });
 
 test('relay request maps snake-case stage into successor task input', () => {

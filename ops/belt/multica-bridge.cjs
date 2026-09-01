@@ -108,7 +108,7 @@ const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "
 const RETRY_ESCALATION_REASONS = new Set([
   "completion_blocked", "completion_qc_blocked", "completion_spec_blocked",
   "completion_build_blocked", "completion_failed", "completion_no_work_product",
-  "missing_result", "stage_cycle_limit", "lifetime_task_limit"
+  "missing_result", "qc_bounce_ceiling", "stage_cycle_limit", "lifetime_task_limit"
 ]);
 const RETRY_ESCALATION_DEADLINE_MINUTES = Number.parseInt(
   process.env.RELAY_RETRY_ESCALATION_DEADLINE_MINUTES || "20", 10
@@ -323,6 +323,27 @@ function retryEscalationReason(reason) {
   return match && RETRY_ESCALATION_REASONS.has(match[1]) ? match[1] : null;
 }
 
+async function retryEscalationSourceTask(client, issue, requestedTaskId = null) {
+  if (requestedTaskId != null && !UUID_RE.test(String(requestedTaskId))) return null;
+  const source = await client.query(
+    `SELECT t.id FROM agent_task_queue t
+      JOIN issue i ON i.id = t.issue_id AND i.workspace_id = $2::uuid
+      WHERE t.issue_id = $1::uuid
+        AND ($4::uuid IS NULL OR t.id = $4::uuid)
+        AND (
+          (t.status IN ('queued','dispatched','running','waiting_local_directory','deferred')
+            AND t.context->>'to_stage' = $3::text)
+          OR (t.status IN ('completed','failed','cancelled') AND EXISTS (
+            SELECT 1 FROM relay_run_log r
+             WHERE r.task_id = t.id AND r.issue_id = t.issue_id
+               AND r.to_stage = $3::text AND r.status = 'pending'
+          ))
+        )
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 2 FOR UPDATE OF t`,
+    [issue.id, issue.workspace_id, issue.status, requestedTaskId]);
+  return source.rows.length === 1 ? source.rows[0].id : null;
+}
+
 async function capEscalationVerified(client, issue, trigger, stage) {
   const since = issue.metadata?.parked_release_at || issue.metadata?.retry_escalation_at || null;
   if (trigger === "stage_cycle_limit") {
@@ -401,6 +422,9 @@ async function selectRetryEscalationOwner(client, issue) {
   const owner = await selectStageOwner(client, issue.workspace_id, "Registered", "Spec");
   if (!owner?.agent_id || !owner.owner_id || owner.archived_at || !owner.selected_runtime_id) {
     throw new Error(`No active Sol-low re-spec owner for workspace ${issue.workspace_id}`);
+  }
+  if (owner.model !== "gpt-5.6-sol" || owner.thinking_level !== "low") {
+    throw new Error(`Sol-low re-spec owner has invalid lane: ${owner.agent_name}`);
   }
   const compatibility = instructionCompatibility(owner.instructions, "Spec");
   const preflight = spendPreflight(owner, { provider: owner.selected_runtime_provider });
@@ -1180,7 +1204,7 @@ async function relayAdvance(req, res, body) {
     // and the review lane on every lap. GSP #151 ran 67 laps.
     // The ceiling is agent_task_queue.max_attempts (default 2) -- the belt's own
     // declared retry limit, applied to stage re-entry instead of to one task.
-    // Past it the ticket is a human's problem, not another paid rebuild.
+    // Past it the ticket changes hands to a Sol-low re-spec, not another paid rebuild.
     if (issue.status === "In Review" && to_stage === "In Progress" &&
         altStages.includes("Human Review")) {
       const bounced = await client.query(
@@ -1195,20 +1219,30 @@ async function relayAdvance(req, res, body) {
       );
       const { n, ceiling } = bounced.rows[0];
       if (n >= ceiling) {
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: "qc_bounce_ceiling" }));
+          return;
+        }
+        retryEscalation = {
+          reason: "qc_bounce_ceiling", trigger_stage: issue.status,
+          attempts: n, ceiling, source_task_id: sourceTaskId,
+          deadline: escalationDeadline()
+        };
+        to_stage = "Spec";
         console.warn(JSON.stringify({
           event: "qc_bounce_ceiling",
           issue_id,
           bounces: n,
           ceiling,
-          redirected_to: "Parked"
+          redirected_to: "Spec",
+          source_task_id: sourceTaskId
         }));
-        to_stage = "Parked";
-        parkedAudit = {
-          trigger: "qc_bounce_ceiling",
-          intendedStage: "In Progress",
-          attempts: n,
-          taskCount: n
-        };
       }
     }
 
@@ -1414,10 +1448,20 @@ async function relayAdvance(req, res, body) {
       );
       if (!cycle.ok && !cicdReturn && !parkedQcRecovery &&
           !noArtifactRescope && !retryEscalation) {
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: cycle.reason }));
+          return;
+        }
         retryEscalation = {
           reason: cycle.reason, trigger_stage: issue.status,
           attempts: history.rows[0]?.n || 0, ceiling: cycle.ceiling,
-          source_task_id: null, deadline: escalationDeadline()
+          source_task_id: sourceTaskId, deadline: escalationDeadline()
         };
         to_stage = cycle.disposition;
         stage = await selectRetryEscalationOwner(client, issue);
@@ -1443,10 +1487,20 @@ async function relayAdvance(req, res, body) {
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
       if (!lifetime.ok && !cicdReturn && !noArtifactRescope && !retryEscalation) {
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: lifetime.reason }));
+          return;
+        }
         retryEscalation = {
           reason: lifetime.reason, trigger_stage: issue.status,
           attempts: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling,
-          source_task_id: null, deadline: escalationDeadline()
+          source_task_id: sourceTaskId, deadline: escalationDeadline()
         };
         to_stage = lifetime.disposition;
         stage = await selectRetryEscalationOwner(client, issue);
@@ -1742,5 +1796,6 @@ module.exports = {
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
   retryEscalationReason,
-  verifiedRetryEscalation
+  verifiedRetryEscalation,
+  retryEscalationSourceTask
 };

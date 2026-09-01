@@ -99,6 +99,7 @@ test('relay advancement admits task results before creating a successor', () => 
   assert.match(source, /retry_escalation_task_id: taskId/);
   assert.match(source, /retry_escalation_stage: triggerStage/);
   assert.match(source, /markRelayLogFailedById\(client, row\.log_id\)/);
+  assert.match(source, /relay_source_task_id: row\.task_id/);
 });
 
 test('retry ceilings leave the daemon through relay authority instead of direct status writes', () => {
