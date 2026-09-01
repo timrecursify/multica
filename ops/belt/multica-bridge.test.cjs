@@ -11,8 +11,43 @@ const {
   existingStageTask,
   replaceStageTask,
   ownerStageForTransition,
-  ensureCompletedRelayLog
+  ensureCompletedRelayLog,
+  isBookkeepingTransition,
+  recordBookkeepingHandoff
 } = require('./multica-bridge.cjs');
+
+test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
+  assert.equal(isBookkeepingTransition('Queue', 'In Progress'), true);
+  assert.equal(isBookkeepingTransition('Spec', 'Queue'), false);
+  assert.equal(isBookkeepingTransition('In Progress', 'In Review'), false);
+});
+
+test('bookkeeping handoff links the existing builder task to the QC trigger', async () => {
+  const calls = [];
+  const replies = [
+    { rows: [{ id: 'builder-task', agent_id: 'builder-agent' }] },
+    { rows: [{ id: 'handoff-log' }] }
+  ];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return replies.shift();
+  } };
+
+  const result = await recordBookkeepingHandoff(client, 'issue-1');
+
+  assert.deepEqual(result, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.match(calls[0].sql, /context->>'to_stage' = 'Queue'/);
+  assert.match(calls[1].sql, /INSERT INTO relay_run_log/);
+  assert.deepEqual(calls[1].values, ['issue-1', 'builder-agent', 'builder-task']);
+  assert.doesNotMatch(calls.map(({ sql }) => sql).join('\n'), /INSERT INTO agent_task_queue/);
+});
+
+test('relay dispatch gates bypass paid admission only for the bookkeeping hop', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /isExecutionStage\(to_stage\) && !parkedRelease && !bookkeepingTransition/);
+  assert.match(source, /isExecutionStage\(to_stage\) && !bookkeepingTransition/);
+  assert.match(source, /if \(bookkeepingTransition\) \{[\s\S]*relayLogId = bookkeepingHandoff\.relayLogId/);
+});
 
 test('transition owner selection preserves forward lanes and routes backward branches to lane owners', () => {
   assert.equal(ownerStageForTransition('Spec', 'Queue'), 'Spec');
