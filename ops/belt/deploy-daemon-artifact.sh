@@ -18,11 +18,14 @@ binary_sha="${m[BINARY_SHA256]}"
 "$binary" version --output json | grep -Fq "\"commit\": \"$expected_sha\"" || fail "artifact version does not carry requested source SHA"
 target="${MULTICA_DAEMON_TARGET:-/home/newadmin/multica-daemon/server}"; pm2_bin="${PM2_BIN:-pm2}"; proc_root="${PROC_ROOT:-/proc}"; app="${MULTICA_DAEMON_PM2_APP:-gsp-multica-worker}"
 [[ "$target" = /* && -f "$target" && ! -L "$target" ]] || fail "daemon target must be an existing regular absolute file"
+lock_file="${MULTICA_DAEMON_DEPLOY_LOCK:-${target}.deploy.lock}"
+exec 9>"$lock_file"
+flock -n 9 || fail "another daemon artifact deployment holds the lock"
 pm2_state(){ "$pm2_bin" jlist | node -e 'let s="";process.stdin.on("data",x=>s+=x);process.stdin.on("end",()=>{let p=JSON.parse(s).find(x=>x.name===process.argv[1]);if(!p)process.exit(2);console.log([p.pid,p.pm2_env.status,p.pm2_env.unstable_restarts].join("|"))})' "$app"; }
 initial="$(pm2_state)" || fail "PM2 app is absent"; IFS='|' read -r initial_pid initial_status initial_restarts <<<"$initial"
 [[ "$initial_status" == online && "$initial_pid" =~ ^[1-9][0-9]*$ ]] || fail "PM2 app is not online"
-health(){ local want="$1" state pid status restarts args; state="$(pm2_state)" || return 1; IFS='|' read -r pid status restarts <<<"$state"; [[ "$pid" =~ ^[1-9][0-9]*$ && "$status" == online && "$restarts" == "$initial_restarts" && -r "$proc_root/$pid/cmdline" && -e "$proc_root/$pid/exe" ]] || return 1; args="$(tr '\0' ' ' < "$proc_root/$pid/cmdline")"; [[ "$args" == *'server daemon start'* && "$args" == *'--max-concurrent-tasks=32'* && "$(sha256sum "$proc_root/$pid/exe" | awk '{print $1}')" == "$want" ]] || return 1; "$target" daemon status >/dev/null 2>&1; }
-target_dir="$(dirname "$target")"; stamp="$(date -u +%Y%m%dT%H%M%SZ)"; backup="${target}.bak-${stamp}"; old_sha="$(sha256sum "$target" | awk '{print $1}')"; tmp="$(mktemp "$target_dir/.server.${expected_sha}.XXXXXX")"
+health(){ local want="$1" state pid status restarts; local -a argv; state="$(pm2_state)" || return 1; IFS='|' read -r pid status restarts <<<"$state"; [[ "$pid" =~ ^[1-9][0-9]*$ && "$status" == online && "$restarts" == "$initial_restarts" && -r "$proc_root/$pid/cmdline" && -e "$proc_root/$pid/exe" ]] || return 1; mapfile -d '' -t argv < "$proc_root/$pid/cmdline"; [[ " ${argv[*]} " == *' server daemon start '* ]] || return 1; local cap_count=0 arg; for arg in "${argv[@]}"; do [[ "$arg" == '--max-concurrent-tasks=32' ]] && ((cap_count+=1)); done; [[ $cap_count == 1 && "$(sha256sum "$proc_root/$pid/exe" | awk '{print $1}')" == "$want" ]] || return 1; "$target" daemon status >/dev/null 2>&1; }
+target_dir="$(dirname "$target")"; stamp="$(date -u +%Y%m%dT%H%M%S%N)"; backup="${target}.bak-${stamp}-${expected_sha:0:12}"; receipt="${target}.deploy-${stamp}-${expected_sha:0:12}.json"; [[ ! -e "$backup" && ! -e "$receipt" ]] || fail "backup or receipt already exists"; old_sha="$(sha256sum "$target" | awk '{print $1}')"; tmp="$(mktemp "$target_dir/.server.${expected_sha}.XXXXXX")"
 rollback(){ local rc="$1"
   [[ -f "$backup" && "$(sha256sum "$backup" | awk '{print $1}')" == "$old_sha" ]] || { echo 'daemon artifact deploy: rollback backup invalid' >&2; exit 79; }
   if ! cp --preserve=mode -- "$backup" "$tmp" || ! mv -f -- "$tmp" "$target"; then echo 'daemon artifact deploy: rollback file restore failed' >&2; exit 79; fi
@@ -34,4 +37,5 @@ cp --preserve=mode -- "$target" "$backup"; [[ "$(sha256sum "$backup" | awk '{pri
 cp --preserve=mode -- "$binary" "$tmp"; chmod 0755 -- "$tmp"; mv -f -- "$tmp" "$target"
 "$pm2_bin" reload "$app" --update-env >/dev/null || rollback 1
 sleep 2; health "$binary_sha" || rollback 1
-printf '{"source_sha":"%s","binary_sha256":"%s","backup":"%s","app":"%s","health":"ok"}\n' "$expected_sha" "$binary_sha" "$backup" "$app"
+set -C; printf '{"source_sha":"%s","binary_sha256":"%s","backup":"%s","app":"%s","health":"ok"}\n' "$expected_sha" "$binary_sha" "$backup" "$app" > "$receipt"; set +C
+cat "$receipt"
