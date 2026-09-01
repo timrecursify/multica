@@ -985,7 +985,8 @@ async function requeueStrandedTasks() {
           console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}; lane_paused=${Boolean(quotaPause)}`);
           continue;
         }
-        const releaseAt = row.metadata?.parked_release_at || null;
+        const releaseAt = row.metadata?.parked_release_at ||
+          row.metadata?.retry_escalation_at || null;
         const history = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1 AND context->>'to_stage' = $2

@@ -107,6 +107,8 @@ test('retry ceilings leave the daemon through relay authority instead of direct 
     source.indexOf('function diagnosisText'));
   assert.match(requeue, /requestRetryEscalation\(row, cycle\.reason\)/);
   assert.match(requeue, /requestRetryEscalation\(row, lifetime\.reason\)/);
+  assert.match(requeue,
+    /row\.metadata\?\.parked_release_at \|\|\s+row\.metadata\?\.retry_escalation_at \|\| null/);
   assert.doesNotMatch(requeue, /applyDisposition\(client, row, cycle\.disposition/);
   assert.doesNotMatch(requeue, /applyDisposition\(client, row, lifetime\.disposition/);
 });
