@@ -1112,10 +1112,17 @@ async function relayAdvance(req, res, body) {
           reason: "paid_dispatch_preflight",
           detail: preflight.reason,
           issue_id: issue.id,
-          agent_id: stage.agent_id
+          agent_id: stage.agent_id,
+          routing: preflight.agent_name ? { agent_name: preflight.agent_name,
+            agent_id: preflight.agent_id, actual_model: preflight.model,
+            actual_effort: preflight.effort, expected_model: preflight.expected_model,
+            expected_effort: preflight.expected_effort } : undefined
         }));
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "paid_dispatch_preflight", detail: preflight.reason }));
+        res.end(JSON.stringify({ error: "paid_dispatch_preflight", detail: preflight.reason,
+          agent_name: preflight.agent_name, agent_id: preflight.agent_id,
+          actual_model: preflight.model, actual_effort: preflight.effort,
+          expected_model: preflight.expected_model, expected_effort: preflight.expected_effort }));
         return;
       }
       // A stage re-entry creates a fresh task, so per-task max_attempts does not

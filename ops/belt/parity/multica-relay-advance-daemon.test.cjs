@@ -8,6 +8,13 @@ test('relay daemon scopes stage configuration to each issue workspace', () => {
   assert.match(source, /a\.workspace_id = rsc\.workspace_id/);
 });
 
+test('routing recovery hold logs bounded routing details', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /event: 'relay_requeue_held'/);
+  assert.match(source, /actual_model: preflight\.model/);
+  assert.match(source, /expected_effort: preflight\.expected_effort/);
+});
+
 test('Registered discovery covers every configured workspace', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /EXISTS \(SELECT 1 FROM relay_stage_config rsc/);

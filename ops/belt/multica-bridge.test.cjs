@@ -46,6 +46,14 @@ test('verdict validation accepts the sanctioned CLI checker field and rejects fo
   assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
 });
 
+test('routing rejections expose only bounded agent routing fields', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /actual_model: preflight\.model/);
+  assert.match(source, /actual_effort: preflight\.effort/);
+  assert.match(source, /expected_model: preflight\.expected_model/);
+  assert.doesNotMatch(source, /routing:.*runtime_config/s);
+});
+
 test('QC evidence parser accepts exactly one structured output marker', () => {
   assert.equal(qcTaskEvidenceMismatch({ result: qcResult() }, validVerdict), null);
   assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC_EVIDENCE_JSON={bad}' } }, validVerdict), 'qc_task_evidence_required');

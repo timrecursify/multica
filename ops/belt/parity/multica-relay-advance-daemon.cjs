@@ -794,7 +794,11 @@ async function requeueStrandedTasks() {
       }
       const preflight = spendPreflight(row, { provider: row.runtime_provider });
       if (!preflight.ok) {
-        console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: paid dispatch preflight ${preflight.reason}`);
+        console.log(JSON.stringify({ event: 'relay_requeue_held', issue_number: row.number,
+          reason: preflight.reason, agent_name: preflight.agent_name,
+          agent_id: preflight.agent_id, actual_model: preflight.model,
+          actual_effort: preflight.effort, expected_model: preflight.expected_model,
+          expected_effort: preflight.expected_effort }));
         continue;
       }
       // A 'completed' predecessor means QC finished without writing a verdict.
