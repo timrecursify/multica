@@ -1,7 +1,7 @@
 -- Restore the production relay vocabulary without rewriting existing issues.
--- 282 is not applied in production, so this migration deliberately repairs
--- only the schema contract. The write trigger preserves compatibility for
--- older clients while storing the canonical relay spelling.
+-- 282 canonicalizes legacy aliases while preserving every canonical status;
+-- this migration repairs the schema contract and keeps older clients
+-- compatible through the write trigger.
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
 CREATE OR REPLACE FUNCTION normalize_issue_status_before_write()
@@ -32,6 +32,7 @@ FOR EACH ROW EXECUTE FUNCTION normalize_issue_status_before_write();
 
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
-     'Human Review', 'CI/CD & Deploy', 'Done', 'Archived', 'Cancelled'));
+     'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
+     'Archived', 'Cancelled'));
 
 ALTER TABLE issue ALTER COLUMN status SET DEFAULT 'Spec';
