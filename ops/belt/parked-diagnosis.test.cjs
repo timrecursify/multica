@@ -48,6 +48,8 @@ test('diagnosis evidence and owner validation fail closed', () => {
   assert.equal(isConcreteRuntimeEvidence('relay.log:42'), true);
   assert.equal(isConcreteRuntimeEvidence('looks good'), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.6-sol', runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'qc' } }), true);
+  assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.6-sol', runtime_config: {} }), true);
+  assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-1', model: 'gpt-5.6-sol', runtime_config: {} }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.5', runtime_config: { reasoning_effort: 'low', role: 'qc' } }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-build-terra-low-1', model: 'gpt-5.6-terra', runtime_config: { role: 'build' } }), false);
 });
@@ -90,4 +92,12 @@ test('missing Sol-low owner persists a named blocker instead of parking silently
   const trace = queries.map(({ sql, values }) => `${sql}\n${JSON.stringify(values)}`).join('\n');
   assert.match(trace, /no_sol_low_diagnosis_owner/);
   assert.match(trace, /multica-park-diagnosis-blocker/);
+});
+
+test('INSERT SELECT parameters carry explicit PostgreSQL types', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./parked-diagnosis.cjs'), 'utf8');
+  assert.match(source, /SELECT \$1::uuid, \$2::uuid, 'system', \$3::uuid, \$4::text, 'system'/);
+  assert.match(source, /SELECT \$1::uuid, \$2::uuid, 'queued', \$3::integer, \$4::uuid, \$5::jsonb/);
+  assert.match(source, /issue_id = \$2::uuid AND context->>'kind' = \$6::text/);
 });
