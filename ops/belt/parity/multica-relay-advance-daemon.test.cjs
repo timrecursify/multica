@@ -29,6 +29,7 @@ test('relay advancement admits task results before creating a successor', () => 
   assert.match(source, /require\('\.\.\/relay-completion-admission\.cjs'\)/);
   assert.match(source, /atq\.result AS task_result/);
   assert.match(source, /completionAdmission\(row\.task_result/);
+  assert.match(source, /applyDisposition\(client,[\s\S]*completion\.disposition, completion\.reason/);
   assert.match(source, /markRelayLogFailedById\(client, row\.log_id\)/);
 });
 

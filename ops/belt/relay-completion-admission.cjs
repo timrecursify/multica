@@ -60,28 +60,29 @@ function textFields(envelope) {
 }
 
 function completionAdmission(result) {
+  const rejected = (reason) => ({ ok: false, reason, disposition: 'Parked' });
   const envelope = asEnvelope(result);
-  if (!envelope) return { ok: false, reason: 'missing_result' };
+  if (!envelope) return rejected('missing_result');
 
   if (Object.prototype.hasOwnProperty.call(envelope, 'work_product')
       && !String(envelope.work_product || '').trim()) {
-    return { ok: false, reason: 'completion_no_work_product' };
+    return rejected('completion_no_work_product');
   }
 
   const texts = textFields(envelope);
-  if (texts.length === 0) return { ok: false, reason: 'missing_result' };
+  if (texts.length === 0) return rejected('missing_result');
 
   for (const field of ['status', 'verdict', 'outcome']) {
     const reason = normalizedOutcome(envelope[field]);
-    if (reason) return { ok: false, reason };
+    if (reason) return rejected(reason);
   }
 
   for (const text of texts) {
     if (NO_WORK_PRODUCT.test(text)) {
-      return { ok: false, reason: 'completion_no_work_product' };
+      return rejected('completion_no_work_product');
     }
     for (const [marker, reason] of RESULT_MARKERS) {
-      if (marker.test(text)) return { ok: false, reason };
+      if (marker.test(text)) return rejected(reason);
     }
   }
 

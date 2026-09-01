@@ -216,7 +216,7 @@ async function findAndAdvanceTasks() {
     // daemon outage delays an advance instead of stranding it forever.
     const query = `SELECT rrl.id AS log_id, atq.issue_id, atq.status AS task_status,
              atq.result AS task_result, atq.error AS task_error,
-             rrl.to_stage, rsc.next_stage
+             i.workspace_id, i.priority, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
       INNER JOIN issue i ON atq.issue_id = i.id
@@ -258,7 +258,10 @@ async function findAndAdvanceTasks() {
           // Process exit 0 is not a work-product guarantee. A completed task
           // carrying an explicit blocker/FAIL (or no result at all) must not
           // advance into a successor lane and buy another paid task.
-          console.log(`${LOG_PREFIX} [completion-admission] HOLD: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}`);
+          const parked = await applyDisposition(client,
+            { ...row, stage: row.to_stage }, completion.disposition, completion.reason,
+            { target_stage: row.to_stage, completion_reason: completion.reason });
+          console.log(`${LOG_PREFIX} [completion-admission] PARK: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, disposition_applied=${parked}`);
           await markRelayLogFailedById(client, row.log_id);
           continue;
         }
@@ -308,7 +311,7 @@ async function recoveryAdvanceTasks() {
     // Get the latest relay_run_log per issue using LATERAL subquery
     const query = `SELECT DISTINCT atq.issue_id, atq.status as task_status,
              atq.result AS task_result, atq.error AS task_error,
-             i.status as to_stage, rsc.next_stage
+             i.workspace_id, i.priority, i.status as to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN issue i ON atq.issue_id = i.id
       INNER JOIN relay_stage_config rsc ON i.status = rsc.stage_name AND rsc.workspace_id = i.workspace_id
@@ -337,7 +340,10 @@ async function recoveryAdvanceTasks() {
         const completion = completionAdmission(row.task_result ??
           (row.task_error ? { error: row.task_error } : null));
         if (!completion.ok) {
-          console.log(`${LOG_PREFIX} [recovery] HOLD: issue=${row.issue_id}, reason=${completion.reason}`);
+          const parked = await applyDisposition(client,
+            { ...row, stage: row.to_stage }, completion.disposition, completion.reason,
+            { target_stage: row.to_stage, completion_reason: completion.reason });
+          console.log(`${LOG_PREFIX} [recovery] PARK: issue=${row.issue_id}, reason=${completion.reason}, disposition_applied=${parked}`);
           await markRelayLogFailed(client, row.issue_id);
           continue;
         }
@@ -679,7 +685,10 @@ async function requeueStrandedTasks() {
           // produce admissible work. Re-dispatching it would buy a duplicate
           // paid task (the GSP #1229 shape), so hold it for diagnosis/operator
           // action instead of treating it as an ordinary missing artifact.
-          console.log(`${LOG_PREFIX} [requeue] HOLD #${row.number}: completed predecessor failed completion admission (${completion.reason})`);
+          const parked = await applyDisposition(client,
+            { ...row, stage: row.stage }, completion.disposition, completion.reason,
+            { target_stage: row.stage, completion_reason: completion.reason });
+          console.log(`${LOG_PREFIX} [requeue] PARK #${row.number}: completed predecessor failed completion admission (${completion.reason}), disposition_applied=${parked}`);
           continue;
         }
       }
