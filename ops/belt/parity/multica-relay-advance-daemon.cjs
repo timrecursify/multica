@@ -341,6 +341,76 @@ async function cleanupStalePendingRows() {
   }
 }
 
+// A QC verdict can be recorded after the relay row that originally delivered
+// the issue to In Review was completed (for example, while this daemon was
+// down or by a QC rerun). findAndAdvanceTasks deliberately consumes only
+// pending, task-correlated rows, so create that missing row here and let its
+// normal QC admission path decide whether the evidence is sufficient.
+async function enqueuePassWithoutRelayRows({ dbPool = pool, logger = console } = {}) {
+  const client = await dbPool.connect();
+  try {
+    const result = await client.query(
+      `WITH candidates AS (
+         SELECT i.id AS issue_id, verdict.checker_id, evidence_task.id AS task_id
+           FROM issue i
+           JOIN relay_stage_config rsc
+             ON rsc.workspace_id = i.workspace_id
+            AND rsc.stage_name = i.status
+           JOIN LATERAL (
+             SELECT checker_id, created_at
+               FROM qc_verdict
+              WHERE issue_id = i.id
+              ORDER BY created_at DESC, id DESC
+              LIMIT 1
+           ) verdict ON true
+           JOIN LATERAL (
+             SELECT id
+               FROM agent_task_queue
+              WHERE issue_id = i.id
+                AND agent_id = verdict.checker_id
+                AND status = 'completed'
+              ORDER BY completed_at DESC, id DESC
+              LIMIT 1
+          ) evidence_task ON true
+          WHERE i.status = 'In Review'
+            AND rsc.next_stage = 'CI/CD & Deploy'
+            AND verdict.verdict = 'PASS'
+            AND verdict.created_at > COALESCE((
+              SELECT MAX(created_at) FROM relay_run_log WHERE issue_id = i.id
+            ), '-infinity'::timestamptz)
+            AND NOT EXISTS (
+              SELECT 1 FROM relay_run_log pending
+               WHERE pending.issue_id = i.id AND pending.status = 'pending'
+            )
+          ORDER BY verdict.created_at ASC
+          LIMIT 20
+       )
+       INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
+       SELECT c.issue_id, 'In Review', 'In Review', c.checker_id, c.task_id, 'pending'
+         FROM candidates c
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log pending
+           WHERE pending.issue_id = c.issue_id AND pending.status = 'pending'
+        )
+       RETURNING id, issue_id`
+    );
+    if (result.rowCount > 0) {
+      logger.log(`${LOG_PREFIX} Enqueued ${result.rowCount} PASS verdict(s) missing relay rows`);
+    }
+    return result.rows;
+  } catch (err) {
+    logger.error(`${LOG_PREFIX} [pass-sweep] DB error: ${err.message}`);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
+async function advanceTick() {
+  await enqueuePassWithoutRelayRows();
+  await findAndAdvanceTasks();
+}
+
 async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   logger = console } = {}) {
   const client = await dbPool.connect();
@@ -1252,14 +1322,14 @@ function startDaemon() {
     process.exit(1);
   }
   console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
-  setInterval(findAndAdvanceTasks, 15000);
+  setInterval(advanceTick, 15000);
   setInterval(findAndAdvanceRegistered, 20000);
   setInterval(recoveryAdvanceTasks, 120000);
   setInterval(cleanupStalePendingRows, 300000);
   setInterval(requeueStrandedTasks, 60000);
   setInterval(processParkedDiagnoses, 30000);
   setInterval(reconcileQuotaPauses, 60000);
-  findAndAdvanceTasks().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
+  advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
   cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
@@ -1268,5 +1338,5 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
+module.exports = { advanceTick, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, startDaemon };

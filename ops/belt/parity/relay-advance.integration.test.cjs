@@ -8,7 +8,7 @@ process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-s
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
 const { qcBounceDecision } = require('../multica-bridge.cjs');
-const { findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
+const { enqueuePassWithoutRelayRows, findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
 const { parseArgs, recover } = require('../recover-stranded-qc-pass.cjs');
 
 const SHA = 'c909401ef7a4a438348eb5ceda33839211721524';
@@ -70,6 +70,29 @@ function advanceHarness(row) {
       logger: { log: (line) => logs.push(line), error: (line) => logs.push(line) } })
   };
 }
+
+test('PASS written after its completed relay row is enqueued for normal admission', async () => {
+  const queries = [];
+  const client = {
+    async query(sql) {
+      queries.push(sql);
+      if (sql.includes('INSERT INTO relay_run_log')) {
+        return { rowCount: 1, rows: [{ id: 'relay-log-new', issue_id: 'issue-1' }] };
+      }
+      throw new Error(`unexpected query: ${sql.slice(0, 60)}`);
+    },
+    release() {}
+  };
+  const rows = await enqueuePassWithoutRelayRows({
+    dbPool: { connect: async () => client }, logger: { log() {}, error() {} }
+  });
+  assert.deepEqual(rows, [{ id: 'relay-log-new', issue_id: 'issue-1' }]);
+  assert.match(queries[0], /i\.status = 'In Review'/);
+  assert.match(queries[0], /verdict\.verdict = 'PASS'/);
+  assert.match(queries[0], /verdict\.created_at > COALESCE/);
+  assert.match(queries[0], /pending\.status = 'pending'/);
+  assert.match(queries[0], /LIMIT 20/);
+});
 
 test('older verdict-recording Sol-low task advances the latest PASS to deploy', async () => {
   const harness = advanceHarness(advanceRow());
