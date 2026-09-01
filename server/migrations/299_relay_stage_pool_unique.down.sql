@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY IF EXISTS relay_stage_pool_workspace_stage_key;

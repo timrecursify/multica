@@ -1610,6 +1610,13 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					r.Put("/env", h.UpdateAgentEnv)
 				})
 			})
+			// Relay stage pools are an operator-only, workspace-scoped dispatch
+			// contract.  The bridge reads this product-owned data; it never owns
+			// deployment-local stage bindings.
+			r.Route("/api/relay-stage-pools", func(r chi.Router) {
+				r.Get("/", h.ListRelayStagePools)
+				r.Put("/{stage}", h.ReplaceRelayStagePool)
+			})
 
 			// Agent templates catalog (browse + detail). The Create flow
 			// lives under /api/agents/from-template above; this route is for
