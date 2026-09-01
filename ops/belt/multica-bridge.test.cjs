@@ -23,6 +23,7 @@ const {
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
+  selectPoolOwner,
   selectStageOwner,
   applyDisposition,
   consumeParkedQcRecovery,
@@ -442,26 +443,26 @@ test('scoper pool selects the least-loaded eligible Sol-low owner', async () => 
   const owner = await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec');
   assert.equal(owner.agent_id, 'agent-b');
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
-  assert.match(calls[1].sql, /ORDER BY active_task_count, p.agent_id/);
+  assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
   assert.deepEqual(calls[0].values, ['workspace-1', 'Registered']);
   assert.deepEqual(calls[1].values, ['workspace-1', 'Spec']);
 });
 
-test('configured scoper pool fails closed when no Sol-low owner is eligible', async () => {
+test('configured stage pool fails closed when its members are incompatible', async () => {
   const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
-    ? { rows: [] } : { rows: [scoper({ model: 'deepseek/deepseek-v4-flash-0731' })] } };
+    ? { rows: [] } : { rows: [scoper({ instructions: 'Own Queue tickets only.' })] } };
   await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
-    /No eligible Sol-low scoper in pool/);
+    /No eligible stage owner in pool/);
 });
 
-test('configured scoper pool does not overfill an agent concurrency limit', async () => {
+test('configured stage pool does not overfill an agent concurrency limit', async () => {
   const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
     ? { rows: [] } : { rows: [scoper({ active_task_count: 1, max_concurrent_tasks: 1 })] } };
   await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
-    /No eligible Sol-low scoper in pool/);
+    /No eligible stage owner in pool/);
 });
 
-test('empty scoper pool preserves the canonical relay owner fallback', async () => {
+test('empty stage pool preserves the canonical relay owner fallback', async () => {
   const calls = [];
   const fallback = { agent_id: 'canonical-agent' };
   const client = { query: async (sql) => {
@@ -472,6 +473,27 @@ test('empty scoper pool preserves the canonical relay owner fallback', async () 
   } };
   assert.equal(await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'), fallback);
   assert.match(calls[2], /FROM relay_stage_config/);
+});
+
+test('pool selection applies to Queue and rotates equal-load agents', async () => {
+  const calls = [];
+  const builders = [
+    scoper({ agent_id: 'builder-older', agent_name: 'build-a', model: 'gpt-5.6-terra',
+      instructions: 'Use this runbook when the issue is in Queue.', last_selected_at: '2026-01-01T00:00:00Z' }),
+    scoper({ agent_id: 'builder-newer', agent_name: 'build-b', model: 'gpt-5.6-terra',
+      instructions: 'Use this runbook when the issue is in Queue.', last_selected_at: '2026-02-01T00:00:00Z' })
+  ];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: builders };
+    return { rows: [] };
+  } };
+  const selected = await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue');
+  assert.equal(selected.agent_id, 'builder-older');
+  assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
+  assert.match(calls[2].sql, /SET last_selected_at = NOW/);
+  assert.deepEqual(calls[2].values, ['workspace-1', 'Queue', 'builder-older']);
 });
 
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
