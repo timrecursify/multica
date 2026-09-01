@@ -444,7 +444,7 @@ async function requeueStrandedTasks() {
        SELECT c.*, ROW_NUMBER() OVER (
                 PARTITION BY c.agent_id ORDER BY c.updated_at ASC
               ) AS rn FROM (
-       SELECT i.id AS issue_id, i.number, i.status AS stage, i.updated_at,
+       SELECT i.id AS issue_id, i.number, i.status AS stage, i.updated_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason,
               r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
@@ -694,11 +694,12 @@ async function requeueStrandedTasks() {
           console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}; lane_paused=${lanePaused}`);
           continue;
         }
+        const releaseAt = row.metadata?.parked_release_at || null;
         const history = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1 AND context->>'to_stage' = $2
-              AND started_at IS NOT NULL`,
-          [row.issue_id, row.stage]
+              AND ($3::timestamptz IS NULL OR created_at >= $3)`,
+          [row.issue_id, row.stage, releaseAt]
         );
         const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
         if (!cycle.ok) {
@@ -712,8 +713,9 @@ async function requeueStrandedTasks() {
         }
         const lifetimeHistory = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
-            WHERE issue_id = $1 AND started_at IS NOT NULL`,
-          [row.issue_id]
+            WHERE issue_id = $1
+              AND ($2::timestamptz IS NULL OR created_at >= $2)`,
+          [row.issue_id, releaseAt]
         );
         const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
         if (!lifetime.ok) {

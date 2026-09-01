@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const fs = require('node:fs');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
   retryAdmission, spendPreflight, stageCycleAdmission, lifetimeTaskAdmission,
@@ -43,6 +44,15 @@ test('infra retry stops when queue loses headroom and never spends attempt', () 
     infraReasons: ['timeout'] }), { ok: true, consumesAttempt: true });
 });
 
+test('infrastructure recovery remains admissible at the attempt ceiling', () => {
+  const args = { attempt: 2, maxAttempts: 2, failureReason: 'timeout',
+    queueAgeMinutes: 5, queueTtlMinutes: 120, infraReasons: ['timeout'] };
+  assert.deepEqual(retryAdmission(args), { ok: true, consumesAttempt: false });
+  assert.deepEqual(retryAdmission({ ...args, failureReason: 'implementation' }), {
+    ok: false, reason: 'attempt_budget_exhausted'
+  });
+});
+
 test('paid dispatch requires a live configured agent', () => {
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter', token_budget: 1000 }).ok, true);
   assert.equal(spendPreflight({ max_concurrent_tasks: 0, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter', token_budget: 1000 }).ok, false);
@@ -53,14 +63,26 @@ test('paid dispatch requires a live configured agent', () => {
     { ok: false, reason: 'provider_quota_paused' });
 });
 
-test('stage cycle breaker parks repeated model calls without human review', () => {
-  // queued_expired rows have no started_at and therefore do not consume the
-  // paid-attempt budget; two such rows still leave a flight admissible.
+test('stage cycle breaker parks repeated task creation without human review', () => {
   assert.deepEqual(stageCycleAdmission(0), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(2), {
     ok: false, reason: 'stage_cycle_limit', ceiling: 2, disposition: 'Parked'
   });
+});
+
+test('recovery ceilings count queued tasks that never started', () => {
+  const source = fs.readFileSync(
+    require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8'
+  );
+  const stageHistory = source.match(
+    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1 AND context->>'to_stage' = \$2\s+AND \(\$3::timestamptz IS NULL OR created_at >= \$3\)/
+  );
+  const lifetimeHistory = source.match(
+    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1\s+AND \(\$2::timestamptz IS NULL OR created_at >= \$2\)/
+  );
+  assert.ok(stageHistory, 'stage ceiling must count every created task');
+  assert.ok(lifetimeHistory, 'lifetime ceiling must count every created task');
 });
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
@@ -87,9 +109,11 @@ test('startup rejects routable stages without an owner', () => {
     { stage_name: 'Done', next_stage: 'Archived', agent_id: null },
     { stage_name: 'Archived', next_stage: null, agent_id: null }
   ];
-  assert.deepEqual(routableOwnerDefects(rows), ['Parked:missing_owner']);
-  assert.throws(() => assertRoutableStageOwners(rows), /Parked:missing_owner/);
-  assert.doesNotThrow(() => assertRoutableStageOwners([rows[0], rows[2], rows[3], rows[4]]));
+  assert.deepEqual(routableOwnerDefects(rows), [
+    'Human Review:missing_owner', 'Parked:missing_owner'
+  ]);
+  assert.throws(() => assertRoutableStageOwners(rows), /Human Review:missing_owner/);
+  assert.doesNotThrow(() => assertRoutableStageOwners([rows[0], rows[3], rows[4]]));
 });
 
 test('startup rejects archived, inactive, and instruction-incompatible owners', () => {
