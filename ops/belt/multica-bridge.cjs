@@ -78,9 +78,14 @@ const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
 const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived"]);
+const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review"]);
 
 function isTerminalStage(stage) {
   return TERMINAL_STAGES.has(stage);
+}
+
+function isNoDispatchArrivalStage(stage) {
+  return isTerminalStage(stage) || NO_DISPATCH_ARRIVAL_STAGES.has(stage);
 }
 
 async function verifiedParkedEvidenceRelease(client, issue, toStage, reason) {
@@ -1500,9 +1505,9 @@ async function relayAdvance(req, res, body) {
 
     const ownerStage = retryEscalation ? "Registered" :
       ownerStageForTransition(issue.status, to_stage);
-    let stage = retryEscalation
+    let stage = isNoDispatchArrivalStage(to_stage) ? {} : (retryEscalation
       ? await selectRetryEscalationOwner(client, issue)
-      : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage);
+      : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage));
     if (retryEscalation) {
       retryEscalation = { ...retryEscalation, owner: stage.agent_name,
         deadline: escalationDeadline() };
@@ -1776,13 +1781,12 @@ async function relayAdvance(req, res, body) {
       });
     }
 
-    if (isTerminalStage(to_stage)) {
+    if (isNoDispatchArrivalStage(to_stage)) {
       relayLogId = await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
-      // A terminal arrival has no stage owner, task, or successor relay. Keep
-      // this return before every dispatch path so future owner configuration
-      // cannot accidentally put a completed ticket back on the belt.
+      // Terminal and human-gate arrivals have no stage owner, task, or
+      // successor relay. Keep this return before every dispatch path.
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -2018,6 +2022,7 @@ module.exports = {
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
   isTerminalStage,
+  isNoDispatchArrivalStage,
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,

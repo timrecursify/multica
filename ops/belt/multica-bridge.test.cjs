@@ -43,7 +43,8 @@ const {
   retryEscalationSourceTask,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
-  isTerminalStage
+  isTerminalStage,
+  isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
 
 test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', async () => {
@@ -1172,21 +1173,51 @@ test('terminal relay transitions are logged and Parked Done remains relay-only a
   assert.match(source, /const parkedDiagnosisDone = issue\.status === "Parked" && to_stage === "Done"/);
   assert.match(source, /to_stage === "Done"/);
   assert.match(source, /work_product_mismatch/);
-  assert.match(source, /if \(isTerminalStage\(to_stage\)\)/);
+  assert.match(source, /if \(isNoDispatchArrivalStage\(to_stage\)\)/);
   assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
 });
 
-test('Parked and In Review arrivals at Done return before task dispatch', () => {
-  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  const terminalArrival = source.slice(source.indexOf('if (isTerminalStage(to_stage))'),
-    source.indexOf('// A bundled child'));
-  for (const fromStage of ['Parked', 'In Review']) {
-    assert.equal(isTerminalStage('Done'), true, `${fromStage} -> Done is terminal`);
+test('empty Human Review pool commits an audit row without a successor task', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
+    status: 'In Review', description: '', parent_issue_id: null, title: 'review me',
+    priority: 'medium', metadata: {} };
+  const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
+  const queries = [];
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    queries.push({ sql, values });
+    if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
+    if (sql.includes('FROM agent_task_queue t') && sql.includes("t.context->>'to_stage' = 'In Review'")) return { rows: [] };
+    if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Human Review' }] };
+    if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Human Review', alt_next_stages: [] }] };
+    if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Human Review' }] };
+    if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
+      persisted.issue.status = values[0];
+      return { rowCount: 1, rows: [{ id: persisted.issue.id, status: persisted.issue.status }] };
+    }
+    if (sql.includes('UPDATE relay_run_log') && sql.includes("SET status = 'completed'")) return { rows: [] };
+    if (sql.includes('INSERT INTO relay_run_log')) {
+      const row = { id: 'relay-log-1', issue_id: values[0], from_stage: values[1], to_stage: values[2],
+        task_id: null, status: 'completed' };
+      persisted.relay_run_log.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+    return { rowCount: 0, rows: [] };
+  } };
+  const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayAdvance({ headers: {} }, res, { issue_id: issue.id, to_stage: 'Human Review',
+      agent_token: 'test-relay-secret' });
+  } finally {
+    setTestClientFactory(null);
   }
-  assert.match(terminalArrival, /task_id: null/);
-  assert.match(terminalArrival, /relay_log_id: relayLogId/);
-  assert.match(terminalArrival, /return;/);
-  assert.doesNotMatch(terminalArrival, /replaceStageTask/);
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body).task_id, null);
+  assert.deepEqual(persisted.relay_run_log, [{ id: 'relay-log-1', issue_id: issue.id,
+    from_stage: 'In Review', to_stage: 'Human Review', task_id: null, status: 'completed' }]);
+  assert.deepEqual(persisted.agent_task_queue, []);
+  assert.equal(persisted.issue.status, 'Human Review');
+  assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
 });
 
 test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {

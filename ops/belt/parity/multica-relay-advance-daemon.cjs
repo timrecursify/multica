@@ -105,8 +105,14 @@ const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10
 // agent is declared by relay_stage_config row 1 (Registered -> Spec,
 // multica-qc-worker-2, the spec writer) -- the belt knew who owned them and
 // still dispatched nobody. Widen further only with the same kind of evidence.
-const REQUEUE_STAGES = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec')
+const NON_REQUEUE_STAGES = new Set(['Human Review', 'Done', 'Cancelled', 'Archived']);
+const configuredRequeueStages = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec')
   .split(',').map(s => s.trim()).filter(Boolean);
+const excludedRequeueStages = configuredRequeueStages.filter((stage) => NON_REQUEUE_STAGES.has(stage));
+const REQUEUE_STAGES = configuredRequeueStages.filter((stage) => !NON_REQUEUE_STAGES.has(stage));
+if (excludedRequeueStages.length > 0) {
+  console.warn(`${LOG_PREFIX} [requeue] ignoring non-dispatch stages: ${excludedRequeueStages.join(', ')}`);
+}
 
 // Mirrors --max-concurrent-tasks in fleet/multica-daemon-wrapper.sh. Not a
 // threshold of our own: it is the number of tasks the Tower can actually hold.
