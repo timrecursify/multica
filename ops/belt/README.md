@@ -77,7 +77,9 @@ is recorded in task context and is never automatically repeated.
 Add `--workspace <UUID>` to constrain a run. The script locks each still-Parked
 issue, skips named blockers and all prior diagnosis tasks (reporting completed,
 failed, and cancelled statuses), and emits stable JSON counts and IDs,
-including stale rows that changed before the lock. It is an operator one-shot
-and is not part of the runtime deploy manifest; rollback is a no-op because
-dry-run performs no writes and apply writes only the ticket comment, blocker
-metadata, and diagnosis task.
+including stale rows that changed before the lock. Each apply candidate has its
+own transaction: a policy rejection is rolled back, included in `counts.failed`
+and `ids.failed`, and does not prevent later candidates or the final receipt.
+It is an operator one-shot and is not part of the runtime deploy manifest;
+rollback is a no-op because dry-run performs no writes and apply writes only the
+ticket comment, blocker metadata, and diagnosis task.

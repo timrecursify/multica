@@ -54,6 +54,13 @@ function usage() {
   return 'Usage: backfill-parked-diagnosis.cjs (--dry-run|--apply) [--batch-size N] [--workspace UUID] [--retry-runtime-evidence] [--recover-runtime-evidence-issue UUID]';
 }
 
+function failureReason(error) {
+  const value = error && (error.code || error.message);
+  const normalized = String(value || 'unknown_apply_rejection')
+    .trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return normalized || 'unknown_apply_rejection';
+}
+
 function interleaveByWorkspace(rows) {
   const groups = new Map();
   for (const row of rows) {
@@ -207,7 +214,7 @@ async function run(pool, options) {
     scanned: 0, scan_limit: options.batch };
   const ids = { queued: [], recovered_v2: [], would_queue: [], skipped: [], skipped_blocker: [],
     skipped_existing: [], skipped_completed: [], skipped_failed: [],
-    skipped_cancelled: [], skipped_no_owner: [], stale: [] };
+    skipped_cancelled: [], skipped_no_owner: [], stale: [], failed: [] };
   if (options.mode === 'dry-run') {
     const listed = await pool.query(candidateSql, values);
     const rows = interleaveByWorkspace(listed.rows).slice(0, options.batch);
@@ -218,16 +225,22 @@ async function run(pool, options) {
     return { mode: options.mode, batch_size: options.batch, workspace: options.workspace, counts, ids };
   }
 
-  // The complete batch shares one transaction: an error rolls back every
-  // comment, blocker, and task insert from this invocation. SKIP LOCKED lets
-  // concurrent operators take distinct tickets without waiting or duplicating.
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const lockedSql = `${candidateSql} FOR UPDATE OF i SKIP LOCKED`;
-    const listed = await client.query(lockedSql, values);
-    const rows = interleaveByWorkspace(listed.rows).slice(0, options.batch);
-    for (const issue of rows) {
+  const listed = await pool.query(candidateSql, values);
+  const rows = interleaveByWorkspace(listed.rows).slice(0, options.batch);
+  for (const listedIssue of rows) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const locked = await client.query(
+        `SELECT id, workspace_id, status, priority, metadata FROM issue
+          WHERE id = $1 AND status = 'Parked' FOR UPDATE SKIP LOCKED`, [listedIssue.id]);
+      if (!locked.rowCount) {
+        counts.stale += 1;
+        ids.stale.push(listedIssue.id);
+        await client.query('ROLLBACK');
+        continue;
+      }
+      const issue = locked.rows[0];
       counts.scanned += 1;
       counts.selected += 1;
       const decision = await inspect(client, issue, options);
@@ -270,14 +283,14 @@ async function run(pool, options) {
         counts.skipped_no_owner += 1;
         ids.skipped_no_owner.push(issue.id);
       }
+      await client.query('COMMIT');
+    } catch (error) {
+      counts.failed += 1;
+      await client.query('ROLLBACK').catch(() => {});
+      ids.failed.push({ issue_id: listedIssue.id, reason: failureReason(error) });
+    } finally {
+      client.release();
     }
-    await client.query('COMMIT');
-  } catch (error) {
-    counts.failed += 1;
-    await client.query('ROLLBACK').catch(() => {});
-    throw error;
-  } finally {
-    client.release();
   }
   return { mode: options.mode, batch_size: options.batch, workspace: options.workspace,
     counts, ids };
@@ -298,5 +311,5 @@ async function main() {
 
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1; });
 module.exports = {
-  MAX_BATCH, MAX_SCAN_WINDOW, NONTERMINAL, interleaveByWorkspace, parseArgs, inspect, run, usage
+  MAX_BATCH, MAX_SCAN_WINDOW, NONTERMINAL, failureReason, interleaveByWorkspace, parseArgs, inspect, run, usage
 };
