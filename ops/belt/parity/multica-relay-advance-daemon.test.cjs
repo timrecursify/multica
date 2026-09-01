@@ -112,8 +112,9 @@ test('stranded-task fixture redispatches a cancelled-only task', async () => {
   await harness.run();
   const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
   assert.ok(insert);
-  assert.match(insert.values[3], /"source":"relay-requeue"/);
-  assert.match(insert.values[3], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
+  assert.equal(insert.values[2], '323e4567-e89b-42d3-a456-426614174000');
+  assert.match(insert.values[4], /"source":"relay-requeue"/);
+  assert.match(insert.values[4], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
 });
 
 test('stranded-task fixtures leave running tasks and bundled children untouched', async () => {
@@ -318,6 +319,14 @@ test('retry ceilings leave the daemon through relay authority instead of direct 
     /row\.metadata\?\.parked_release_at \|\|\s+row\.metadata\?\.retry_escalation_at \|\| null/);
   assert.doesNotMatch(requeue, /applyDisposition\(client, row, cycle\.disposition/);
   assert.doesNotMatch(requeue, /applyDisposition\(client, row, lifetime\.disposition/);
+});
+
+test('stranded-task recovery propagates the issue workspace to its successor', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('function diagnosisText'));
+  assert.match(requeue, /agent_id, issue_id, workspace_id, status, runtime_id/);
+  assert.match(requeue, /\[row\.agent_id, row\.issue_id, row\.workspace_id, row\.runtime_id/);
 });
 
 test('stranded-task recovery excludes completed predecessors before admission', () => {
