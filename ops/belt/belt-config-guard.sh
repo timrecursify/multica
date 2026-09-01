@@ -15,6 +15,7 @@ readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
 readonly WANT_CONCURRENCY=20
+readonly WANT_WORKSPACES_ROOT=/home/newadmin/multica-workspaces-gsp
 readonly BUILD_AGENT=gsp-build-deepseek-flash-1
 # 2026-08-31 14:20 UTC: global 12 -> 20, build capacity 3 -> 15, QC 4 each.
 # Tim's directive: 12-15 build employees, 3-4 QC.
@@ -108,13 +109,32 @@ running_tasks() {
   "${PSQL[@]}" -c "SELECT count(*) FROM agent_task_queue WHERE status='running';" 2>/dev/null || echo 99
 }
 
-# 1. Tower concurrency must persist in the wrapper.
+# Empty values are invalid rather than defaults: accepting one would silently
+# widen capacity or direct workspaces to an unexpected root.
+daemon_launch_config() {
+  printf '%s|%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-"$WANT_CONCURRENCY"}" \
+    "${MULTICA_DAEMON_WORKSPACES_ROOT-"$WANT_WORKSPACES_ROOT"}"
+}
+
+validate_daemon_launch_config() {
+  local cap root
+  IFS='|' read -r cap root < <(daemon_launch_config)
+  [[ "$cap" =~ ^[1-9][0-9]*$ ]] && [[ -n "$root" && "$root" == /* ]]
+}
+
+# 1. Tower concurrency and root must remain PM2-configurable.
 guard_wrapper() {
-  grep -q -- "--max-concurrent-tasks=${WANT_CONCURRENCY}" "$WRAPPER" && return 0
-  if sed -i -E "s/--max-concurrent-tasks=[0-9]+/--max-concurrent-tasks=${WANT_CONCURRENCY}/" "$WRAPPER"; then
-    fixed+=("wrapper concurrency re-applied -> ${WANT_CONCURRENCY}")
-  else
-    unfixable+=("could not rewrite $WRAPPER")
+  # The wrapper resolves these values at launch; rewriting a literal flag would
+  # mask PM2 environment overrides. Drift is escalated without touching code.
+  if ! validate_daemon_launch_config; then
+    unfixable+=("invalid PM2 daemon launch config: cap must be a positive integer and workspaces root an absolute path")
+  elif [[ ! -x "$WRAPPER" ]] ||
+     ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS-20' "$WRAPPER" ||
+     ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp' "$WRAPPER" ||
+     ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS' "$ECOSYSTEM" ||
+     ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT' "$ECOSYSTEM" ||
+     grep -q -- '--max-concurrent-tasks=' "$WRAPPER"; then
+    unfixable+=("wrapper configuration drifted; expected env-resolved concurrency/root in $WRAPPER")
   fi
 }
 
@@ -127,10 +147,10 @@ guard_tower_process() {
     unfixable+=("gsp-multica-worker held by ${AI_HOLD_FILE}")
     return 0
   fi
-  live=$(ps -eo args | grep "[m]ultica-daemon/server daemon start" \
-         | grep -o -- "--max-concurrent-tasks=[0-9]*" | head -1 | cut -d= -f2)
+  live=$(ps -eo args | grep "[m]ultica-daemon/server daemon start" | head -1)
   [[ -z "$live" ]] && { unfixable+=("Tower process not found"); return; }
-  [[ "$live" == "$WANT_CONCURRENCY" ]] && return 0
+  [[ "$live" != *"--max-concurrent-tasks="* ]] && return 0
+  [[ "$live" == *"--max-concurrent-tasks=${WANT_CONCURRENCY}"* ]] && return 0
   if (( $(running_tasks) > 0 )); then
     unfixable+=("Tower running concurrency=$live, want ${WANT_CONCURRENCY}; deferred, flights in progress")
     return
@@ -865,6 +885,7 @@ guard_unshipped_closures() {
   return 0
 }
 
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 guard_wrapper; guard_tower_process; guard_pm2; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 for f in "${fixed[@]:-}";     do [[ -n "$f" ]] && echo "belt-config-guard: FIXED $f"; done
@@ -881,3 +902,4 @@ Repaired automatically this run:
 $(printf '  - %s\n' "${fixed[@]:-none}")"
 fi
 echo "belt-config-guard: fixed=${#fixed[@]} unfixable=${#unfixable[@]}"
+fi
