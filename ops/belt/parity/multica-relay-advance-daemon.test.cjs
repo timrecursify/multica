@@ -1,7 +1,85 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
-const { qcCompletionAdvance, processParkedDiagnoses } = require('./multica-relay-advance-daemon.cjs');
+const { qcCompletionAdvance, processParkedDiagnoses,
+  requeueStrandedTasks } = require('./multica-relay-advance-daemon.cjs');
+
+function strandedFixture(overrides = {}) {
+  return {
+    issue_id: '223e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000',
+    number: 159,
+    stage: 'Queue',
+    updated_at: '2026-09-01T21:46:00Z',
+    metadata: {},
+    dead_task_id: '123e4567-e89b-42d3-a456-426614174000',
+    dead_task_status: 'failed',
+    attempt: 1,
+    max_attempts: 2,
+    failure_reason: 'cancelled',
+    dead_task_result: null,
+    dead_task_error: 'task cancelled by server',
+    from_stage: 'Queue',
+    agent_id: '423e4567-e89b-42d3-a456-426614174000',
+    runtime_id: '523e4567-e89b-42d3-a456-426614174000',
+    runtime_provider: 'codex',
+    runtime_mode: 'cloud',
+    instructions: 'Queue',
+    model: 'deepseek/chat',
+    thinking_level: 'low',
+    max_concurrent_tasks: 1,
+    token_budget: 1,
+    runtime_config: {},
+    archived_at: null,
+    agent_name: 'builder',
+    ...overrides
+  };
+}
+
+function strandedHarness(candidates) {
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('ROW_NUMBER() OVER')) return { rows: candidates };
+    if (sql.includes('COALESCE(a.max_concurrent_tasks')) {
+      return { rows: candidates.map((row) => ({ agent_id: row.agent_id, cap: 1, in_flight: 0 })) };
+    }
+    if (sql.includes('max(EXTRACT(epoch')) return { rows: [{ age: 0 }] };
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (sql.includes('pg_advisory_xact_lock') || sql.includes('FROM issue WHERE id')) return { rows: [] };
+    if (sql.includes('FROM agent_task_queue') && sql.includes('FOR UPDATE')) return { rows: [] };
+    if (sql.includes('count(*)::int AS n')) return { rows: [{ n: 1 }] };
+    if (sql.includes('INSERT INTO agent_task_queue')) {
+      return { rows: [{ id: '623e4567-e89b-42d3-a456-426614174000' }] };
+    }
+    if (sql.includes('INSERT INTO relay_run_log')) return { rows: [] };
+    throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
+  }, release() {} };
+  return { queries, run: () => requeueStrandedTasks({ dbPool: { connect: async () => client } }) };
+}
+
+test('stranded-task fixture redispatches a cancelled-only task', async () => {
+  const harness = strandedHarness([strandedFixture()]);
+  await harness.run();
+  const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.ok(insert);
+  assert.match(insert.values[3], /"source":"relay-requeue"/);
+  assert.match(insert.values[3], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
+});
+
+test('stranded-task fixtures leave running tasks and bundled children untouched', async () => {
+  for (const fixture of [
+    { ...strandedFixture({ dead_task_status: 'running' }), label: 'running' },
+    { ...strandedFixture({ parent_issue_id: '723e4567-e89b-42d3-a456-426614174000' }), label: 'bundled child' }
+  ]) {
+    // The candidate-query fixture models rows after the daemon's SQL predicate:
+    // neither a running task nor a child (`i.parent_issue_id IS NULL`) qualifies.
+    const harness = strandedHarness([]);
+    await harness.run();
+    assert.equal(harness.queries.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue')), false,
+      `${fixture.label} must not be redispatched`);
+  }
+});
 
 const QC_ROW = {
   task_id: '11111111-1111-4111-8111-111111111111',

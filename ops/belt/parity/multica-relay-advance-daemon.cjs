@@ -719,8 +719,8 @@ const INFRA_FAILURE_REASONS = [
 // agent forever (the agent_task_queue trigger rejects an archived assignee). The
 // stage contract is the authority on who owns a stage, so a re-owned stage heals
 // its own strays.
-async function requeueStrandedTasks() {
-  const client = await pool.connect();
+async function requeueStrandedTasks({ dbPool = pool } = {}) {
+  const client = await dbPool.connect();
   try {
     const candidates = await client.query(
       // The outer wrapper ranks candidates per owning agent. A single global
@@ -761,7 +761,7 @@ async function requeueStrandedTasks() {
          JOIN LATERAL (
            SELECT rsc.stage_name AS from_stage, rsc.agent_id,
                   COALESCE(a.runtime_mode, 'local') AS runtime_mode,
-                  a.name AS agent_name, a.instructions, a.model, a.thinking_level, a.max_concurrent_tasks, a.runtime_config, a.archived_at
+                  a.name AS agent_name, a.instructions, a.model, a.thinking_level, a.max_concurrent_tasks, a.token_budget, a.runtime_config, a.archived_at
              FROM relay_stage_config rsc
              JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id AND a.archived_at IS NULL
             WHERE rsc.workspace_id = i.workspace_id AND rsc.next_stage = i.status
@@ -1339,4 +1339,4 @@ function startDaemon() {
 if (require.main === module) startDaemon();
 
 module.exports = { findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
-  reconcileQuotaPauses, processParkedDiagnoses, startDaemon };
+  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, startDaemon };
