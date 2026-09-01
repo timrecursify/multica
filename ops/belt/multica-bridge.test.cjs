@@ -125,6 +125,7 @@ test('transition owner selection preserves forward lanes and routes backward bra
 function transition() {
   return {
     issueId: 'issue-1', fromStage: 'In Progress', toStage: 'In Review',
+    workspaceId: 'workspace-1',
     agentId: 'agent-1', priority: 3, runtimeId: 'runtime-1',
     context: JSON.stringify({ from_stage: 'In Progress', to_stage: 'In Review' }),
     triggerSummary: 'Relay stage transition: In Progress -> In Review'
@@ -149,6 +150,8 @@ test('stage transition supersedes stale work before enqueuing and logging its su
   assert.match(calls[0].sql, /NOT LIKE 'manual%'/);
   assert.match(calls[0].sql, /'Human Review', 'Parked', 'Rejected'/);
   assert.match(calls[1].sql, /WHERE NOT EXISTS/);
+  assert.match(calls[1].sql, /agent_id, issue_id, workspace_id/);
+  assert.equal(calls[1].values[2], 'workspace-1');
   assert.match(calls[2].sql, /INSERT INTO relay_run_log/);
   assert.deepEqual(calls[2].values, ['issue-1', 'In Progress', 'In Review', 'agent-1', 'task-new']);
 });
