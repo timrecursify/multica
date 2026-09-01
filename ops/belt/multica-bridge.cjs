@@ -219,6 +219,26 @@ function validateRelayVerdict(payload) {
   return null;
 }
 
+function qcBounceDecision(latestVerdict, expectedStage) {
+  if (latestVerdict?.verdict !== "PASS") return { action: "escalate" };
+  if (!MD5_RE.test(String(latestVerdict.work_product_md5 || "")) ||
+      expectedStage !== "CI/CD & Deploy") {
+    return { action: "hold", reason: "pass_deploy_evidence_invalid" };
+  }
+  return { action: "deploy", toStage: expectedStage };
+}
+
+async function latestQcVerdict(client, issueId) {
+  const result = await client.query(
+    `SELECT verdict, work_product_md5
+       FROM qc_verdict
+      WHERE issue_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1`, [issueId]
+  );
+  return result.rows[0] || null;
+}
+
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
   const result = await client.query(
     `SELECT t.id, t.agent_id, t.status, t.context, t.result, a.name AS agent_name
@@ -1209,6 +1229,24 @@ async function relayAdvance(req, res, body) {
     const expectedStage = transitionResult.rows[0]?.next_stage;
     const altStages = transitionResult.rows[0]?.alt_next_stages || [];
     const allowedStages = [expectedStage].concat(altStages).filter(Boolean);
+    if (issue.status === "In Review" && to_stage === "Spec") {
+      const decision = qcBounceDecision(await latestQcVerdict(client, issue_id), expectedStage);
+      if (decision.action === "hold") {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: decision.reason }));
+        return;
+      }
+      if (decision.action === "deploy") {
+        to_stage = decision.toStage;
+        retryEscalation = null;
+        console.warn(JSON.stringify({
+          event: "qc_pass_rescope_suppressed",
+          issue_id,
+          redirected_to: to_stage
+        }));
+      }
+    }
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
@@ -1240,42 +1278,59 @@ async function relayAdvance(req, res, body) {
     // Past it the ticket changes hands to a Sol-low re-spec, not another paid rebuild.
     if (issue.status === "In Review" && to_stage === "In Progress" &&
         altStages.includes("Human Review")) {
-      const bounced = await client.query(
-        `SELECT count(*)::int AS n,
-                COALESCE(max(q.max_attempts), 2) AS ceiling
-           FROM relay_run_log l
-           LEFT JOIN agent_task_queue q ON q.id = l.task_id
-          WHERE l.issue_id = $1
-            AND l.from_stage = 'In Review'
-            AND l.to_stage = 'In Progress'`,
-        [issue_id]
-      );
-      const { n, ceiling } = bounced.rows[0];
-      if (n >= ceiling) {
-        const sourceTaskId = await retryEscalationSourceTask(
-          client, issue, body.relay_source_task_id
-        );
-        if (!sourceTaskId) {
-          await client.query("ROLLBACK");
-          res.writeHead(409, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
-            reason: "qc_bounce_ceiling" }));
-          return;
-        }
-        retryEscalation = {
-          reason: "qc_bounce_ceiling", trigger_stage: issue.status,
-          attempts: n, ceiling, source_task_id: sourceTaskId,
-          deadline: escalationDeadline()
-        };
-        to_stage = "Spec";
+      const decision = qcBounceDecision(await latestQcVerdict(client, issue_id), expectedStage);
+      if (decision.action === "hold") {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: decision.reason }));
+        return;
+      }
+      if (decision.action === "deploy") {
+        to_stage = decision.toStage;
+        retryEscalation = null;
         console.warn(JSON.stringify({
-          event: "qc_bounce_ceiling",
+          event: "qc_pass_bounce_suppressed",
           issue_id,
-          bounces: n,
-          ceiling,
-          redirected_to: "Spec",
-          source_task_id: sourceTaskId
+          redirected_to: to_stage
         }));
+      } else {
+        const bounced = await client.query(
+          `SELECT count(*)::int AS n,
+                  COALESCE(max(q.max_attempts), 2) AS ceiling
+             FROM relay_run_log l
+             LEFT JOIN agent_task_queue q ON q.id = l.task_id
+            WHERE l.issue_id = $1
+              AND l.from_stage = 'In Review'
+              AND l.to_stage = 'In Progress'`,
+          [issue_id]
+        );
+        const { n, ceiling } = bounced.rows[0];
+        if (n >= ceiling) {
+          const sourceTaskId = await retryEscalationSourceTask(
+            client, issue, body.relay_source_task_id
+          );
+          if (!sourceTaskId) {
+            await client.query("ROLLBACK");
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+              reason: "qc_bounce_ceiling" }));
+            return;
+          }
+          retryEscalation = {
+            reason: "qc_bounce_ceiling", trigger_stage: issue.status,
+            attempts: n, ceiling, source_task_id: sourceTaskId,
+            deadline: escalationDeadline()
+          };
+          to_stage = "Spec";
+          console.warn(JSON.stringify({
+            event: "qc_bounce_ceiling",
+            issue_id,
+            bounces: n,
+            ceiling,
+            redirected_to: "Spec",
+            source_task_id: sourceTaskId
+          }));
+        }
       }
     }
 
@@ -1837,6 +1892,7 @@ module.exports = {
   isBookkeepingTransition,
   recordBookkeepingHandoff,
   validateRelayVerdict,
+  qcBounceDecision,
   latestCompletedSolLowQcTask,
   qcTaskEvidenceMismatch,
   relayVerdict,

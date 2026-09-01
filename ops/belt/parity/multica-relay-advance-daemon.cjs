@@ -37,14 +37,17 @@ function strictQcAttempt(row, verdictMd5) {
   const bound = String(row.qc_attempt_bound_sha || '').toLowerCase();
   const observed = String(row.qc_attempt_observed_sha || '').toLowerCase();
   const md5 = String(row.qc_attempt_work_product_md5 || '').toLowerCase();
+  const evidenceAgentId = row.qc_attempt_evidence_agent_id || row.task_agent_id;
   const ok = row.qc_attempt_verdict === 'PASS' && row.qc_attempt_qualifying === true &&
     row.qc_attempt_model === 'gpt-5.6-sol' && row.qc_attempt_effort === 'low' &&
-    row.qc_verdict_checker_id === row.task_agent_id &&
+    row.qc_verdict_checker_id === evidenceAgentId &&
     /^[0-9a-f]{40}$/.test(bound) && bound === observed && md5 === verdictMd5;
-  return ok ? { ok: true, boundSha: bound } : { ok: false, reason: 'qc_attempt_mismatch' };
+  return ok ? { ok: true, boundSha: bound,
+    evidenceTaskId: row.qc_attempt_evidence_task_id || row.task_id }
+    : { ok: false, reason: 'qc_attempt_mismatch' };
 }
 
-function legacyQcVerdict(row, verdictMd5) {
+function legacyQcVerdict(row, verdictMd5, requireVerdictWindow = true) {
   const taskSha = uniqueFullSha(JSON.stringify(row.task_result || ''));
   const verdictSha = uniqueFullSha(row.qc_verdict_notes);
   const started = Date.parse(row.task_started_at || '');
@@ -52,25 +55,38 @@ function legacyQcVerdict(row, verdictMd5) {
   const recorded = Date.parse(row.qc_verdict_created_at || '');
   const inWindow = Number.isFinite(started) && Number.isFinite(completed) &&
     Number.isFinite(recorded) && recorded >= started && recorded <= completed + 30000;
-  const ok = row.qc_verdict_checker_id === row.task_agent_id && inWindow &&
+  const ok = row.qc_verdict_checker_id === row.task_agent_id &&
+    row.task_agent_model === 'gpt-5.6-sol' && row.task_agent_effort === 'low' &&
+    (!requireVerdictWindow || inWindow) &&
     taskSha && taskSha === verdictSha && MD5_RE.test(verdictMd5);
-  return ok ? { ok: true, boundSha: taskSha } : { ok: false, reason: 'legacy_qc_evidence_mismatch' };
+  return ok ? { ok: true, boundSha: taskSha, evidenceTaskId: row.task_id }
+    : { ok: false, reason: 'legacy_qc_evidence_mismatch' };
 }
 
 function qcCompletionAdvance(row) {
   if (row.to_stage !== 'In Review' || row.next_stage !== 'CI/CD & Deploy') {
     return { ok: false, reason: 'manual_gated_stage' };
   }
-  if (row.task_status !== 'completed' || row.task_agent_model !== 'gpt-5.6-sol' ||
-      row.task_agent_effort !== 'low' || row.qc_verdict !== 'PASS') {
+  if (row.task_status !== 'completed' || row.qc_verdict !== 'PASS') {
     return { ok: false, reason: 'completed_sol_low_pass_required' };
   }
   const md5 = String(row.qc_verdict_work_product_md5 || '').toLowerCase();
   if (!MD5_RE.test(md5)) return { ok: false, reason: 'qc_work_product_md5_required' };
   const strict = strictQcAttempt(row, md5);
-  const evidence = strict || legacyQcVerdict(row, md5);
-  return evidence.ok ? { ok: true, workProductMd5: md5, boundSha: evidence.boundSha }
-    : evidence;
+  if (strict) {
+    return strict.ok ? { ok: true, workProductMd5: md5, boundSha: strict.boundSha,
+      evidenceTaskId: strict.evidenceTaskId } : strict;
+  }
+  const candidates = Array.isArray(row.qc_evidence_tasks) && row.qc_evidence_tasks.length > 0
+    ? row.qc_evidence_tasks.map((task) => ({ ...row, ...task })) : [row];
+  for (const candidate of candidates) {
+    const evidence = legacyQcVerdict(candidate, md5, candidates.length === 1 && candidate === row);
+    if (evidence.ok) {
+      return { ok: true, workProductMd5: md5, boundSha: evidence.boundSha,
+        evidenceTaskId: evidence.evidenceTaskId };
+    }
+  }
+  return { ok: false, reason: 'legacy_qc_evidence_mismatch' };
 }
 
 // Deliberately small: the DeepSeek build lane is paid, so a backlog drains at a
@@ -305,8 +321,9 @@ async function cleanupStalePendingRows() {
   }
 }
 
-async function findAndAdvanceTasks() {
-  const client = await pool.connect();
+async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
+  logger = console } = {}) {
+  const client = await dbPool.connect();
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
 
@@ -333,6 +350,9 @@ async function findAndAdvanceTasks() {
              attempt.qualifying AS qc_attempt_qualifying,
              attempt.model AS qc_attempt_model,
              attempt.effort AS qc_attempt_effort,
+             attempt.evidence_task_id AS qc_attempt_evidence_task_id,
+             attempt.evidence_agent_id AS qc_attempt_evidence_agent_id,
+             evidence.tasks AS qc_evidence_tasks,
              i.workspace_id, i.priority, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
@@ -345,13 +365,43 @@ async function findAndAdvanceTasks() {
          ORDER BY created_at DESC LIMIT 1
       ) verdict ON true
       LEFT JOIN LATERAL (
-        SELECT verdict, work_product_md5, bound_sha, observed_head,
-               qualifying, model, effort
-          FROM qc_attempt
-         WHERE issue_id = atq.issue_id
-           AND notes LIKE '%relay_task_id=' || atq.id::text || '%'
-         ORDER BY created_at DESC LIMIT 1
+        SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
+               qa.qualifying, qa.model, qa.effort,
+               evidence_task.id AS evidence_task_id,
+               evidence_task.agent_id AS evidence_agent_id
+          FROM qc_attempt qa
+          INNER JOIN agent_task_queue evidence_task
+                  ON evidence_task.issue_id = qa.issue_id
+                 AND evidence_task.id::text = substring(
+                       qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+         WHERE qa.issue_id = atq.issue_id
+           AND evidence_task.agent_id = verdict.checker_id
+           AND qa.work_product_md5 = verdict.work_product_md5
+         ORDER BY qa.created_at DESC LIMIT 1
       ) attempt ON true
+      LEFT JOIN LATERAL (
+        SELECT jsonb_agg(jsonb_build_object(
+                 'task_id', evidence_task.id,
+                 'task_status', evidence_task.status,
+                 'task_result', evidence_task.result,
+                 'task_agent_id', evidence_task.agent_id,
+                 'task_agent_model', evidence_agent.model,
+                 'task_agent_effort', evidence_agent.thinking_level,
+                 'task_started_at', evidence_task.started_at,
+                 'task_completed_at', evidence_task.completed_at
+               ) ORDER BY evidence_task.completed_at DESC) AS tasks
+          FROM agent_task_queue evidence_task
+          INNER JOIN agent evidence_agent
+                  ON evidence_agent.id = evidence_task.agent_id
+                 AND evidence_agent.workspace_id = i.workspace_id
+         WHERE evidence_task.issue_id = atq.issue_id
+           AND evidence_task.agent_id = verdict.checker_id
+           AND evidence_task.status = 'completed'
+           AND COALESCE(evidence_agent.model,
+                        evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
+           AND COALESCE(evidence_agent.thinking_level,
+                        evidence_agent.runtime_config->>'reasoning_effort') = 'low'
+      ) evidence ON true
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
@@ -374,12 +424,12 @@ async function findAndAdvanceTasks() {
        RETURNING rrl.id, rrl.issue_id`
     );
     if (failed.rowCount > 0) {
-      console.log(`${LOG_PREFIX} Closed ${failed.rowCount} relay log(s) whose task failed/cancelled; NOT advanced`);
+      logger.log(`${LOG_PREFIX} Closed ${failed.rowCount} relay log(s) whose task failed/cancelled; NOT advanced`);
     }
 
     if (result.rows.length === 0) return;
 
-    console.log(`${LOG_PREFIX} Found ${result.rows.length} tasks ready to advance`);
+    logger.log(`${LOG_PREFIX} Found ${result.rows.length} tasks ready to advance`);
 
     for (const row of result.rows) {
       try {
@@ -390,7 +440,7 @@ async function findAndAdvanceTasks() {
           // carrying an explicit blocker/FAIL (or no result at all) must not
           // buy another same-lane attempt. The bridge changes hands to re-spec.
           const escalation = await requestRetryEscalation(row, completion.reason);
-          console.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
+          logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
           await markRelayLogFailedById(client, row.log_id);
           continue;
         }
@@ -400,38 +450,38 @@ async function findAndAdvanceTasks() {
         // Sol-low task carries a SHA-bound PASS plus the current artifact MD5.
         const qcAdvance = qcCompletionAdvance(row);
         if (gatedStages.includes(row.next_stage) && !qcAdvance.ok) {
-          console.log(`${LOG_PREFIX} SKIPPED: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=stage requires manual QC approval`);
-          await markRelayLogCompletedById(client, row.log_id);
+          logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
           continue;
         }
 
         const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
-          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+          agent_token: RELAY_AGENT_SECRET,
+          relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
           ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
-        const response = await postToRelay(payload);
+        const response = await postRelay(payload);
 
         if (response.ok) {
           const proof = qcAdvance.ok ? ` sha=${qcAdvance.boundSha} md5=${qcAdvance.workProductMd5}` : '';
-          console.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})${proof}`);
+          logger.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})${proof}`);
           await markRelayLogCompletedById(client, row.log_id);
         } else if (response.deferred) {
           // Preserve the task-correlated pending log. The same advance becomes
           // eligible once the predecessor is terminal; recording failure here
           // would strand it permanently.
-          console.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
+          logger.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
         } else {
           // The relay's own error text was parsed and then discarded, so 76 of every
           // 400 log lines were a bare `status 409` with no cause. Print the reason.
-          console.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
+          logger.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
           await markRelayLogFailedById(client, row.log_id);
         }
       } catch (err) {
-        console.error(`${LOG_PREFIX} Error: ${err.message}`);
+        logger.error(`${LOG_PREFIX} Error: ${err.message}`);
         await markRelayLogFailedById(client, row.log_id);
       }
     }
   } catch (err) {
-    console.error(`${LOG_PREFIX} DB error: ${err.message}`);
+    logger.error(`${LOG_PREFIX} DB error: ${err.message}`);
   } finally {
     client.release();
   }
@@ -1231,4 +1281,5 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { pauseQuotaLane, qcCompletionAdvance, reconcileQuotaPauses, startDaemon };
+module.exports = { findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
+  reconcileQuotaPauses, startDaemon };
