@@ -22,6 +22,7 @@ function initializeRuntime() {
 const BOT = 'b8ecc1c4-d58c-4233-a669-7ede7060531c';
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
+const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
 // Merging is the one irreversible action here, so it is opt-in and defaults on
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
@@ -29,14 +30,15 @@ const ciFailureCounts = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-function gh(args) {
+let gh = function github(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
-}
+};
 
-let relay = function relayRequest(issueId, toStage, currentWorkProductMd5) {
+let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: relayToken,
-      ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}) });
+      ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}),
+      ...(reason ? { reason } : {}) });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);
@@ -83,6 +85,13 @@ async function escalateCi(issue, pr, ci) {
   log(`PARKED #${issue.number} ${pr.repo}#${pr.num}: ci=${ci} for ${CI_FAILURE_POLLS} consecutive polls`);
 }
 
+async function returnToBuild(issue, pr, reason) {
+  const detail = `${pr.repo}#${pr.num} ${reason}`;
+  await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${detail}`);
+  await closePendingTask(issue.id);
+  log(`RETURN #${issue.number} ${detail}`);
+}
+
 function countCiFailure(issue, pr, sha, ci) {
   const key = `${issue.id}:${pr.repo}#${pr.num}:${sha}`;
   if (ci !== 'red' && ci !== 'unknown') {
@@ -126,10 +135,15 @@ function findAllPRs(work) {
 // Green means every completed run on THIS head SHA succeeded. A run list
 // filtered by status alone can return a success from an older SHA of the same
 // branch, which is how a red PR reads as green.
-function ciState(repo, sha) {
+function ciState(repo, sha, createdAt, now = Date.now()) {
   try {
     const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=30`]));
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
+    if (!(runs.workflow_runs || []).length) {
+      const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
+      return Number.isFinite(ageMinutes) && ageMinutes >= CI_ABSENT_MINUTES ? 'absent' : 'pending';
+    }
+    if ((runs.workflow_runs || []).some(r => r.status !== 'completed')) return 'pending';
     if (!done.length) return 'pending';
     if (done.every(r => r.conclusion === 'success')) return 'green';
     if (done.some(r => r.conclusion === 'failure')) return 'red';
@@ -210,7 +224,7 @@ async function sweep() {
       const states = [];
       for (const cand of prs) {
         states.push({ pr: cand,
-          info: JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid'])) });
+          info: JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt'])) });
       }
       const openStates = states.filter(s2 => s2.info.state !== 'MERGED' && s2.info.state !== 'CLOSED');
       if (!openStates.length) {
@@ -224,7 +238,16 @@ async function sweep() {
       const pr = openStates[0].pr;
       const info = openStates[0].info;
 
-      const ci = ciState(pr.repo, info.headRefOid);
+      if (info.mergeable === 'CONFLICTING') {
+        await returnToBuild(issue, pr, 'merge conflict; verify master..merge diff after rebase');
+        continue;
+      }
+
+      const ci = ciState(pr.repo, info.headRefOid, info.createdAt);
+      if (ci === 'absent') {
+        await returnToBuild(issue, pr, `no CI runs after ${CI_ABSENT_MINUTES} minutes`);
+        continue;
+      }
       const failures = countCiFailure(issue, pr, info.headRefOid, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
@@ -233,8 +256,6 @@ async function sweep() {
         continue;
       }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
-      if (info.mergeable === 'CONFLICTING') { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} conflicting`); continue; }
-
       try { await mirrorVerdictToPR(issue, pr, info.headRefOid); }
       catch (e) { log(`MIRROR-ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0,140)}`); }
 
@@ -270,6 +291,8 @@ function setTestDependencies(dependencies) {
   if (require.main === module) throw new Error('test dependencies unavailable in worker process');
   if (dependencies.pool) pool = dependencies.pool;
   if (dependencies.relay) relay = dependencies.relay;
+  if (dependencies.gh) gh = dependencies.gh;
 }
 
-module.exports = { countCiFailure, escalateCi, routeFinishedPR, setTestDependencies, sweep };
+module.exports = { ciState, countCiFailure, escalateCi, returnToBuild,
+  routeFinishedPR, setTestDependencies, sweep };

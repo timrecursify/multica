@@ -33,6 +33,17 @@ async function testFinishedRoutes() {
     'red',
   );
   assert.deepStrictEqual(calls, [['issue-3', 'Parked']]);
+
+  calls.length = 0;
+  await worker.returnToBuild(
+    { id: 'issue-4', number: 4 },
+    { repo: 'owner/repo', num: '8' },
+    'merge conflict; verify master..merge diff after rebase',
+  );
+  assert.deepStrictEqual(calls, [[
+    'issue-4', 'In Progress', null,
+    'RETURN:In Progress — owner/repo#8 merge conflict; verify master..merge diff after rebase',
+  ]]);
 }
 
 function testConsecutiveFailures() {
@@ -45,9 +56,22 @@ function testConsecutiveFailures() {
   assert.equal(worker.countCiFailure(issue, pr, 'sha-2', 'red'), 1);
 }
 
+function testAbsentCi() {
+  worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [] }) });
+  const now = Date.parse('2026-09-01T14:30:00Z');
+  assert.equal(worker.ciState('owner/repo', 'sha', '2026-09-01T14:00:00Z', now), 'absent');
+  assert.equal(worker.ciState('owner/repo', 'sha', '2026-09-01T14:20:00Z', now), 'pending');
+  worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [
+    { status: 'completed', conclusion: 'success' },
+    { status: 'in_progress', conclusion: null },
+  ] }) });
+  assert.equal(worker.ciState('owner/repo', 'sha', '2026-09-01T14:00:00Z', now), 'pending');
+}
+
 (async () => {
   await testFinishedRoutes();
   testConsecutiveFailures();
+  testAbsentCi();
   console.log('multica-cicd-worker tests passed');
 })().catch(error => {
   console.error(error);
