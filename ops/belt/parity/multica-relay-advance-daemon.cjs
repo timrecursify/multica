@@ -15,6 +15,7 @@ const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
   namedBlocker, isConcreteRuntimeEvidence, verifyRuntimeEvidence, currentPassWorkProductMD5,
   diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 const { completionAdmission } = require('../relay-completion-admission.cjs');
+const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -157,6 +158,14 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
     [disposition, row.issue_id]
   );
   if (changed.rowCount > 0 && disposition === 'Parked') {
+    await recordParkedEntry(client, {
+      issueId: row.issue_id,
+      fromStage: row.stage,
+      trigger: reason,
+      intendedStage: evidence.target_stage || null,
+      attempts: evidence.historical_tasks || 0,
+      taskCount: evidence.task_count || evidence.historical_tasks || 0
+    });
     const diagnosisTaskId = await recordParkAndQueueDiagnosis(client,
       { id: row.issue_id, workspace_id: row.workspace_id, status: row.stage,
         priority: row.priority }, { ...evidence, reason,
