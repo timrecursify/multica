@@ -32,8 +32,13 @@ if ! flock -n 9; then
 fi
 
 daemon_bin="${MULTICA_DAEMON_BIN:-/home/newadmin/multica-daemon/server}"
+daemon_cwd="${MULTICA_DAEMON_CWD:-/home/newadmin/multica-daemon}"
+if [[ -z "$daemon_cwd" || "$daemon_cwd" != /* || ! -d "$daemon_cwd" ]]; then
+  echo "multica-daemon-wrapper: MULTICA_DAEMON_CWD must be an existing absolute directory" >&2
+  exit 64
+fi
 export MULTICA_DAEMON_PORT="${MULTICA_DAEMON_PORT:-20464}"
-cd /home/newadmin/multica-daemon
+cd -- "$daemon_cwd"
 exec "$daemon_bin" daemon start --foreground --daemon-id=gsp-multica-worker \
   --heartbeat-interval=30s --poll-interval=2s --workspaces-root="$root" \
   --max-concurrent-tasks="$cap_raw"
