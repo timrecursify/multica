@@ -1053,7 +1053,8 @@ async function processParkedDiagnoses() {
         ? await verifyRuntimeEvidence(client, task.issue_id, evidence, task.id) : false;
       const completionMD5 = outcome === 'already_fixed' && evidenceVerified
         ? await currentPassWorkProductMD5(client, task.issue_id) : null;
-      const invalidAlreadyFixed = outcome === 'already_fixed' && !completionMD5;
+      const invalidAlreadyFixed = outcome === 'already_fixed' && !evidenceVerified;
+      const needsQC = outcome === 'already_fixed' && evidenceVerified && !completionMD5;
       const invalidBlocked = outcome === 'genuinely_blocked' && !blocker;
       const duplicate = text.match(/duplicate[_ ](?:of|issue)\s*[:#]?\s*([0-9a-f-]{8,}|\d+)/i)?.[1] || null;
       let duplicateIssueId = null;
@@ -1070,7 +1071,7 @@ async function processParkedDiagnoses() {
       const invalidDuplicate = outcome === 'duplicate' && !duplicateIssueId;
       const hasSpec = outcome === 'fixable' ? await hasBindingSpec(client, task.issue_id) : true;
       const action = diagnosisOutcomeAction({ outcome, evidenceVerified: Boolean(completionMD5), duplicateIssueId,
-        blocker, missingOutcome, invalidAlreadyFixed, invalidDuplicate, hasBindingSpec: hasSpec });
+        blocker, missingOutcome, invalidAlreadyFixed, invalidDuplicate, hasBindingSpec: hasSpec, needsQC });
       const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${missingOutcome ? 'blocker: diagnosis response omitted an explicit outcome.\n' : ''}${invalidAlreadyFixed ? 'blocker: already_fixed requires concrete runtime_evidence.\n' : ''}${invalidBlocked ? 'blocker: genuinely_blocked requires a named blocker.\n' : ''}${invalidDuplicate ? 'blocker: duplicate requires an existing same-workspace duplicate_of target.\n' : ''}${evidence ? `runtime_evidence: ${evidence}\n` : ''}${blocker ? `blocker: ${blocker}\n` : ''}${text.slice(0, 2000)}`;
       await client.query(
         `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
@@ -1121,14 +1122,15 @@ async function processParkedDiagnoses() {
       if (nextStage) {
         const response = await postToRelay({ issue_id: task.issue_id, to_stage: nextStage,
           agent_token: RELAY_AGENT_SECRET,
-          ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}) });
+          ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
+          ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
         if (!response.ok) {
           // Keep the diagnosis retryable when the bridge is unavailable. The
           // bridge owns terminal transitions and must record the gate result.
           await client.query(
             `UPDATE agent_task_queue
                 SET context = context - 'diagnosis_processed'
-              WHERE id = $1`, [task.id]);
+              WHERE id = $1::uuid`, [task.id]);
         }
         console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
       } else {

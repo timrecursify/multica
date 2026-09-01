@@ -108,9 +108,12 @@ function selectDiagnosisOwner(rows) {
 // ordinary QC result (or from falling through to a builder dispatch).
 function diagnosisOutcomeAction({ outcome, evidenceVerified = false, duplicateIssueId = null,
   blocker = null, missingOutcome = false, invalidAlreadyFixed = false,
-  invalidDuplicate = false, hasBindingSpec = true }) {
+  invalidDuplicate = false, hasBindingSpec = true, needsQC = false }) {
   if (outcome === 'fixable') {
     return { action: 'release', status: 'Parked', nextStage: hasBindingSpec ? 'Queue' : 'Spec' };
+  }
+  if (outcome === 'already_fixed' && needsQC) {
+    return { action: 'release', status: 'Parked', nextStage: 'In Review' };
   }
   if (outcome === 'already_fixed' && evidenceVerified) return { action: 'close', status: 'Done' };
   if (outcome === 'duplicate' && duplicateIssueId) {

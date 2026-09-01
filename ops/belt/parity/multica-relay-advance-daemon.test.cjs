@@ -67,6 +67,9 @@ test('runtime-evidence recovery is one-shot, typed, and stays on relay authority
   assert.match(diagnosis, /t\.context->>'kind' = \$2::text/);
   assert.match(diagnosis, /i\.workspace_id = \$3::uuid/);
   assert.match(diagnosis, /postToRelay\(\{ issue_id: task\.issue_id, to_stage: nextStage/);
+  assert.match(diagnosis, /const needsQC = outcome === 'already_fixed' && evidenceVerified && !completionMD5/);
+  assert.match(diagnosis, /runtime_evidence_verified:\$\{evidence\}/);
+  assert.match(diagnosis, /WHERE id = \$1::uuid/);
   assert.doesNotMatch(diagnosis, /UPDATE issue SET status/);
 });
 
