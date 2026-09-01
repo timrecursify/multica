@@ -379,6 +379,8 @@ test('release admission is explicit, one-use, and resets task history by time', 
   assert.match(source, /created_at >= \$3/);
   assert.match(source, /created_at >= \$2/);
   assert.match(source, /'parked_release_once'.*'\{parked_release_at\}'/s);
+  assert.match(source, /\["Queue", "Spec"\]\.includes\(to_stage\)/);
+  assert.match(source, /if \(!bindingSpec && parkedRelease\) \{[\s\S]*?to_stage = "Spec"/);
 });
 
 test('lifetime rejection emits structured evidence', () => {

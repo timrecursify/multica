@@ -81,6 +81,15 @@ function logQuotaPauseFlip({ agent_name: agentName, timestamp, paused }) {
   console.warn(`${LOG_PREFIX} ${quotaPauseFlipLogLine(agentName, timestamp, paused)}`);
 }
 
+async function hasBindingSpec(client, issueId) {
+  const result = await client.query(
+    `SELECT 1 FROM comment
+      WHERE issue_id = $1 AND content LIKE '%## Spec%' AND content LIKE '%## Evidence%'
+      LIMIT 1`, [issueId]
+  );
+  return result.rowCount > 0;
+}
+
 async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () => Date.now(),
   onFlip = logQuotaPauseFlip,
   onError = (err) => console.error(`${LOG_PREFIX} [quota-pause] reconciliation error: ${err.message}`) } = {}) {
@@ -1034,8 +1043,9 @@ async function processParkedDiagnoses() {
         duplicateIssueId = target.rows[0]?.id || null;
       }
       const invalidDuplicate = outcome === 'duplicate' && !duplicateIssueId;
+      const hasSpec = outcome === 'fixable' ? await hasBindingSpec(client, task.issue_id) : true;
       const action = diagnosisOutcomeAction({ outcome, evidenceVerified: Boolean(completionMD5), duplicateIssueId,
-        blocker, missingOutcome, invalidAlreadyFixed, invalidDuplicate });
+        blocker, missingOutcome, invalidAlreadyFixed, invalidDuplicate, hasBindingSpec: hasSpec });
       const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${missingOutcome ? 'blocker: diagnosis response omitted an explicit outcome.\n' : ''}${invalidAlreadyFixed ? 'blocker: already_fixed requires concrete runtime_evidence.\n' : ''}${invalidBlocked ? 'blocker: genuinely_blocked requires a named blocker.\n' : ''}${invalidDuplicate ? 'blocker: duplicate requires an existing same-workspace duplicate_of target.\n' : ''}${evidence ? `runtime_evidence: ${evidence}\n` : ''}${blocker ? `blocker: ${blocker}\n` : ''}${text.slice(0, 2000)}`;
       await client.query(
         `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)

@@ -57,6 +57,8 @@ test('validated Parked outcomes map to bounded state actions', () => {
     { action: 'hold', status: 'Parked', blocker: 'Sol-low diagnosis: billing' });
   assert.equal(diagnosisOutcomeAction({ outcome: 'fixable' }).action, 'release');
   assert.equal(diagnosisOutcomeAction({ outcome: 'fixable' }).status, 'Parked');
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'fixable', hasBindingSpec: false }),
+    { action: 'release', status: 'Parked', nextStage: 'Spec' });
 });
 
 test('diagnosis evidence and owner validation fail closed', () => {
@@ -93,6 +95,7 @@ test('diagnosis processing is workspace-scoped and serializes concurrent ticks',
   assert.match(source, /context->>'no_builder'/);
   assert.match(source, /diagnosisOutcomeAction\(\{ outcome/);
   assert.match(source, /action\.action === 'release'/);
+  assert.match(source, /hasBindingSpec\(client, task\.issue_id\)/);
   assert.match(source, /action\.action === 'close' \? action\.status : null/);
   assert.match(source, /current_work_product_md5: completionMD5/);
   assert.doesNotMatch(source, /UPDATE issue SET status = 'Done'/);
