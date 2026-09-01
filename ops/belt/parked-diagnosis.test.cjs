@@ -91,7 +91,7 @@ test('diagnosis prefers an attributable Sol-low scoper, then the dedicated seat'
 test('diagnosis processing is workspace-scoped and serializes concurrent ticks', () => {
   const source = fs.readFileSync(require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /FOR UPDATE OF t SKIP LOCKED/);
-  assert.match(source, /WHERE workspace_id = \$1 AND id <> \$2/);
+  assert.match(source, /WHERE workspace_id = \$1::uuid AND id <> \$2::uuid/);
   assert.match(source, /t\.context->>'kind' = \$2/);
   assert.match(source, /context->>'no_builder'/);
   assert.match(source, /diagnosisOutcomeAction\(\{ outcome/);
