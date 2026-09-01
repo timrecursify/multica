@@ -104,7 +104,13 @@ function strandedHarness(fixtures) {
     if (sql.includes('INSERT INTO relay_run_log')) return { rows: [] };
     throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
   }, release() {} };
-  return { queries, run: () => requeueStrandedTasks({ dbPool: { connect: async () => client } }) };
+  return { queries, client, run: () => requeueStrandedTasks({ dbPool: { connect: async () => client } }) };
+}
+
+function loadRequeueDaemon() {
+  const modulePath = require.resolve('./multica-relay-advance-daemon.cjs');
+  delete require.cache[modulePath];
+  return require(modulePath);
 }
 
 test('stranded-task fixture redispatches a cancelled-only task', async () => {
@@ -131,12 +137,27 @@ test('stranded-task fixtures leave running tasks and bundled children untouched'
   }
 });
 
-test('Human Review tickets are outside the exact requeue stage set', () => {
+test('RELAY_REQUEUE_STAGES drops Human Review before binding the candidate SQL', async () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  const humanReview = strandedFixture({ stage: 'Human Review' });
-  assert.equal(humanReview.stage, 'Human Review');
   assert.match(source, /RELAY_REQUEUE_STAGES \|\| 'Queue,In Progress,Spec'/);
-  assert.doesNotMatch(source, /RELAY_REQUEUE_STAGES \|\| '[^']*Human Review/);
+  const previous = process.env.RELAY_REQUEUE_STAGES;
+  const warnings = [];
+  const warn = console.warn;
+  process.env.RELAY_REQUEUE_STAGES = 'Human Review';
+  console.warn = (line) => warnings.push(line);
+  try {
+    const { requeueStrandedTasks: configuredRequeue } = loadRequeueDaemon();
+    const harness = strandedHarness([strandedFixture({ stage: 'Human Review' })]);
+    await configuredRequeue({ dbPool: { connect: async () => harness.client } });
+    const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
+    assert.deepEqual(candidateQuery.values[1], []);
+  } finally {
+    console.warn = warn;
+    if (previous === undefined) delete process.env.RELAY_REQUEUE_STAGES;
+    else process.env.RELAY_REQUEUE_STAGES = previous;
+    loadRequeueDaemon();
+  }
+  assert.deepEqual(warnings, ['[relay-advance-daemon] [requeue] ignoring non-dispatch stages: Human Review']);
 });
 
 test('completed-latest fixture is excluded by the candidate predicate', () => {
