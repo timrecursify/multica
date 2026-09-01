@@ -66,6 +66,7 @@ function isSolLowDiagnosisAgent(agent) {
     ? agent.runtime_config : {};
   const name = String((agent && agent.name) || '').toLowerCase();
   const model = String((agent && agent.model) || '').toLowerCase();
+  const instructions = String((agent && agent.instructions) || '').toLowerCase();
   const configuredModel = cfg.model == null ? model : String(cfg.model).toLowerCase();
   const configuredEffort = cfg.reasoning_effort == null
     ? (/(?:^|-)sol-low(?:-|$)/.test(name) ? 'low' : '')
@@ -74,13 +75,39 @@ function isSolLowDiagnosisAgent(agent) {
     .filter(Boolean).join(' ').toLowerCase();
   const solLowModel = model === 'gpt-5.6-sol' && configuredModel === 'gpt-5.6-sol' &&
     configuredEffort === 'low';
-  const canonicalWorkspaceSeat = /^(?:gsp|ppp)-/.test(name);
-  return canonicalWorkspaceSeat && solLowModel && /qc|scop|diagnos/.test(role) &&
+  // Parked diagnosis is deliberately a dedicated seat. Existing QC/spec seats
+  // are scoped to In Review/Spec and reject Parked tasks, which silently burns
+  // diagnosis calls without producing an actionable outcome.
+  const dedicatedParkedSeat = /^(?:gsp|ppp)-parked-diagnosis-sol-low(?:-|$)/.test(name);
+  const permitsParked = /\bparked\b/.test(instructions) &&
+    /diagnos/.test(instructions) &&
+    /(?:fixable|already[_ ]fixed|duplicate|genuinely[_ ]blocked)/.test(instructions);
+  return dedicatedParkedSeat && solLowModel && /diagnos/.test(role) && permitsParked &&
     cfg.parked_diagnosis !== false;
 }
 
 function isBuilderDispatchAllowed(context) {
   return !(context && context.no_builder === true);
+}
+
+// Convert a validated diagnosis into one bounded state action. Keeping this
+// mapping explicit prevents a completed diagnosis from being treated as an
+// ordinary QC result (or from falling through to a builder dispatch).
+function diagnosisOutcomeAction({ outcome, evidenceVerified = false, duplicateIssueId = null,
+  blocker = null, missingOutcome = false, invalidAlreadyFixed = false,
+  invalidDuplicate = false }) {
+  if (outcome === 'fixable') return { action: 'release', status: 'Parked', nextStage: 'Queue' };
+  if (outcome === 'already_fixed' && evidenceVerified) return { action: 'close', status: 'Done' };
+  if (outcome === 'duplicate' && duplicateIssueId) {
+    return { action: 'close', status: 'Cancelled', duplicateIssueId };
+  }
+  const holdReason = missingOutcome ? 'Sol-low diagnosis response omitted an explicit outcome'
+    : invalidAlreadyFixed ? 'runtime_evidence_unverified'
+      : invalidDuplicate ? 'duplicate response did not resolve a same-workspace duplicate_of target'
+        : outcome === 'genuinely_blocked' && !blocker
+          ? 'genuinely_blocked response omitted a named blocker'
+          : `Sol-low diagnosis: ${blocker || outcome}`;
+  return { action: 'hold', status: 'Parked', blocker: holdReason };
 }
 
 async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = null) {
@@ -138,7 +165,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   );
 
   const owner = await client.query(
-    `SELECT a.id, a.name, a.model, a.runtime_config, a.runtime_id
+    `SELECT a.id, a.name, a.model, a.runtime_config, a.runtime_id, a.instructions
        FROM agent a
       WHERE a.workspace_id = $1 AND a.archived_at IS NULL
         AND a.status IN ('idle', 'working')
@@ -209,6 +236,7 @@ module.exports = {
   diagnosisEvidence,
   formatParkReason,
   isBuilderDispatchAllowed,
+  diagnosisOutcomeAction,
   isConcreteRuntimeEvidence,
   isSolLowDiagnosisAgent,
   namedBlocker,
