@@ -4,10 +4,13 @@ import (
 	"context"
 	"fmt"
 	"math/rand/v2"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestExactConcurrentIndexHook(t *testing.T) {
@@ -35,7 +38,7 @@ func TestExactConcurrentIndexHook(t *testing.T) {
 
 	// An absent relation must let the concurrent migration continue.
 	hook := exactConcurrentIndexHook(index, "unused")
-	if err := hook(ctx, pool); err != nil {
+	if _, err := hook(ctx, pool); err != nil {
 		t.Fatalf("absent index: %v", err)
 	}
 
@@ -46,10 +49,17 @@ func TestExactConcurrentIndexHook(t *testing.T) {
 	if err := pool.QueryRow(ctx, "SELECT pg_get_indexdef(to_regclass($1))", index).Scan(&definition); err != nil {
 		t.Fatalf("read index definition: %v", err)
 	}
-	if err := exactConcurrentIndexHook(index, definition)(ctx, pool); err != nil {
+	skip, err := buildBudgetWorkspaceIndexHookForRelation(table, index, definition)(ctx, pool)
+	if err != nil {
+		t.Fatalf("existing build_budget: %v", err)
+	}
+	if skip {
+		t.Fatal("existing build_budget skipped migration SQL")
+	}
+	if _, err := exactConcurrentIndexHook(index, definition)(ctx, pool); err != nil {
 		t.Fatalf("expected valid index: %v", err)
 	}
-	if err := exactConcurrentIndexHook(index, definition+" WHERE false")(ctx, pool); err == nil {
+	if _, err := exactConcurrentIndexHook(index, definition+" WHERE false")(ctx, pool); err == nil {
 		t.Fatal("wrong valid index definition was accepted")
 	}
 	if _, err := pool.Exec(ctx, "DROP INDEX CONCURRENTLY "+index); err != nil {
@@ -61,7 +71,7 @@ func TestExactConcurrentIndexHook(t *testing.T) {
 	if _, err := pool.Exec(ctx, "CREATE UNIQUE INDEX CONCURRENTLY "+index+" ON "+table+" (workspace_id, scope, scope_ref) NULLS NOT DISTINCT"); err == nil {
 		t.Fatal("invalid-index setup unexpectedly succeeded")
 	}
-	if err := exactConcurrentIndexHook(index, definition)(ctx, pool); err != nil {
+	if _, err := exactConcurrentIndexHook(index, definition)(ctx, pool); err != nil {
 		t.Fatalf("remove invalid index: %v", err)
 	}
 	var exists bool
@@ -70,5 +80,100 @@ func TestExactConcurrentIndexHook(t *testing.T) {
 	}
 	if exists {
 		t.Fatal("invalid index was not removed")
+	}
+}
+
+func TestBuildBudgetMigrationsSkipCleanSchema(t *testing.T) {
+	pool := openTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	suffix := fmt.Sprintf("%d_%d", time.Now().UnixNano(), rand.Uint32())
+	schema := "migrate_build_budget_clean_" + suffix
+	schemaIdent := pgx.Identifier{schema}.Sanitize()
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schemaIdent); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schemaIdent+" CASCADE"); err != nil {
+			t.Logf("drop schema: %v", err)
+		}
+	})
+
+	dir := t.TempDir()
+	files := []struct {
+		version string
+		sql     string
+	}{
+		{"286_build_budget_scope_workspace", "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_build_budget_scope_workspace ON build_budget (workspace_id, scope, scope_ref);\n"},
+		{"287_build_budget_scope_drop_v1", "DROP INDEX CONCURRENTLY IF EXISTS uq_build_budget_scope;\n"},
+	}
+	paths := make([]string, 0, len(files))
+	for _, file := range files {
+		path := filepath.Join(dir, file.version+".up.sql")
+		if err := os.WriteFile(path, []byte(file.sql), 0o600); err != nil {
+			t.Fatalf("write %s: %v", file.version, err)
+		}
+		paths = append(paths, path)
+	}
+	if err := runMigrations(ctx, pool, runOptions{
+		Direction:             "up",
+		Files:                 paths,
+		SchemaMigrationsTable: schema + ".schema_migrations",
+		AdvisoryLockKey:       int64(rand.Uint64()&0x7fffffffffffffff) | 1,
+		Hooks:                 preMigrationHooks,
+	}); err != nil {
+		t.Fatalf("clean schema migrations: %v", err)
+	}
+
+	var relationExists bool
+	if err := pool.QueryRow(ctx, "SELECT to_regclass('public.build_budget') IS NOT NULL").Scan(&relationExists); err != nil {
+		t.Fatalf("check build_budget relation: %v", err)
+	}
+	if relationExists {
+		t.Fatal("clean-schema migration created build_budget")
+	}
+	var versions int
+	if err := pool.QueryRow(ctx, "SELECT count(*) FROM "+pgx.Identifier{schema, "schema_migrations"}.Sanitize()).Scan(&versions); err != nil {
+		t.Fatalf("count recorded migrations: %v", err)
+	}
+	if versions != len(files) {
+		t.Fatalf("recorded migrations = %d, want %d", versions, len(files))
+	}
+}
+
+func TestRunMigrationsRejectsSkipForOtherVersions(t *testing.T) {
+	pool := openTestPool(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	suffix := fmt.Sprintf("%d_%d", time.Now().UnixNano(), rand.Uint32())
+	schema := "migrate_skip_guard_" + suffix
+	schemaIdent := pgx.Identifier{schema}.Sanitize()
+	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+schemaIdent); err != nil {
+		t.Fatalf("create schema: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+schemaIdent+" CASCADE"); err != nil {
+			t.Logf("drop schema: %v", err)
+		}
+	})
+
+	const version = "288_skip_must_fail"
+	path := filepath.Join(t.TempDir(), version+".up.sql")
+	if err := os.WriteFile(path, []byte("SELECT 1;\n"), 0o600); err != nil {
+		t.Fatalf("write migration: %v", err)
+	}
+	err := runMigrations(ctx, pool, runOptions{
+		Direction:             "up",
+		Files:                 []string{path},
+		SchemaMigrationsTable: schema + ".schema_migrations",
+		AdvisoryLockKey:       int64(rand.Uint64()&0x7fffffffffffffff) | 1,
+		Hooks: map[string]preMigrationHook{
+			version: func(context.Context, *pgxpool.Pool) (bool, error) { return true, nil },
+		},
+	})
+	if err == nil {
+		t.Fatal("unexpected skip was accepted")
 	}
 }
