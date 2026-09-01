@@ -777,7 +777,7 @@ async function relayAdvance(req, res, body) {
       const successor = await replaceStageTask(client, {
         issueId: issue_id,
         fromStage: issue.status,
-        toStage,
+        toStage: to_stage,
         agentId: stage.agent_id,
         priority: taskPriority,
         runtimeId: stage.selected_runtime_id,
