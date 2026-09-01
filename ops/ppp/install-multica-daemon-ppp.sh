@@ -5,7 +5,6 @@ set -Eeo pipefail
 
 PROFILE="ppp-prod-codex"
 UNIT="multica-daemon-ppp.service"
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOME_DIR="${HOME:?HOME must be set}"
 USER_DIR="${XDG_CONFIG_HOME:-$HOME_DIR/.config}/systemd/user"
 UNIT_DST="$USER_DIR/$UNIT"
