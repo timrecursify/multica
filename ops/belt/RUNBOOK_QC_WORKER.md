@@ -27,6 +27,8 @@ procedure once with `VERDICT=PASS` or `VERDICT=FAIL`. Use only `sk multica
 verdict` and `sk multica advance` for state changes: never curl, use a secret,
 or write SQL.
 
+Minimum sk-cli requirement: `sk multica verdict` must accept `--board gsp`; if its help says prod only, the checker aborts with `BLOCKED`.
+
 ```bash
 CHECKOUT_RESULT="$(sk multica qc-checkout "$REPO" --ref "$BOUND_SHA")"
 CHECKOUT="$(jq -r '.path' <<<"$CHECKOUT_RESULT")"
@@ -38,6 +40,11 @@ FAILURE_CLASS=none; QUALIFYING=true
 # For an unavailable prerequisite: FAILURE_CLASS=evidence|tool|access;
 # QUALIFYING=false; BLOCKED_REASON='actionable reason'
 IDEM_KEY="qc-${NUMBER}-${BOUND_SHA}-${VERDICT}"
+VERDICT_NOTES=''
+if [ "$VERDICT" = FAIL ]; then
+  VERDICT_NOTES="${REWORK_SUMMARY:?set a concise rework summary}"
+  test -z "${BLOCKED_REASON:-}" || VERDICT_NOTES="BLOCKED: $BLOCKED_REASON"
+fi
 QC_EVIDENCE_JSON="$(jq -cn --arg verdict "$VERDICT" --arg work_product_md5 "$WORK_PRODUCT_MD5" \
   --arg bound_sha "$BOUND_SHA" --arg observed_sha "$OBSERVED_SHA" \
   --arg failure_class "$FAILURE_CLASS" --arg model gpt-5.6-sol --arg effort low \
@@ -48,7 +55,8 @@ test -z "${BLOCKED_REASON:-}" || printf 'BLOCKED: %s\n' "$BLOCKED_REASON"
 sk multica verdict "$NUMBER" --board "$BOARD" --verdict "$VERDICT" \
   --bound-sha "$BOUND_SHA" --observed-sha "$OBSERVED_SHA" \
   --work-product-md5 "$WORK_PRODUCT_MD5" --failure-class "$FAILURE_CLASS" \
-  --qualifying "$QUALIFYING" --model gpt-5.6-sol --effort low --idem-key "$IDEM_KEY"
+  --qualifying "$QUALIFYING" --model gpt-5.6-sol --effort low --idem-key "$IDEM_KEY" \
+  --notes "$VERDICT_NOTES"
 ```
 
 The `QC_EVIDENCE_JSON=` line must be in the completed task output exactly once.

@@ -304,6 +304,17 @@ const validVerdict = Object.freeze({
   qualifying: true, model: 'gpt-5.6-sol', effort: 'low', idem_key: 'qc-verdict-000517'
 });
 const qcResult = (evidence = validVerdict) => ({ output: `QC completed\nQC_EVIDENCE_JSON=${JSON.stringify(evidence)}` });
+const runbookVerdict = ({ verdict = 'PASS', failureClass = 'none', qualifying = true,
+  idemKey, reworkSummary = '', blockedReason = '' } = {}) => ({
+  ...validVerdict,
+  verdict,
+  failure_class: failureClass,
+  qualifying,
+  idem_key: idemKey,
+  notes: verdict === 'FAIL'
+    ? (blockedReason ? `BLOCKED: ${blockedReason}` : reworkSummary)
+    : ''
+});
 
 test('verdict validation accepts the sanctioned CLI checker field and rejects forged lane metadata', () => {
   assert.equal(validateRelayVerdict(validVerdict), null);
@@ -459,7 +470,7 @@ test('runbook-shaped verdicts advance through the relay handler', async () => {
   };
   setTestClientFactory(() => client);
   try {
-    const pass = { ...validVerdict, idem_key: 'qc-runbook-pass-0001' };
+    const pass = runbookVerdict({ idemKey: 'qc-runbook-pass-0001' });
     task.result = qcResult(pass);
     assert.equal((await post(pass)).status, 201);
     const values = attempts[0];
@@ -476,8 +487,11 @@ test('runbook-shaped verdicts advance through the relay handler', async () => {
       return { ...res, json: JSON.parse(res.body) };
     };
     assert.equal((await advance('CI/CD & Deploy')).json.issue.status, 'CI/CD & Deploy');
-    const blocked = { ...pass, verdict: 'FAIL', failure_class: 'evidence', qualifying: false,
-      idem_key: 'qc-runbook-blocked-0001', notes: 'BLOCKED: add the pull request and full SHA.' };
+    const failed = runbookVerdict({ verdict: 'FAIL', failureClass: 'implementation', qualifying: false,
+      idemKey: 'qc-runbook-fail-0001', reworkSummary: 'Restore the missing validation.' });
+    assert.equal(failed.notes, 'Restore the missing validation.');
+    const blocked = runbookVerdict({ verdict: 'FAIL', failureClass: 'evidence', qualifying: false,
+      idemKey: 'qc-runbook-blocked-0001', blockedReason: 'add the pull request and full SHA.' });
     task.result = qcResult(blocked);
     assert.equal((await post(blocked)).status, 201);
     assert.equal(verdicts[1][3], 'FAIL');
@@ -493,6 +507,10 @@ test('QC runbook emits bridge evidence and advances both verdict dispositions', 
   assert.match(runbook, /--bound-sha "\$BOUND_SHA" --observed-sha "\$OBSERVED_SHA"/);
   assert.match(runbook, /--work-product-md5 "\$WORK_PRODUCT_MD5" --failure-class "\$FAILURE_CLASS"/);
   assert.match(runbook, /--qualifying "\$QUALIFYING" --model gpt-5\.6-sol --effort low --idem-key "\$IDEM_KEY"/);
+  assert.match(runbook, /--notes "\$VERDICT_NOTES"/);
+  assert.match(runbook, /VERDICT_NOTES="\$\{REWORK_SUMMARY:\?set a concise rework summary\}"/);
+  assert.match(runbook, /VERDICT_NOTES="BLOCKED: \$BLOCKED_REASON"/);
+  assert.match(runbook, /verdict` must accept `--board gsp`/);
   assert.match(runbook, /--to "CI\/CD & Deploy" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
   assert.match(runbook, /--to "In Progress" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
   assert.match(runbook, /BLOCKED: <reason>/);
