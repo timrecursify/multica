@@ -4,8 +4,10 @@ const fs = require('node:fs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
-process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-secret';
-process.env.RELAY_OPERATOR_SECRET = process.env.RELAY_OPERATOR_SECRET || 'test-operator-secret';
+// This handler test sends fixed fixture credentials. Do not inherit a live
+// relay credential, which would make the expected 201 path return 403.
+process.env.RELAY_AGENT_SECRET = 'test-relay-secret';
+process.env.RELAY_OPERATOR_SECRET = 'test-operator-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
 const {
