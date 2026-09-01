@@ -608,7 +608,7 @@ async function ssoBridge(req, res) {
 async function canonicalStageOwner(client, workspaceId, ownerStage) {
   const result = await client.query(
     `SELECT rsc.agent_id, rsc.agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
-            a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
+            a.instructions, a.model, a.thinking_level, a.max_concurrent_tasks, a.runtime_config,
             (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
             COALESCE(a.runtime_id, (
               SELECT ar.id FROM agent_runtime ar
@@ -1112,10 +1112,17 @@ async function relayAdvance(req, res, body) {
           reason: "paid_dispatch_preflight",
           detail: preflight.reason,
           issue_id: issue.id,
-          agent_id: stage.agent_id
+          agent_id: stage.agent_id,
+          routing: preflight.agent_name ? { agent_name: preflight.agent_name,
+            agent_id: preflight.agent_id, actual_model: preflight.model,
+            actual_effort: preflight.effort, expected_model: preflight.expected_model,
+            expected_effort: preflight.expected_effort } : undefined
         }));
         res.writeHead(503, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "paid_dispatch_preflight", detail: preflight.reason }));
+        res.end(JSON.stringify({ error: "paid_dispatch_preflight", detail: preflight.reason,
+          agent_name: preflight.agent_name, agent_id: preflight.agent_id,
+          actual_model: preflight.model, actual_effort: preflight.effort,
+          expected_model: preflight.expected_model, expected_effort: preflight.expected_effort }));
         return;
       }
       // A stage re-entry creates a fresh task, so per-task max_attempts does not

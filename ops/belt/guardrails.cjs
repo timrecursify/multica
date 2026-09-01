@@ -119,6 +119,8 @@ function spendPreflight(agent, selectedRuntime = {}) {
   if (agent.runtime_config && agent.runtime_config.quota_paused === true) {
     return { ok: false, reason: `provider_quota_paused:${agent.name || agent.agent_name || agent.id || 'unknown_agent'}` };
   }
+  const routing = beltRoutingAdmission(agent, selectedRuntime);
+  if (!routing.ok) return routing;
   const model = String(selectedRuntime.model || agent.model || '').trim();
   const provider = String(selectedRuntime.provider || '').toLowerCase();
   const paid = selectedRuntime.paid === true || provider === 'openrouter' || /^deepseek[/:]/i.test(model);
@@ -133,6 +135,20 @@ function spendPreflight(agent, selectedRuntime = {}) {
     return { ok: false, reason: 'missing_paid_token_budget' };
   }
   return { ok: true, cap };
+}
+
+function beltRoutingAdmission(agent, selectedRuntime = {}) {
+  const name = String(agent?.name || agent?.agent_name || '').toLowerCase();
+  const model = String(agent?.model || '').toLowerCase();
+  const effort = String(agent?.thinking_level || '').toLowerCase();
+  const details = { agent_name: agent?.name || agent?.agent_name || null, agent_id: agent?.id || agent?.agent_id || null, model, effort, expected_effort: 'low' };
+  const build = name.includes('build');
+  const qcOrSpec = name.includes('qc') || name.includes('spec');
+  if (!build && !qcOrSpec) return { ok: true };
+  if (effort !== 'low') return { ok: false, reason: 'belt_low_reasoning_effort_required', ...details };
+  if (build && !(/^deepseek[/:]/.test(model) || model === 'gpt-5.6-terra')) return { ok: false, reason: 'builder_requires_deepseek_or_terra', ...details, expected_model: 'deepseek/*|gpt-5.6-terra' };
+  if (qcOrSpec && model !== 'gpt-5.6-sol') return { ok: false, reason: 'qc_spec_requires_sol_low', ...details, expected_model: 'gpt-5.6-sol' };
+  return { ok: true };
 }
 
 function quotaPauseClearance({ pausedAt, fallbackAt, budgetExhausted, now = Date.now(),
@@ -220,6 +236,7 @@ module.exports = {
   crossStageExecutionAdmission,
   retryAdmission,
   spendPreflight,
+  beltRoutingAdmission,
   QUOTA_PAUSE_MAX_AGE_MS,
   quotaPauseClearance,
   quotaPauseFlipLogLine,
