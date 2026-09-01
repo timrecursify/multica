@@ -341,6 +341,24 @@ test('verdict checker identity is selected from the completed same-workspace Sol
   assert.match(calls[0].sql, /ORDER BY t\.completed_at DESC NULLS LAST/);
 });
 
+test('completed In Review rerun task is admitted for the QC verdict', async () => {
+  const rerunTask = {
+    id: 'rerun-qc-task', agent_id: 'qc-agent', status: 'completed',
+    context: { to_stage: 'In Review' }, result: { output: 'QC VERDICT: PASS' },
+    agent_name: 'qc-sol-low'
+  };
+  const client = { query: async (sql, values) => {
+    assert.deepEqual(values, ['issue-in-review', 'workspace-for-issue']);
+    assert.match(sql, /i\.workspace_id = t\.workspace_id/);
+    assert.match(sql, /t\.context->>'to_stage' = 'In Review'/);
+    return { rows: [rerunTask] };
+  } };
+  assert.equal(
+    await latestCompletedSolLowQcTask(client, 'issue-in-review', 'workspace-for-issue'),
+    rerunTask
+  );
+});
+
 test('verdict route never trusts a caller supplied checker identity', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.doesNotMatch(source, /RELAY_QC_ACTOR_ID/);
