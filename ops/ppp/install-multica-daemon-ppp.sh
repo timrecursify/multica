@@ -161,18 +161,26 @@ install_mode() {
     printf 'would install release %s, binary %s, Codex %s, profile %s, health port %s\n' "$RELEASE_DIR" "$DAEMON_BIN" "$CODEX_PATH" "$PROFILE" "$HEALTH_PORT"
     return
   fi
+  local was_enabled=0
+  if "$SYSTEMCTL" --user is-enabled --quiet "$UNIT"; then was_enabled=1; fi
   BACKUP_DIR="$BACKUP_ROOT/$(date -u +%Y%m%dT%H%M%SZ)-$$"
   mkdir -p "$BACKUP_DIR" "$USER_DIR" "$(dirname "$WRAPPER_DST")" "$(dirname "$ENV_FILE")" "$WORKSPACES_ROOT"
   backup_file "$UNIT_DST" unit || true; backup_file "$WRAPPER_DST" wrapper || true; backup_file "$ENV_FILE" env || true
   printf '%s\n' "$BACKUP_DIR" >"$BACKUP_ROOT/latest"
   rollback_install() {
     local rc=$?; set +e
+    ((rc == 0)) && rc=1
     restore_file "$UNIT_DST" unit; restore_file "$WRAPPER_DST" wrapper; restore_file "$ENV_FILE" env
+    if ((was_enabled)); then
+      "$SYSTEMCTL" --user enable "$UNIT" >/dev/null 2>&1 || true
+    else
+      "$SYSTEMCTL" --user disable "$UNIT" >/dev/null 2>&1 || true
+    fi
     "$SYSTEMCTL" --user daemon-reload >/dev/null 2>&1 || true
-    trap - ERR
+    trap - ERR INT TERM HUP
     exit "$rc"
   }
-  trap rollback_install ERR
+  trap rollback_install ERR INT TERM HUP
   install -m 0644 "$RELEASE_DIR/ops/ppp/systemd/$UNIT" "$UNIT_DST"
   install -m 0755 "$RELEASE_DIR/ops/ppp/multica-daemon-ppp.sh" "$WRAPPER_DST"
   umask 077
@@ -180,7 +188,7 @@ install_mode() {
   chmod 0600 "$ENV_FILE"
   run "$SYSTEMCTL" --user daemon-reload
   run "$SYSTEMCTL" --user enable "$UNIT"
-  trap - ERR
+  trap - ERR INT TERM HUP
   echo "installed PPP daemon artifacts; daemon remains stopped (backup: $BACKUP_DIR)"
 }
 
