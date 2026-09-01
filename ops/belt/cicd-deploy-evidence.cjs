@@ -46,7 +46,7 @@ function multicaInstalled(pr, run = command, read = fs.readdirSync, readFile = f
 function deployed(pr, dependencies = {}) {
   const run = dependencies.run || command;
   if (pr.repo === 'timrecursify/sk-cli') return skInstalled(pr.mergeCommit.oid, run);
-  if (pr.repo === 'timrecursify/multica') return multicaInstalled(pr, run, dependencies.stat, dependencies.read);
+  if (pr.repo === 'timrecursify/multica') return multicaInstalled(pr, run, dependencies.read, dependencies.readFile);
   return false;
 }
 
