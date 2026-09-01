@@ -6,6 +6,8 @@ process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
 process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
+process.env.MULTICA_API_URL = process.env.MULTICA_API_URL || 'http://multica.test';
+process.env.MULTICA_OPERATOR_SECRET = process.env.MULTICA_OPERATOR_SECRET || 'test-operator-secret';
 
 const {
   existingStageTask,
@@ -13,8 +15,27 @@ const {
   ownerStageForTransition,
   ensureCompletedRelayLog,
   isBookkeepingTransition,
-  recordBookkeepingHandoff
+  recordBookkeepingHandoff,
+  notifyCommittedTask
 } = require('./multica-bridge.cjs');
+
+test('committed relay tasks are handed back to the server notification path', async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true };
+  };
+  try {
+    await notifyCommittedTask('task-1');
+  } finally {
+    global.fetch = originalFetch;
+  }
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].url, /\/api\/operator\/tasks\/task-1\/enqueued$/);
+  assert.equal(calls[0].options.method, 'POST');
+  assert.match(calls[0].options.headers.Authorization, /^Bearer /);
+});
 
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
   assert.equal(isBookkeepingTransition('Queue', 'In Progress'), true);

@@ -21,6 +21,8 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const SSO_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID;
+const MULTICA_API_URL = process.env.MULTICA_API_URL;
+const MULTICA_OPERATOR_SECRET = process.env.MULTICA_OPERATOR_SECRET;
 
 // One canonical login (Cloudflare Access) serving several isolated client
 // workspaces. The hostname the user arrived on decides which workspace they
@@ -43,9 +45,29 @@ for (const [name, value] of Object.entries({
   JWT_SECRET,
   DATABASE_URL: MULTICA_DB,
   RELAY_AGENT_SECRET,
-  MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID
+  MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID,
+  MULTICA_API_URL,
+  MULTICA_OPERATOR_SECRET
 })) {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
+}
+
+// The bridge owns the transaction that inserts relay tasks, but it must not
+// bypass the server process that owns the empty-claim cache and daemon WS hub.
+// Call this only after COMMIT: a wakeup for a rolled-back task can make a
+// daemon spend a claim round trip, while a committed task without this call can
+// remain hidden behind a cached empty claim until its TTL expires.
+async function notifyCommittedTask(taskId) {
+  if (!taskId) return;
+  const response = await fetch(`${MULTICA_API_URL.replace(/\/$/, "")}/api/operator/tasks/${taskId}/enqueued`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${MULTICA_OPERATOR_SECRET}`
+    }
+  });
+  if (!response.ok) {
+    throw new Error(`task enqueue notification failed: ${response.status} ${await response.text()}`);
+  }
 }
 
 const PORT = Number(process.env.PORT || 5005);
@@ -544,6 +566,7 @@ async function relayAdvance(req, res, body) {
     if (issue.status === to_stage) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
       await client.query("COMMIT");
+      await notifyCommittedTask(taskId);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
@@ -1025,6 +1048,7 @@ async function relayAdvance(req, res, body) {
     }
 
     await client.query("COMMIT");
+    await notifyCommittedTask(taskId);
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
@@ -1117,5 +1141,6 @@ module.exports = {
   ownerStageForTransition,
   ensureCompletedRelayLog,
   isBookkeepingTransition,
-  recordBookkeepingHandoff
+  recordBookkeepingHandoff,
+  notifyCommittedTask
 };

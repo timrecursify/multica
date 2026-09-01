@@ -1716,6 +1716,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 			// Task routing via Scoping stage complexity evaluation (Phase 2).
 			// Routes a task to a specific daemon lane (junior vs senior).
 			r.Post("/api/relay/advance", h.RelayAdvance)
+			// The legacy relay bridge inserts its successor task directly in its
+			// transaction. Route its post-commit notification through the server
+			// instance that owns the empty-claim cache and daemon wakeup hub.
+			r.With(operatorAuth).Post("/api/operator/tasks/{taskId}/enqueued", h.RelayTaskEnqueued)
 
 			// Workspace-wide agent task snapshot for presence derivation:
 			// every active task + each agent's most recent terminal task.
