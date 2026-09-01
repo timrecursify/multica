@@ -8,7 +8,7 @@ process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-s
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
 const { qcBounceDecision } = require('../multica-bridge.cjs');
-const { findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
+const { enqueuePassWithoutRelayRows, findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
 const { parseArgs, recover } = require('../recover-stranded-qc-pass.cjs');
 
 const SHA = 'c909401ef7a4a438348eb5ceda33839211721524';
@@ -44,7 +44,7 @@ function advanceRow(evidenceResult = `QC PASS exact SHA ${SHA}`) {
   };
 }
 
-function advanceHarness(row) {
+function advanceHarness(row, currentPass = { verdict: 'PASS', work_product_md5: MD5 }) {
   const queries = [];
   const logs = [];
   const payloads = [];
@@ -52,6 +52,9 @@ function advanceHarness(row) {
     async query(sql, values) {
       queries.push({ sql, values });
       if (sql.includes('SELECT rrl.id AS log_id')) return { rows: [row] };
+      if (sql.includes('SELECT verdict, work_product_md5 FROM qc_verdict')) {
+        return { rows: currentPass ? [currentPass] : [] };
+      }
       if (sql.includes("atq.status IN ('failed', 'cancelled')")) {
         return { rowCount: 0, rows: [] };
       }
@@ -71,6 +74,29 @@ function advanceHarness(row) {
   };
 }
 
+test('PASS written after its completed relay row is enqueued for normal admission', async () => {
+  const queries = [];
+  const client = {
+    async query(sql) {
+      queries.push(sql);
+      if (sql.includes('INSERT INTO relay_run_log')) {
+        return { rowCount: 1, rows: [{ id: 'relay-log-new', issue_id: 'issue-1' }] };
+      }
+      throw new Error(`unexpected query: ${sql.slice(0, 60)}`);
+    },
+    release() {}
+  };
+  const rows = await enqueuePassWithoutRelayRows({
+    dbPool: { connect: async () => client }, logger: { log() {}, error() {} }
+  });
+  assert.deepEqual(rows, [{ id: 'relay-log-new', issue_id: 'issue-1' }]);
+  assert.match(queries[0], /i\.status = 'In Review'/);
+  assert.match(queries[0], /verdict\.verdict = 'PASS'/);
+  assert.match(queries[0], /verdict\.created_at > COALESCE/);
+  assert.match(queries[0], /pending\.status = 'pending'/);
+  assert.match(queries[0], /LIMIT 20/);
+});
+
 test('older verdict-recording Sol-low task advances the latest PASS to deploy', async () => {
   const harness = advanceHarness(advanceRow());
   await harness.run();
@@ -80,6 +106,30 @@ test('older verdict-recording Sol-low task advances the latest PASS to deploy', 
     '11111111-1111-4111-8111-111111111111');
   assert.equal(harness.payloads[0].current_work_product_md5, MD5);
   assert.ok(harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'")));
+});
+
+test('PASS replay with matching current work-product MD5 is enqueued', async () => {
+  const harness = advanceHarness(advanceRow());
+  await harness.run();
+  assert.equal(harness.payloads.length, 1);
+  assert.ok(harness.queries.some(({ sql }) =>
+    sql.includes('SELECT verdict, work_product_md5 FROM qc_verdict')));
+});
+
+test('PASS replay with mismatched current work-product MD5 is skipped', async () => {
+  const harness = advanceHarness(advanceRow(), {
+    verdict: 'PASS', work_product_md5: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  });
+  await harness.run();
+  assert.equal(harness.payloads.length, 0);
+  assert.ok(harness.logs.some((line) => line.includes('stale_pass_md5_mismatch')));
+});
+
+test('PASS replay without a verdict work-product MD5 is skipped', async () => {
+  const harness = advanceHarness({ ...advanceRow(), qc_verdict_work_product_md5: '' });
+  await harness.run();
+  assert.equal(harness.payloads.length, 0);
+  assert.ok(harness.logs.some((line) => line.includes('pass_without_md5')));
 });
 
 test('permanently mismatched evidence is held after the bounded retry limit', async () => {
