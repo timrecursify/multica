@@ -38,6 +38,11 @@ test('Parked evidence QC return is a canonical consumed-release-only edge', () =
   assert.match(source, /context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
 });
 
+test('Parked evidence return selects the canonical In Review QC owner', () => {
+  assert.equal(ownerStageForTransition('Parked', 'In Review'), 'In Progress');
+  assert.equal(ownerStageForTransition('Parked', 'Spec'), 'Registered');
+});
+
 const validVerdict = Object.freeze({
   issue_id: '123e4567-e89b-42d3-a456-426614174000', checker: 'BRAVO-000517',
   verdict: 'PASS', work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e',

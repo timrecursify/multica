@@ -126,6 +126,10 @@ function ownerStageForTransition(fromStage, toStage) {
   // absent from stageOrder. A diagnosis-authorized no-spec release returns to
   // Spec and must use the Registered scoper pool, never Parked's prior builder.
   if (fromStage === "Parked" && toStage === "Spec") return "Registered";
+  // A verified already-fixed diagnosis returns directly to QC. Parked has no
+  // execution owner, so selecting the source row would reuse the pre-park
+  // builder; use the canonical In Progress -> In Review Sol-low owner instead.
+  if (fromStage === "Parked" && toStage === "In Review") return "In Progress";
   const stageOrder = ["Registered", "Spec", "Queue", "In Progress", "In Review", "Human Review", "CI/CD & Deploy"];
   const fromIndex = stageOrder.indexOf(fromStage);
   const toIndex = stageOrder.indexOf(toStage);
