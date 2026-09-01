@@ -19,6 +19,9 @@ test('selection allows temporary blockers and retryable diagnoses before the bat
   const pool = {
     query: async (sql) => {
       assert.match(sql, /NOT EXISTS \([\s\S]*agent_task_queue d/);
+      assert.match(sql, /mega\.id = i\.parent_issue_id/);
+      assert.match(sql, /mega\.title LIKE 'MEGA%'/);
+      assert.match(sql, /mega\.status NOT IN \('Done', 'Archived', 'Cancelled'\)/);
       assert.match(sql, /NOT IN \('failed', 'cancelled'\)/);
       assert.doesNotMatch(sql, /parked_blocker/);
       return { rows: ids.map((id) => ({ id, workspace_id: 'w', status: 'Parked', priority: 'low', metadata: {} })), rowCount: ids.length };
@@ -27,6 +30,34 @@ test('selection allows temporary blockers and retryable diagnoses before the bat
   const result = await run(pool, parseArgs(['--dry-run', '--batch-size', '1']));
   assert.deepEqual(result.ids.would_queue, ['eligible']);
   assert.equal(result.counts.scanned, 1);
+});
+
+test('folded #63 under open MEGA #1029 is skipped and the next candidate commits atomically', async () => {
+  const state = { events: [], queued: [] };
+  const megaChild = { id: '63', number: 63, workspace_id: 'gsp', status: 'Parked', priority: 'low',
+    parent_issue_id: '1029', metadata: { bundled_into: '1029' } };
+  const next = { id: '64', number: 64, workspace_id: 'gsp', status: 'Parked', priority: 'low', metadata: {} };
+  const client = { query: async (sql, values) => {
+    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') { state.events.push(sql); return { rows: [], rowCount: 0 }; }
+    if (sql.includes('WITH ranked AS')) {
+      assert.match(sql, /mega\.id = i\.parent_issue_id/);
+      // The fake is the observed result of the SQL predicate: #63 is omitted
+      // because its parent #1029 is an open MEGA, so #64 fills this batch slot.
+      return { rows: [next], rowCount: 1 };
+    }
+    if (sql.includes('SELECT id, status FROM agent_task_queue') || sql.includes('SELECT 1 FROM comment') ||
+        sql.includes('SELECT failure_reason, error') || sql.includes('SELECT verdict FROM qc_verdict')) return { rows: [], rowCount: 0 };
+    if (sql.includes('FROM agent a')) return { rows: [{ id: 'sol', name: 'gsp-parked-diagnosis-sol-low-1',
+      model: 'gpt-5.6-sol', runtime_id: 'r', instructions: 'Parked diagnosis: fixable, already_fixed, duplicate, genuinely_blocked.',
+      runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } }], rowCount: 1 };
+    if (sql.includes('INSERT INTO agent_task_queue')) { state.queued.push(values[1]); return { rows: [{ id: 'task-64' }], rowCount: 1 }; }
+    return { rows: [], rowCount: 0 };
+  }, release() {} };
+  const result = await run({ connect: async () => client }, parseArgs(['--apply', '--batch-size', '1']));
+  assert.equal(megaChild.metadata.bundled_into, '1029');
+  assert.deepEqual(result.ids.queued, ['64:task-64']);
+  assert.deepEqual(state.queued, ['64']);
+  assert.deepEqual(state.events, ['BEGIN', 'COMMIT']);
 });
 
 test('inspection permits temporary blockers and blocks nonterminal diagnosis tasks', async () => {

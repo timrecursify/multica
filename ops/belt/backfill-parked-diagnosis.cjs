@@ -103,6 +103,15 @@ async function run(pool, options) {
               ROW_NUMBER() OVER (PARTITION BY i.workspace_id ORDER BY i.id) AS workspace_rank
          FROM issue i
         WHERE i.status = 'Parked' ${where}
+          -- A folded child belongs to its open MEGA. It may remain Parked
+          -- while the MEGA is being delivered, but must not consume a Sol
+          -- diagnosis slot or re-enter the independent retry ladder.
+          AND NOT EXISTS (
+            SELECT 1 FROM issue mega
+             WHERE mega.id = i.parent_issue_id
+               AND mega.title LIKE 'MEGA%'
+               AND mega.status NOT IN ('Done', 'Archived', 'Cancelled')
+          )
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue d
              WHERE d.issue_id = i.id AND d.context->>'kind' = ${kindParam}
