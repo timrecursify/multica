@@ -1165,19 +1165,6 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
-    // The relay credential is held by belt automation. A terminal ticket may
-    // be moved only by an explicit operator path that records its reason, not
-    // by this automated endpoint. In particular, do not let Done's optional
-    // CI/CD successor re-enter the belt.
-    if (isTerminalStage(issue.status)) {
-      await client.query("ROLLBACK");
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        error: "terminal_stage_relay_exit_forbidden",
-        message: "terminal tickets cannot be advanced by relay automation"
-      }));
-      return;
-    }
     const noArtifactRescope = await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
