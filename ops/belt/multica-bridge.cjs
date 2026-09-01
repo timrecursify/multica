@@ -13,6 +13,7 @@ const {
   assertRoutableStageOwners,
   crossStageExecutionAdmission
 } = require("./guardrails.cjs");
+const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed } = require("./parked-diagnosis.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -79,6 +80,11 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
       WHERE id = $2 AND status <> $1 RETURNING id`,
     [disposition, issue.id]
   );
+  if (changed.rowCount > 0 && disposition === 'Parked') {
+    const diagnosisTaskId = await recordParkAndQueueDiagnosis(client, issue,
+      { ...evidence, reason });
+    if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
+  }
   await client.query(
     `UPDATE agent_task_queue
         SET status = 'cancelled', completed_at = NOW(),
@@ -87,7 +93,8 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
         -- A disposition must not interrupt a paid task that already started.
         -- Running predecessors are handled by cross-stage admission and are
         -- allowed to reach a terminal state before any successor is created.
-        AND status IN ('queued','dispatched','waiting_local_directory','deferred')`,
+        AND status IN ('queued','dispatched','waiting_local_directory','deferred')
+        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'`,
     [issue.id, reason]
   );
   if (changed.rowCount > 0) {
@@ -185,6 +192,10 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
 }
 
 async function replaceStageTask(client, task) {
+  const context = typeof task.context === 'string' ? JSON.parse(task.context) : task.context;
+  if (!isBuilderDispatchAllowed(context)) {
+    throw new Error('builder dispatcher rejected a no_builder diagnosis task');
+  }
   // The issue row is locked by relayAdvance. Cancel only unstarted relay work
   // for another execution stage before making the successor visible. Running
   // paid work and manual/disposition tasks are deliberately preserved.

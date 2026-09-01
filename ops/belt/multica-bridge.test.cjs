@@ -82,6 +82,15 @@ test('stage transition fails before commit when no successor task exists', async
   assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
 });
 
+test('builder dispatcher rejects diagnosis tasks marked no_builder', async () => {
+  const { replaceStageTask } = require('./multica-bridge.cjs');
+  let queries = 0;
+  await assert.rejects(() => replaceStageTask({ query: async () => { queries++; } }, {
+    ...transition(), context: JSON.stringify({ kind: 'parked_diagnosis', no_builder: true })
+  }), /no_builder diagnosis task/);
+  assert.equal(queries, 0);
+});
+
 test('an already-created matching successor is linked instead of permitting a taskless transition', async () => {
   const replies = [{ rows: [] }, { rows: [] }, { rows: [{ id: 'task-existing' }] }, { rows: [] }];
   const client = { query: async () => replies.shift() };
@@ -123,6 +132,14 @@ test('lifetime rejection emits structured evidence', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source,
     /event: "relay_advance_rejected",\s+reason: lifetime\.reason,[\s\S]*disposition_applied: moved/);
+});
+
+test('parking records a reason and hands off one Sol-low diagnosis', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /recordParkAndQueueDiagnosis/);
+  assert.match(source, /disposition === 'Parked'/);
+  assert.match(source, /context->>'kind', ''\) <> 'parked_diagnosis'/);
 });
 
 test('relay request maps snake-case stage into successor task input', () => {

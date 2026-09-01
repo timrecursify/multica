@@ -9,6 +9,9 @@ const {
   quotaCircuitAdmission,
   crossStageExecutionAdmission
 } = require('../guardrails.cjs');
+const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
+  namedBlocker, isConcreteRuntimeEvidence, verifyRuntimeEvidence,
+  PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -75,6 +78,13 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
       WHERE id = $2 AND status <> $1 RETURNING id`,
     [disposition, row.issue_id]
   );
+  if (changed.rowCount > 0 && disposition === 'Parked') {
+    const diagnosisTaskId = await recordParkAndQueueDiagnosis(client,
+      { id: row.issue_id, workspace_id: row.workspace_id, status: row.stage,
+        priority: row.priority }, { ...evidence, reason,
+        failure_reason: row.failure_reason });
+    if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
+  }
   await client.query(
     `UPDATE agent_task_queue
         SET status = 'cancelled', completed_at = NOW(),
@@ -83,7 +93,8 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
         -- Never interrupt a paid task already executing. Cross-stage
         -- admission defers successors until running predecessors are
         -- terminal; only unstarted work may be retired by a disposition.
-        AND status IN ('queued','dispatched','waiting_local_directory','deferred')`,
+        AND status IN ('queued','dispatched','waiting_local_directory','deferred')
+        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'`,
     [row.issue_id, reason]
   );
   if (changed.rowCount > 0) {
@@ -458,7 +469,7 @@ async function requeueStrandedTasks() {
        SELECT c.*, ROW_NUMBER() OVER (
                 PARTITION BY c.agent_id ORDER BY c.updated_at ASC
               ) AS rn FROM (
-       SELECT i.id AS issue_id, i.number, i.status AS stage, i.updated_at, i.metadata,
+       SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage, i.updated_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason,
               r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
@@ -535,6 +546,7 @@ async function requeueStrandedTasks() {
                ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
                AND COALESCE(q.context->>'to_stage', '') = i.status
           )
+          AND COALESCE(t.context->>'no_builder', 'false') <> 'true'
           -- A bundled child is never its own unit of work: its MEGA parent
           -- carries the fix. The bridge withholds the child's task at the
           -- relay hop, which leaves the child sitting in a stage with no task
@@ -825,12 +837,156 @@ async function requeueStrandedTasks() {
   }
 }
 
+function diagnosisText(result) {
+  if (typeof result === 'string') return result;
+  if (!result || typeof result !== 'object') return '';
+  return [result.comment, result.output, result.text, result.error]
+    .filter(Boolean).join('\n');
+}
+
+async function processParkedDiagnoses() {
+  const client = await pool.connect();
+  try {
+    const { rows: candidates } = await client.query(
+      `SELECT t.id, i.workspace_id
+         FROM agent_task_queue t
+         JOIN issue i ON i.id = t.issue_id
+        WHERE t.status = 'completed'
+          AND t.context->>'kind' = $1
+          AND COALESCE(t.context->>'diagnosis_processed', 'false') <> 'true'
+          AND i.workspace_id IS NOT NULL
+        ORDER BY t.completed_at ASC
+        LIMIT 25`, [PARK_DIAGNOSIS_KIND]);
+    for (const candidate of candidates) {
+      // Claim the diagnosis row under lock. Multiple relay daemon instances
+      // may tick together; SKIP LOCKED prevents duplicate outcomes/comments.
+      await client.query('BEGIN');
+      const locked = await client.query(
+        `SELECT t.id, t.issue_id, t.result, t.context,
+                i.workspace_id, i.status, i.number
+           FROM agent_task_queue t
+           JOIN issue i ON i.id = t.issue_id
+          WHERE t.id = $1
+            AND t.context->>'kind' = $2
+            AND i.workspace_id = $3
+            AND t.status = 'completed'
+            AND COALESCE(t.context->>'diagnosis_processed', 'false') <> 'true'
+          FOR UPDATE OF t SKIP LOCKED`, [candidate.id, PARK_DIAGNOSIS_KIND, candidate.workspace_id]);
+      if (locked.rows.length === 0) {
+        await client.query('ROLLBACK');
+        continue;
+      }
+      const task = locked.rows[0];
+      const text = diagnosisText(task.result);
+      const parsedOutcome = parseDiagnosisOutcome(text);
+      const evidence = diagnosisEvidence(text);
+      const blocker = namedBlocker(text);
+      // A malformed Sol-low response must not create an unbounded retry or a
+      // silent parked ticket. Treat it as a named blocker until an operator
+      // can rerun the single diagnosis task deliberately.
+      const outcome = parsedOutcome || 'genuinely_blocked';
+      const missingOutcome = !parsedOutcome;
+      const evidenceVerified = outcome === 'already_fixed' && isConcreteRuntimeEvidence(evidence)
+        ? await verifyRuntimeEvidence(client, task.issue_id, evidence, task.id) : false;
+      const invalidAlreadyFixed = outcome === 'already_fixed' && !evidenceVerified;
+      const invalidBlocked = outcome === 'genuinely_blocked' && !blocker;
+      const duplicate = text.match(/duplicate[_ ](?:of|issue)\s*[:#]?\s*([0-9a-f-]{8,}|\d+)/i)?.[1] || null;
+      let duplicateIssueId = null;
+      if (outcome === 'duplicate' && duplicate) {
+        const target = await client.query(
+          `SELECT id FROM issue
+            WHERE workspace_id = $1 AND id <> $2
+              AND status NOT IN ('Cancelled', 'Archived')
+              AND (id::text = $3 OR number::text = $3)
+            ORDER BY (status = 'Done') DESC, updated_at DESC
+            LIMIT 1`, [task.workspace_id, task.issue_id, duplicate]);
+        duplicateIssueId = target.rows[0]?.id || null;
+      }
+      const invalidDuplicate = outcome === 'duplicate' && !duplicateIssueId;
+      const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${missingOutcome ? 'blocker: diagnosis response omitted an explicit outcome.\n' : ''}${invalidAlreadyFixed ? 'blocker: already_fixed requires concrete runtime_evidence.\n' : ''}${invalidBlocked ? 'blocker: genuinely_blocked requires a named blocker.\n' : ''}${invalidDuplicate ? 'blocker: duplicate requires an existing same-workspace duplicate_of target.\n' : ''}${evidence ? `runtime_evidence: ${evidence}\n` : ''}${blocker ? `blocker: ${blocker}\n` : ''}${text.slice(0, 2000)}`;
+      await client.query(
+        `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+         SELECT $1, $2, 'system', $3, $4, 'system'
+          WHERE NOT EXISTS (
+            SELECT 1 FROM comment WHERE issue_id = $1
+              AND content LIKE '<!-- multica-diagnosis-outcome -->%'
+              AND content LIKE $5
+          )`,
+        [task.issue_id, task.workspace_id, '00000000-0000-0000-0000-000000000000',
+          content, `%outcome: ${outcome}.%`]
+      );
+      if (outcome === 'fixable') {
+        await client.query(
+          `UPDATE issue SET metadata = jsonb_set(
+                    jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                      '{parked_release_once}', 'true'::jsonb, true),
+                    '{parked_release_at}', to_jsonb(NOW()), true),
+                  updated_at = NOW()
+             WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
+      } else if (outcome === 'already_fixed' && evidenceVerified) {
+        await client.query(
+          `UPDATE issue SET status = 'Done', updated_at = NOW()
+             WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
+      } else if (outcome === 'duplicate' && duplicateIssueId) {
+        await client.query(
+          `UPDATE issue SET status = 'Cancelled',
+                  metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2),
+                  updated_at = NOW()
+             WHERE id = $1 AND status = 'Parked'`, [task.issue_id, duplicateIssueId]);
+      } else if (outcome === 'duplicate') {
+        await client.query(
+          `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+                    jsonb_build_object('parked_blocker', 'duplicate outcome missing duplicate_of target'),
+                  updated_at = NOW()
+             WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
+      } else {
+        await client.query(
+          `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+                    jsonb_build_object('parked_blocker', $2),
+                  updated_at = NOW()
+             WHERE id = $1 AND status = 'Parked'`, [task.issue_id,
+            missingOutcome ? 'Sol-low diagnosis response omitted an explicit outcome'
+              : invalidAlreadyFixed ? 'runtime_evidence_unverified'
+              : invalidBlocked ? 'genuinely_blocked response omitted a named blocker'
+              : invalidDuplicate ? 'duplicate response did not resolve a same-workspace duplicate_of target'
+              : `Sol-low diagnosis: ${blocker}`]);
+      }
+      await client.query(
+        `UPDATE agent_task_queue
+            SET context = COALESCE(context, '{}'::jsonb) || '{"diagnosis_processed":true}'::jsonb
+          WHERE id = $1`, [task.id]);
+      await client.query('COMMIT');
+      if (outcome === 'fixable') {
+        const response = await postToRelay({ issue_id: task.issue_id, to_stage: 'Queue', agent_token: RELAY_AGENT_SECRET });
+        if (!response.ok) {
+          // Keep the diagnosis retryable when the bridge is unavailable; the
+          // release marker is harmless and the bridge consumes it once.
+          await client.query(
+            `UPDATE agent_task_queue
+                SET context = context - 'diagnosis_processed'
+              WHERE id = $1`, [task.id]);
+        }
+        console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: fixable -> Queue; relay=${response.status}`);
+      } else {
+        console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome}`);
+      }
+    }
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error(`${LOG_PREFIX} [diagnosis] DB error: ${err.message}`);
+  } finally {
+    client.release();
+  }
+}
+
 console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
 setInterval(findAndAdvanceTasks, 15000);
 setInterval(findAndAdvanceRegistered, 20000);
 setInterval(recoveryAdvanceTasks, 120000);
 setInterval(cleanupStalePendingRows, 300000);
 setInterval(requeueStrandedTasks, 60000);
+setInterval(processParkedDiagnoses, 30000);
 findAndAdvanceTasks().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
 findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
 cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
+processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
