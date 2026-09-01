@@ -36,14 +36,18 @@ async function reserveRecovery(client, issueId, failedTaskId, verify = verifyRun
   const candidate = await client.query(
     `SELECT i.id, d.id AS diagnosis_id, d.result AS diagnosis_result
        FROM issue i JOIN agent_task_queue failed ON failed.id = $2::uuid AND failed.issue_id = i.id
+       JOIN agent_task_queue original ON original.id = (failed.context->>'requeue_of_task')::uuid AND original.issue_id = i.id
        JOIN agent a ON a.id = failed.agent_id AND a.workspace_id = i.workspace_id
        JOIN relay_stage_config cfg ON cfg.workspace_id = i.workspace_id AND cfg.stage_name = 'In Progress' AND cfg.next_stage = 'In Review' AND cfg.agent_id = failed.agent_id
        JOIN LATERAL (SELECT id, result FROM agent_task_queue d WHERE d.issue_id = i.id AND d.status = 'completed' AND d.context->>'kind' = 'parked_diagnosis' AND d.context->>'evidence_correction_retry' = 'true' ORDER BY d.completed_at DESC NULLS LAST, d.created_at DESC, d.id DESC LIMIT 1) d ON true
       WHERE i.id = $1::uuid AND i.status = 'Parked'
-        AND failed.context->>'from_stage' = 'Parked' AND failed.context->>'to_stage' = 'In Review'
+        AND failed.context->>'source' = 'relay-requeue' AND failed.context->>'from_stage' = 'In Progress' AND failed.context->>'to_stage' = 'In Review' AND failed.context->>'dead_task_reason' = 'operator_orphan_repair'
         AND failed.status = 'failed' AND failed.failure_reason = 'cancelled' AND failed.started_at IS NOT NULL AND failed.completed_at IS NOT NULL
+        AND original.context->>'from_stage' = 'Parked' AND original.context->>'to_stage' = 'In Review'
+        AND original.status = 'failed' AND original.started_at IS NULL AND original.failure_reason = 'operator_orphan_repair'
         AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol' AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
         AND NOT EXISTS (SELECT 1 FROM task_usage u WHERE u.task_id = failed.id)
+        AND NOT EXISTS (SELECT 1 FROM task_usage original_usage WHERE original_usage.task_id = original.id)
         AND NOT EXISTS (SELECT 1 FROM agent_task_queue live WHERE live.issue_id = i.id AND live.context->>'to_stage' = 'In Review' AND live.status IN ('queued','dispatched','running','waiting_local_directory','deferred'))
       FOR UPDATE OF i, failed, d`, [issueId, failedTaskId]);
   const row = candidate.rows[0]; if (!row) return null;
