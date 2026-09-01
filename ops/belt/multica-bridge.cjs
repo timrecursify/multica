@@ -181,7 +181,7 @@ function validateRelayVerdict(payload) {
 
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
   const result = await client.query(
-    `SELECT t.id, t.agent_id, t.context, t.result, a.name AS agent_name
+    `SELECT t.id, t.agent_id, t.status, t.context, t.result, a.name AS agent_name
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
@@ -194,6 +194,103 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
     [issueId, workspaceId]
   );
   return result.rows[0] || null;
+}
+
+function taskResultText(result) {
+  if (result == null) return "";
+  if (typeof result === "string") {
+    try { result = JSON.parse(result); } catch { return result; }
+  }
+  if (!result || typeof result !== "object") return "";
+  return [result.output, result.comment, result.error]
+    .filter((value) => typeof value === "string").join("\n");
+}
+
+function isNoArtifactQcBlock(text) {
+  if (typeof text !== "string" || !/^\s*QC[- ]BLOCKED\b/im.test(text)) return false;
+  if (/^\s*QC\s+VERDICT\s*:\s*(?:PASS|FAIL)\b/im.test(text) || /QC_EVIDENCE_JSON=/m.test(text)) return false;
+  if (PR_URL_RE.test(text) || /\b[0-9a-f]{40}\b/i.test(text)) return false;
+  return /\bNO-SHA\b/i.test(text) ||
+    /\bno\s+(?:(?:implementation|bound|reviewable)\s+)?SHA\b/i.test(text) ||
+    /\bno\s+(?:linked\s+)?PR\b/i.test(text) ||
+    /\bno\s+immutable\s+tracked-tree\s+artifact\b/i.test(text);
+}
+
+function operatorRescopeIssueId(explicitIssueId, reason) {
+  if (explicitIssueId != null) return String(explicitIssueId);
+  const match = String(reason || "").match(
+    /^RETURN:Spec — QC-BLOCKED NO-SHA operator re-scope ([0-9a-f-]+)$/i
+  );
+  return match?.[1] || null;
+}
+
+async function issueImplementationArtifact(client, issueId) {
+  const result = await client.query(
+    `SELECT
+       EXISTS (SELECT 1 FROM qc_verdict WHERE issue_id = $1) AS has_qc_verdict,
+       EXISTS (
+         SELECT 1 FROM agent_task_queue
+          WHERE issue_id = $1 AND status = 'completed'
+            AND context->>'to_stage' = 'Queue'
+            AND (
+              NULLIF(BTRIM(COALESCE(result->>'work_product', '')), '') IS NOT NULL
+              OR result::text ~* 'https?://github\\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/pull/[0-9]+'
+              OR result::text ~* '"(implementation_sha|bound_sha|observed_sha)"[^0-9a-f]{0,32}[0-9a-f]{40}'
+            )
+       ) AS has_builder_artifact,
+       EXISTS (
+         SELECT 1 FROM comment
+          WHERE issue_id = $1 AND (
+            content ~* 'https?://github\\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/pull/[0-9]+'
+            OR content ~* '(^|[\r\n])[[:space:]*-]*(implementation[_ ]sha|bound[_ ]sha|observed[_ ]sha)[[:space:]]*[:=][[:space:]]*[0-9a-f]{40}'
+          )
+       ) AS has_comment_artifact`, [issueId]);
+  const row = result.rows[0] || {};
+  return Boolean(row.has_qc_verdict || row.has_builder_artifact || row.has_comment_artifact);
+}
+
+async function noArtifactRescopeAdmission(client, issue, toStage, operatorIssueId) {
+  if (toStage !== "Spec" || !["In Review", "Human Review"].includes(issue.status)) return false;
+  if (!UUID_RE.test(String(operatorIssueId || "")) ||
+      String(operatorIssueId).toLowerCase() !== String(issue.id).toLowerCase()) return false;
+  if (issue.metadata?.no_artifact_rescope_consumed_at) return false;
+  const task = await latestCompletedSolLowQcTask(client, issue.id, issue.workspace_id);
+  if (!task || task.status !== "completed" || !isNoArtifactQcBlock(taskResultText(task.result))) return false;
+  return !await issueImplementationArtifact(client, issue.id);
+}
+
+async function consumeNoArtifactRescope(client, issue) {
+  const consumed = await client.query(
+    `UPDATE issue
+        SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                                 '{no_artifact_rescope_consumed_at}', to_jsonb(NOW()), true),
+            updated_at = NOW()
+      WHERE id = $1::uuid AND status IN ('In Review', 'Human Review')
+        AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'no_artifact_rescope_consumed_at')
+      RETURNING id`, [issue.id]);
+  return consumed.rowCount === 1;
+}
+
+async function latestQcNoArtifactSignal(client, issue) {
+  const latest = await client.query(
+    `SELECT t.result, c.content
+       FROM agent_task_queue t
+       JOIN agent a ON a.id = t.agent_id AND a.workspace_id = t.workspace_id
+       LEFT JOIN LATERAL (
+         SELECT content FROM comment
+          WHERE issue_id = t.issue_id AND author_type = 'agent' AND author_id = t.agent_id
+            AND created_at >= t.created_at
+          ORDER BY created_at DESC, id DESC LIMIT 1
+       ) c ON true
+      WHERE t.issue_id = $1 AND t.workspace_id = $2
+        AND t.context->>'to_stage' = 'In Review'
+        AND t.status IN ('queued','dispatched','running','waiting_local_directory','deferred','completed')
+        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id]);
+  const row = latest.rows[0];
+  return Boolean(row && (isNoArtifactQcBlock(taskResultText(row.result)) ||
+    isNoArtifactQcBlock(row.content)));
 }
 
 function qcTaskEvidenceMismatch(task, payload) {
@@ -800,7 +897,8 @@ async function relayVerdict(req, res, payload) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit } = body;
+    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
+      operator_rescope_issue_id } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -845,6 +943,26 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    const noArtifactRescope = await noArtifactRescopeAdmission(
+      client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
+    );
+    if (issue.status === "In Review" && to_stage === "Human Review" &&
+        await latestQcNoArtifactSignal(client, issue)) {
+      await client.query("ROLLBACK");
+      console.warn(JSON.stringify({
+        event: "relay_advance_rejected",
+        reason: "technical_human_review_forbidden",
+        issue_id: issue.id,
+        from_stage: issue.status,
+        to_stage
+      }));
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "technical_human_review_forbidden",
+        message: "QC-BLOCKED NO-SHA work must be re-scoped by Sol-low; Human Review is money-only"
+      }));
+      return;
+    }
     const targetStageResult = await client.query(
       "SELECT stage_name FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
       [issue.workspace_id, to_stage]
@@ -926,7 +1044,8 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    if (!parkedRelease && !parkedEvidenceQcRelease && !parkedDiagnosisDone && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
+    if (!parkedRelease && !parkedEvidenceQcRelease && !parkedDiagnosisDone &&
+        !noArtifactRescope && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
@@ -1174,7 +1293,7 @@ async function relayAdvance(req, res, body) {
       const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
         client, issue, to_stage, reason, parkedEvidenceQcRelease
       );
-      if (!cycle.ok && !cicdReturn && !parkedQcRecovery) {
+      if (!cycle.ok && !cicdReturn && !parkedQcRecovery && !noArtifactRescope) {
         const moved = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
           target_stage: to_stage, historical_tasks: history.rows[0]?.n || 0,
           ceiling: cycle.ceiling
@@ -1209,7 +1328,7 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !cicdReturn) {
+      if (!lifetime.ok && !cicdReturn && !noArtifactRescope) {
         const moved = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
           target_stage: to_stage, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
           ceiling: lifetime.ceiling
@@ -1278,6 +1397,9 @@ async function relayAdvance(req, res, body) {
         client, issue.id, cicdReturnCapBypass
       )) {
         throw new Error(`CI/CD return authorization already consumed: ${issue.id}`);
+      }
+      if (noArtifactRescope && !await consumeNoArtifactRescope(client, issue)) {
+        throw new Error(`no-artifact re-scope authorization already consumed: ${issue.id}`);
       }
     }
 
@@ -1349,6 +1471,10 @@ async function relayAdvance(req, res, body) {
         to_stage,
         agent_name: stage.agent_name,
         ...(cicdReturn ? { return_reason: reason } : {}),
+        ...(noArtifactRescope ? {
+          rescope_reason: "qc_blocked_no_artifact",
+          operator_rescope_issue_id: issue.id
+        } : {}),
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
@@ -1484,5 +1610,12 @@ module.exports = {
   authorizeCicdReturnCapBypass,
   selectStageOwner,
   applyDisposition,
-  consumeParkedQcRecovery
+  consumeParkedQcRecovery,
+  taskResultText,
+  isNoArtifactQcBlock,
+  operatorRescopeIssueId,
+  issueImplementationArtifact,
+  noArtifactRescopeAdmission,
+  consumeNoArtifactRescope,
+  latestQcNoArtifactSignal
 };
