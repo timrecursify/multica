@@ -20,6 +20,7 @@ const RESULT_MARKERS = [
   [/^\s*(?:SPEC|BUILD)[- ]BLOCKED\b(?:\s*[:—-]|\s*$)/im, 'completion_blocked'],
   [/^\s*BLOCKED(?:\s+ON\s+VERIFICATION)?\b(?:\s*[:—-]|\s*$)/im, 'completion_blocked'],
   [/^\s*QC\s+VERDICT\s*:\s*(?:FAIL|FAILED)\b/im, 'completion_failed'],
+  [/^\s*FAIL(?:ED)?\s*(?:[:—-]\s*|\s*$)/im, 'completion_failed'],
   [/^\s*(?:RESULT|OUTCOME)\s*:\s*(?:FAIL|FAILED|BLOCKED)\b/im, 'completion_failed']
 ];
 

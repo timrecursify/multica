@@ -25,6 +25,7 @@ test('holds QC-BLOCKED completion evidence', () => {
 test('holds explicit FAIL completion evidence', () => {
   assert.equal(completionAdmission({ output: 'QC VERDICT: FAIL\nMissing required fixture.' }).reason,
     'completion_failed');
+  assert.equal(completionAdmission({ output: 'FAIL' }).reason, 'completion_failed');
 });
 
 test('holds missing result and explicit no-work-product result', () => {
