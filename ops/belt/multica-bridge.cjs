@@ -646,7 +646,7 @@ async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
             AND atq.status IN ('queued','dispatched','running','waiting_local_directory','deferred')
        ) active ON true
       WHERE p.workspace_id = $1 AND p.stage_name = $2 AND p.enabled = true
-      ORDER BY active_task_count, p.agent_id`, [workspaceId, ownerStage]);
+      ORDER BY active_task_count, p.agent_id`, [workspaceId, toStage]);
   if (result.rows.length === 0) return null;
   const eligible = result.rows.filter((row) => row.archived_at === null &&
     ["idle", "working"].includes(row.agent_status) && row.model === "gpt-5.6-sol" &&

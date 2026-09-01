@@ -187,6 +187,8 @@ test('scoper pool selects the least-loaded eligible Sol-low owner', async () => 
   assert.equal(owner.agent_id, 'agent-b');
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
   assert.match(calls[1].sql, /ORDER BY active_task_count, p.agent_id/);
+  assert.deepEqual(calls[0].values, ['workspace-1', 'Registered']);
+  assert.deepEqual(calls[1].values, ['workspace-1', 'Spec']);
 });
 
 test('configured scoper pool fails closed when no Sol-low owner is eligible', async () => {
