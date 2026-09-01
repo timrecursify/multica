@@ -10,4 +10,13 @@ MULTICA_DAEMON_MAX_CONCURRENT_TASKS=bad MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS= MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces assert_invalid
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT=relative assert_invalid
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT= assert_invalid
+wrapper_fixture="$(mktemp)"
+trap 'rm -f -- "$wrapper_fixture"' EXIT
+printf '%s\n' '  --max-concurrent-tasks="$cap_raw"' >"$wrapper_fixture"
+wrapper_has_explicit_concurrency_flag "$wrapper_fixture"
+printf '%s\n' '  --max-concurrent-tasks=10' >"$wrapper_fixture"
+if wrapper_has_explicit_concurrency_flag "$wrapper_fixture"; then
+  echo 'hard-coded daemon concurrency flag unexpectedly accepted' >&2
+  exit 1
+fi
 echo 'belt config guard launch regression passed'
