@@ -21,14 +21,14 @@ async function recover(client, issueId) {
   const issue = await client.query(
     `SELECT i.id, i.workspace_id, i.priority FROM issue i
       WHERE i.id = $1::uuid AND i.status = 'In Review'
-        AND NOT EXISTS (SELECT 1 FROM task_usage u WHERE u.issue_id = i.id)
         AND NOT EXISTS (SELECT 1 FROM agent_task_queue live WHERE live.issue_id = i.id
           AND live.context->>'to_stage' = 'In Review'
           AND live.status IN ('queued','dispatched','running','waiting_local_directory','deferred'))
         AND EXISTS (SELECT 1 FROM agent_task_queue wrong WHERE wrong.issue_id = i.id
           AND wrong.context->>'from_stage' = 'Parked' AND wrong.context->>'to_stage' = 'In Review'
           AND wrong.status = 'failed' AND wrong.started_at IS NULL
-          AND wrong.failure_reason = 'operator_orphan_repair')
+          AND wrong.failure_reason = 'operator_orphan_repair'
+          AND NOT EXISTS (SELECT 1 FROM task_usage u WHERE u.task_id = wrong.id))
       FOR UPDATE`, [issueId]);
   const row = issue.rows[0];
   if (!row) return null;

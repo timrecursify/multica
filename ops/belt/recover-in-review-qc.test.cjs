@@ -14,7 +14,8 @@ test('requires exact UUID operator scope', () => {
 test('recovery admits the observed #1009/#23696 failed-orphan shape only', () => {
   const source = require('node:fs').readFileSync(require.resolve('./recover-in-review-qc.cjs'), 'utf8');
   assert.match(source, /i\.status = 'In Review'/);
-  assert.match(source, /task_usage/);
+  assert.match(source, /task_usage u WHERE u\.task_id = wrong\.id/);
+  assert.doesNotMatch(source, /task_usage u WHERE u\.issue_id = i\.id/);
   assert.match(source, /wrong\.status = 'failed' AND wrong\.started_at IS NULL/);
   assert.match(source, /wrong\.failure_reason = 'operator_orphan_repair'/);
   assert.match(source, /live\.status IN/);
