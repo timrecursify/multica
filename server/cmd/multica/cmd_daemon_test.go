@@ -1166,3 +1166,19 @@ func clearDaemonTaskEnv(t *testing.T) {
 		t.Setenv(key, "")
 	}
 }
+
+func TestDaemonStartGuardDistinguishesSupervisorPortFromTaskContext(t *testing.T) {
+	t.Chdir(t.TempDir())
+	clearDaemonTaskEnv(t)
+	t.Setenv("MULTICA_DAEMON_PORT", "20464")
+	if err := requireHumanLocalDaemonStart(); err != nil {
+		t.Fatalf("supervisor port rejected: %v", err)
+	}
+	t.Setenv("MULTICA_TASK_ID", "task-test")
+	if err := requireHumanLocalDaemonStart(); err == nil {
+		t.Fatal("managed child unexpectedly allowed daemon start")
+	}
+	if err := requireHumanLocalCommand("daemon stop"); err == nil {
+		t.Fatal("other daemon command guard weakened")
+	}
+}

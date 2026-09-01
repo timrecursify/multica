@@ -370,6 +370,13 @@ func requireHumanLocalCommand(command string) error {
 	return nil
 }
 
+func requireHumanLocalDaemonStart() error {
+	if inAgentExecutionContext() || hasDaemonTaskContextMarker() {
+		return fmt.Errorf("daemon start is not available inside a daemon-managed task")
+	}
+	return nil
+}
+
 func hasDaemonTaskContextMarker() bool {
 	return daemonTaskContextMarkerPath() != ""
 }
