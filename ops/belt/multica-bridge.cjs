@@ -109,6 +109,10 @@ const BACKWARD_LANE_OWNER_STAGE = Object.freeze({
 });
 
 function ownerStageForTransition(fromStage, toStage) {
+  // Parked is a disposition rather than a configured execution lane, so it is
+  // absent from stageOrder. A diagnosis-authorized no-spec release returns to
+  // Spec and must use the Registered scoper pool, never Parked's prior builder.
+  if (fromStage === "Parked" && toStage === "Spec") return "Registered";
   const stageOrder = ["Registered", "Spec", "Queue", "In Progress", "In Review", "Human Review", "CI/CD & Deploy"];
   const fromIndex = stageOrder.indexOf(fromStage);
   const toIndex = stageOrder.indexOf(toStage);

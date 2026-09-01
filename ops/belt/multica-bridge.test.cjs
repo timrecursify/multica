@@ -320,6 +320,7 @@ test('transition owner selection preserves forward lanes and routes backward bra
   assert.equal(ownerStageForTransition('CI/CD & Deploy', 'In Progress'), 'Queue');
   assert.equal(ownerStageForTransition('CI/CD & Deploy', 'Spec'), 'Registered');
   assert.equal(ownerStageForTransition('Queue', 'Spec'), 'Registered');
+  assert.equal(ownerStageForTransition('Parked', 'Spec'), 'Registered');
 });
 
 function transition() {
