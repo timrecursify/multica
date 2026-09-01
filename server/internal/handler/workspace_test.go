@@ -342,6 +342,12 @@ VALUES (date_trunc('hour', now()), $1, $2, $3, 'delete-test', 'workspace-rollup'
 `, wsID, rollupRuntimeID, rollupAgentID); err != nil {
 		t.Fatalf("create workspace dirty usage: %v", err)
 	}
+	if _, err := testPool.Exec(ctx, `
+INSERT INTO relay_stage_agent_pool (workspace_id, stage_name, agent_id)
+VALUES ($1, 'Spec', $2)
+`, wsID, agentID); err != nil {
+		t.Fatalf("create relay stage agent pool row: %v", err)
+	}
 
 	var runtimeProfileID string
 	if err := testPool.QueryRow(ctx, `
@@ -425,6 +431,7 @@ VALUES ($1, $2, gen_random_uuid(), 's3://workspace-delete/pending-object')
 	}
 
 	for _, table := range []string{
+		"relay_stage_agent_pool",
 		"task_usage_hourly_dirty",
 		"task_usage_hourly",
 		"runtime_profile",

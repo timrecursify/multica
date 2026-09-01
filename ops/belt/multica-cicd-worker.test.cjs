@@ -14,7 +14,10 @@ async function testFinishedRoutes() {
     relay: async (...args) => calls.push(args),
   });
   await worker.routeFinishedPR({ id: 'issue-1', number: 1 }, 'PR merged');
-  assert.deepStrictEqual(calls, [['issue-1', 'Parked']]);
+  assert.deepStrictEqual(calls, [[
+    'issue-1', 'In Progress', null,
+    'RETURN:In Progress — PR merged; latest QC is FAIL',
+  ]]);
   assert.match(queries[1].sql, /context->>'to_stage'='CI\/CD & Deploy'/);
 
   calls.length = 0;
@@ -32,7 +35,32 @@ async function testFinishedRoutes() {
     { repo: 'owner/repo', num: '7' },
     'red',
   );
-  assert.deepStrictEqual(calls, [['issue-3', 'Parked']]);
+  assert.deepStrictEqual(calls, [[
+    'issue-3', 'In Progress', null,
+    'RETURN:In Progress — owner/repo#7 ci=red for 3 consecutive polls',
+  ]]);
+
+  calls.length = 0;
+  await worker.escalateCi(
+    { id: 'issue-3', number: 3 },
+    { repo: 'owner/repo', num: '7' },
+    'mixed',
+  );
+  assert.deepStrictEqual(calls, [[
+    'issue-3', 'In Progress', null,
+    'RETURN:In Progress — owner/repo#7 ci=mixed for 3 consecutive polls',
+  ]]);
+
+  calls.length = 0;
+  await worker.escalateCi(
+    { id: 'issue-3', number: 3 },
+    { repo: 'owner/repo', num: '7' },
+    'pending',
+  );
+  assert.deepStrictEqual(calls, [[
+    'issue-3', 'In Progress', null,
+    'RETURN:In Progress — owner/repo#7 ci=pending for 3 consecutive polls',
+  ]]);
 
   calls.length = 0;
   await worker.returnToBuild(
@@ -52,7 +80,8 @@ function testConsecutiveFailures() {
   assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'red'), 1);
   assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'unknown'), 2);
   assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'mixed'), 3);
-  assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'pending'), 0);
+  assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'pending'), 4);
+  assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'no_checks'), 0);
   assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'red'), 1);
   assert.equal(worker.countCiFailure(issue, pr, 'sha-2', 'red'), 1);
 }
@@ -61,7 +90,7 @@ function testAbsentCi() {
   worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [] }) });
   const now = Date.parse('2026-09-01T14:30:00Z');
   assert.equal(worker.ciState('owner/repo', 'sha', '2026-09-01T14:00:00Z', now), 'absent');
-  assert.equal(worker.ciState('owner/repo', 'sha', '2026-09-01T14:20:00Z', now), 'pending');
+  assert.equal(worker.ciState('owner/repo', 'sha', '2026-09-01T14:20:00Z', now), 'no_checks');
   worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [
     { status: 'completed', conclusion: 'success' },
     { status: 'in_progress', conclusion: null },
