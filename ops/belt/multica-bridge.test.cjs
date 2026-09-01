@@ -37,7 +37,8 @@ const {
   verifiedRetryEscalation,
   retryEscalationSourceTask,
   authorizeRelayStatusWrites,
-  rerunParkedDiagnosis
+  rerunParkedDiagnosis,
+  isTerminalStage
 } = require('./multica-bridge.cjs');
 
 test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', async () => {
@@ -1066,10 +1067,33 @@ test('relay stage lookups bind configuration and owners to the issue workspace',
 
 test('terminal relay transitions are logged and Parked Done remains relay-only and PASS-gated', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /const terminalStages = new Set\(\["Done", "Cancelled", "Archived"\]\)/);
+  assert.equal(isTerminalStage('Done'), true);
+  assert.equal(isTerminalStage('Cancelled'), true);
+  assert.equal(isTerminalStage('Archived'), true);
   assert.match(source, /const parkedDiagnosisDone = issue\.status === "Parked" && to_stage === "Done"/);
   assert.match(source, /to_stage === "Done"/);
   assert.match(source, /work_product_mismatch/);
-  assert.match(source, /if \(terminalStages\.has\(to_stage\)\)/);
+  assert.match(source, /if \(isTerminalStage\(to_stage\)\)/);
   assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
+});
+
+test('Parked and In Review arrivals at Done return before task dispatch', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const terminalArrival = source.slice(source.indexOf('if (isTerminalStage(to_stage))'),
+    source.indexOf('// A bundled child'));
+  for (const fromStage of ['Parked', 'In Review']) {
+    assert.equal(isTerminalStage('Done'), true, `${fromStage} -> Done is terminal`);
+  }
+  assert.match(terminalArrival, /task_id: null/);
+  assert.match(terminalArrival, /relay_log_id: relayLogId/);
+  assert.match(terminalArrival, /return;/);
+  assert.doesNotMatch(terminalArrival, /replaceStageTask/);
+});
+
+test('relay automation cannot advance a terminal ticket', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const guard = source.slice(source.indexOf('const issue = issueResult.rows[0];'),
+    source.indexOf('const noArtifactRescope'));
+  assert.match(guard, /if \(isTerminalStage\(issue\.status\)\)/);
+  assert.match(guard, /terminal_stage_relay_exit_forbidden/);
 });

@@ -132,6 +132,15 @@ test('PASS replay without a verdict work-product MD5 is skipped', async () => {
   assert.ok(harness.logs.some((line) => line.includes('pass_without_md5')));
 });
 
+test('dispatch-on-exit closes terminal arrivals without a follow-on relay', async () => {
+  const terminal = { ...advanceRow(), to_stage: 'Done', next_stage: 'CI/CD & Deploy' };
+  const harness = advanceHarness(terminal);
+  await harness.run();
+  assert.deepEqual(harness.payloads, []);
+  assert.ok(harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'")));
+  assert.ok(harness.logs.some((line) => line.includes('TERMINAL:') && line.includes("stage='Done'")));
+});
+
 test('permanently mismatched evidence is held after the bounded retry limit', async () => {
   const harness = advanceHarness(advanceRow('QC result contains no bound SHA'));
   await harness.run();

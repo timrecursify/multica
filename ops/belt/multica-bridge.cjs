@@ -69,6 +69,11 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
+const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived"]);
+
+function isTerminalStage(stage) {
+  return TERMINAL_STAGES.has(stage);
+}
 
 async function verifiedParkedEvidenceRelease(client, issue, toStage, reason) {
   if (issue.status !== 'Parked' || toStage !== 'In Review' || issue.metadata?.parked_release_once !== true) return false;
@@ -1129,7 +1134,6 @@ async function relayAdvance(req, res, body) {
 
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
-    const terminalStages = new Set(["Done", "Cancelled", "Archived"]);
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -1146,6 +1150,19 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    // The relay credential is held by belt automation. A terminal ticket may
+    // be moved only by an explicit operator path that records its reason, not
+    // by this automated endpoint. In particular, do not let Done's optional
+    // CI/CD successor re-enter the belt.
+    if (isTerminalStage(issue.status)) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_relay_exit_forbidden",
+        message: "terminal tickets cannot be advanced by relay automation"
+      }));
+      return;
+    }
     const noArtifactRescope = await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
@@ -1203,7 +1220,7 @@ async function relayAdvance(req, res, body) {
       issue.metadata?.retry_escalation_at || null;
     if (issue.status === to_stage && !retryEscalation) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
-      const relayLogId = terminalStages.has(to_stage)
+      const relayLogId = isTerminalStage(to_stage)
         ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -1715,10 +1732,22 @@ async function relayAdvance(req, res, body) {
       });
     }
 
-    if (terminalStages.has(to_stage)) {
+    if (isTerminalStage(to_stage)) {
       relayLogId = await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
+      // A terminal arrival has no stage owner, task, or successor relay. Keep
+      // this return before every dispatch path so future owner configuration
+      // cannot accidentally put a completed ticket back on the belt.
+      await client.query("COMMIT");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        issue: result.rows[0],
+        task_id: null,
+        relay_log_id: relayLogId
+      }));
+      return;
     }
 
     // A bundled child must never be dispatched on its own. Its MEGA parent IS
@@ -1937,6 +1966,7 @@ module.exports = {
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
+  isTerminalStage,
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,

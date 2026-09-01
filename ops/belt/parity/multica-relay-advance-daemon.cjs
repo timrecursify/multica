@@ -22,6 +22,7 @@ const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
+const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
 const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
@@ -528,6 +529,14 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
 
     for (const row of result.rows) {
       try {
+        // A completed terminal arrival is a final ledger entry, not an exit
+        // trigger. This also neutralizes old rows created before the bridge
+        // stopped terminal-stage dispatch.
+        if (TERMINAL_STAGES.has(row.to_stage)) {
+          await markRelayLogCompletedById(client, row.log_id);
+          logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
+          continue;
+        }
         const completion = completionAdmission(row.task_result ??
           (row.task_error ? { error: row.task_error } : null));
         if (!completion.ok) {
