@@ -5327,7 +5327,9 @@ SELECT
   relay_stage_config.stage_name,
   COUNT(issue.id)::int AS ticket_count
 FROM relay_stage_config
-LEFT JOIN issue ON issue.status = relay_stage_config.stage_name
+LEFT JOIN issue ON issue.workspace_id = relay_stage_config.workspace_id
+  AND issue.status = relay_stage_config.stage_name
+WHERE relay_stage_config.workspace_id = $1
 GROUP BY relay_stage_config.id, relay_stage_config.stage_name
 ORDER BY relay_stage_config.id
 `
@@ -5339,8 +5341,8 @@ type ListWorkspaceStageCountsRow struct {
 
 // Current ticket totals by configured relay stage. Configured stages with no
 // tickets are retained as zero rows.
-func (q *Queries) ListWorkspaceStageCounts(ctx context.Context) ([]ListWorkspaceStageCountsRow, error) {
-	rows, err := q.db.Query(ctx, listWorkspaceStageCounts)
+func (q *Queries) ListWorkspaceStageCounts(ctx context.Context, workspaceID pgtype.UUID) ([]ListWorkspaceStageCountsRow, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceStageCounts, workspaceID)
 	if err != nil {
 		return nil, err
 	}
