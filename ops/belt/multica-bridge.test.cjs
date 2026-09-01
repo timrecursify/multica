@@ -93,6 +93,13 @@ test('lifetime rejection emits structured evidence', () => {
     /event: "relay_advance_rejected",\s+reason: lifetime\.reason,[\s\S]*disposition_applied: moved/);
 });
 
+test('parking records a reason and hands off one Sol-low diagnosis', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /recordParkAndQueueDiagnosis/);
+  assert.match(source, /disposition === 'Parked'/);
+});
+
 test('relay request maps snake-case stage into successor task input', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
