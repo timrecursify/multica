@@ -473,7 +473,15 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 		"(LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s OR EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s))",
 		phraseContainsParam, phraseContainsParam, wsParam, phraseContainsParam,
 	)
-	whereParts = append(whereParts, phraseMatch)
+	// For multi-word queries the all-terms predicate below logically includes
+	// a full-phrase match: a phrase containing every term necessarily satisfies
+	// every per-term condition. Keeping both predicates makes Postgres execute
+	// one additional correlated comment search across the workspace without
+	// changing the result set. Retain the phrase predicate only for the
+	// single-term path; phrase relevance is still preserved in ORDER BY.
+	if len(termContainsParams) <= 1 {
+		whereParts = append(whereParts, phraseMatch)
+	}
 
 	// Multi-word AND match (each term must appear somewhere). Same
 	// workspace_id-in-subquery contract as above.
