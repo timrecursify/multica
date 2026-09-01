@@ -61,7 +61,6 @@ function interleaveByWorkspace(rows) {
 async function inspect(client, issue) {
   const blocker = issue.metadata && typeof issue.metadata === 'object'
     ? issue.metadata.parked_blocker : null;
-  if (blocker) return { kind: 'skip', reason: 'named_parked_blocker' };
   const task = await client.query(
     `SELECT id, status FROM agent_task_queue
       WHERE issue_id = $1 AND context->>'kind' = $2
@@ -76,15 +75,19 @@ async function inspect(client, issue) {
         : status === 'cancelled' ? 'cancelled_parked_diagnosis'
           : (status == null || NONTERMINAL.includes(status)) ? 'nonterminal_parked_diagnosis'
             : 'existing_parked_diagnosis';
-    return { kind: 'skip',
-      reason,
-      status,
-      task_id: task.rows[0].id };
+    // Failed/cancelled diagnosis attempts are explicitly retryable. Completed
+    // and nonterminal attempts stay protected from duplicate dispatch.
+    if (status === 'failed' || status === 'cancelled') {
+      return { kind: 'eligible', has_reason_comment: true, retrying: reason, status,
+        prior_task_id: task.rows[0].id, previous_blocker: blocker };
+    }
+    return { kind: 'skip', reason, status, task_id: task.rows[0].id };
   }
   const comment = await client.query(
     `SELECT 1 FROM comment WHERE issue_id = $1
       AND content LIKE '<!-- multica-park-reason -->%' LIMIT 1`, [issue.id]);
-  return { kind: 'eligible', has_reason_comment: comment.rowCount > 0 };
+  return { kind: 'eligible', has_reason_comment: comment.rowCount > 0,
+    previous_blocker: blocker };
 }
 
 async function run(pool, options) {
@@ -100,10 +103,10 @@ async function run(pool, options) {
               ROW_NUMBER() OVER (PARTITION BY i.workspace_id ORDER BY i.id) AS workspace_rank
          FROM issue i
         WHERE i.status = 'Parked' ${where}
-          AND NOT (COALESCE(i.metadata, '{}'::jsonb) ? 'parked_blocker')
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue d
              WHERE d.issue_id = i.id AND d.context->>'kind' = ${kindParam}
+               AND COALESCE(LOWER(d.status), '') NOT IN ('failed', 'cancelled')
           )
      )
      SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata

@@ -64,18 +64,60 @@ function namedBlocker(text) {
 function isSolLowDiagnosisAgent(agent) {
   const cfg = agent && agent.runtime_config && typeof agent.runtime_config === 'object'
     ? agent.runtime_config : {};
+  const name = String((agent && agent.name) || '').toLowerCase();
   const model = String((agent && agent.model) || '').toLowerCase();
+  const instructions = String((agent && agent.instructions) || '').toLowerCase();
   const configuredModel = cfg.model == null ? model : String(cfg.model).toLowerCase();
-  const role = [agent && agent.name, cfg.role, cfg.lane, cfg.agent_role]
+  const configuredEffort = cfg.reasoning_effort == null
+    ? (/(?:^|-)sol-low(?:-|$)/.test(name) ? 'low' : '')
+    : String(cfg.reasoning_effort).toLowerCase();
+  const role = [name, cfg.role, cfg.lane, cfg.agent_role]
     .filter(Boolean).join(' ').toLowerCase();
   const solLowModel = model === 'gpt-5.6-sol' && configuredModel === 'gpt-5.6-sol' &&
-    cfg.reasoning_effort === 'low';
-  return solLowModel && /qc|scop|diagnos/.test(role) &&
+    configuredEffort === 'low';
+  // Parked diagnosis is deliberately a dedicated seat. Existing QC/spec seats
+  // are scoped to In Review/Spec and reject Parked tasks, which silently burns
+  // diagnosis calls without producing an actionable outcome.
+  const dedicatedParkedSeat = /^(?:gsp|ppp)-parked-diagnosis-sol-low(?:-|$)/.test(name);
+  const permitsParked = /\bparked\b/.test(instructions) &&
+    /diagnos/.test(instructions) &&
+    /(?:fixable|already[_ ]fixed|duplicate|genuinely[_ ]blocked)/.test(instructions);
+  return dedicatedParkedSeat && solLowModel && /diagnos/.test(role) && permitsParked &&
     cfg.parked_diagnosis !== false;
 }
 
 function isBuilderDispatchAllowed(context) {
   return !(context && context.no_builder === true);
+}
+
+// Prefer the original Spec owner when that owner is also explicitly admitted
+// to the Sol-low diagnosis lane. Attribution must never widen authority: an
+// ordinary scoper cannot receive a diagnosis task.
+function selectDiagnosisOwner(rows) {
+  const eligible = (rows || []).filter(isSolLowDiagnosisAgent);
+  return eligible.find((row) => row.is_original_scoper === true) || eligible[0] || null;
+}
+
+// Convert a validated diagnosis into one bounded state action. Keeping this
+// mapping explicit prevents a completed diagnosis from being treated as an
+// ordinary QC result (or from falling through to a builder dispatch).
+function diagnosisOutcomeAction({ outcome, evidenceVerified = false, duplicateIssueId = null,
+  blocker = null, missingOutcome = false, invalidAlreadyFixed = false,
+  invalidDuplicate = false, hasBindingSpec = true }) {
+  if (outcome === 'fixable') {
+    return { action: 'release', status: 'Parked', nextStage: hasBindingSpec ? 'Queue' : 'Spec' };
+  }
+  if (outcome === 'already_fixed' && evidenceVerified) return { action: 'close', status: 'Done' };
+  if (outcome === 'duplicate' && duplicateIssueId) {
+    return { action: 'close', status: 'Cancelled', duplicateIssueId };
+  }
+  const holdReason = missingOutcome ? 'Sol-low diagnosis response omitted an explicit outcome'
+    : invalidAlreadyFixed ? 'runtime_evidence_unverified'
+      : invalidDuplicate ? 'duplicate response did not resolve a same-workspace duplicate_of target'
+        : outcome === 'genuinely_blocked' && !blocker
+          ? 'genuinely_blocked response omitted a named blocker'
+          : `Sol-low diagnosis: ${blocker || outcome}`;
+  return { action: 'hold', status: 'Parked', blocker: holdReason };
 }
 
 async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = null) {
@@ -95,6 +137,16 @@ async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = 
   const values = kind === 'task' ? [id, issueId, excludeTaskId] : [id, issueId];
   const result = await client.query(queries[kind], values);
   return result.rowCount > 0;
+}
+
+async function currentPassWorkProductMD5(client, issueId) {
+  const result = await client.query(
+    `SELECT verdict, work_product_md5 FROM qc_verdict
+      WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issueId]);
+  const verdict = result.rows[0];
+  if (verdict?.verdict !== 'PASS' || typeof verdict.work_product_md5 !== 'string' ||
+      !verdict.work_product_md5.trim()) return null;
+  return verdict.work_product_md5;
 }
 
 async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
@@ -123,17 +175,22 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   // makes a repeated rejection idempotent without hiding the first diagnosis.
   if (!evidence.skip_reason_comment) await client.query(
     `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
-     SELECT $1, $2, 'system', $3, $4, 'system'
+     SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
       WHERE NOT EXISTS (
-        SELECT 1 FROM comment WHERE issue_id = $1 AND content LIKE $5
-          AND content LIKE $6
+        SELECT 1 FROM comment WHERE issue_id = $1::uuid AND content LIKE $5::text
+          AND content LIKE $6::text
       )`,
     [issue.id, issue.workspace_id, ZERO_UUID, content, `${PARK_REASON_MARKER}%`,
       `%reason_code: ${evidence.reason || evidence.reason_code || 'unknown'}%`]
   );
 
   const owner = await client.query(
-    `SELECT a.id, a.name, a.model, a.runtime_config, a.runtime_id
+    `SELECT a.id, a.name, a.model, a.runtime_config, a.runtime_id, a.instructions,
+             EXISTS (
+               SELECT 1 FROM agent_task_queue prior
+                WHERE prior.issue_id = $2::uuid AND prior.agent_id = a.id
+                  AND prior.context->>'to_stage' = 'Spec'
+             ) AS is_original_scoper
        FROM agent a
       WHERE a.workspace_id = $1 AND a.archived_at IS NULL
         AND a.status IN ('idle', 'working')
@@ -141,25 +198,25 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
              OR a.runtime_config::text ILIKE '%sol%')
       ORDER BY (a.status = 'idle') DESC, a.updated_at ASC
       LIMIT 20`,
-    [issue.workspace_id]
+    [issue.workspace_id, issue.id]
   );
-  const ownerRow = owner.rows.find(isSolLowDiagnosisAgent);
+  const ownerRow = selectDiagnosisOwner(owner.rows);
   if (!ownerRow) {
     const blocker = 'no_sol_low_diagnosis_owner';
     await client.query(
       `UPDATE issue
           SET metadata = COALESCE(metadata, '{}'::jsonb) ||
-                jsonb_build_object('parked_blocker', $2),
+                jsonb_build_object('parked_blocker', $2::text),
               updated_at = NOW()
-        WHERE id = $1 AND status = 'Parked'`,
+        WHERE id = $1::uuid AND status = 'Parked'`,
       [issue.id, blocker]
     );
     await client.query(
       `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
-       SELECT $1, $2, 'system', $3, $4, 'system'
+       SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
         WHERE NOT EXISTS (
           SELECT 1 FROM comment
-           WHERE issue_id = $1 AND content LIKE $5
+           WHERE issue_id = $1::uuid AND content LIKE $5::text
         )`,
       [issue.id, issue.workspace_id, ZERO_UUID,
         `${PARK_BLOCKER_MARKER}\nparked_diagnosis_blocker: ${blocker}\n` +
@@ -170,24 +227,36 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
       workspace_id: issue.workspace_id, blocker }));
     return null;
   }
-  const context = diagnosisContext({ reason: evidence.reason || evidence.reason_code,
-    stage: issue.status, attempts, ceiling: evidence.ceiling });
+  // A previous no-owner hold is temporary once a qualifying diagnosis seat is
+  // available. Keep genuinely-blocked tickets protected by their completed
+  // diagnosis task, not by a stale metadata flag.
+  await client.query(
+    `UPDATE issue
+        SET metadata = COALESCE(metadata, '{}'::jsonb) - 'parked_blocker',
+            updated_at = NOW()
+      WHERE id = $1::uuid AND status = 'Parked'`, [issue.id]);
+  const context = {
+    ...diagnosisContext({ reason: evidence.reason || evidence.reason_code,
+      stage: issue.status, attempts, ceiling: evidence.ceiling }),
+    owner_selection: ownerRow.is_original_scoper === true ? 'original_scoper' : 'dedicated_sol_low'
+  };
   const task = await client.query(
     `INSERT INTO agent_task_queue (
-       agent_id, issue_id, status, priority, runtime_id, context,
+       agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
        trigger_summary, force_fresh_session, originator_source,
        trigger_evidence_kind, attempt, max_attempts
      )
-     SELECT $1, $2, 'queued', $3, $4, $5::jsonb,
+     SELECT $1::uuid, $2::uuid, $3::uuid, 'queued', $4::integer, $5::uuid, $6::jsonb,
             'Sol-low parked-ticket diagnosis (no builder dispatch)', TRUE,
             'unattributed', 'relay_disposition', 1, 1
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue
-        WHERE issue_id = $2 AND context->>'kind' = $6
+        WHERE issue_id = $2::uuid AND context->>'kind' = $7::text
+          AND COALESCE(LOWER(status), '') NOT IN ('failed', 'cancelled')
       )
       ON CONFLICT DO NOTHING
       RETURNING id`,
-    [ownerRow.id, issue.id,
+    [ownerRow.id, issue.id, issue.workspace_id,
       PRIORITY[String(issue.priority || 'none').toLowerCase()] ?? (Number(issue.priority) || 0),
       ownerRow.runtime_id,
       JSON.stringify(context), PARK_DIAGNOSIS_KIND]
@@ -204,8 +273,11 @@ module.exports = {
   diagnosisEvidence,
   formatParkReason,
   isBuilderDispatchAllowed,
+  diagnosisOutcomeAction,
   isConcreteRuntimeEvidence,
   isSolLowDiagnosisAgent,
+  selectDiagnosisOwner,
+  currentPassWorkProductMD5,
   namedBlocker,
   parseDiagnosisOutcome,
   recordParkAndQueueDiagnosis,
