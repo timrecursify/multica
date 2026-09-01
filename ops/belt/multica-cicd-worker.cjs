@@ -29,7 +29,6 @@ const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
 const ciFailureCounts = new Map();
-const deployWaitCounts = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -88,9 +87,12 @@ async function park(issue, reason) {
 }
 
 async function deployPending(issue, reason) {
-  const key = issue.id;
-  const count = (deployWaitCounts.get(key) || 0) + 1;
-  deployWaitCounts.set(key, count);
+  // Stored on issue.metadata so a daemon restart cannot reset the ceiling.
+  const saved = await pool.query(
+    `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+       'cicd_deploy_wait_polls', (COALESCE(metadata->>'cicd_deploy_wait_polls', '0')::int + 1)::text), updated_at=NOW()
+     WHERE id=$1 RETURNING metadata->>'cicd_deploy_wait_polls' AS count`, [issue.id]);
+  const count = Number(saved.rows[0]?.count || 0);
   if (count >= CI_FAILURE_POLLS) return park(issue, `${reason}; deploy evidence retry ceiling ${CI_FAILURE_POLLS}`);
   await pool.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
     VALUES ($1, $2, 'agent', $3, $4, 'comment')`, [issue.id, issue.workspace_id, BOT, `${reason}; retry ${count}/${CI_FAILURE_POLLS}`]);
@@ -214,7 +216,7 @@ async function mirrorVerdictToPR(issue, pr, headSha) {
 
 async function sweep() {
   const { rows } = await pool.query(
-    `SELECT id, number, title, workspace_id FROM issue WHERE status='CI/CD & Deploy' ORDER BY number`);
+    `SELECT id, number, title, workspace_id, metadata FROM issue WHERE status='CI/CD & Deploy' ORDER BY number`);
   if (!rows.length) { log('[poll] CI/CD & Deploy is empty'); return; }
   log(`[poll] ${rows.length} ticket(s) in CI/CD & Deploy`);
   for (const issue of rows) {

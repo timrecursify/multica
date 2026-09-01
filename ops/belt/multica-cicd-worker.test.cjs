@@ -107,13 +107,19 @@ function testHumanReviewIsNotDispatchable() {
 
 async function testCompletionAdmission() {
   const calls = [];
+  const retries = new Map();
   let issue = { id: 'closed', number: 11, workspace_id: 'gsp' };
   const setup = (content, state, deployed = false) => worker.setTestDependencies({
-    pool: { query: async (sql) => {
+    pool: { query: async (sql, params) => {
       if (sql.includes("FROM issue WHERE status")) return { rows: [issue] };
       if (sql.includes('FROM comment')) return { rows: [{ content }] };
       if (sql.includes('FROM qc_verdict')) return { rows: [{ verdict: 'PASS', work_product_md5: 'md5' }] };
       if (sql.includes('relay_stage_config')) return { rows: [] };
+      if (sql.includes('cicd_deploy_wait_polls')) {
+        const count = (retries.get(params[0]) || 0) + 1;
+        retries.set(params[0], count);
+        return { rows: [{ count: String(count) }] };
+      }
       return { rows: [] };
     } }, relay: async (...args) => calls.push(args),
     gh: () => JSON.stringify({ state, mergeable: 'MERGEABLE', headRefOid: 'head', createdAt: '2026-09-01T00:00:00Z', mergedAt: '2026-09-01T01:00:00Z', mergeCommit: { oid: 'merge' } }),

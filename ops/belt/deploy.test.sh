@@ -23,6 +23,7 @@ declare -a files=(
   "gsp-multica/parity/multica-relay-advance-daemon.cjs"
   "gsp-multica/parity/relay-dead-rows.cjs"
   "multica-cicd-worker.cjs"
+  "cicd-deploy-evidence.cjs"
   "multica-archiver.cjs"
   "tools/belt-config-guard.sh"
   "gsp-multica/fleet/multica-daemon-wrapper.sh"

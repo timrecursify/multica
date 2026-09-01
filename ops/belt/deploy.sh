@@ -221,6 +221,14 @@ for index in "${!sources[@]}"; do
 done
 
 trap - ERR
+if [[ "$mode" == apply ]]; then
+  receipt_dir="$runtime_root/gsp-multica/deploy-receipts"
+  mkdir -p -- "$receipt_dir"
+  source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
+  receipt="$receipt_dir/belt-${timestamp}.json"
+  printf '{"repo":"timrecursify/multica","source_sha":"%s"}\n' "$source_sha" > "$receipt"
+  printf 'Receipt: %s\n' "$receipt"
+fi
 printf 'No processes were restarted.\n'
 if [[ "$mode" == apply ]]; then
   printf 'Rollback receipt: %s --rollback %s' "$0" "$timestamp"
