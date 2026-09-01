@@ -27,6 +27,7 @@ use a `current`/`latest` symlink or a source checkout as the daemon binary.
 export MULTICA_RELEASE_DIR="/opt/multica/releases/$SHA"
 export MULTICA_DAEMON_BIN="$MULTICA_RELEASE_DIR/multica"
 export MULTICA_SERVER_URL="https://multica.ai"
+cd "$MULTICA_RELEASE_DIR"
 multica login --profile ppp-prod-codex
 ops/ppp/install-multica-daemon-ppp.sh
 ops/ppp/install-multica-daemon-ppp.sh --check
