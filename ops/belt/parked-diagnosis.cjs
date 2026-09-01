@@ -62,12 +62,12 @@ function namedBlocker(text) {
 function isSolLowDiagnosisAgent(agent) {
   const cfg = agent && agent.runtime_config && typeof agent.runtime_config === 'object'
     ? agent.runtime_config : {};
-  const model = [agent && agent.model, cfg.model, cfg.model_alias, cfg.model_name]
-    .filter(Boolean).join(' ').toLowerCase();
+  const model = String((agent && agent.model) || '').toLowerCase();
+  const configuredModel = cfg.model == null ? model : String(cfg.model).toLowerCase();
   const role = [agent && agent.name, cfg.role, cfg.lane, cfg.agent_role]
     .filter(Boolean).join(' ').toLowerCase();
-  const solLowModel = /sol[-_ ]?low/.test(model) ||
-    (/gpt-5\.5/.test(model) && (cfg.reasoning_effort === 'low' || cfg.tier === 'low'));
+  const solLowModel = model === 'gpt-5.6-sol' && configuredModel === 'gpt-5.6-sol' &&
+    cfg.reasoning_effort === 'low';
   return solLowModel && /qc|scop|diagnos/.test(role) &&
     cfg.parked_diagnosis !== false;
 }
@@ -76,11 +76,34 @@ function isBuilderDispatchAllowed(context) {
   return !(context && context.no_builder === true);
 }
 
+async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = null) {
+  const text = String(evidence || '').trim();
+  const match = text.match(/\b(task|qc|activity):([0-9a-f-]{8,})\b/i);
+  if (!match) return false;
+  const kind = match[1].toLowerCase();
+  const id = match[2];
+  const queries = {
+    task: `SELECT 1 FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id
+             WHERE t.id = $1 AND t.issue_id = $2 AND t.id IS DISTINCT FROM $3
+               AND t.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'
+               AND t.status IN ('completed','failed','cancelled')`,
+    qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1 AND v.issue_id = $2`,
+    activity: `SELECT 1 FROM activity_log WHERE id = $1 AND issue_id = $2`
+  };
+  const values = kind === 'task' ? [id, issueId, excludeTaskId] : [id, issueId];
+  const result = await client.query(queries[kind], values);
+  return result.rowCount > 0;
+}
+
 async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   const attempts = evidence.historical_tasks ?? evidence.rejection_count ?? evidence.attempt_count;
   const history = await client.query(
     `SELECT failure_reason, error FROM agent_task_queue
-      WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]);
+      WHERE issue_id = $1
+        AND status IN ('failed', 'cancelled', 'completed')
+        AND (failure_reason IS NOT NULL OR error IS NOT NULL)
+        AND failure_reason IS DISTINCT FROM 'relay_stage_transition_superseded'
+      ORDER BY created_at DESC LIMIT 1`, [issue.id]);
   const verdict = await client.query(
     `SELECT verdict FROM qc_verdict WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]);
   const lastError = evidence.last_error || evidence.failure_reason || evidence.error ||
@@ -162,5 +185,6 @@ module.exports = {
   isSolLowDiagnosisAgent,
   namedBlocker,
   parseDiagnosisOutcome,
-  recordParkAndQueueDiagnosis
+  recordParkAndQueueDiagnosis,
+  verifyRuntimeEvidence
 };
