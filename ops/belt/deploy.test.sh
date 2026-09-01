@@ -52,6 +52,7 @@ grep -q 'Would copy .*/parked-diagnosis.cjs to .*/gsp-multica/parked-diagnosis.c
 grep -q 'Would copy .*/parked-entry-audit.cjs to .*/gsp-multica/parked-entry-audit.cjs' "$dry_log"
 grep -q 'Would copy .*/parity/relay-dead-rows.cjs to .*/gsp-multica/parity/relay-dead-rows.cjs' "$dry_log"
 grep -q 'parity/relay-dead-rows.cjs' "$root_dir/verify.sh"
+grep -q 'Would copy .*/cicd-deploy-evidence.cjs to .*/cicd-deploy-evidence.cjs' "$dry_log"
 
 # Remove the dependency from a disposable manifest copy. Validation must fail
 # before copy, proving the deploy cannot restart with an incomplete runtime.
@@ -87,6 +88,8 @@ done
 
 apply_log="$tmp_dir/apply.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$apply_log"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" >"$tmp_dir/verify.log"
+grep -q "Match: $tmp_dir/cicd-deploy-evidence.cjs" "$tmp_dir/verify.log"
 receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$apply_log")"
 [[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" >/dev/null
@@ -94,6 +97,7 @@ BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" 
 [[ ! -e "$tmp_dir/gsp-multica/parked-diagnosis.cjs" ]] || { echo 'rollback did not remove parked diagnosis target' >&2; exit 1; }
 [[ ! -e "$tmp_dir/gsp-multica/parked-entry-audit.cjs" ]] || { echo 'rollback did not remove parked entry audit target' >&2; exit 1; }
 [[ ! -e "$tmp_dir/gsp-multica/parity/relay-dead-rows.cjs" ]] || { echo 'rollback did not remove relay dead rows target' >&2; exit 1; }
+[[ ! -e "$tmp_dir/cicd-deploy-evidence.cjs" ]] || { echo 'rollback did not remove deploy evidence target' >&2; exit 1; }
 [[ ! -e "$tmp_dir/gsp-multica/relay-completion-admission.cjs" ]] || { echo 'rollback did not remove completion admission target' >&2; exit 1; }
 
 before_bridge="$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")"

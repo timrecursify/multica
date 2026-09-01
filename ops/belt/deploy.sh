@@ -122,10 +122,11 @@ for index in "${!sources[@]}"; do
   selected "$index" || continue
   new_targets[$index]=0
   [[ "${targets[$index]}" == "$runtime_root/gsp-multica/guardrails.cjs" ||
-     "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ||
-     "${targets[$index]}" == "$runtime_root/gsp-multica/parked-entry-audit.cjs" ||
-     "${targets[$index]}" == "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs" ||
-     "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
+      "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/parked-entry-audit.cjs" ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs" ||
+      "${targets[$index]}" == "$runtime_root/cicd-deploy-evidence.cjs" ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
     invalid=1
