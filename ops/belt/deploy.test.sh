@@ -13,7 +13,7 @@ grep -q 'readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-
 bash -n "$guard_source"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
-mkdir -p "$tmp_dir/gsp-multica/parity" "$tmp_dir/tools" "$tmp_dir/multica-doctrine"
+mkdir -p "$tmp_dir/gsp-multica/parity" "$tmp_dir/gsp-multica/fleet" "$tmp_dir/tools" "$tmp_dir/multica-doctrine"
 
 declare -a files=(
   "gsp-multica/multica-bridge.cjs"
@@ -21,6 +21,8 @@ declare -a files=(
   "gsp-multica/parity/multica-relay-advance-daemon.cjs"
   "multica-cicd-worker.cjs"
   "tools/belt-config-guard.sh"
+  "gsp-multica/fleet/multica-daemon-wrapper.sh"
+  "gsp-multica/fleet/ecosystem.gsp-belt.config.js"
   "tools/multica-bundle.py"
   "multica-doctrine/RUNBOOK_SPEC_WORKER.md"
   "multica-doctrine/RUNBOOK_BUILD_WORKER.md"
@@ -31,6 +33,7 @@ for rel in "${files[@]}"; do
   [[ "$rel" == gsp-multica/guardrails.cjs ]] && continue
   source_file="$root_dir/${rel##*/}"
   [[ "$rel" == gsp-multica/parity/* ]] && source_file="$root_dir/parity/${rel##*/}"
+  [[ "$rel" == gsp-multica/fleet/* ]] && source_file="$root_dir/${rel##*/}"
   target="$tmp_dir/$rel"
   cp -- "$source_file" "$target"
   printf 'original:%s\n' "$rel" >> "$tmp_dir/originals"
@@ -48,6 +51,7 @@ for rel in "${files[@]}"; do
   else
     source_file="$root_dir/${rel##*/}"
     [[ "$rel" == gsp-multica/parity/* ]] && source_file="$root_dir/parity/${rel##*/}"
+    [[ "$rel" == gsp-multica/fleet/* ]] && source_file="$root_dir/${rel##*/}"
     cmp -s -- "$source_file" "$target" || { echo "target not restored: $rel" >&2; exit 1; }
   fi
 done
