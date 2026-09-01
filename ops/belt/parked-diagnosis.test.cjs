@@ -14,6 +14,7 @@ const {
   recordParkAndQueueDiagnosis,
   diagnosisOutcomeAction,
   isSolLowDiagnosisAgent,
+  selectDiagnosisOwner,
   PARK_REASON_MARKER,
   PARK_DIAGNOSIS_KIND
 } = require('./parked-diagnosis.cjs');
@@ -56,6 +57,8 @@ test('validated Parked outcomes map to bounded state actions', () => {
     { action: 'hold', status: 'Parked', blocker: 'Sol-low diagnosis: billing' });
   assert.equal(diagnosisOutcomeAction({ outcome: 'fixable' }).action, 'release');
   assert.equal(diagnosisOutcomeAction({ outcome: 'fixable' }).status, 'Parked');
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'fixable', hasBindingSpec: false }),
+    { action: 'release', status: 'Parked', nextStage: 'Spec' });
 });
 
 test('diagnosis evidence and owner validation fail closed', () => {
@@ -73,6 +76,17 @@ test('diagnosis evidence and owner validation fail closed', () => {
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-build-terra-low-1', model: 'gpt-5.6-terra', runtime_config: { role: 'build' } }), false);
 });
 
+test('diagnosis prefers an attributable Sol-low scoper, then the dedicated seat', () => {
+  const instructions = 'Parked diagnosis: fixable, already_fixed, duplicate, genuinely_blocked.';
+  const dedicated = { id: 'dedicated', name: 'gsp-parked-diagnosis-sol-low-1',
+    model: 'gpt-5.6-sol', instructions,
+    runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } };
+  const scoper = { ...dedicated, id: 'scoper', is_original_scoper: true };
+  assert.equal(selectDiagnosisOwner([dedicated, scoper]).id, 'scoper');
+  assert.equal(selectDiagnosisOwner([dedicated, { ...scoper, model: 'gpt-5.6-terra' }]).id,
+    'dedicated');
+});
+
 test('diagnosis processing is workspace-scoped and serializes concurrent ticks', () => {
   const source = fs.readFileSync(require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /FOR UPDATE OF t SKIP LOCKED/);
@@ -81,6 +95,7 @@ test('diagnosis processing is workspace-scoped and serializes concurrent ticks',
   assert.match(source, /context->>'no_builder'/);
   assert.match(source, /diagnosisOutcomeAction\(\{ outcome/);
   assert.match(source, /action\.action === 'release'/);
+  assert.match(source, /hasBindingSpec\(client, task\.issue_id\)/);
   assert.match(source, /action\.action === 'close' \? action\.status : null/);
   assert.match(source, /current_work_product_md5: completionMD5/);
   assert.doesNotMatch(source, /UPDATE issue SET status = 'Done'/);
@@ -154,7 +169,8 @@ test('queued diagnosis task is scoped to the issue workspace', async () => {
     if (/SELECT a\.id, a\.name/.test(sql)) return { rows: [{
       id: 'agent-1', name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol',
       runtime_id: 'runtime-1', instructions: 'Parked diagnosis: fixable, already_fixed, duplicate, genuinely_blocked.',
-      runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' }
+      runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' },
+      is_original_scoper: false
     }] };
     if (/INSERT INTO agent_task_queue/.test(sql)) return { rows: [{ id: 'task-1' }] };
     return { rowCount: 0, rows: [] };
@@ -167,6 +183,7 @@ test('queued diagnosis task is scoped to the issue workspace', async () => {
   assert.ok(insert, 'diagnosis INSERT was executed');
   assert.match(insert.sql, /agent_id, issue_id, workspace_id, status/);
   assert.equal(insert.values[2], 'workspace-1');
+  assert.match(insert.values[5], /"owner_selection":"dedicated_sol_low"/);
 });
 
 test('INSERT SELECT parameters carry explicit PostgreSQL types', () => {

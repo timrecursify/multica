@@ -816,7 +816,7 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayStage(res, to_stage);
       return;
     }
-    const parkedRelease = issue.status === "Parked" && to_stage === "Queue" &&
+    const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
       issue.metadata?.parked_release_once === true;
     // Parked -> Done is reserved for the relay's already-fixed diagnosis
     // outcome. It still reaches the current PASS + work-product-hash gate
@@ -892,7 +892,7 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
     }
-    if (issue.status === "Parked" && to_stage === "Queue" && !parkedRelease) {
+    if (issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) && !parkedRelease) {
       await client.query("ROLLBACK");
       console.warn(JSON.stringify({
         event: "relay_advance_rejected", reason: "parked_release_required",
@@ -900,7 +900,7 @@ async function relayAdvance(req, res, body) {
       }));
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "parked_release_required",
-        message: "set parked_release_once metadata for one deliberate release" }));
+        message: "a completed Sol-low diagnosis must authorize one deliberate release" }));
       return;
     }
 
@@ -994,7 +994,12 @@ async function relayAdvance(req, res, body) {
     let bindingSpec = null;
     if (issue.workspace_id === SPEC_ENFORCED_WORKSPACE && to_stage === "Queue") {
       bindingSpec = await latestSpecComment(client, issue.id);
-      if (!bindingSpec) {
+      if (!bindingSpec && parkedRelease) {
+        // A diagnosis-approved release must never bounce a no-spec issue into
+        // Queue just to receive spec_required. Re-enter the scoper lane once;
+        // the existing release timestamp keeps this bounded from the new stage.
+        to_stage = "Spec";
+      } else if (!bindingSpec) {
         await client.query("ROLLBACK");
         console.warn(JSON.stringify({
           event: "relay_advance_rejected",
