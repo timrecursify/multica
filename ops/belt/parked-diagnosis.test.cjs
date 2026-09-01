@@ -82,6 +82,8 @@ test('diagnosis processing is workspace-scoped and serializes concurrent ticks',
   assert.match(source, /action\.status === 'Done'/);
   assert.match(source, /action\.status === 'Cancelled'/);
   assert.match(source, /action\.action === 'release'/);
+  assert.match(source, /SELECT \$1::uuid, \$2::uuid, 'system', \$3::uuid, \$4::text, 'system'/);
+  assert.match(source, /jsonb_build_object\('parked_blocker', \$2::text\)/);
 });
 
 test('runtime evidence must resolve to an issue-scoped durable row', async () => {

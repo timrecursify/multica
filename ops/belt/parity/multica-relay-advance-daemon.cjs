@@ -908,11 +908,11 @@ async function processParkedDiagnoses() {
       const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${missingOutcome ? 'blocker: diagnosis response omitted an explicit outcome.\n' : ''}${invalidAlreadyFixed ? 'blocker: already_fixed requires concrete runtime_evidence.\n' : ''}${invalidBlocked ? 'blocker: genuinely_blocked requires a named blocker.\n' : ''}${invalidDuplicate ? 'blocker: duplicate requires an existing same-workspace duplicate_of target.\n' : ''}${evidence ? `runtime_evidence: ${evidence}\n` : ''}${blocker ? `blocker: ${blocker}\n` : ''}${text.slice(0, 2000)}`;
       await client.query(
         `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
-         SELECT $1, $2, 'system', $3, $4, 'system'
+         SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
           WHERE NOT EXISTS (
-            SELECT 1 FROM comment WHERE issue_id = $1
+            SELECT 1 FROM comment WHERE issue_id = $1::uuid
               AND content LIKE '<!-- multica-diagnosis-outcome -->%'
-              AND content LIKE $5
+              AND content LIKE $5::text
           )`,
         [task.issue_id, task.workspace_id, '00000000-0000-0000-0000-000000000000',
           content, `%outcome: ${outcome}.%`]
@@ -932,13 +932,13 @@ async function processParkedDiagnoses() {
       } else if (action.action === 'close' && action.status === 'Cancelled') {
         await client.query(
           `UPDATE issue SET status = 'Cancelled',
-                  metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2),
+                  metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2::uuid),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id, duplicateIssueId]);
       } else {
         await client.query(
           `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
-                    jsonb_build_object('parked_blocker', $2),
+                    jsonb_build_object('parked_blocker', $2::text),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id,
             action.blocker]);
