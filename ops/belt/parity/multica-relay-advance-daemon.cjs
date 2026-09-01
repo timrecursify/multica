@@ -999,8 +999,14 @@ async function processParkedDiagnoses() {
          FROM agent_task_queue t
          JOIN issue i ON i.id = t.issue_id
         WHERE t.status = 'completed'
-          AND t.context->>'kind' = $1
-          AND COALESCE(t.context->>'diagnosis_processed', 'false') <> 'true'
+          AND t.context->>'kind' = $1::text
+          AND (
+            COALESCE(t.context->>'diagnosis_processed', 'false') <> 'true'
+            OR (t.context->>'evidence_correction_retry' = 'true'
+                AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
+                AND COALESCE(t.context->>'runtime_evidence_recovery_consumed', 'false') <> 'true'
+                AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
+          )
           AND i.workspace_id IS NOT NULL
         ORDER BY t.completed_at ASC
         LIMIT 25`, [PARK_DIAGNOSIS_KIND]);
@@ -1013,11 +1019,17 @@ async function processParkedDiagnoses() {
                 i.workspace_id, i.status, i.number
            FROM agent_task_queue t
            JOIN issue i ON i.id = t.issue_id
-          WHERE t.id = $1
-            AND t.context->>'kind' = $2
-            AND i.workspace_id = $3
+          WHERE t.id = $1::uuid
+            AND t.context->>'kind' = $2::text
+            AND i.workspace_id = $3::uuid
             AND t.status = 'completed'
-            AND COALESCE(t.context->>'diagnosis_processed', 'false') <> 'true'
+            AND (
+              COALESCE(t.context->>'diagnosis_processed', 'false') <> 'true'
+              OR (t.context->>'evidence_correction_retry' = 'true'
+                  AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
+                  AND COALESCE(t.context->>'runtime_evidence_recovery_consumed', 'false') <> 'true'
+                  AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
+            )
           FOR UPDATE OF t SKIP LOCKED`, [candidate.id, PARK_DIAGNOSIS_KIND, candidate.workspace_id]);
       if (locked.rows.length === 0) {
         await client.query('ROLLBACK');
@@ -1037,16 +1049,17 @@ async function processParkedDiagnoses() {
         ? await verifyRuntimeEvidence(client, task.issue_id, evidence, task.id) : false;
       const completionMD5 = outcome === 'already_fixed' && evidenceVerified
         ? await currentPassWorkProductMD5(client, task.issue_id) : null;
-      const invalidAlreadyFixed = outcome === 'already_fixed' && !completionMD5;
+      const invalidAlreadyFixed = outcome === 'already_fixed' && !evidenceVerified;
+      const needsQC = outcome === 'already_fixed' && evidenceVerified && !completionMD5;
       const invalidBlocked = outcome === 'genuinely_blocked' && !blocker;
       const duplicate = text.match(/duplicate[_ ](?:of|issue)\s*[:#]?\s*([0-9a-f-]{8,}|\d+)/i)?.[1] || null;
       let duplicateIssueId = null;
       if (outcome === 'duplicate' && duplicate) {
         const target = await client.query(
           `SELECT id FROM issue
-            WHERE workspace_id = $1 AND id <> $2
+            WHERE workspace_id = $1::uuid AND id <> $2::uuid
               AND status NOT IN ('Cancelled', 'Archived')
-              AND (id::text = $3 OR number::text = $3)
+              AND (id::text = $3::text OR number::text = $3::text)
             ORDER BY (status = 'Done') DESC, updated_at DESC
             LIMIT 1`, [task.workspace_id, task.issue_id, duplicate]);
         duplicateIssueId = target.rows[0]?.id || null;
@@ -1054,7 +1067,7 @@ async function processParkedDiagnoses() {
       const invalidDuplicate = outcome === 'duplicate' && !duplicateIssueId;
       const hasSpec = outcome === 'fixable' ? await hasBindingSpec(client, task.issue_id) : true;
       const action = diagnosisOutcomeAction({ outcome, evidenceVerified: Boolean(completionMD5), duplicateIssueId,
-        blocker, missingOutcome, invalidAlreadyFixed, invalidDuplicate, hasBindingSpec: hasSpec });
+        blocker, missingOutcome, invalidAlreadyFixed, invalidDuplicate, hasBindingSpec: hasSpec, needsQC });
       const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${missingOutcome ? 'blocker: diagnosis response omitted an explicit outcome.\n' : ''}${invalidAlreadyFixed ? 'blocker: already_fixed requires concrete runtime_evidence.\n' : ''}${invalidBlocked ? 'blocker: genuinely_blocked requires a named blocker.\n' : ''}${invalidDuplicate ? 'blocker: duplicate requires an existing same-workspace duplicate_of target.\n' : ''}${evidence ? `runtime_evidence: ${evidence}\n` : ''}${blocker ? `blocker: ${blocker}\n` : ''}${text.slice(0, 2000)}`;
       await client.query(
         `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
@@ -1074,38 +1087,46 @@ async function processParkedDiagnoses() {
                       '{parked_release_once}', 'true'::jsonb, true),
                     '{parked_release_at}', to_jsonb(NOW()), true),
                   updated_at = NOW()
-             WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
+             WHERE id = $1::uuid AND status = 'Parked'`, [task.issue_id]);
       } else if (action.action === 'close' && action.status === 'Cancelled') {
         await client.query(
           `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2::uuid),
                   updated_at = NOW()
-             WHERE id = $1 AND status = 'Parked'`, [task.issue_id, duplicateIssueId]);
+             WHERE id = $1::uuid AND status = 'Parked'`, [task.issue_id, duplicateIssueId]);
+      } else if (action.action === 'close' && action.status === 'Done') {
+        // Done is owned by the relay's terminal authority below. Do not write
+        // issue metadata as a proxy for a terminal transition.
       } else {
         await client.query(
           `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
                     jsonb_build_object('parked_blocker', $2::text),
                   updated_at = NOW()
-             WHERE id = $1 AND status = 'Parked'`, [task.issue_id,
+             WHERE id = $1::uuid AND status = 'Parked'`, [task.issue_id,
             action.blocker]);
       }
       await client.query(
         `UPDATE agent_task_queue
-            SET context = COALESCE(context, '{}'::jsonb) || '{"diagnosis_processed":true}'::jsonb
-          WHERE id = $1`, [task.id]);
+            SET context = COALESCE(context, '{}'::jsonb) ||
+                  CASE WHEN context->>'evidence_correction_retry' = 'true'
+                       AND context->>'diagnosis_processed' = 'true'
+                    THEN '{"runtime_evidence_recovery_consumed":true}'::jsonb
+                    ELSE '{"diagnosis_processed":true}'::jsonb END
+          WHERE id = $1::uuid`, [task.id]);
       await client.query('COMMIT');
       const nextStage = action.action === 'release' ? action.nextStage
         : action.action === 'close' ? action.status : null;
       if (nextStage) {
         const response = await postToRelay({ issue_id: task.issue_id, to_stage: nextStage,
           agent_token: RELAY_AGENT_SECRET,
-          ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}) });
+          ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
+          ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
         if (!response.ok) {
           // Keep the diagnosis retryable when the bridge is unavailable. The
           // bridge owns terminal transitions and must record the gate result.
           await client.query(
             `UPDATE agent_task_queue
                 SET context = context - 'diagnosis_processed'
-              WHERE id = $1`, [task.id]);
+              WHERE id = $1::uuid`, [task.id]);
         }
         console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
       } else {
