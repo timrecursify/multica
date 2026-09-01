@@ -2411,6 +2411,14 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		return profileSetSignature(nil)
 	}
 	for _, profile := range resp.RuntimeProfiles {
+		if allowed := configuredAgentAllowlist(); len(allowed) > 0 {
+			if _, ok := allowed[strings.ToLower(strings.TrimSpace(profile.ProtocolFamily))]; !ok {
+				d.logger.Info("skip custom runtime profile: provider is not allowed",
+					"workspace_id", workspaceID, "profile_id", profile.ID,
+					"protocol_family", profile.ProtocolFamily)
+				continue
+			}
+		}
 		if profile.CommandName == "" || profile.ProtocolFamily == "" {
 			d.logger.Warn("skip custom runtime profile: missing command_name or protocol_family",
 				"workspace_id", workspaceID, "profile_id", profile.ID, "display_name", profile.DisplayName)
