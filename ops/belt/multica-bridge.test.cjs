@@ -35,8 +35,22 @@ const {
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
-  authorizeRelayStatusWrites
+  authorizeRelayStatusWrites,
+  rerunParkedDiagnosis
 } = require('./multica-bridge.cjs');
+
+test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue WHERE')) return { rowCount: 1, rows: [{ id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'w', status: 'Parked', priority: 'low' }] };
+    if (sql.includes("operator_rerun_idem_key")) return { rowCount: 1, rows: [{ id: 'existing-task' }] };
+    return { rowCount: 0, rows: [] };
+  } };
+  const result = await rerunParkedDiagnosis(client, { issue_id: '123e4567-e89b-42d3-a456-426614174000', idempotency_key: 'rerun-0001' });
+  assert.deepEqual(result, { ok: true, replay: true, task_id: 'existing-task' });
+  assert.match(calls[0].sql, /pg_advisory_xact_lock/);
+});
 
 test('relay status authority is transaction-local', async () => {
   const calls = [];
