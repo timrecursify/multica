@@ -74,6 +74,31 @@ const REPLACEABLE_TASK_STATUSES = [
   "queued", "dispatched", "waiting_local_directory", "deferred"
 ];
 
+// Relay owners are normally keyed by the stage being left: Spec -> Queue
+// wakes the builder and In Progress -> In Review wakes QC. A backward branch
+// re-enters an earlier execution lane, however, so the owner for the stage
+// being left may be incompatible with the destination (for example,
+// In Review -> In Progress would otherwise wake the deploy agent). Resolve
+// those branches to the canonical entry owner of their destination lane while
+// retaining the existing source-stage convention for forward transitions.
+const BACKWARD_LANE_OWNER_STAGE = Object.freeze({
+  Spec: "Registered",
+  Queue: "Queue",
+  "In Progress": "Queue",
+  "In Review": "In Progress",
+  "CI/CD & Deploy": "In Review"
+});
+
+function ownerStageForTransition(fromStage, toStage) {
+  const stageOrder = ["Registered", "Spec", "Queue", "In Progress", "In Review", "Human Review", "CI/CD & Deploy"];
+  const fromIndex = stageOrder.indexOf(fromStage);
+  const toIndex = stageOrder.indexOf(toStage);
+  if (fromIndex !== -1 && toIndex !== -1 && toIndex < fromIndex) {
+    return BACKWARD_LANE_OWNER_STAGE[toStage] || fromStage;
+  }
+  return fromStage;
+}
+
 async function applyDisposition(client, issue, disposition, reason, evidence = {}) {
   const changed = await client.query(
     `UPDATE issue SET status = $1, updated_at = NOW()
@@ -569,6 +594,7 @@ async function relayAdvance(req, res, body) {
       );
     }
 
+    const ownerStage = ownerStageForTransition(issue.status, to_stage);
     const stageResult = await client.query(
       `SELECT rsc.agent_id, rsc.agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
               a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
@@ -591,8 +617,9 @@ async function relayAdvance(req, res, body) {
       // Stage owners are keyed by the stage being left: Spec -> Queue wakes
       // the builder, and In Progress -> In Review wakes QC. Looking up the
       // target stage would select the next lane's owner and can burn a paid
-      // call on an incompatible runbook.
-      [issue.workspace_id, issue.status]
+      // call on an incompatible runbook. Backward branches are the exception:
+      // they deliberately select the canonical owner for the destination lane.
+      [issue.workspace_id, ownerStage]
     );
 
     if (stageResult.rows.length === 0) {
@@ -950,4 +977,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { existingStageTask, replaceStageTask };
+module.exports = { existingStageTask, replaceStageTask, ownerStageForTransition };

@@ -7,7 +7,18 @@ process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
 process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
-const { existingStageTask, replaceStageTask } = require('./multica-bridge.cjs');
+const { existingStageTask, replaceStageTask, ownerStageForTransition } = require('./multica-bridge.cjs');
+
+test('transition owner selection preserves forward lanes and routes backward branches to lane owners', () => {
+  assert.equal(ownerStageForTransition('Spec', 'Queue'), 'Spec');
+  assert.equal(ownerStageForTransition('In Progress', 'In Review'), 'In Progress');
+  assert.equal(ownerStageForTransition('In Review', 'In Progress'), 'Queue');
+  assert.equal(ownerStageForTransition('Human Review', 'In Review'), 'In Progress');
+  assert.equal(ownerStageForTransition('CI/CD & Deploy', 'Queue'), 'Queue');
+  assert.equal(ownerStageForTransition('CI/CD & Deploy', 'In Progress'), 'Queue');
+  assert.equal(ownerStageForTransition('CI/CD & Deploy', 'Spec'), 'Registered');
+  assert.equal(ownerStageForTransition('Queue', 'Spec'), 'Registered');
+});
 
 function transition() {
   return {
