@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
+const { qcCompletionAdvance } = require('./parity/multica-relay-advance-daemon.cjs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
@@ -22,6 +23,7 @@ const {
   latestCompletedSolLowQcTask,
   qcTaskEvidenceMismatch,
   relayVerdict,
+  relayAdvance,
   setTestClientFactory,
   isCicdReturn,
   consumeCicdReturnAuthorization,
@@ -302,6 +304,17 @@ const validVerdict = Object.freeze({
   qualifying: true, model: 'gpt-5.6-sol', effort: 'low', idem_key: 'qc-verdict-000517'
 });
 const qcResult = (evidence = validVerdict) => ({ output: `QC completed\nQC_EVIDENCE_JSON=${JSON.stringify(evidence)}` });
+const runbookVerdict = ({ verdict = 'PASS', failureClass = 'none', qualifying = true,
+  idemKey, reworkSummary = '', blockedReason = '' } = {}) => ({
+  ...validVerdict,
+  verdict,
+  failure_class: failureClass,
+  qualifying,
+  idem_key: idemKey,
+  notes: verdict === 'FAIL'
+    ? (blockedReason ? `BLOCKED: ${blockedReason}` : reworkSummary)
+    : ''
+});
 
 test('verdict validation accepts the sanctioned CLI checker field and rejects forged lane metadata', () => {
   assert.equal(validateRelayVerdict(validVerdict), null);
@@ -421,6 +434,89 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   } finally {
     setTestClientFactory(null);
   }
+});
+
+test('runbook-shaped verdicts advance through the relay handler', async () => {
+  const attempts = [];
+  const verdicts = [];
+  const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'qc-agent',
+    agent_name: 'qc-sol-low', context: {}, result: qcResult() };
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql) || /FROM "issue"\s+WHERE id = \$1\s+FOR UPDATE/.test(sql)) {
+      return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1', status: 'In Review',
+        description: '', parent_issue_id: null, title: 'QC fixture', priority: 'none', metadata: {} }] };
+    }
+    if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
+    if (/SELECT verdict, work_product_md5 FROM qc_verdict/.test(sql)) {
+      const latest = verdicts.at(-1);
+      return { rows: latest ? [{ verdict: latest[3], work_product_md5: latest[4] }] : [] };
+    }
+    if (/FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/INSERT INTO qc_attempt/.test(sql)) attempts.push(values);
+    if (/INSERT INTO qc_verdict/.test(sql)) verdicts.push(values);
+    if (/SELECT stage_name FROM relay_stage_config/.test(sql)) return { rows: [{ stage_name: values[1] }] };
+    if (/SELECT next_stage, alt_next_stages/.test(sql)) return { rows: [{ next_stage: 'CI/CD & Deploy', alt_next_stages: ['In Progress'] }] };
+    if (/SELECT t\.result, c\.content/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_config rsc/.test(sql)) return { rows: [{ agent_id: null, agent_name: null, owner_id: null }] };
+    if (/UPDATE "issue"\s+SET status/.test(sql)) return { rowCount: 1, rows: [{ id: validVerdict.issue_id, status: values[0] }] };
+    return { rows: [] };
+  } };
+  const post = async (payload) => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
+    return res;
+  };
+  setTestClientFactory(() => client);
+  try {
+    const pass = runbookVerdict({ idemKey: 'qc-runbook-pass-0001' });
+    task.result = qcResult(pass);
+    assert.equal((await post(pass)).status, 201);
+    const values = attempts[0];
+    const row = { task_id: task.id, to_stage: 'In Review', next_stage: 'CI/CD & Deploy', task_status: 'completed',
+      task_agent_id: task.agent_id, task_agent_model: 'gpt-5.6-sol', task_agent_effort: 'low',
+      qc_verdict_checker_id: task.agent_id, qc_verdict: 'PASS', qc_verdict_work_product_md5: pass.work_product_md5,
+      qc_attempt_verdict: values[2], qc_attempt_work_product_md5: values[3], qc_attempt_bound_sha: values[4],
+      qc_attempt_observed_sha: values[5], qc_attempt_qualifying: values[7], qc_attempt_evidence_task_id: task.id,
+      qc_attempt_evidence_agent_id: task.agent_id, qc_attempt_evidence_agent_model: 'gpt-5.6-sol', qc_attempt_evidence_agent_effort: 'low' };
+    const advance = async (to_stage) => {
+      const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+      await relayAdvance({}, res, { issue_id: validVerdict.issue_id, to_stage,
+        agent_token: 'test-relay-secret', current_work_product_md5: pass.work_product_md5 });
+      return { ...res, json: JSON.parse(res.body) };
+    };
+    assert.equal((await advance('CI/CD & Deploy')).json.issue.status, 'CI/CD & Deploy');
+    const failed = runbookVerdict({ verdict: 'FAIL', failureClass: 'implementation', qualifying: false,
+      idemKey: 'qc-runbook-fail-0001', reworkSummary: 'Restore the missing validation.' });
+    assert.equal(failed.notes, 'Restore the missing validation.');
+    const blocked = runbookVerdict({ verdict: 'FAIL', failureClass: 'evidence', qualifying: false,
+      idemKey: 'qc-runbook-blocked-0001', blockedReason: 'add the pull request and full SHA.' });
+    task.result = qcResult(blocked);
+    assert.equal((await post(blocked)).status, 201);
+    assert.equal(verdicts[1][3], 'FAIL');
+    assert.match(verdicts[1][5], /BLOCKED: add the pull request and full SHA\./);
+    assert.equal((await advance('In Progress')).json.issue.status, 'In Progress');
+  } finally { setTestClientFactory(null); }
+});
+
+test('QC runbook emits bridge evidence and advances both verdict dispositions', () => {
+  const runbook = fs.readFileSync(require.resolve('./RUNBOOK_QC_WORKER.md'), 'utf8');
+  assert.match(runbook, /QC_EVIDENCE_JSON=/);
+  assert.match(runbook, /sk multica verdict "\$NUMBER" --board "\$BOARD" --verdict "\$VERDICT"/);
+  assert.match(runbook, /--bound-sha "\$BOUND_SHA" --observed-sha "\$OBSERVED_SHA"/);
+  assert.match(runbook, /--work-product-md5 "\$WORK_PRODUCT_MD5" --failure-class "\$FAILURE_CLASS"/);
+  assert.match(runbook, /--qualifying "\$QUALIFYING" --model gpt-5\.6-sol --effort low --idem-key "\$IDEM_KEY"/);
+  assert.match(runbook, /--notes "\$VERDICT_NOTES"/);
+  assert.match(runbook, /VERDICT_NOTES="\$\{REWORK_SUMMARY:\?set a concise rework summary\}"/);
+  assert.match(runbook, /VERDICT_NOTES="BLOCKED: \$BLOCKED_REASON"/);
+  assert.match(runbook, /verdict` must accept `--board gsp`/);
+  assert.match(runbook, /--to "CI\/CD & Deploy" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
+  assert.match(runbook, /--to "In Progress" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
+  assert.match(runbook, /BLOCKED: <reason>/);
+  assert.match(runbook, /git -C "\$CHECKOUT" ls-tree -r --full-tree "\$BOUND_SHA" \| LC_ALL=C sort \| md5sum/);
+  assert.doesNotMatch(runbook, /What changed.*md5sum|WORK_PRODUCT="\$\(jq/);
+  assert.doesNotMatch(runbook, /curl --|RELAY_URL|RELAY_AGENT_SECRET/);
 });
 
 test('only a named CI/CD return is eligible for a repair authorization', () => {

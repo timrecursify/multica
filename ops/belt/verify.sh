@@ -14,6 +14,7 @@ declare -a sources=(
   "$root_dir/multica-bundle.py"
   "$root_dir/RUNBOOK_SPEC_WORKER.md"
   "$root_dir/RUNBOOK_BUILD_WORKER.md"
+  "$root_dir/RUNBOOK_QC_WORKER.md"
   "$root_dir/WORKER_COMMON.md"
 )
 
@@ -28,6 +29,7 @@ declare -a targets=(
   "/home/newadmin/tools/multica-bundle.py"
   "/home/newadmin/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
   "/home/newadmin/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
+  "/home/newadmin/multica-doctrine/RUNBOOK_QC_WORKER.md"
   "/home/newadmin/multica-doctrine/WORKER_COMMON.md"
 )
 

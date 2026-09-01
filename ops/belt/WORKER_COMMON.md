@@ -24,6 +24,11 @@ Use `MULTICA_WORKSPACE_ID` as the authority for the board:
 Stop if the value is missing or different. Ticket numbers are not unique
 across workspaces. Pass the selected `--board` on every `sk multica` command.
 
+The task prompt supplies the issue `NUMBER` and pull-request HTTPS URL. The
+QC runbook resolves that URL and its full bound SHA with `sk multica
+qc-checkout`; the JSON output supplies `CHECKOUT` from `.path` and confirms
+the SHA in `.sha`. Do not infer these values from the managed workdir.
+
 ## Evidence and transitions
 
 - Read the issue and its comments before acting. Treat prior claims as

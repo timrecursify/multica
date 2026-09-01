@@ -29,6 +29,7 @@ declare -a files=(
   "tools/multica-bundle.py"
   "multica-doctrine/RUNBOOK_SPEC_WORKER.md"
   "multica-doctrine/RUNBOOK_BUILD_WORKER.md"
+  "multica-doctrine/RUNBOOK_QC_WORKER.md"
   "multica-doctrine/WORKER_COMMON.md"
   "gsp-multica/relay-completion-admission.cjs"
 )
