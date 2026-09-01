@@ -106,4 +106,5 @@ test('relay stage lookups bind configuration and owners to the issue workspace',
   assert.match(source, /workspace_id = \$1 AND stage_name = \$2/);
   assert.match(source, /a\.workspace_id = rsc\.workspace_id/);
   assert.match(source, /Relay owner workspace mismatch/);
+  assert.match(source, /ORDER BY rsc\.workspace_id, rsc\.id/);
 });

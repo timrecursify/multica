@@ -370,14 +370,14 @@ async function findAndAdvanceRegistered() {
                  AND r.to_stage = 'Spec'
                  AND r.status = 'rejected'
                  AND r.created_at >= NOW() - INTERVAL '24 hours'
-            ) < $3
+            ) < $2
           )
           AND (
             SELECT count(*) FROM agent_task_queue t
              WHERE t.issue_id = i.id
                AND t.context->>'to_stage' = 'Spec'
                AND t.started_at IS NOT NULL
-          ) < $3
+          ) < $2
         )
       LIMIT 10`;
 

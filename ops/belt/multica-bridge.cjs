@@ -852,8 +852,7 @@ async function assertRoutableStagesHaveOwners() {
               a.instructions AS owner_instructions
          FROM relay_stage_config rsc
          LEFT JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id
-        WHERE rsc.workspace_id = $1
-        ORDER BY rsc.id`, [SSO_WORKSPACE_ID]
+        ORDER BY rsc.workspace_id, rsc.id`
     );
     assertRoutableStageOwners(result.rows);
   } finally {

@@ -12,4 +12,6 @@ test('Registered discovery covers every configured workspace', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /EXISTS \(SELECT 1 FROM relay_stage_config rsc/);
   assert.doesNotMatch(source, /i\.workspace_id = \$2/);
+  assert.doesNotMatch(source, /\) < \$3/);
+  assert.match(source, /client\.query\(query, \['Registered', STAGE_CYCLE_LIMIT\]\)/);
 });
