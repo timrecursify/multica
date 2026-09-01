@@ -22,6 +22,9 @@ if [[ -z "$root" || "$root" != /* ]]; then
 fi
 export MULTICA_DAEMON_MAX_CONCURRENT_TASKS="$cap_raw"
 export MULTICA_DAEMON_WORKSPACES_ROOT="$root"
+# Current daemon binaries consume this environment variable. Keep the fleet
+# wrapper variable above for the belt guard and rollback scripts.
+export MULTICA_WORKSPACES_ROOT="$root"
 
 lock_file="${MULTICA_DAEMON_LOCK_FILE:-/home/newadmin/.local/state/gsp-multica-worker.lock}"
 mkdir -p -- "$(dirname -- "$lock_file")"
@@ -39,6 +42,17 @@ if [[ -z "$daemon_cwd" || "$daemon_cwd" != /* || ! -d "$daemon_cwd" ]]; then
 fi
 export MULTICA_DAEMON_PORT="${MULTICA_DAEMON_PORT:-20464}"
 cd -- "$daemon_cwd"
-exec "$daemon_bin" daemon start --foreground --daemon-id=gsp-multica-worker \
-  --heartbeat-interval=30s --poll-interval=2s --workspaces-root="$root" \
-  --max-concurrent-tasks="$cap_raw"
+daemon_help="$($daemon_bin daemon start --help 2>&1)" || {
+  echo "multica-daemon-wrapper: unable to inspect daemon start capabilities" >&2
+  exit 64
+}
+daemon_args=(daemon start --foreground --daemon-id=gsp-multica-worker
+  --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks="$cap_raw")
+# `--workspaces-root` was removed from a short-lived daemon release. The
+# environment setting is its documented replacement; old rollback artifacts
+# still need the flag, so detect the installed binary rather than guessing a
+# version string.
+if grep -Fq -- '--workspaces-root' <<<"$daemon_help"; then
+  daemon_args+=(--workspaces-root="$root")
+fi
+exec "$daemon_bin" "${daemon_args[@]}"
