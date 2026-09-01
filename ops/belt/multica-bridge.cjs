@@ -158,7 +158,12 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
 }
 
 function qcTaskEvidenceMismatch(task, payload) {
-  const evidence = task.result;
+  const output = task.result && typeof task.result === "object" ? task.result.output : null;
+  if (typeof output !== "string") return "qc_task_evidence_required";
+  const matches = [...output.matchAll(/^QC_EVIDENCE_JSON=(\{[^\r\n]*\})$/gm)];
+  if (matches.length !== 1) return "qc_task_evidence_required";
+  let evidence;
+  try { evidence = JSON.parse(matches[0][1]); } catch { return "qc_task_evidence_required"; }
   if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return "qc_task_evidence_required";
   if (evidence.verdict !== payload.verdict) return "qc_task_verdict_mismatch";
   if (String(evidence.work_product_md5 || "").toLowerCase() !== payload.work_product_md5.toLowerCase()) return "qc_task_work_product_mismatch";
@@ -691,11 +696,6 @@ async function relayVerdict(req, res, payload) {
     if (!qcTask) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "completed_sol_low_qc_required");
-    }
-    const taskHead = qcTask.context && typeof qcTask.context === "object" ? qcTask.context.head_sha : null;
-    if (typeof taskHead !== "string" || taskHead.toLowerCase() !== payload.bound_sha.toLowerCase()) {
-      await client.query("ROLLBACK");
-      return relayVerdictError(res, 409, "qc_task_sha_mismatch");
     }
     const evidenceMismatch = qcTaskEvidenceMismatch(qcTask, payload);
     if (evidenceMismatch) {

@@ -17,6 +17,7 @@ const {
   recordBookkeepingHandoff,
   validateRelayVerdict,
   latestCompletedSolLowQcTask,
+  qcTaskEvidenceMismatch,
   relayVerdict,
   setTestClientFactory,
   isCicdReturn,
@@ -32,6 +33,7 @@ const validVerdict = Object.freeze({
   observed_sha: '0123456789012345678901234567890123456789', failure_class: 'none',
   qualifying: true, model: 'gpt-5.6-sol', effort: 'low', idem_key: 'qc-verdict-000517'
 });
+const qcResult = (evidence = validVerdict) => ({ output: `QC completed\nQC_EVIDENCE_JSON=${JSON.stringify(evidence)}` });
 
 test('verdict validation accepts the sanctioned CLI checker field and rejects forged lane metadata', () => {
   assert.equal(validateRelayVerdict(validVerdict), null);
@@ -41,6 +43,13 @@ test('verdict validation accepts the sanctioned CLI checker field and rejects fo
   assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
+});
+
+test('QC evidence parser accepts exactly one structured output marker', () => {
+  assert.equal(qcTaskEvidenceMismatch({ result: qcResult() }, validVerdict), null);
+  assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC_EVIDENCE_JSON={bad}' } }, validVerdict), 'qc_task_evidence_required');
+  assert.equal(qcTaskEvidenceMismatch({ result: { output: `${qcResult().output}\nQC_EVIDENCE_JSON=${JSON.stringify(validVerdict)}` } }, validVerdict), 'qc_task_evidence_required');
+  assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC VERDICT: PASS' } }, validVerdict), 'qc_task_evidence_required');
 });
 
 test('verdict checker identity is selected from the completed same-workspace Sol-low QC task', async () => {
@@ -75,7 +84,7 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   const writes = [];
   let task = {
     id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1',
-    context: { head_sha: validVerdict.bound_sha }, result: { ...validVerdict }
+    context: {}, result: qcResult()
   };
   const client = {
     async connect() {}, async end() {},
@@ -104,13 +113,13 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
     assert.equal(writes[0][2], 'qc-sol-low-1', 'checker_name must come from QC agent, not CLI checker');
     result = await call({ ...validVerdict, idem_key: 'qc-verdict-wrong-md5', work_product_md5: 'a41d8cd98f00b204e9800998ecf8427e' });
     assert.equal(result.json.error, 'qc_task_work_product_mismatch');
-    task = { ...task, result: { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false } };
+    task = { ...task, result: qcResult({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false }) };
     result = await call({ ...validVerdict, idem_key: 'qc-verdict-fail-pass' });
     assert.equal(result.json.error, 'qc_task_verdict_mismatch');
     task = null;
     result = await call({ ...validVerdict, idem_key: 'qc-verdict-cross-workspace' });
     assert.equal(result.json.error, 'completed_sol_low_qc_required');
-    task = { id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1', context: { head_sha: validVerdict.bound_sha }, result: { ...validVerdict } };
+    task = { id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1', context: {}, result: qcResult() };
     result = await call({ ...validVerdict, checker: 'replay-forgery' });
     assert.equal(result.status, 200, 'same immutable evidence must replay despite a forged checker string');
     result = await call({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false });
