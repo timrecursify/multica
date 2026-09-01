@@ -12,7 +12,7 @@ const {
   isExecutionStage,
   assertRoutableStageOwners
 } = require("./guardrails.cjs");
-const { recordParkAndQueueDiagnosis } = require("./parked-diagnosis.cjs");
+const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed } = require("./parked-diagnosis.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -181,6 +181,10 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
 }
 
 async function replaceStageTask(client, task) {
+  const context = typeof task.context === 'string' ? JSON.parse(task.context) : task.context;
+  if (!isBuilderDispatchAllowed(context)) {
+    throw new Error('builder dispatcher rejected a no_builder diagnosis task');
+  }
   // The issue row is locked by relayAdvance.  Cancel every live task that was
   // created for another stage before making the successor visible, so a flight
   // cannot retain work from its previous stage after this transaction commits.
