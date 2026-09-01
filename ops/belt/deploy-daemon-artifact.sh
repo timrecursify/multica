@@ -1,42 +1,37 @@
 #!/usr/bin/env bash
-# Atomically install an exact-SHA daemon artifact and reload only its PM2 app.
-# This command is an operator surface: --apply is required and it emits a
-# receipt that binds the install, backup, binary checksum, and health result.
 set -Eeuo pipefail
-
 artifact_dir=""; expected_sha=""; apply=0
-while (($#)); do
-  case "$1" in
-    --artifact-dir) artifact_dir="${2:-}"; shift 2 ;;
-    --source-sha) expected_sha="${2:-}"; shift 2 ;;
-    --apply) apply=1; shift ;;
-    *) echo "usage: $0 --artifact-dir DIR --source-sha SHA --apply" >&2; exit 64 ;;
-  esac
-done
-fail() { echo "daemon artifact deploy: $*" >&2; exit 78; }
+while (($#)); do case "$1" in --artifact-dir) artifact_dir="${2:-}"; shift 2;; --source-sha) expected_sha="${2:-}"; shift 2;; --apply) apply=1; shift;; *) exit 64;; esac; done
+fail(){ echo "daemon artifact deploy: $*" >&2; exit 78; }
 [[ $apply == 1 && "$expected_sha" =~ ^[0-9a-f]{40}$ ]] || fail "--apply and a 40-character --source-sha are required"
-[[ "$artifact_dir" = /* && -d "$artifact_dir" && ! -L "$artifact_dir" ]] || fail "artifact directory must be an absolute real directory"
+[[ "$artifact_dir" = /* && -d "$artifact_dir" && ! -L "$artifact_dir" && "$(realpath -e -- "$artifact_dir")" == "$artifact_dir" ]] || fail "artifact directory must be canonical"
 manifest="$artifact_dir/daemon-artifact.env"; binary="$artifact_dir/multica-linux-amd64"
-[[ -f "$manifest" && -f "$binary" && ! -L "$binary" && -x "$binary" ]] || fail "artifact manifest or executable is missing"
-source "$manifest"
-[[ "${SOURCE_SHA:-}" == "$expected_sha" && "${GOOS:-}" == linux && "${GOARCH:-}" == amd64 ]] || fail "artifact identity does not match requested source SHA"
-[[ "$(sha256sum "$binary" | awk '{print $1}')" == "${BINARY_SHA256:-}" ]] || fail "artifact checksum mismatch"
+[[ -f "$manifest" && ! -L "$manifest" && -f "$binary" && ! -L "$binary" && -x "$binary" ]] || fail "artifact manifest or executable is missing"
+declare -A m=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+  [[ "$line" =~ ^(SOURCE_SHA|BINARY_SHA256|GOOS|GOARCH)=([A-Za-z0-9._-]+)$ ]] || fail "invalid manifest line"
+  key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"; [[ -z "${m[$key]+x}" ]] || fail "duplicate manifest key: $key"; m[$key]="$value"
+done < "$manifest"
+[[ ${#m[@]} == 4 && "${m[SOURCE_SHA]-}" == "$expected_sha" && "${m[BINARY_SHA256]-}" =~ ^[0-9a-f]{64}$ && "${m[GOOS]-}" == linux && "${m[GOARCH]-}" == amd64 ]] || fail "artifact identity does not match requested source SHA"
+binary_sha="${m[BINARY_SHA256]}"
+[[ "$(sha256sum "$binary" | awk '{print $1}')" == "$binary_sha" ]] || fail "artifact checksum mismatch"
 "$binary" version --output json | grep -Fq "\"commit\": \"$expected_sha\"" || fail "artifact version does not carry requested source SHA"
-
-target="${MULTICA_DAEMON_TARGET:-/home/newadmin/multica-daemon/server}"
-pm2_bin="${PM2_BIN:-pm2}"; ps_bin="${PS_BIN:-ps}"; app="${MULTICA_DAEMON_PM2_APP:-gsp-multica-worker}"
+target="${MULTICA_DAEMON_TARGET:-/home/newadmin/multica-daemon/server}"; pm2_bin="${PM2_BIN:-pm2}"; proc_root="${PROC_ROOT:-/proc}"; app="${MULTICA_DAEMON_PM2_APP:-gsp-multica-worker}"
 [[ "$target" = /* && -f "$target" && ! -L "$target" ]] || fail "daemon target must be an existing regular absolute file"
-target_dir="$(dirname "$target")"; stamp="$(date -u +%Y%m%dT%H%M%SZ)"; backup="${target}.bak-${stamp}"
-before_argv="$($ps_bin -eo args= | awk '$0 ~ /server daemon start/ {print; exit}')"
-[[ "$before_argv" == *'--max-concurrent-tasks'* ]] || fail "running daemon argv lacks --max-concurrent-tasks"
-tmp="$(mktemp "$target_dir/.server.${expected_sha}.XXXXXX")"
-cleanup() { rm -f -- "$tmp"; }
-rollback() { cp --preserve=mode -- "$backup" "$target"; "$pm2_bin" reload "$app" --update-env >/dev/null; cleanup; exit 1; }
-trap cleanup EXIT
-cp --preserve=mode -- "$target" "$backup"
+pm2_state(){ "$pm2_bin" jlist | node -e 'let s="";process.stdin.on("data",x=>s+=x);process.stdin.on("end",()=>{let p=JSON.parse(s).find(x=>x.name===process.argv[1]);if(!p)process.exit(2);console.log([p.pid,p.pm2_env.status,p.pm2_env.unstable_restarts].join("|"))})' "$app"; }
+initial="$(pm2_state)" || fail "PM2 app is absent"; IFS='|' read -r initial_pid initial_status initial_restarts <<<"$initial"
+[[ "$initial_status" == online && "$initial_pid" =~ ^[1-9][0-9]*$ ]] || fail "PM2 app is not online"
+health(){ local want="$1" state pid status restarts args; state="$(pm2_state)" || return 1; IFS='|' read -r pid status restarts <<<"$state"; [[ "$pid" =~ ^[1-9][0-9]*$ && "$status" == online && "$restarts" == "$initial_restarts" && -r "$proc_root/$pid/cmdline" && -e "$proc_root/$pid/exe" ]] || return 1; args="$(tr '\0' ' ' < "$proc_root/$pid/cmdline")"; [[ "$args" == *'server daemon start'* && "$args" == *'--max-concurrent-tasks=32'* && "$(sha256sum "$proc_root/$pid/exe" | awk '{print $1}')" == "$want" ]] || return 1; "$target" daemon status >/dev/null 2>&1; }
+target_dir="$(dirname "$target")"; stamp="$(date -u +%Y%m%dT%H%M%SZ)"; backup="${target}.bak-${stamp}"; old_sha="$(sha256sum "$target" | awk '{print $1}')"; tmp="$(mktemp "$target_dir/.server.${expected_sha}.XXXXXX")"
+rollback(){ local rc="$1"
+  [[ -f "$backup" && "$(sha256sum "$backup" | awk '{print $1}')" == "$old_sha" ]] || { echo 'daemon artifact deploy: rollback backup invalid' >&2; exit 79; }
+  if ! cp --preserve=mode -- "$backup" "$tmp" || ! mv -f -- "$tmp" "$target"; then echo 'daemon artifact deploy: rollback file restore failed' >&2; exit 79; fi
+  if ! "$pm2_bin" reload "$app" --update-env >/dev/null || ! health "$old_sha"; then echo 'daemon artifact deploy: rollback reload or health failed' >&2; exit 79; fi
+  exit "$rc"
+}
+trap 'rm -f -- "$tmp"' EXIT
+cp --preserve=mode -- "$target" "$backup"; [[ "$(sha256sum "$backup" | awk '{print $1}')" == "$old_sha" ]] || fail "backup verification failed"
 cp --preserve=mode -- "$binary" "$tmp"; chmod 0755 -- "$tmp"; mv -f -- "$tmp" "$target"
-if ! "$pm2_bin" reload "$app" --update-env >/dev/null; then rollback; fi
-sleep 2
-after_argv="$($ps_bin -eo args= | awk '$0 ~ /server daemon start/ {print; exit}')"
-if [[ "$after_argv" != *'--max-concurrent-tasks'* ]] || ! "$target" version --output json | grep -Fq "\"commit\": \"$expected_sha\""; then rollback; fi
-printf '{"source_sha":"%s","binary_sha256":"%s","backup":"%s","app":"%s","health":"ok"}\n' "$expected_sha" "$BINARY_SHA256" "$backup" "$app"
+"$pm2_bin" reload "$app" --update-env >/dev/null || rollback 1
+sleep 2; health "$binary_sha" || rollback 1
+printf '{"source_sha":"%s","binary_sha256":"%s","backup":"%s","app":"%s","health":"ok"}\n' "$expected_sha" "$binary_sha" "$backup" "$app"
