@@ -146,18 +146,29 @@ guard_wrapper() {
 # 1b. The running Tower must match the wrapper. A patched file is not a patched
 # process: a restart that happened while the file was drifted leaves a correct
 # file and a wrong process, which the file check alone cannot see.
+tower_concurrency_state() {
+  local live="$1"
+  if [[ ! "$live" =~ (^|[[:space:]])--max-concurrent-tasks= ]]; then
+    printf '%s\n' missing
+  elif [[ "$live" =~ (^|[[:space:]])--max-concurrent-tasks=${WANT_CONCURRENCY}([[:space:]]|$) ]]; then
+    printf '%s\n' correct
+  else
+    printf '%s\n' mismatched
+  fi
+}
+
 guard_tower_process() {
-  local live
+  local live concurrency_state
   if ai_hold_active; then
     unfixable+=("gsp-multica-worker held by ${AI_HOLD_FILE}")
     return 0
   fi
   live=$(ps -eo args | grep "[m]ultica-daemon/server daemon start" | head -1)
   [[ -z "$live" ]] && { unfixable+=("Tower process not found"); return; }
-  [[ "$live" != *"--max-concurrent-tasks="* ]] && return 0
-  [[ "$live" == *"--max-concurrent-tasks=${WANT_CONCURRENCY}"* ]] && return 0
+  concurrency_state=$(tower_concurrency_state "$live")
+  [[ "$concurrency_state" == correct ]] && return 0
   if (( $(running_tasks) > 0 )); then
-    unfixable+=("Tower running concurrency=$live, want ${WANT_CONCURRENCY}; deferred, flights in progress")
+    unfixable+=("Tower running concurrency ${concurrency_state}: $live, want ${WANT_CONCURRENCY}; deferred, flights in progress")
     return
   fi
   if "$PM2" startOrRestart "$ECOSYSTEM" --only gsp-multica-worker >/dev/null 2>&1; then
