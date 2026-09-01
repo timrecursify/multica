@@ -93,7 +93,8 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
         -- Never interrupt a paid task already executing. Cross-stage
         -- admission defers successors until running predecessors are
         -- terminal; only unstarted work may be retired by a disposition.
-        AND status IN ('queued','dispatched','waiting_local_directory','deferred')`,
+        AND status IN ('queued','dispatched','waiting_local_directory','deferred')
+        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'`,
     [row.issue_id, reason]
   );
   if (changed.rowCount > 0) {

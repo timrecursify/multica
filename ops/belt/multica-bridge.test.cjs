@@ -139,6 +139,7 @@ test('parking records a reason and hands off one Sol-low diagnosis', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /recordParkAndQueueDiagnosis/);
   assert.match(source, /disposition === 'Parked'/);
+  assert.match(source, /context->>'kind', ''\) <> 'parked_diagnosis'/);
 });
 
 test('relay request maps snake-case stage into successor task input', () => {

@@ -93,7 +93,8 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
         -- A disposition must not interrupt a paid task that already started.
         -- Running predecessors are handled by cross-stage admission and are
         -- allowed to reach a terminal state before any successor is created.
-        AND status IN ('queued','dispatched','waiting_local_directory','deferred')`,
+        AND status IN ('queued','dispatched','waiting_local_directory','deferred')
+        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'`,
     [issue.id, reason]
   );
   if (changed.rowCount > 0) {
