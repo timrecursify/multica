@@ -51,6 +51,7 @@ function testConsecutiveFailures() {
   const pr = { repo: 'owner/repo', num: '7' };
   assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'red'), 1);
   assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'unknown'), 2);
+  assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'mixed'), 3);
   assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'pending'), 0);
   assert.equal(worker.countCiFailure(issue, pr, 'sha-1', 'red'), 1);
   assert.equal(worker.countCiFailure(issue, pr, 'sha-2', 'red'), 1);
