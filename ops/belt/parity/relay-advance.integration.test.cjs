@@ -44,7 +44,7 @@ function advanceRow(evidenceResult = `QC PASS exact SHA ${SHA}`) {
   };
 }
 
-function advanceHarness(row) {
+function advanceHarness(row, currentPass = { verdict: 'PASS', work_product_md5: MD5 }) {
   const queries = [];
   const logs = [];
   const payloads = [];
@@ -52,6 +52,9 @@ function advanceHarness(row) {
     async query(sql, values) {
       queries.push({ sql, values });
       if (sql.includes('SELECT rrl.id AS log_id')) return { rows: [row] };
+      if (sql.includes('SELECT verdict, work_product_md5 FROM qc_verdict')) {
+        return { rows: currentPass ? [currentPass] : [] };
+      }
       if (sql.includes("atq.status IN ('failed', 'cancelled')")) {
         return { rowCount: 0, rows: [] };
       }
@@ -103,6 +106,30 @@ test('older verdict-recording Sol-low task advances the latest PASS to deploy', 
     '11111111-1111-4111-8111-111111111111');
   assert.equal(harness.payloads[0].current_work_product_md5, MD5);
   assert.ok(harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'")));
+});
+
+test('PASS replay with matching current work-product MD5 is enqueued', async () => {
+  const harness = advanceHarness(advanceRow());
+  await harness.run();
+  assert.equal(harness.payloads.length, 1);
+  assert.ok(harness.queries.some(({ sql }) =>
+    sql.includes('SELECT verdict, work_product_md5 FROM qc_verdict')));
+});
+
+test('PASS replay with mismatched current work-product MD5 is skipped', async () => {
+  const harness = advanceHarness(advanceRow(), {
+    verdict: 'PASS', work_product_md5: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+  });
+  await harness.run();
+  assert.equal(harness.payloads.length, 0);
+  assert.ok(harness.logs.some((line) => line.includes('stale_pass_md5_mismatch')));
+});
+
+test('PASS replay without a verdict work-product MD5 is skipped', async () => {
+  const harness = advanceHarness({ ...advanceRow(), qc_verdict_work_product_md5: '' });
+  await harness.run();
+  assert.equal(harness.payloads.length, 0);
+  assert.ok(harness.logs.some((line) => line.includes('pass_without_md5')));
 });
 
 test('permanently mismatched evidence is held after the bounded retry limit', async () => {

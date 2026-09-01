@@ -545,6 +545,10 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         // Sol-low task carries a SHA-bound PASS plus the current artifact MD5.
         const qcAdvance = qcCompletionAdvance(row);
         if (gatedStages.includes(row.next_stage) && !qcAdvance.ok) {
+          if (qcAdvance.reason === 'qc_work_product_md5_required') {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
+            continue;
+          }
           if (qcAdvance.reason === 'qc_attempt_mismatch' ||
               qcAdvance.reason === 'legacy_qc_evidence_mismatch') {
             const held = await holdQcEvidenceMismatch(client, row.log_id);
@@ -555,6 +559,18 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
           }
           logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
           continue;
+        }
+
+        if (qcAdvance.ok) {
+          const currentWorkProductMd5 = await currentPassWorkProductMD5(client, row.issue_id);
+          if (!currentWorkProductMd5) {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
+            continue;
+          }
+          if (currentWorkProductMd5.toLowerCase() !== qcAdvance.workProductMd5) {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=stale_pass_md5_mismatch`);
+            continue;
+          }
         }
 
         const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
