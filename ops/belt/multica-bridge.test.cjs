@@ -61,6 +61,13 @@ test('relay dispositions preserve already-running paid work', () => {
   assert.match(disposition, /status IN \('queued','dispatched','waiting_local_directory','deferred'\)/);
 });
 
+test('cross-stage admission returns a bounded defer for active predecessors', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /res\.writeHead\(202, \{ 'Content-Type': 'application\/json', 'Retry-After': '15' \}\)/);
+  assert.match(source, /retry_after_seconds: 15/);
+  assert.match(source, /message: 'a prior relay execution is still active/);
+});
+
 test('stage transition fails before commit when no successor task exists', async () => {
   const calls = [];
   const replies = [{ rows: [] }, { rows: [] }, { rows: [] }];
