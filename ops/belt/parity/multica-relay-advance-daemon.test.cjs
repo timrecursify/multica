@@ -23,3 +23,28 @@ test('dispositions do not cancel paid tasks that already started', () => {
   assert.doesNotMatch(disposition, /status IN \([^)]*running/);
   assert.match(disposition, /status IN \('queued','dispatched','waiting_local_directory','deferred'\)/);
 });
+
+test('relay advancement admits task results before creating a successor', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /require\('\.\.\/relay-completion-admission\.cjs'\)/);
+  assert.match(source, /atq\.result AS task_result/);
+  assert.match(source, /completionAdmission\(row\.task_result/);
+  assert.match(source, /applyDisposition\(client,[\s\S]*completion\.disposition, completion\.reason/);
+  assert.match(source, /markRelayLogFailedById\(client, row\.log_id\)/);
+});
+
+test('stranded-task recovery does not retry a semantically blocked completion', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /t\.result AS dead_task_result/);
+  assert.match(source, /row\.dead_task_status === 'completed'/);
+  assert.match(source, /completed predecessor failed completion admission/);
+});
+
+test('Registered recovery applies the same completion gate', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const recovery = source.slice(source.indexOf('async function recoveryAdvanceTasks'),
+    source.indexOf('function postToRelay'));
+  assert.match(recovery, /atq\.result AS task_result/);
+  assert.match(recovery, /completionAdmission\(row\.task_result/);
+  assert.match(recovery, /reason=task_not_completed/);
+});

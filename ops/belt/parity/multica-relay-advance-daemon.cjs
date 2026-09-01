@@ -12,6 +12,7 @@ const {
 const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
   namedBlocker, isConcreteRuntimeEvidence, verifyRuntimeEvidence,
   diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
+const { completionAdmission } = require('../relay-completion-admission.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -214,7 +215,8 @@ async function findAndAdvanceTasks() {
     // No completed_at window: eligibility is the task's terminal state, so a
     // daemon outage delays an advance instead of stranding it forever.
     const query = `SELECT rrl.id AS log_id, atq.issue_id, atq.status AS task_status,
-             rrl.to_stage, rsc.next_stage
+             atq.result AS task_result, atq.error AS task_error,
+             i.workspace_id, i.priority, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
       INNER JOIN issue i ON atq.issue_id = i.id
@@ -250,6 +252,19 @@ async function findAndAdvanceTasks() {
 
     for (const row of result.rows) {
       try {
+        const completion = completionAdmission(row.task_result ??
+          (row.task_error ? { error: row.task_error } : null));
+        if (!completion.ok) {
+          // Process exit 0 is not a work-product guarantee. A completed task
+          // carrying an explicit blocker/FAIL (or no result at all) must not
+          // advance into a successor lane and buy another paid task.
+          const parked = await applyDisposition(client,
+            { ...row, stage: row.to_stage }, completion.disposition, completion.reason,
+            { target_stage: row.to_stage, completion_reason: completion.reason });
+          console.log(`${LOG_PREFIX} [completion-admission] PARK: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, disposition_applied=${parked}`);
+          await markRelayLogFailedById(client, row.log_id);
+          continue;
+        }
         // Check if next stage is gated; skip auto-advance if it is
         if (gatedStages.includes(row.next_stage)) {
           console.log(`${LOG_PREFIX} SKIPPED: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=stage requires manual QC approval`);
@@ -294,7 +309,9 @@ async function recoveryAdvanceTasks() {
   try {
 
     // Get the latest relay_run_log per issue using LATERAL subquery
-    const query = `SELECT DISTINCT atq.issue_id, atq.status as task_status, i.status as to_stage, rsc.next_stage
+    const query = `SELECT DISTINCT atq.issue_id, atq.status as task_status,
+             atq.result AS task_result, atq.error AS task_error,
+             i.workspace_id, i.priority, i.status as to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN issue i ON atq.issue_id = i.id
       INNER JOIN relay_stage_config rsc ON i.status = rsc.stage_name AND rsc.workspace_id = i.workspace_id
@@ -315,6 +332,21 @@ async function recoveryAdvanceTasks() {
 
     for (const row of result.rows) {
       try {
+        if (row.task_status !== 'completed') {
+          console.log(`${LOG_PREFIX} [recovery] HOLD: issue=${row.issue_id}, status=${row.task_status}, reason=task_not_completed`);
+          await markRelayLogFailed(client, row.issue_id);
+          continue;
+        }
+        const completion = completionAdmission(row.task_result ??
+          (row.task_error ? { error: row.task_error } : null));
+        if (!completion.ok) {
+          const parked = await applyDisposition(client,
+            { ...row, stage: row.to_stage }, completion.disposition, completion.reason,
+            { target_stage: row.to_stage, completion_reason: completion.reason });
+          console.log(`${LOG_PREFIX} [recovery] PARK: issue=${row.issue_id}, reason=${completion.reason}, disposition_applied=${parked}`);
+          await markRelayLogFailed(client, row.issue_id);
+          continue;
+        }
         // Check if next stage is gated; skip auto-advance if it is
         if (gatedStages.includes(row.next_stage)) {
           console.log(`${LOG_PREFIX} [recovery] SKIPPED: issue=${row.issue_id}, from_stage='${row.to_stage}', to_stage='${row.next_stage}', reason=gated stage requires manual approval`);
@@ -472,6 +504,7 @@ async function requeueStrandedTasks() {
        SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage, i.updated_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason,
+              t.result AS dead_task_result, t.error AS dead_task_error,
               r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
               r.model, r.max_concurrent_tasks, r.runtime_config, r.archived_at,
               COALESCE(
@@ -644,6 +677,21 @@ async function requeueStrandedTasks() {
       // A cold start has no prior task, so it is attempt 1 of the queue's own
       // default ceiling -- never row.attempt + 1 on a NULL.
       const coldStart = !row.dead_task_id;
+      if (row.dead_task_status === 'completed') {
+        const completion = completionAdmission(row.dead_task_result ??
+          (row.dead_task_error ? { error: row.dead_task_error } : null));
+        if (!completion.ok) {
+          // The predecessor reached process status=completed but did not
+          // produce admissible work. Re-dispatching it would buy a duplicate
+          // paid task (the GSP #1229 shape), so hold it for diagnosis/operator
+          // action instead of treating it as an ordinary missing artifact.
+          const parked = await applyDisposition(client,
+            { ...row, stage: row.stage }, completion.disposition, completion.reason,
+            { target_stage: row.stage, completion_reason: completion.reason });
+          console.log(`${LOG_PREFIX} [requeue] PARK #${row.number}: completed predecessor failed completion admission (${completion.reason}), disposition_applied=${parked}`);
+          continue;
+        }
+      }
       const compatibility = instructionCompatibility(row.instructions, row.stage);
       if (!compatibility.ok) {
         console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: agent instructions do not authorize '${compatibility.stage}'`);
