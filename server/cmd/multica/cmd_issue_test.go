@@ -1120,6 +1120,69 @@ func TestResolveTaskRunID(t *testing.T) {
 	}
 }
 
+func TestRunIssueCancelTaskUsesExactTaskEndpointWithoutListing(t *testing.T) {
+	const taskID = "abcd1234-0000-0000-0000-000000000000"
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.Method != http.MethodPost || r.URL.Path != "/api/tasks/"+taskID+"/cancel" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": taskID, "status": "cancelled"})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	cmd := &cobra.Command{}
+	cmd.Flags().String("issue", "", "")
+	cmd.Flags().String("output", "json", "")
+	if _, err := captureStdout(t, func() error { return runIssueCancelTask(cmd, []string{taskID}) }); err != nil {
+		t.Fatalf("runIssueCancelTask: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("request count = %d, want 1 (%v)", len(paths), paths)
+	}
+}
+
+func TestRunIssueCancelTaskScopesExactUUIDToIssue(t *testing.T) {
+	const (
+		issueID = "1881a167-4bb6-4602-944b-f40ce4192fe6"
+		taskID  = "abcd1234-0000-0000-0000-000000000000"
+	)
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/issues/MUL-1852":
+			json.NewEncoder(w).Encode(map[string]any{"id": issueID, "identifier": "MUL-1852"})
+		case "/api/issues/" + issueID + "/tasks/" + taskID + "/cancel":
+			json.NewEncoder(w).Encode(map[string]any{"id": taskID, "status": "cancelled"})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	cmd := &cobra.Command{}
+	cmd.Flags().String("issue", "", "")
+	cmd.Flags().String("output", "json", "")
+	_ = cmd.Flags().Set("issue", "MUL-1852")
+	if _, err := captureStdout(t, func() error { return runIssueCancelTask(cmd, []string{taskID}) }); err != nil {
+		t.Fatalf("runIssueCancelTask: %v", err)
+	}
+	if want := []string{"/api/issues/MUL-1852", "/api/issues/" + issueID + "/tasks/" + taskID + "/cancel"}; fmt.Sprint(paths) != fmt.Sprint(want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+}
+
 func TestRunIssueRunMessagesResolvesShortTaskPrefix(t *testing.T) {
 	issueID := "1881a167-4bb6-4602-944b-f40ce4192fe6"
 	taskID := "abcd1234-0000-0000-0000-000000000000"
