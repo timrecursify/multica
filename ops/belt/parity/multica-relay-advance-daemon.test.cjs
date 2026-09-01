@@ -15,14 +15,11 @@ test('requeue candidate SQL binds the stage array with a real PostgreSQL client'
   const sql = source.slice(start + 1, end);
   assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
   assert.match(sql, /LIMIT \$1::int/);
-  // The shared test DB predates this unrelated projection. Keep the exact
-  // requeue predicate and parameter expressions when executing it there.
-  const testDbSql = sql.replace('a.token_budget, ', '');
   const params = [3, ['Queue', 'In Progress', 'Spec']];
   const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
   try {
     await client.connect();
-    const result = await client.query(testDbSql, params);
+    const result = await client.query(sql, params);
     assert.ok(Array.isArray(result.rows));
   } finally {
     await client.end();
