@@ -62,6 +62,9 @@ const SPEC_BEGIN = "<!-- RELAY-SPEC:BEGIN -->";
 const SPEC_END = "<!-- RELAY-SPEC:END -->";
 const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || "2", 10);
 const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMIT || "6", 10);
+const LIVE_TASK_STATUSES = [
+  "queued", "dispatched", "running", "waiting_local_directory", "deferred"
+];
 
 async function applyDisposition(client, issue, disposition, reason, evidence = {}) {
   const changed = await client.query(
@@ -169,6 +172,77 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
     from_stage: fromStage,
     to_stage: toStage
   }));
+}
+
+async function replaceStageTask(client, task) {
+  // The issue row is locked by relayAdvance.  Cancel every live task that was
+  // created for another stage before making the successor visible, so a flight
+  // cannot retain work from its previous stage after this transaction commits.
+  await client.query(
+    `UPDATE agent_task_queue
+        SET status = 'cancelled', completed_at = NOW(),
+            prepare_lease_expires_at = NULL,
+            failure_reason = 'relay_stage_transition_superseded'
+      WHERE issue_id = $1
+        AND status::text = ANY($2::text[])
+        AND COALESCE(context->>'to_stage', '') IS DISTINCT FROM $3`,
+    [task.issueId, LIVE_TASK_STATUSES, task.toStage]
+  );
+
+  const inserted = await client.query(
+    `INSERT INTO agent_task_queue (
+       agent_id, issue_id, status, priority, runtime_id, context,
+       trigger_summary, force_fresh_session, originator_source,
+       trigger_evidence_kind
+     )
+     SELECT $1, $2, 'queued', $3, $4, $5::jsonb, $6, TRUE,
+            'unattributed', 'relay_stage_transition'
+      WHERE NOT EXISTS (
+        SELECT 1 FROM agent_task_queue active
+         WHERE active.issue_id = $2
+           AND active.status::text = ANY($7::text[])
+           AND active.context->>'to_stage' = $8
+      )
+       ON CONFLICT DO NOTHING
+       RETURNING id`,
+    [task.agentId, task.issueId, task.priority, task.runtimeId, task.context,
+      task.triggerSummary, LIVE_TASK_STATUSES, task.toStage]
+  );
+
+  const taskId = inserted.rows[0]?.id || await existingStageTask(
+    client, task.issueId, task.toStage
+  );
+  if (!taskId) {
+    throw new Error(`relay successor task was not created for issue ${task.issueId} stage ${task.toStage}`);
+  }
+
+  const log = await client.query(
+    `INSERT INTO relay_run_log (
+       issue_id, from_stage, to_stage, agent_id, task_id, status
+     )
+     SELECT $1, $2, $3, $4, $5, 'pending'
+      WHERE NOT EXISTS (
+        SELECT 1 FROM relay_run_log
+         WHERE issue_id = $1 AND task_id = $5
+      )
+     RETURNING id`,
+    [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
+  );
+  return { taskId, relayLogId: log.rows[0]?.id || null };
+}
+
+async function existingStageTask(client, issueId, toStage) {
+  const existing = await client.query(
+    `SELECT id FROM agent_task_queue
+      WHERE issue_id = $1
+        AND status::text = ANY($2::text[])
+        AND context->>'to_stage' = $3
+      ORDER BY created_at DESC
+      LIMIT 1
+      FOR UPDATE`,
+    [issueId, LIVE_TASK_STATUSES, toStage]
+  );
+  return existing.rows[0]?.id || null;
 }
 
 async function ssoBridge(req, res) {
@@ -292,7 +366,7 @@ async function relayAdvance(req, res, body) {
     }
 
     const issueResult = await client.query(
-      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority
+      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
        WHERE id = $1
        FOR UPDATE`,
@@ -307,13 +381,18 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    const parkedRelease = issue.status === "Parked" && to_stage === "Queue" &&
+      issue.metadata?.parked_release_once === true;
+    const releaseAt = issue.metadata?.parked_release_at || null;
     if (issue.status === to_stage) {
+      const taskId = await existingStageTask(client, issue.id, to_stage);
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
         issue: { id: issue.id, status: issue.status },
-        transition: "already_applied"
+        transition: "already_applied",
+        task_id: taskId
       }));
       return;
     }
@@ -336,9 +415,20 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    if (!allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
+    if (!parkedRelease && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
+      return;
+    }
+    if (issue.status === "Parked" && to_stage === "Queue" && !parkedRelease) {
+      await client.query("ROLLBACK");
+      console.warn(JSON.stringify({
+        event: "relay_advance_rejected", reason: "parked_release_required",
+        issue_id: issue.id, target_stage: to_stage
+      }));
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "parked_release_required",
+        message: "set parked_release_once metadata for one deliberate release" }));
       return;
     }
 
@@ -492,7 +582,7 @@ async function relayAdvance(req, res, body) {
     // by the owner's runbook and its concurrency/model configuration is valid.
     // Unknown instructions fail closed: a worker that would stop on this stage
     // has no useful outcome and still consumes vendor tokens.
-    if (stage.agent_id && isExecutionStage(to_stage)) {
+    if (stage.agent_id && isExecutionStage(to_stage) && !parkedRelease) {
       const compatibility = instructionCompatibility(stage.instructions, to_stage);
       if (!compatibility.ok) {
         // Persist rejected advances so the Registered recovery pass can apply
@@ -570,8 +660,8 @@ async function relayAdvance(req, res, body) {
       const history = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
           WHERE issue_id = $1 AND context->>'to_stage' = $2
-            AND started_at IS NOT NULL`,
-        [issue.id, to_stage]
+            AND ($3::timestamptz IS NULL OR created_at >= $3)`,
+        [issue.id, to_stage, releaseAt]
       );
       const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
       if (!cycle.ok) {
@@ -603,8 +693,9 @@ async function relayAdvance(req, res, body) {
       }
       const lifetimeHistory = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
-          WHERE issue_id = $1 AND started_at IS NOT NULL`,
-        [issue.id]
+          WHERE issue_id = $1
+            AND ($2::timestamptz IS NULL OR created_at >= $2)`,
+        [issue.id, releaseAt]
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       if (!lifetime.ok) {
@@ -613,6 +704,16 @@ async function relayAdvance(req, res, body) {
           ceiling: lifetime.ceiling
         });
         await client.query("COMMIT");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: lifetime.reason,
+          issue_id: issue.id,
+          target_stage: to_stage,
+          historical_tasks: lifetimeHistory.rows[0]?.n || 0,
+          ceiling: lifetime.ceiling,
+          disposition: lifetime.disposition,
+          disposition_applied: moved
+        }));
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: lifetime.reason, disposition: lifetime.disposition,
           disposition_applied: moved, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
@@ -623,11 +724,20 @@ async function relayAdvance(req, res, body) {
 
     const result = await client.query(
       `UPDATE "issue"
-       SET status = $1, updated_at = NOW()
+       SET status = $1,
+           metadata = CASE WHEN $3 THEN
+             jsonb_set(COALESCE(metadata, '{}'::jsonb) - 'parked_release_once',
+                       '{parked_release_at}', to_jsonb(NOW()), true)
+             ELSE metadata END,
+           updated_at = NOW()
        WHERE id = $2
        RETURNING id, status`,
-      [to_stage, issue_id]
+      [to_stage, issue_id, parkedRelease]
     );
+    if (parkedRelease) {
+      console.warn(JSON.stringify({ event: "parked_release_consumed",
+        issue_id: issue.id, from_stage: issue.status, to_stage }));
+    }
 
     let taskId = null;
     let relayLogId = null;
@@ -664,50 +774,18 @@ async function relayAdvance(req, res, body) {
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
       });
-      // A pending task will pick the issue up at its current stage, so a second
-      // task is redundant; the stage transition must not be sacrificed to it.
-      const taskResult = await client.query(
-        `INSERT INTO agent_task_queue (
-           agent_id, issue_id, status, priority, runtime_id, context,
-           trigger_summary, force_fresh_session, originator_source,
-           trigger_evidence_kind
-         )
-         SELECT $1, $2, 'queued', $3, $4, $5::jsonb, $6, TRUE,
-                'unattributed', 'relay_stage_transition'
-          WHERE NOT EXISTS (
-            SELECT 1 FROM agent_task_queue active
-             WHERE active.issue_id = $2
-               AND active.status IN ('queued', 'dispatched', 'running',
-                                     'waiting_local_directory', 'deferred')
-               AND active.context->>'to_stage' = $7
-          )
-           ON CONFLICT DO NOTHING
-           RETURNING id`,
-        [
-          stage.agent_id,
-          issue_id,
-          taskPriority,
-          stage.selected_runtime_id,
-          context,
-          `Relay stage transition: ${issue.status} -> ${to_stage}`,
-          to_stage
-        ]
-      );
-      if (taskResult.rows.length === 0) {
-        console.error('[relay] task already pending for issue', issue_id, 'agent', stage.agent_id, '- stage transition committed without new task');
-      } else {
-        taskId = taskResult.rows[0].id;
-
-        const logResult = await client.query(
-          `INSERT INTO relay_run_log (
-             issue_id, from_stage, to_stage, agent_id, task_id, status
-           )
-           VALUES ($1, $2, $3, $4, $5, 'pending')
-           RETURNING id`,
-          [issue_id, issue.status, to_stage, stage.agent_id, taskId]
-        );
-        relayLogId = logResult.rows[0].id;
-      }
+      const successor = await replaceStageTask(client, {
+        issueId: issue_id,
+        fromStage: issue.status,
+        toStage,
+        agentId: stage.agent_id,
+        priority: taskPriority,
+        runtimeId: stage.selected_runtime_id,
+        context,
+        triggerSummary: `Relay stage transition: ${issue.status} -> ${to_stage}`
+      });
+      taskId = successor.taskId;
+      relayLogId = successor.relayLogId;
     }
 
     await client.query("COMMIT");
@@ -790,7 +868,11 @@ async function start() {
   });
 }
 
-start().catch((err) => {
-  console.error(`Relay bridge startup refused: ${err.message}`);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  start().catch((err) => {
+    console.error(`Relay bridge startup refused: ${err.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { existingStageTask, replaceStageTask };
