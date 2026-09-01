@@ -366,7 +366,7 @@ async function relayAdvance(req, res, body) {
     }
 
     const issueResult = await client.query(
-      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority
+      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
        WHERE id = $1
        FOR UPDATE`,
@@ -381,6 +381,9 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    const parkedRelease = issue.status === "Parked" && to_stage === "Queue" &&
+      issue.metadata?.parked_release_once === true;
+    const releaseAt = issue.metadata?.parked_release_at || null;
     if (issue.status === to_stage) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
       await client.query("COMMIT");
@@ -415,6 +418,17 @@ async function relayAdvance(req, res, body) {
     if (!allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
+      return;
+    }
+    if (issue.status === "Parked" && to_stage === "Queue" && !parkedRelease) {
+      await client.query("ROLLBACK");
+      console.warn(JSON.stringify({
+        event: "relay_advance_rejected", reason: "parked_release_required",
+        issue_id: issue.id, target_stage: to_stage
+      }));
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "parked_release_required",
+        message: "set parked_release_once metadata for one deliberate release" }));
       return;
     }
 
@@ -568,7 +582,7 @@ async function relayAdvance(req, res, body) {
     // by the owner's runbook and its concurrency/model configuration is valid.
     // Unknown instructions fail closed: a worker that would stop on this stage
     // has no useful outcome and still consumes vendor tokens.
-    if (stage.agent_id && isExecutionStage(to_stage)) {
+    if (stage.agent_id && isExecutionStage(to_stage) && !parkedRelease) {
       const compatibility = instructionCompatibility(stage.instructions, to_stage);
       if (!compatibility.ok) {
         // Persist rejected advances so the Registered recovery pass can apply
@@ -646,8 +660,8 @@ async function relayAdvance(req, res, body) {
       const history = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
           WHERE issue_id = $1 AND context->>'to_stage' = $2
-            AND started_at IS NOT NULL`,
-        [issue.id, to_stage]
+            AND ($3::timestamptz IS NULL OR created_at >= $3)`,
+        [issue.id, to_stage, releaseAt]
       );
       const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
       if (!cycle.ok) {
@@ -679,8 +693,9 @@ async function relayAdvance(req, res, body) {
       }
       const lifetimeHistory = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
-          WHERE issue_id = $1 AND started_at IS NOT NULL`,
-        [issue.id]
+          WHERE issue_id = $1
+            AND ($2::timestamptz IS NULL OR created_at >= $2)`,
+        [issue.id, releaseAt]
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       if (!lifetime.ok) {
@@ -689,6 +704,16 @@ async function relayAdvance(req, res, body) {
           ceiling: lifetime.ceiling
         });
         await client.query("COMMIT");
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: lifetime.reason,
+          issue_id: issue.id,
+          target_stage: to_stage,
+          historical_tasks: lifetimeHistory.rows[0]?.n || 0,
+          ceiling: lifetime.ceiling,
+          disposition: lifetime.disposition,
+          disposition_applied: moved
+        }));
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: lifetime.reason, disposition: lifetime.disposition,
           disposition_applied: moved, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
@@ -699,11 +724,20 @@ async function relayAdvance(req, res, body) {
 
     const result = await client.query(
       `UPDATE "issue"
-       SET status = $1, updated_at = NOW()
+       SET status = $1,
+           metadata = CASE WHEN $3 THEN
+             jsonb_set(COALESCE(metadata, '{}'::jsonb) - 'parked_release_once',
+                       '{parked_release_at}', to_jsonb(NOW()), true)
+             ELSE metadata END,
+           updated_at = NOW()
        WHERE id = $2
        RETURNING id, status`,
-      [to_stage, issue_id]
+      [to_stage, issue_id, parkedRelease]
     );
+    if (parkedRelease) {
+      console.warn(JSON.stringify({ event: "parked_release_consumed",
+        issue_id: issue.id, from_stage: issue.status, to_stage }));
+    }
 
     let taskId = null;
     let relayLogId = null;

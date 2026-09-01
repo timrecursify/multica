@@ -74,3 +74,20 @@ test('an already-applied transition locates its existing live successor task', a
   assert.deepEqual(calls[0].values, ['issue-1',
     ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred'], 'In Review']);
 });
+
+test('release admission is explicit, one-use, and resets task history by time', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /parked_release_once === true/);
+  assert.match(source, /reason: "parked_release_required"/);
+  assert.match(source, /created_at >= \$3/);
+  assert.match(source, /created_at >= \$2/);
+  assert.match(source, /'parked_release_once'.*'\{parked_release_at\}'/s);
+});
+
+test('lifetime rejection emits structured evidence', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source,
+    /event: "relay_advance_rejected",\s+reason: lifetime\.reason,[\s\S]*disposition_applied: moved/);
+});
