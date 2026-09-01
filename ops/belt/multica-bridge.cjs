@@ -105,6 +105,14 @@ const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 const IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "access"]);
+const RETRY_ESCALATION_REASONS = new Set([
+  "completion_blocked", "completion_qc_blocked", "completion_spec_blocked",
+  "completion_build_blocked", "completion_failed", "completion_no_work_product",
+  "missing_result", "qc_bounce_ceiling", "stage_cycle_limit", "lifetime_task_limit"
+]);
+const RETRY_ESCALATION_DEADLINE_MINUTES = Number.parseInt(
+  process.env.RELAY_RETRY_ESCALATION_DEADLINE_MINUTES || "20", 10
+);
 let testClientFactory = null;
 // A stage transition may retire work that has not started. Running paid work
 // is never cancelled here: crossStageExecutionAdmission defers the successor
@@ -308,6 +316,123 @@ function qcTaskEvidenceMismatch(task, payload) {
   if (evidence.failure_class !== payload.failure_class || evidence.qualifying !== payload.qualifying ||
       evidence.model !== payload.model || evidence.effort !== payload.effort) return "qc_task_evidence_mismatch";
   return null;
+}
+
+function retryEscalationReason(reason) {
+  const match = String(reason || "").match(/^retry_escalation:([a-z_]+)$/);
+  return match && RETRY_ESCALATION_REASONS.has(match[1]) ? match[1] : null;
+}
+
+async function retryEscalationSourceTask(client, issue, requestedTaskId = null) {
+  if (requestedTaskId != null && !UUID_RE.test(String(requestedTaskId))) return null;
+  const source = await client.query(
+    `SELECT t.id FROM agent_task_queue t
+      JOIN issue i ON i.id = t.issue_id AND i.workspace_id = $2::uuid
+      WHERE t.issue_id = $1::uuid
+        AND ($4::uuid IS NULL OR t.id = $4::uuid)
+        AND (
+          (t.status IN ('queued','dispatched','running','waiting_local_directory','deferred')
+            AND t.context->>'to_stage' = $3::text)
+          OR (t.status IN ('completed','failed','cancelled') AND EXISTS (
+            SELECT 1 FROM relay_run_log r
+             WHERE r.task_id = t.id AND r.issue_id = t.issue_id
+               AND r.to_stage = $3::text AND r.status = 'pending'
+          ))
+        )
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 2 FOR UPDATE OF t`,
+    [issue.id, issue.workspace_id, issue.status, requestedTaskId]);
+  return source.rows.length === 1 ? source.rows[0].id : null;
+}
+
+async function capEscalationVerified(client, issue, trigger, stage) {
+  const since = issue.metadata?.parked_release_at || issue.metadata?.retry_escalation_at || null;
+  if (trigger === "stage_cycle_limit") {
+    const history = await client.query(
+      `SELECT count(*)::int AS n FROM agent_task_queue
+        WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
+          AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz)`,
+      [issue.id, stage, since]);
+    return Number(history.rows[0]?.n || 0) >= STAGE_CYCLE_LIMIT;
+  }
+  if (trigger !== "lifetime_task_limit") return true;
+  const history = await client.query(
+    `SELECT count(*)::int AS n FROM agent_task_queue
+      WHERE issue_id = $1::uuid
+        AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)`,
+    [issue.id, since]);
+  return Number(history.rows[0]?.n || 0) >= LIFETIME_TASK_LIMIT;
+}
+
+async function verifiedRetryEscalation(client, issue, body) {
+  const trigger = retryEscalationReason(body.reason);
+  const taskId = body.retry_escalation_task_id;
+  const stage = body.retry_escalation_stage;
+  if (!trigger && !taskId && !stage) return null;
+  if (!trigger || body.to_stage !== "Spec" || !UUID_RE.test(String(taskId || "")) ||
+      typeof stage !== "string" || stage !== issue.status ||
+      issue.metadata?.retry_escalation?.source_task_id === taskId) return false;
+  const task = await client.query(
+    `SELECT t.status, t.result, t.error FROM agent_task_queue t
+      JOIN issue i ON i.id = t.issue_id AND i.workspace_id = $3::uuid
+      WHERE t.id = $1::uuid AND t.issue_id = $2::uuid
+        AND (t.context->>'to_stage' = $4::text OR EXISTS (
+          SELECT 1 FROM relay_run_log r
+           WHERE r.task_id = t.id AND r.issue_id = t.issue_id AND r.to_stage = $4::text
+        ))
+        AND t.status IN ('completed', 'failed', 'cancelled') FOR UPDATE OF t`,
+    [taskId, issue.id, issue.workspace_id, stage]
+  );
+  const row = task.rows[0];
+  if (!row) return false;
+  if (trigger.startsWith("completion_") || trigger === "missing_result") {
+    const admission = completionAdmission(row.result ?? (row.error ? { error: row.error } : null));
+    if (row.status !== "completed" || admission.ok || admission.reason !== trigger) return false;
+  }
+  if (!await capEscalationVerified(client, issue, trigger, stage)) return false;
+  return { reason: trigger, trigger_stage: stage, source_task_id: taskId };
+}
+
+function escalationDeadline() {
+  const minutes = Number.isInteger(RETRY_ESCALATION_DEADLINE_MINUTES) &&
+    RETRY_ESCALATION_DEADLINE_MINUTES > 0 ? RETRY_ESCALATION_DEADLINE_MINUTES : 20;
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString();
+}
+
+async function recordRetryEscalation(client, issue, escalation) {
+  const details = { ...escalation, target_stage: "Spec", model: "gpt-5.6-sol", effort: "low" };
+  await client.query(
+    `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+          jsonb_build_object('retry_escalation', $2::jsonb, 'retry_escalation_at', to_jsonb(NOW())),
+        updated_at = NOW() WHERE id = $1::uuid`, [issue.id, JSON.stringify(details)]);
+  const content = `<!-- multica-retry-escalation -->\nreason_code: ${details.reason}\n` +
+    `failed_stage: ${details.trigger_stage}\nowner: ${details.owner}\ndeadline: ${details.deadline}\n` +
+    `source_task_id: ${details.source_task_id || "bridge_cap"}\nnext_action: Sol-low re-spec`;
+  await client.query(
+    `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+     SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
+      WHERE NOT EXISTS (SELECT 1 FROM comment WHERE issue_id = $1::uuid AND content = $4::text)`,
+    [issue.id, issue.workspace_id, "00000000-0000-0000-0000-000000000000", content]);
+  await client.query(
+    `INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+     VALUES ($1::uuid, $2::uuid, 'system', 'relay_retry_escalated', $3::jsonb)`,
+    [issue.workspace_id, issue.id, JSON.stringify(details)]);
+}
+
+async function selectRetryEscalationOwner(client, issue) {
+  const owner = await selectStageOwner(client, issue.workspace_id, "Registered", "Spec");
+  if (!owner?.agent_id || !owner.owner_id || owner.archived_at || !owner.selected_runtime_id) {
+    throw new Error(`No active Sol-low re-spec owner for workspace ${issue.workspace_id}`);
+  }
+  if (owner.model !== "gpt-5.6-sol" || owner.thinking_level !== "low") {
+    throw new Error(`Sol-low re-spec owner has invalid lane: ${owner.agent_name}`);
+  }
+  const compatibility = instructionCompatibility(owner.instructions, "Spec");
+  const preflight = spendPreflight(owner, { provider: owner.selected_runtime_provider });
+  if (!compatibility.ok || !preflight.ok) {
+    const reason = compatibility.ok ? preflight.reason : "instruction_incompatible";
+    throw new Error(`Sol-low re-spec owner refused: ${reason}`);
+  }
+  return owner;
 }
 
 async function applyDisposition(client, issue, disposition, reason, evidence = {}) {
@@ -963,6 +1088,15 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
+    let retryEscalation = await verifiedRetryEscalation(client, issue, body);
+    if (retryEscalation === false) {
+      await client.query("ROLLBACK");
+      console.warn(JSON.stringify({ event: "relay_advance_rejected",
+        reason: "retry_escalation_evidence_required", issue_id: issue.id }));
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "retry_escalation_evidence_required" }));
+      return;
+    }
     const targetStageResult = await client.query(
       "SELECT stage_name FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
       [issue.workspace_id, to_stage]
@@ -987,8 +1121,9 @@ async function relayAdvance(req, res, body) {
     const cicdReturn = isCicdReturn(issue.status, to_stage, reason) &&
       !issue.metadata?.cicd_return_consumed_at;
     let cicdReturnCapBypass = false;
-    const releaseAt = issue.metadata?.parked_release_at || null;
-    if (issue.status === to_stage) {
+    const releaseAt = issue.metadata?.parked_release_at ||
+      issue.metadata?.retry_escalation_at || null;
+    if (issue.status === to_stage && !retryEscalation) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
       const relayLogId = terminalStages.has(to_stage)
         ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
@@ -1044,8 +1179,9 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    if (!parkedRelease && !parkedEvidenceQcRelease && !parkedDiagnosisDone &&
-        !noArtifactRescope && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
+    if (!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&
+        !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) &&
+        !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
@@ -1068,7 +1204,7 @@ async function relayAdvance(req, res, body) {
     // and the review lane on every lap. GSP #151 ran 67 laps.
     // The ceiling is agent_task_queue.max_attempts (default 2) -- the belt's own
     // declared retry limit, applied to stage re-entry instead of to one task.
-    // Past it the ticket is a human's problem, not another paid rebuild.
+    // Past it the ticket changes hands to a Sol-low re-spec, not another paid rebuild.
     if (issue.status === "In Review" && to_stage === "In Progress" &&
         altStages.includes("Human Review")) {
       const bounced = await client.query(
@@ -1083,20 +1219,30 @@ async function relayAdvance(req, res, body) {
       );
       const { n, ceiling } = bounced.rows[0];
       if (n >= ceiling) {
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: "qc_bounce_ceiling" }));
+          return;
+        }
+        retryEscalation = {
+          reason: "qc_bounce_ceiling", trigger_stage: issue.status,
+          attempts: n, ceiling, source_task_id: sourceTaskId,
+          deadline: escalationDeadline()
+        };
+        to_stage = "Spec";
         console.warn(JSON.stringify({
           event: "qc_bounce_ceiling",
           issue_id,
           bounces: n,
           ceiling,
-          redirected_to: "Parked"
+          redirected_to: "Spec",
+          source_task_id: sourceTaskId
         }));
-        to_stage = "Parked";
-        parkedAudit = {
-          trigger: "qc_bounce_ceiling",
-          intendedStage: "In Progress",
-          attempts: n,
-          taskCount: n
-        };
       }
     }
 
@@ -1181,8 +1327,15 @@ async function relayAdvance(req, res, body) {
       );
     }
 
-    const ownerStage = ownerStageForTransition(issue.status, to_stage);
-    const stage = await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage);
+    const ownerStage = retryEscalation ? "Registered" :
+      ownerStageForTransition(issue.status, to_stage);
+    let stage = retryEscalation
+      ? await selectRetryEscalationOwner(client, issue)
+      : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage);
+    if (retryEscalation) {
+      retryEscalation = { ...retryEscalation, owner: stage.agent_name,
+        deadline: escalationDeadline() };
+    }
 
     if (!stage) {
       throw new Error(`Missing relay configuration for stage: ${to_stage}`);
@@ -1282,7 +1435,7 @@ async function relayAdvance(req, res, body) {
       // A stage re-entry creates a fresh task, so per-task max_attempts does not
       // stop a QC FAIL loop. Count every historical task for this issue and
       // target stage before admitting another paid call; once the ceiling is
-      // reached the flight receives an explicit human disposition.
+      // reached the flight changes hands to a bounded Sol-low re-spec task.
       const history = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
           WHERE issue_id = $1 AND context->>'to_stage' = $2
@@ -1293,32 +1446,37 @@ async function relayAdvance(req, res, body) {
       const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
         client, issue, to_stage, reason, parkedEvidenceQcRelease
       );
-      if (!cycle.ok && !cicdReturn && !parkedQcRecovery && !noArtifactRescope) {
-        const moved = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
-          target_stage: to_stage, historical_tasks: history.rows[0]?.n || 0,
-          ceiling: cycle.ceiling
-        });
-        await client.query("COMMIT");
+      if (!cycle.ok && !cicdReturn && !parkedQcRecovery &&
+          !noArtifactRescope && !retryEscalation) {
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: cycle.reason }));
+          return;
+        }
+        retryEscalation = {
+          reason: cycle.reason, trigger_stage: issue.status,
+          attempts: history.rows[0]?.n || 0, ceiling: cycle.ceiling,
+          source_task_id: sourceTaskId, deadline: escalationDeadline()
+        };
+        to_stage = cycle.disposition;
+        stage = await selectRetryEscalationOwner(client, issue);
+        retryEscalation.owner = stage.agent_name;
         console.warn(JSON.stringify({
-          event: "relay_advance_rejected",
+          event: "relay_retry_escalated",
           reason: cycle.reason,
           issue_id: issue.id,
           target_stage: to_stage,
           historical_tasks: history.rows[0]?.n || 0,
           ceiling: cycle.ceiling,
           disposition: cycle.disposition,
-          disposition_applied: moved
+          escalation_owner: stage.agent_name,
+          deadline: retryEscalation.deadline
         }));
-        res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: cycle.reason,
-          message: "stage retry ceiling reached; issue parked and retry eligibility removed",
-          disposition: cycle.disposition,
-          target_stage: to_stage,
-          historical_tasks: history.rows[0]?.n || 0,
-          ceiling: cycle.ceiling
-        }));
-        return;
       }
       const lifetimeHistory = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
@@ -1328,27 +1486,36 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !cicdReturn && !noArtifactRescope) {
-        const moved = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
-          target_stage: to_stage, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
-          ceiling: lifetime.ceiling
-        });
-        await client.query("COMMIT");
+      if (!lifetime.ok && !cicdReturn && !noArtifactRescope && !retryEscalation) {
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: lifetime.reason }));
+          return;
+        }
+        retryEscalation = {
+          reason: lifetime.reason, trigger_stage: issue.status,
+          attempts: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling,
+          source_task_id: sourceTaskId, deadline: escalationDeadline()
+        };
+        to_stage = lifetime.disposition;
+        stage = await selectRetryEscalationOwner(client, issue);
+        retryEscalation.owner = stage.agent_name;
         console.warn(JSON.stringify({
-          event: "relay_advance_rejected",
+          event: "relay_retry_escalated",
           reason: lifetime.reason,
           issue_id: issue.id,
           target_stage: to_stage,
           historical_tasks: lifetimeHistory.rows[0]?.n || 0,
           ceiling: lifetime.ceiling,
           disposition: lifetime.disposition,
-          disposition_applied: moved
+          escalation_owner: stage.agent_name,
+          deadline: retryEscalation.deadline
         }));
-        res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: lifetime.reason, disposition: lifetime.disposition,
-          disposition_applied: moved, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
-          ceiling: lifetime.ceiling }));
-        return;
       }
     }
 
@@ -1419,6 +1586,7 @@ async function relayAdvance(req, res, body) {
       console.warn(JSON.stringify({ event: "parked_release_consumed",
         issue_id: issue.id, from_stage: issue.status, to_stage }));
     }
+    if (retryEscalation) await recordRetryEscalation(client, issue, retryEscalation);
 
     let taskId = null;
     let relayLogId = null;
@@ -1470,6 +1638,13 @@ async function relayAdvance(req, res, body) {
         from_stage: issue.status,
         to_stage,
         agent_name: stage.agent_name,
+        ...(retryEscalation ? {
+          kind: "retry_escalation",
+          escalation_reason: retryEscalation.reason,
+          escalation_owner: retryEscalation.owner,
+          escalation_deadline: retryEscalation.deadline,
+          escalation_source_task_id: retryEscalation.source_task_id
+        } : {}),
         ...(cicdReturn ? { return_reason: reason } : {}),
         ...(noArtifactRescope ? {
           rescope_reason: "qc_blocked_no_artifact",
@@ -1488,7 +1663,9 @@ async function relayAdvance(req, res, body) {
         priority: taskPriority,
         runtimeId: stage.selected_runtime_id,
         context,
-        triggerSummary: `Relay stage transition: ${issue.status} -> ${to_stage}`
+        triggerSummary: retryEscalation
+          ? `Sol-low re-spec escalation: ${retryEscalation.reason}`
+          : `Relay stage transition: ${issue.status} -> ${to_stage}`
       });
       taskId = successor.taskId;
       relayLogId = successor.relayLogId;
@@ -1617,5 +1794,8 @@ module.exports = {
   issueImplementationArtifact,
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
-  latestQcNoArtifactSignal
+  latestQcNoArtifactSignal,
+  retryEscalationReason,
+  verifiedRetryEscalation,
+  retryEscalationSourceTask
 };

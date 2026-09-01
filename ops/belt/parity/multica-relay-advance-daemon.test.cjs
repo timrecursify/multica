@@ -95,8 +95,23 @@ test('relay advancement admits task results before creating a successor', () => 
   assert.match(source, /require\('\.\.\/relay-completion-admission\.cjs'\)/);
   assert.match(source, /atq\.result AS task_result/);
   assert.match(source, /completionAdmission\(row\.task_result/);
-  assert.match(source, /applyDisposition\(client,[\s\S]*completion\.disposition, completion\.reason/);
+  assert.match(source, /requestRetryEscalation\(row, completion\.reason\)/);
+  assert.match(source, /retry_escalation_task_id: taskId/);
+  assert.match(source, /retry_escalation_stage: triggerStage/);
   assert.match(source, /markRelayLogFailedById\(client, row\.log_id\)/);
+  assert.match(source, /relay_source_task_id: row\.task_id/);
+});
+
+test('retry ceilings leave the daemon through relay authority instead of direct status writes', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('function diagnosisText'));
+  assert.match(requeue, /requestRetryEscalation\(row, cycle\.reason\)/);
+  assert.match(requeue, /requestRetryEscalation\(row, lifetime\.reason\)/);
+  assert.match(requeue,
+    /row\.metadata\?\.parked_release_at \|\|\s+row\.metadata\?\.retry_escalation_at \|\| null/);
+  assert.doesNotMatch(requeue, /applyDisposition\(client, row, cycle\.disposition/);
+  assert.doesNotMatch(requeue, /applyDisposition\(client, row, lifetime\.disposition/);
 });
 
 test('stranded-task recovery does not retry a semantically blocked completion', () => {

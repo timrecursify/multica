@@ -60,7 +60,9 @@ function textFields(envelope) {
 }
 
 function completionAdmission(result) {
-  const rejected = (reason) => ({ ok: false, reason, disposition: 'Parked' });
+  const rejected = (reason) => ({
+    ok: false, reason, disposition: 'Spec', escalation: 'sol_low_respec'
+  });
   const envelope = asEnvelope(result);
   if (!envelope) return rejected('missing_result');
 
