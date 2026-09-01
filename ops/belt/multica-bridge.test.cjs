@@ -546,6 +546,61 @@ test('nine one-slot builders fill fairly and a tenth waits until capacity frees'
   assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
 });
 
+test('twenty concurrent stage retries create one active successor task', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') {
+    return t.skip('integration test requires a real DATABASE_URL');
+  }
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  await admin.connect();
+  const schema = `relay_pool_retry_${Date.now()}`;
+  const issueId = '11111111-1111-1111-1111-111111111111';
+  const agentId = '22222222-2222-2222-2222-222222222222';
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`SET search_path TO ${schema}`);
+    await admin.query(`CREATE TABLE agent_task_queue (
+      id uuid PRIMARY KEY DEFAULT (md5(random()::text || clock_timestamp()::text))::uuid, agent_id uuid NOT NULL,
+      issue_id uuid NOT NULL, workspace_id uuid NOT NULL, status text NOT NULL,
+      priority integer NOT NULL, runtime_id uuid, context jsonb NOT NULL,
+      trigger_summary text, force_fresh_session boolean, originator_source text,
+      trigger_evidence_kind text, completed_at timestamptz, prepare_lease_expires_at timestamptz,
+      failure_reason text, created_at timestamptz NOT NULL DEFAULT now()
+    ); CREATE TABLE relay_run_log (
+      id serial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
+      to_stage text, agent_id uuid, task_id uuid, status text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const task = {
+      issueId, workspaceId: '33333333-3333-3333-3333-333333333333',
+      fromStage: 'Spec', toStage: 'Queue', agentId,
+      priority: 1, runtimeId: null,
+      serialize: true,
+      context: JSON.stringify({ source: 'relay-advance', to_stage: 'Queue' }),
+      triggerSummary: 'concurrency test'
+    };
+    const retry = async () => {
+      const client = new Client({ connectionString: databaseUrl });
+      await client.connect();
+      try {
+        await client.query(`SET search_path TO ${schema}`);
+        await client.query('BEGIN');
+        const result = await replaceStageTask(client, task);
+        await client.query('COMMIT');
+        return result;
+      } finally { await client.end(); }
+    };
+    await Promise.all(Array.from({ length: 20 }, retry));
+    const { rows } = await admin.query(`SELECT count(*)::int AS count
+      FROM agent_task_queue WHERE issue_id=$1::uuid AND status='queued'`, [issueId]);
+    assert.equal(rows[0].count, 1);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
   assert.equal(isBookkeepingTransition('Queue', 'In Progress'), true);
   assert.equal(isBookkeepingTransition('Spec', 'Queue'), false);
