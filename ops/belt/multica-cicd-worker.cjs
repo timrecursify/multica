@@ -9,11 +9,16 @@
 const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
-const { Pool } = require('/home/newadmin/node_modules/pg');
+let pool;
+let relayToken;
 
-const ENV = fs.readFileSync('/home/newadmin/.secrets/multica-remote/remote-bridge.env', 'utf8');
-const RELAY_TOKEN = ENV.split('\n').find(l => l.startsWith('RELAY_AGENT_SECRET=')).split('=')[1];
-let pool = new Pool({ connectionString: ENV.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });
+function initializeRuntime() {
+  const { Pool } = require('pg');
+  const envPath = process.env.MULTICA_REMOTE_BRIDGE_ENV || '/home/newadmin/.secrets/multica-remote/remote-bridge.env';
+  const env = fs.readFileSync(envPath, 'utf8');
+  relayToken = env.split('\n').find(l => l.startsWith('RELAY_AGENT_SECRET=')).split('=')[1];
+  pool = new Pool({ connectionString: env.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });
+}
 const BOT = 'b8ecc1c4-d58c-4233-a669-7ede7060531c';
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
@@ -30,7 +35,7 @@ function gh(args) {
 
 let relay = function relayRequest(issueId, toStage, currentWorkProductMd5) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: RELAY_TOKEN,
+    const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: relayToken,
       ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}) });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
@@ -251,6 +256,7 @@ async function sweep() {
 }
 
 async function main() {
+  initializeRuntime();
   log(`[cicd-worker] started; poll=${POLL_MS}ms merge=${MERGE_ENABLED}`);
   for (;;) {
     await sweep().catch(e => log('[sweep] error:', e.message));

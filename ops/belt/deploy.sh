@@ -34,6 +34,7 @@ runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/home/newadmin}"
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
   "$root_dir/guardrails.cjs"
+  "$root_dir/parked-diagnosis.cjs"
   "$root_dir/parity/multica-relay-advance-daemon.cjs"
   "$root_dir/multica-cicd-worker.cjs"
   "$root_dir/belt-config-guard.sh"
@@ -48,6 +49,7 @@ declare -a sources=(
 declare -a targets=(
   "$runtime_root/gsp-multica/multica-bridge.cjs"
   "$runtime_root/gsp-multica/guardrails.cjs"
+  "$runtime_root/gsp-multica/parked-diagnosis.cjs"
   "$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
   "$runtime_root/multica-cicd-worker.cjs"
   "$runtime_root/tools/belt-config-guard.sh"
@@ -60,15 +62,55 @@ declare -a targets=(
 )
 
 selected() {
-  [[ -z "$only_target" || ( "$only_target" == multica-cicd-worker && "$1" -eq 3 ) ]]
+  [[ -z "$only_target" || ( "$only_target" == multica-cicd-worker && "$1" -eq 4 ) ]]
 }
 
 invalid=0
 declare -a new_targets=()
+declare -A manifest_indexes=()
+for index in "${!sources[@]}"; do
+  manifest_indexes["${sources[$index]}"]="$index"
+done
+
+# Validate every relative CommonJS require before any backup or copy. This
+# keeps the manifest closed under runtime dependencies, so a missing module
+# fails the deploy before the first target is touched.
+for index in "${!sources[@]}"; do
+  selected "$index" || continue
+  source_file="${sources[$index]}"
+  [[ -f "$source_file" ]] || continue
+  case "$source_file" in
+    *.cjs|*.js)
+      while IFS= read -r dependency; do
+        [[ "$dependency" == ./* || "$dependency" == ../* ]] || continue
+        dependency_file="$(dirname -- "$source_file")/$dependency"
+        if [[ ! -f "$dependency_file" ]]; then
+          if [[ -f "${dependency_file}.cjs" ]]; then
+            dependency_file="${dependency_file}.cjs"
+          elif [[ -f "${dependency_file}.js" ]]; then
+            dependency_file="${dependency_file}.js"
+          fi
+        fi
+        dependency_file="$(cd -- "$(dirname -- "$dependency_file")" && pwd)/$(basename -- "$dependency_file")"
+        dependency_index="${manifest_indexes[$dependency_file]-}"
+        if [[ -z "$dependency_index" ]]; then
+          printf 'Missing manifest runtime dependency: %s requires %s\n' "$source_file" "$dependency_file" >&2
+          invalid=1
+        elif ! selected "$dependency_index" && [[ ! -f "${targets[$dependency_index]}" ]]; then
+          printf 'Missing runtime dependency target: %s requires %s\n' "$source_file" "${targets[$dependency_index]}" >&2
+          invalid=1
+        fi
+      done < <(grep -oE "require\([[:space:]]*[\"'][^\"']+[\"'][[:space:]]*\)" "$source_file" |
+        sed -E "s/^require\([[:space:]]*[\"']([^\"']+)[\"'][[:space:]]*\)$/\1/")
+      ;;
+  esac
+done
+
 for index in "${!sources[@]}"; do
   selected "$index" || continue
   new_targets[$index]=0
-  [[ "${targets[$index]}" == "$runtime_root/gsp-multica/guardrails.cjs" ]] && new_targets[$index]=1
+  [[ "${targets[$index]}" == "$runtime_root/gsp-multica/guardrails.cjs" ||
+     "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
     invalid=1
