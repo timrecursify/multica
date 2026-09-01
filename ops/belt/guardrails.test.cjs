@@ -6,7 +6,7 @@ const {
   crossStageExecutionAdmission,
   retryAdmission, spendPreflight, stageCycleAdmission, lifetimeTaskAdmission,
   isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
-  quotaCircuitAdmission
+  quotaCircuitAdmission, QUOTA_PAUSE_MAX_AGE_MS, quotaPauseClearance, quotaPauseFlipLogLine
 } = require('./guardrails.cjs');
 
 test('any bundled child is withheld, regardless of parent state', () => {
@@ -89,8 +89,30 @@ test('paid dispatch requires a live configured agent', () => {
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter' }).ok, false);
   assert.equal(spendPreflight({ max_concurrent_tasks: null, instructions: 'Queue', model: 'gpt-5.6-luna' }, { provider: 'codex' }).ok, true);
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: '' }, { provider: 'codex' }).ok, true);
-  assert.deepEqual(spendPreflight({ instructions: 'Queue', runtime_config: { quota_paused: true } }, { provider: 'codex' }),
-    { ok: false, reason: 'provider_quota_paused' });
+  assert.deepEqual(spendPreflight({ id: 'a-1', name: 'DeepSeek Builder', instructions: 'Queue', runtime_config: { quota_paused: true } }, { provider: 'codex' }),
+    { ok: false, reason: 'provider_quota_paused:DeepSeek Builder' });
+  assert.deepEqual(spendPreflight({ agent_name: 'Queued Builder', instructions: 'Queue', runtime_config: { quota_paused: true } }, { provider: 'codex' }),
+    { ok: false, reason: 'provider_quota_paused:Queued Builder' });
+});
+
+test('quota pauses self-clear after fifteen minutes without an exhausted workspace budget', () => {
+  const now = Date.parse('2026-09-01T12:16:00.000Z');
+  const old = '2026-09-01T12:00:00.000Z';
+  assert.deepEqual(quotaPauseClearance({ pausedAt: old, budgetExhausted: false, now }), {
+    clear: true, reason: 'build_budget_not_exhausted'
+  });
+  assert.deepEqual(quotaPauseClearance({ pausedAt: old, budgetExhausted: true, now }), {
+    clear: false, reason: 'build_budget_exhausted'
+  });
+  assert.deepEqual(quotaPauseClearance({ pausedAt: old, budgetExhausted: false,
+    now: Date.parse(old) + QUOTA_PAUSE_MAX_AGE_MS }), {
+    clear: false, reason: 'pause_within_grace_period'
+  });
+  assert.deepEqual(quotaPauseClearance({ pausedAt: 'not-a-timestamp', budgetExhausted: true, now }), {
+    clear: true, reason: 'invalid_pause_timestamp'
+  });
+  assert.equal(quotaPauseFlipLogLine('DeepSeek Builder', old, true),
+    'quota_paused flip agent="DeepSeek Builder" timestamp=2026-09-01T12:00:00.000Z value=true');
 });
 
 test('stage cycle breaker parks repeated task creation without human review', () => {

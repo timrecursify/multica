@@ -48,3 +48,19 @@ test('Registered recovery applies the same completion gate', () => {
   assert.match(recovery, /completionAdmission\(row\.task_result/);
   assert.match(recovery, /reason=task_not_completed/);
 });
+
+test('quota pause flips are timestamped and stale unbudgeted pauses self-clear', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /'quota_paused_at', to_jsonb\(NOW\(\)\)/);
+  const pause = source.slice(source.indexOf('async function pauseQuotaLane'),
+    source.indexOf('function logQuotaPauseFlip'));
+  assert.doesNotMatch(pause, /console\.warn/);
+  assert.match(source, /if \(quotaPause\) \{\s+logQuotaPauseFlip/);
+  assert.match(source, /FOR UPDATE SKIP LOCKED/);
+  assert.match(source, /b\.scope = 'workspace'/);
+  assert.match(source, /b\.state = 'closed'/);
+  assert.match(source, /b\.spent_ticks \+ b\.reserved_ticks >= b\.limit_ticks/);
+  assert.match(source, /committedFlips\.push\(\{ agent_name: agent\.agent_name, timestamp, paused: false \}\)/);
+  assert.match(source, /await client\.query\('COMMIT'\);\s+for \(const flip of committedFlips\) onFlip\(flip\)/);
+  assert.match(source, /setInterval\(reconcileQuotaPauses, 60000\)/);
+});
