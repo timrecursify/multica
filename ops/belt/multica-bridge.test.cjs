@@ -23,6 +23,7 @@ const {
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
+  selectPoolOwner,
   selectStageOwner,
   applyDisposition,
   consumeParkedQcRecovery,
@@ -456,26 +457,26 @@ test('scoper pool selects the least-loaded eligible Sol-low owner', async () => 
   const owner = await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec');
   assert.equal(owner.agent_id, 'agent-b');
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
-  assert.match(calls[1].sql, /ORDER BY active_task_count, p.agent_id/);
-  assert.deepEqual(calls[0].values, ['workspace-1', 'Registered']);
+  assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
+  assert.deepEqual(calls[0].values, ['workspace-1', 'Spec']);
   assert.deepEqual(calls[1].values, ['workspace-1', 'Spec']);
 });
 
-test('configured scoper pool fails closed when no Sol-low owner is eligible', async () => {
+test('configured stage pool fails closed when its members are incompatible', async () => {
   const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
-    ? { rows: [] } : { rows: [scoper({ model: 'deepseek/deepseek-v4-flash-0731' })] } };
+    ? { rows: [] } : { rows: [scoper({ instructions: 'Own Queue tickets only.' })] } };
   await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
-    /No eligible Sol-low scoper in pool/);
+    /No eligible stage owner in pool/);
 });
 
-test('configured scoper pool does not overfill an agent concurrency limit', async () => {
+test('configured stage pool does not overfill an agent concurrency limit', async () => {
   const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
     ? { rows: [] } : { rows: [scoper({ active_task_count: 1, max_concurrent_tasks: 1 })] } };
   await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
-    /No eligible Sol-low scoper in pool/);
+    /No eligible stage owner in pool/);
 });
 
-test('empty scoper pool preserves the canonical relay owner fallback', async () => {
+test('empty stage pool preserves the canonical relay owner fallback', async () => {
   const calls = [];
   const fallback = { agent_id: 'canonical-agent' };
   const client = { query: async (sql) => {
@@ -486,6 +487,180 @@ test('empty scoper pool preserves the canonical relay owner fallback', async () 
   } };
   assert.equal(await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'), fallback);
   assert.match(calls[2], /FROM relay_stage_config/);
+});
+
+test('pool selection applies to Queue and rotates equal-load agents', async () => {
+  const calls = [];
+  const builders = [
+    scoper({ agent_id: 'builder-older', agent_name: 'build-a', model: 'gpt-5.6-terra',
+      instructions: 'Use this runbook when the issue is in Queue.', last_selected_at: '2026-01-01T00:00:00Z' }),
+    scoper({ agent_id: 'builder-newer', agent_name: 'build-b', model: 'gpt-5.6-terra',
+      instructions: 'Use this runbook when the issue is in Queue.', last_selected_at: '2026-02-01T00:00:00Z' })
+  ];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: builders };
+    return { rows: [] };
+  } };
+  const selected = await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue');
+  assert.equal(selected.agent_id, 'builder-older');
+  assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
+  assert.match(calls[2].sql, /SET last_selected_at = NOW/);
+  assert.deepEqual(calls[2].values, ['workspace-1', 'Queue', 'builder-older']);
+});
+
+test('nine one-slot builders fill fairly and a tenth waits until capacity frees', async () => {
+  const agents = Array.from({ length: 9 }, (_, index) => ({
+    agent_id: `builder-${index + 1}`,
+    agent_name: `gsp-build-terra-low-${String(index + 1).padStart(2, '0')}`,
+    owner_id: `builder-${index + 1}`,
+    agent_status: 'idle', archived_at: null, instructions: 'Queue allowed',
+    max_concurrent_tasks: 1, active_task_count: 0,
+    selected_runtime_id: 'runtime-1', selected_runtime_provider: 'codex',
+    last_selected_at: null
+  }));
+  const active = new Set();
+  const client = { query: async (sql, values = []) => {
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool p/.test(sql)) {
+      return { rows: agents.map((agent) => ({ ...agent,
+        active_task_count: active.has(agent.agent_id) ? 1 : 0,
+        last_selected_at: active.has(agent.agent_id) ? new Date().toISOString() : null
+      })) };
+    }
+    if (/UPDATE relay_stage_agent_pool SET last_selected_at/.test(sql)) {
+      active.add(values[2]);
+      return { rows: [] };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  }};
+  const selected = [];
+  for (let index = 0; index < 9; index += 1) {
+    selected.push((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id);
+  }
+  assert.equal(new Set(selected).size, 9);
+  await assert.rejects(selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue'),
+    /No eligible stage owner/);
+  active.delete(selected[0]);
+  assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
+});
+
+test('twenty concurrent stage retries create one active successor task', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') {
+    return t.skip('integration test requires a real DATABASE_URL');
+  }
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  await admin.connect();
+  const schema = `relay_pool_retry_${Date.now()}`;
+  const issueId = '11111111-1111-1111-1111-111111111111';
+  const agentId = '22222222-2222-2222-2222-222222222222';
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`SET search_path TO ${schema}`);
+    await admin.query(`CREATE TABLE agent_task_queue (
+      id uuid PRIMARY KEY DEFAULT (md5(random()::text || clock_timestamp()::text))::uuid, agent_id uuid NOT NULL,
+      issue_id uuid NOT NULL, workspace_id uuid NOT NULL, status text NOT NULL,
+      priority integer NOT NULL, runtime_id uuid, context jsonb NOT NULL,
+      trigger_summary text, force_fresh_session boolean, originator_source text,
+      trigger_evidence_kind text, completed_at timestamptz, prepare_lease_expires_at timestamptz,
+      failure_reason text, created_at timestamptz NOT NULL DEFAULT now()
+    ); CREATE TABLE relay_run_log (
+      id serial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
+      to_stage text, agent_id uuid, task_id uuid, status text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const task = {
+      issueId, workspaceId: '33333333-3333-3333-3333-333333333333',
+      fromStage: 'Spec', toStage: 'Queue', agentId,
+      priority: 1, runtimeId: null,
+      serialize: true,
+      context: JSON.stringify({ source: 'relay-advance', to_stage: 'Queue' }),
+      triggerSummary: 'concurrency test'
+    };
+    const retry = async () => {
+      const client = new Client({ connectionString: databaseUrl });
+      await client.connect();
+      try {
+        await client.query(`SET search_path TO ${schema}`);
+        await client.query('BEGIN');
+        const result = await replaceStageTask(client, task);
+        await client.query('COMMIT');
+        return result;
+      } finally { await client.end(); }
+    };
+    await Promise.all(Array.from({ length: 20 }, retry));
+    const { rows } = await admin.query(`SELECT count(*)::int AS count
+      FROM agent_task_queue WHERE issue_id=$1::uuid AND status='queued'`, [issueId]);
+    assert.equal(rows[0].count, 1);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
+test('twenty concurrent Queue entries through both routes rotate across equal-load pool agents', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') {
+    return t.skip('integration test requires a real DATABASE_URL');
+  }
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  await admin.connect();
+  const schema = `relay_pool_queue_${Date.now()}`;
+  const workspaceId = '33333333-3333-3333-3333-333333333333';
+  const runtimeId = '44444444-4444-4444-4444-444444444444';
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`SET search_path TO ${schema}`);
+    await admin.query(`CREATE TABLE relay_stage_pool (
+      workspace_id uuid NOT NULL, stage_name text NOT NULL, enabled boolean NOT NULL
+    ); CREATE TABLE relay_stage_agent_pool (
+      workspace_id uuid NOT NULL, stage_name text NOT NULL, agent_id uuid NOT NULL,
+      enabled boolean NOT NULL, last_selected_at timestamptz
+    ); CREATE TABLE agent (
+      id uuid PRIMARY KEY, workspace_id uuid NOT NULL, name text NOT NULL, runtime_id uuid,
+      archived_at timestamptz, status text NOT NULL, instructions text, model text,
+      thinking_level text, max_concurrent_tasks integer NOT NULL, runtime_config jsonb
+    ); CREATE TABLE agent_runtime (
+      id uuid PRIMARY KEY, workspace_id uuid NOT NULL, provider text NOT NULL, status text NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    ); CREATE TABLE agent_task_queue (agent_id uuid NOT NULL, status text NOT NULL)`);
+    await admin.query(`INSERT INTO relay_stage_pool (workspace_id, stage_name, enabled)
+      VALUES ($1::uuid, 'Queue', true)`, [workspaceId]);
+    await admin.query(`INSERT INTO agent_runtime (id, workspace_id, provider, status)
+      VALUES ($1::uuid, $2::uuid, 'codex', 'online')`, [runtimeId, workspaceId]);
+    for (let index = 1; index <= 20; index += 1) {
+      const agentId = `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      await admin.query(`INSERT INTO agent
+        (id, workspace_id, name, runtime_id, status, instructions, max_concurrent_tasks)
+        VALUES ($1::uuid, $2::uuid, $3, $4::uuid, 'idle', 'read RUNBOOK_BUILD_WORKER.md', 1)`,
+      [agentId, workspaceId, `builder-${index}`, runtimeId]);
+      await admin.query(`INSERT INTO relay_stage_agent_pool
+        (workspace_id, stage_name, agent_id, enabled) VALUES ($1::uuid, 'Queue', $2::uuid, true)`,
+      [workspaceId, agentId]);
+    }
+    const select = async (fromStage) => {
+      const client = new Client({ connectionString: databaseUrl });
+      await client.connect();
+      try {
+        await client.query(`SET search_path TO ${schema}`);
+        await client.query('BEGIN');
+        const selected = await selectStageOwner(client, workspaceId,
+          ownerStageForTransition(fromStage, 'Queue'), 'Queue');
+        await client.query('COMMIT');
+        return selected.agent_id;
+      } finally { await client.end(); }
+    };
+    const selected = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+      select(index % 2 === 0 ? 'Spec' : 'In Progress')));
+    assert.equal(new Set(selected).size, 20);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
 });
 
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {

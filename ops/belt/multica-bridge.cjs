@@ -642,6 +642,15 @@ async function authorizeCicdReturnCapBypass(client, issueId, capBypass) {
 }
 
 async function replaceStageTask(client, task) {
+  // The issue row lock normally serializes relayAdvance callers. Keep the
+  // enqueue primitive safe for recovery/replay callers too: the predicate and
+  // insert must share a stage-specific transaction lock or simultaneous
+  // retries can both observe no active successor.
+  if (task.serialize) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+      task.issueId, task.toStage
+    ]);
+  }
   const context = typeof task.context === 'string' ? JSON.parse(task.context) : task.context;
   if (!isBuilderDispatchAllowed(context)) {
     throw new Error('builder dispatcher rejected a no_builder diagnosis task');
@@ -929,17 +938,20 @@ async function canonicalStageOwner(client, workspaceId, ownerStage) {
   return result.rows[0] || null;
 }
 
-async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
-  if (toStage !== "Spec") return null;
-  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, ownerStage]);
+async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
+  // Selection and the rotation update share the relay transaction. The advisory
+  // lock makes equal-load choices stable under concurrent advances into this pool.
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, toStage]);
   const result = await client.query(
     `SELECT p.agent_id, a.name AS agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
             a.status AS agent_status, a.instructions, a.model, a.thinking_level,
-            a.max_concurrent_tasks, a.runtime_config,
+            a.max_concurrent_tasks, a.runtime_config, p.last_selected_at,
             COALESCE(own_runtime.provider, online_runtime.provider) AS selected_runtime_provider,
             COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id,
             COALESCE(active.task_count, 0)::int AS active_task_count
        FROM relay_stage_agent_pool p
+       JOIN relay_stage_pool policy ON policy.workspace_id = p.workspace_id
+        AND policy.stage_name = p.stage_name AND policy.enabled = true
        LEFT JOIN agent a ON a.id = p.agent_id AND a.workspace_id = p.workspace_id
        LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
         AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
@@ -954,19 +966,24 @@ async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
             AND atq.status IN ('queued','dispatched','running','waiting_local_directory','deferred')
        ) active ON true
       WHERE p.workspace_id = $1 AND p.stage_name = $2 AND p.enabled = true
-      ORDER BY active_task_count, p.agent_id`, [workspaceId, toStage]);
+      ORDER BY active_task_count, p.last_selected_at NULLS FIRST, p.agent_id`, [workspaceId, toStage]);
   if (result.rows.length === 0) return null;
   const eligible = result.rows.filter((row) => row.archived_at === null &&
-    ["idle", "working"].includes(row.agent_status) && row.model === "gpt-5.6-sol" &&
-    row.thinking_level === "low" && row.selected_runtime_id &&
+    ["idle", "working"].includes(row.agent_status) && row.selected_runtime_id &&
     Number(row.active_task_count) < Number(row.max_concurrent_tasks) &&
     instructionCompatibility(row.instructions, toStage).ok);
-  if (eligible.length === 0) throw new Error(`No eligible Sol-low scoper in pool: ${workspaceId}/${ownerStage}`);
-  return eligible[0];
+  if (eligible.length === 0) throw new Error(`No eligible stage owner in pool: ${workspaceId}/${toStage}`);
+  const selected = eligible[0];
+  await client.query(
+    `UPDATE relay_stage_agent_pool SET last_selected_at = NOW()
+      WHERE workspace_id = $1 AND stage_name = $2 AND agent_id = $3`,
+    [workspaceId, toStage, selected.agent_id]
+  );
+  return selected;
 }
 
 async function selectStageOwner(client, workspaceId, ownerStage, toStage) {
-  const pooled = await selectScoperPoolOwner(client, workspaceId, ownerStage, toStage);
+  const pooled = await selectPoolOwner(client, workspaceId, ownerStage, toStage);
   return pooled || canonicalStageOwner(client, workspaceId, ownerStage);
 }
 
@@ -1726,6 +1743,7 @@ async function relayAdvance(req, res, body) {
         from_stage: issue.status,
         to_stage,
         agent_name: stage.agent_name,
+        pool_stage: stage.pool_stage || (stage.agent_id ? to_stage : null),
         ...(retryEscalation ? {
           kind: "retry_escalation",
           escalation_reason: retryEscalation.reason,
@@ -1900,6 +1918,7 @@ module.exports = {
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
+  selectPoolOwner,
   selectStageOwner,
   applyDisposition,
   consumeParkedQcRecovery,
