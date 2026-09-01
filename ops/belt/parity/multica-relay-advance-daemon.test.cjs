@@ -131,12 +131,12 @@ test('stranded-task fixtures leave running tasks and bundled children untouched'
   }
 });
 
-test('In Review fixture is outside the exact requeue stage set', () => {
+test('Human Review tickets are outside the exact requeue stage set', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  const inReview = strandedFixture({ stage: 'In Review' });
-  assert.equal(inReview.stage, 'In Review');
+  const humanReview = strandedFixture({ stage: 'Human Review' });
+  assert.equal(humanReview.stage, 'Human Review');
   assert.match(source, /RELAY_REQUEUE_STAGES \|\| 'Queue,In Progress,Spec'/);
-  assert.doesNotMatch(source, /RELAY_REQUEUE_STAGES \|\| '[^']*In Review/);
+  assert.doesNotMatch(source, /RELAY_REQUEUE_STAGES \|\| '[^']*Human Review/);
 });
 
 test('completed-latest fixture is excluded by the candidate predicate', () => {

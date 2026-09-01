@@ -98,10 +98,18 @@ function testAbsentCi() {
   assert.equal(worker.ciState('owner/repo', 'sha', '2026-09-01T14:00:00Z', now), 'pending');
 }
 
+function testHumanReviewIsNotDispatchable() {
+  const source = require('fs').readFileSync(require.resolve('./multica-cicd-worker.cjs'), 'utf8');
+  const sweep = source.slice(source.indexOf('async function sweep()'), source.indexOf('async function main()'));
+  assert.match(sweep, /WHERE status='CI\/CD & Deploy'/);
+  assert.doesNotMatch(sweep, /Human Review/);
+}
+
 (async () => {
   await testFinishedRoutes();
   testConsecutiveFailures();
   testAbsentCi();
+  testHumanReviewIsNotDispatchable();
   console.log('multica-cicd-worker tests passed');
 })().catch(error => {
   console.error(error);

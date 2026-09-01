@@ -41,7 +41,8 @@ const {
   retryEscalationSourceTask,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
-  isTerminalStage
+  isTerminalStage,
+  isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
 
 test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', async () => {
@@ -1076,21 +1077,27 @@ test('terminal relay transitions are logged and Parked Done remains relay-only a
   assert.match(source, /const parkedDiagnosisDone = issue\.status === "Parked" && to_stage === "Done"/);
   assert.match(source, /to_stage === "Done"/);
   assert.match(source, /work_product_mismatch/);
-  assert.match(source, /if \(isTerminalStage\(to_stage\)\)/);
+  assert.match(source, /if \(isNoDispatchArrivalStage\(to_stage\)\)/);
   assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
 });
 
-test('Parked and In Review arrivals at Done return before task dispatch', () => {
+test('empty-pool In Review and Parked arrivals at Human Review return before task dispatch', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  const terminalArrival = source.slice(source.indexOf('if (isTerminalStage(to_stage))'),
+  const noDispatchArrival = source.slice(source.indexOf('if (isNoDispatchArrivalStage(to_stage))'),
     source.indexOf('// A bundled child'));
+  const ownerSelection = source.slice(source.indexOf('const ownerStage ='),
+    source.indexOf('// A paid call is admitted'));
   for (const fromStage of ['Parked', 'In Review']) {
-    assert.equal(isTerminalStage('Done'), true, `${fromStage} -> Done is terminal`);
+    assert.equal(isNoDispatchArrivalStage('Human Review'), true,
+      `${fromStage} -> Human Review is a no-dispatch human gate`);
   }
-  assert.match(terminalArrival, /task_id: null/);
-  assert.match(terminalArrival, /relay_log_id: relayLogId/);
-  assert.match(terminalArrival, /return;/);
-  assert.doesNotMatch(terminalArrival, /replaceStageTask/);
+  assert.equal(isTerminalStage('Human Review'), false);
+  assert.match(noDispatchArrival, /task_id: null/);
+  assert.match(noDispatchArrival, /relay_log_id: relayLogId/);
+  assert.match(noDispatchArrival, /return;/);
+  assert.doesNotMatch(noDispatchArrival, /replaceStageTask/);
+  assert.match(ownerSelection, /isNoDispatchArrivalStage\(to_stage\) \? \{\}/);
+  assert.match(ownerSelection, /: await selectStageOwner\(client, issue\.workspace_id, ownerStage, to_stage\)\);/);
 });
 
 test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {
