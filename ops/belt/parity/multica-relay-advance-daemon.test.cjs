@@ -1,8 +1,33 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
+const { Client } = require('pg');
 const { qcCompletionAdvance, processParkedDiagnoses,
   requeueStrandedTasks } = require('./multica-relay-advance-daemon.cjs');
+
+const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+
+test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const start = source.indexOf('`SELECT i.id AS issue_id');
+  const end = source.indexOf('`', start + 1);
+  assert.ok(start >= 0 && end > start, 'requeue candidate SQL must be present');
+  const sql = source.slice(start + 1, end);
+  assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
+  assert.match(sql, /LIMIT \$1::int/);
+  // The shared test DB predates this unrelated projection. Keep the exact
+  // requeue predicate and parameter expressions when executing it there.
+  const testDbSql = sql.replace('a.token_budget, ', '');
+  const params = [3, ['Queue', 'In Progress', 'Spec']];
+  const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
+  try {
+    await client.connect();
+    const result = await client.query(testDbSql, params);
+    assert.ok(Array.isArray(result.rows));
+  } finally {
+    await client.end();
+  }
+});
 
 function strandedFixture(overrides = {}) {
   return {
@@ -318,7 +343,11 @@ test('diagnosis release retries every non-2xx response and records the attempt',
 
 test('diagnosis release stops retrying at five failures and saves the relay error', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const releaseFailure = source.slice(source.indexOf('async function recordDiagnosisReleaseFailure'),
+    source.indexOf('async function processParkedDiagnoses'));
   assert.match(source, /if \(nextAttempts >= 5\)/);
+  assert.match(releaseFailure, /WHERE id = \$1::uuid/);
+  assert.match(releaseFailure, /'diagnosis_release_attempts', \$2::int/);
   assert.match(source, /'diagnosis_release_error', \$3::text/);
   assert.match(source, /status=\$\{response\.status\}; body=\$\{response\.body/);
   assert.match(source, /fetch_error=\$\{err\.message\}/);

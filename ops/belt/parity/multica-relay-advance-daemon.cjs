@@ -758,7 +758,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
               AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
             ORDER BY rsc.id LIMIT 1
          ) r ON true
-        WHERE i.status = ANY($2)
+        WHERE i.status = ANY($2::text[])
           -- t.id IS NULL is the cold start: a ticket that reached this stage
           -- and never had a first task. The lateral above used to be an inner
           -- join, so such a ticket produced no row and was invisible to the
@@ -783,7 +783,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
           -- open for disposition.
           AND i.parent_issue_id IS NULL
         ORDER BY i.created_at ASC
-        LIMIT $1`,
+        LIMIT $1::int`,
       [REQUEUE_BATCH, REQUEUE_STAGES]
     );
 
