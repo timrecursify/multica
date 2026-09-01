@@ -68,6 +68,11 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MD5_RE = /^[a-f0-9]{32}$/i;
+const SHA_RE = /^[a-f0-9]{40}$/i;
+const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
+const IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 // A stage transition may retire work that has not started. Running paid work
 // is never cancelled here: crossStageExecutionAdmission defers the successor
 // until it becomes terminal, preserving the predecessor's work product.
@@ -108,6 +113,46 @@ function ownerStageForTransition(fromStage, toStage) {
     return BACKWARD_LANE_OWNER_STAGE[toStage] || fromStage;
   }
   return fromStage;
+}
+
+function relayVerdictError(res, status, error) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error }));
+}
+
+function validateRelayVerdict(payload) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "invalid_payload";
+  const required = ["issue_id", "callsign", "verdict", "work_product_md5", "bound_sha", "observed_sha", "failure_class", "qualifying", "model", "effort", "idem_key"];
+  if (required.some((key) => !(key in payload))) return "missing_fields";
+  if (!UUID_RE.test(payload.issue_id)) return "invalid_issue_id";
+  if (typeof payload.callsign !== "string" || !IDENTITY_RE.test(payload.callsign)) return "invalid_callsign";
+  if (payload.verdict !== "PASS" && payload.verdict !== "FAIL") return "invalid_verdict";
+  if (typeof payload.work_product_md5 !== "string" || !MD5_RE.test(payload.work_product_md5)) return "invalid_work_product_md5";
+  if (typeof payload.bound_sha !== "string" || !SHA_RE.test(payload.bound_sha)) return "invalid_bound_sha";
+  if (typeof payload.observed_sha !== "string" || !SHA_RE.test(payload.observed_sha)) return "invalid_observed_sha";
+  if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
+  if (typeof payload.failure_class !== "string" || !IDENTITY_RE.test(payload.failure_class)) return "invalid_failure_class";
+  if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
+  if (payload.model !== "gpt-5.6-sol" || payload.effort !== "low") return "invalid_qc_lane";
+  if (typeof payload.idem_key !== "string" || !IDEM_KEY_RE.test(payload.idem_key)) return "invalid_idem_key";
+  return null;
+}
+
+async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
+  const result = await client.query(
+    `SELECT t.id, t.agent_id, t.context, a.name AS agent_name
+       FROM agent_task_queue t
+       JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
+       JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
+      WHERE t.issue_id = $1 AND i.workspace_id = $2 AND t.status = 'completed'
+        AND t.context->>'to_stage' = 'In Review'
+        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+      ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
+      LIMIT 1 FOR UPDATE`,
+    [issueId, workspaceId]
+  );
+  return result.rows[0] || null;
 }
 
 async function applyDisposition(client, issue, disposition, reason, evidence = {}) {
@@ -583,6 +628,108 @@ async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
 async function selectStageOwner(client, workspaceId, ownerStage, toStage) {
   const pooled = await selectScoperPoolOwner(client, workspaceId, ownerStage, toStage);
   return pooled || canonicalStageOwner(client, workspaceId, ownerStage);
+}
+
+async function relayVerdict(req, res, payload) {
+  if (!RELAY_AGENT_SECRET || payload.agent_token !== RELAY_AGENT_SECRET) {
+    relayVerdictError(res, 403, "invalid_token");
+    return;
+  }
+  const invalid = validateRelayVerdict(payload);
+  if (invalid) {
+    relayVerdictError(res, 400, invalid);
+    return;
+  }
+  const client = new Client({ connectionString: MULTICA_DB });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [payload.idem_key]);
+    const prior = await client.query(
+      `SELECT issue_id, checker_name, verdict, work_product_md5, bound_sha,
+              observed_head, failure_class, qualifying, model, effort
+         FROM qc_attempt WHERE idem_key = $1 FOR UPDATE`, [payload.idem_key]
+    );
+    if (prior.rows.length > 0) {
+      const existing = prior.rows[0];
+      const same = existing.issue_id === payload.issue_id &&
+        existing.checker_name === payload.callsign && existing.verdict === payload.verdict &&
+        String(existing.work_product_md5).toLowerCase() === payload.work_product_md5.toLowerCase() &&
+        String(existing.bound_sha).toLowerCase() === payload.bound_sha.toLowerCase() &&
+        String(existing.observed_head).toLowerCase() === payload.observed_sha.toLowerCase() &&
+        existing.failure_class === payload.failure_class && existing.qualifying === payload.qualifying &&
+        existing.model === payload.model && existing.effort === payload.effort;
+      await client.query("COMMIT");
+      if (!same) return relayVerdictError(res, 409, "idempotency_conflict");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, replay: true, issue_id: payload.issue_id,
+        work_product_md5: existing.work_product_md5 }));
+      return;
+    }
+
+    const issue = await client.query(
+      `SELECT id, workspace_id FROM issue WHERE id = $1 FOR UPDATE`, [payload.issue_id]
+    );
+    if (issue.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return relayVerdictError(res, 404, "issue_not_found");
+    }
+    const qcTask = await latestCompletedSolLowQcTask(client, payload.issue_id, issue.rows[0].workspace_id);
+    if (!qcTask) {
+      await client.query("ROLLBACK");
+      return relayVerdictError(res, 409, "completed_sol_low_qc_required");
+    }
+    const taskHead = qcTask.context && typeof qcTask.context === "object" ? qcTask.context.head_sha : null;
+    if (typeof taskHead !== "string" || taskHead.toLowerCase() !== payload.bound_sha.toLowerCase()) {
+      await client.query("ROLLBACK");
+      return relayVerdictError(res, 409, "qc_task_sha_mismatch");
+    }
+    const notes = [
+      `relay_task_id=${qcTask.id}`,
+      `relay_agent_id=${qcTask.agent_id}`,
+      `relay_agent_name=${qcTask.agent_name}`,
+      typeof payload.notes === "string" && payload.notes.length <= 2000 ? payload.notes : null,
+    ].filter(Boolean).join("\n");
+    const current = await client.query(
+      `SELECT issue_id FROM qc_verdict WHERE issue_id = $1 FOR UPDATE`, [payload.issue_id]
+    );
+    await client.query(
+      `INSERT INTO qc_attempt
+         (issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head,
+          failure_class, qualifying, model, effort, idem_key, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+      [payload.issue_id, payload.callsign, payload.verdict, payload.work_product_md5,
+        payload.bound_sha, payload.observed_sha, payload.failure_class, payload.qualifying,
+        payload.model, payload.effort, payload.idem_key, notes]
+    );
+    if (current.rows.length > 0) {
+      await client.query(
+        `UPDATE qc_verdict SET checker_id = $2, checker_name = $3, verdict = $4,
+                work_product_md5 = $5, notes = $6, created_at = NOW()
+          WHERE issue_id = $1`,
+        [payload.issue_id, qcTask.agent_id, payload.callsign, payload.verdict,
+          payload.work_product_md5, notes]
+      );
+    } else {
+      await client.query(
+        `INSERT INTO qc_verdict
+           (issue_id, checker_id, checker_name, verdict, work_product_md5, notes)
+         VALUES ($1, $2, $3, $4, $5, $6)`,
+        [payload.issue_id, qcTask.agent_id, payload.callsign, payload.verdict,
+          payload.work_product_md5, notes]
+      );
+    }
+    await client.query("COMMIT");
+    res.writeHead(201, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true, issue_id: payload.issue_id,
+      checker_id: qcTask.agent_id, work_product_md5: payload.work_product_md5 }));
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[relay/verdict] ERROR:", err.message);
+    relayVerdictError(res, 500, "internal_error");
+  } finally {
+    await client.end().catch(() => {});
+  }
 }
 
 async function relayAdvance(req, res, body) {
@@ -1150,7 +1297,18 @@ async function relayAdvance(req, res, body) {
 }
 
 const server = http.createServer(async (req, res) => {
-  if (req.method === "POST" && req.url === "/relay/advance") {
+  if (req.url === "/relay/verdict") {
+    if (req.method !== "POST") return relayVerdictError(res, 405, "method_not_allowed");
+    let body = "";
+    req.on("data", chunk => { body += chunk; });
+    req.on("end", () => {
+      try {
+        relayVerdict(req, res, JSON.parse(body));
+      } catch {
+        relayVerdictError(res, 400, "invalid_json");
+      }
+    });
+  } else if (req.method === "POST" && req.url === "/relay/advance") {
     let body = "";
     req.on("data", chunk => body += chunk);
     req.on("end", () => {
@@ -1217,6 +1375,8 @@ module.exports = {
   completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff,
+  validateRelayVerdict,
+  latestCompletedSolLowQcTask,
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,

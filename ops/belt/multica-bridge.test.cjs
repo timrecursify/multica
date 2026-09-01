@@ -15,11 +15,56 @@ const {
   completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff,
+  validateRelayVerdict,
+  latestCompletedSolLowQcTask,
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
   selectStageOwner
 } = require('./multica-bridge.cjs');
+
+const validVerdict = Object.freeze({
+  issue_id: '123e4567-e89b-42d3-a456-426614174000', callsign: 'BRAVO-000517',
+  verdict: 'PASS', work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e',
+  bound_sha: '0123456789012345678901234567890123456789',
+  observed_sha: '0123456789012345678901234567890123456789', failure_class: 'none',
+  qualifying: true, model: 'gpt-5.6-sol', effort: 'low', idem_key: 'qc-verdict-000517'
+});
+
+test('verdict validation requires a callsign and rejects forged lane metadata', () => {
+  assert.equal(validateRelayVerdict(validVerdict), null);
+  assert.equal(validateRelayVerdict({ ...validVerdict, callsign: undefined }), 'invalid_callsign');
+  assert.equal(validateRelayVerdict({ ...validVerdict, observed_sha: 'f123456789012345678901234567890123456789' }), 'sha_binding_mismatch');
+  assert.equal(validateRelayVerdict({ ...validVerdict, work_product_md5: 'not-an-md5' }), 'invalid_work_product_md5');
+  assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
+  assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
+});
+
+test('verdict checker identity is selected from the completed same-workspace Sol-low QC task', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low', context: { head_sha: validVerdict.bound_sha } }] };
+  } };
+  const task = await latestCompletedSolLowQcTask(client, 'issue-1', 'workspace-1');
+  assert.equal(task.agent_id, 'agent-1');
+  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1']);
+  assert.match(calls[0].sql, /i\.workspace_id = t\.workspace_id/);
+  assert.match(calls[0].sql, /a\.workspace_id = i\.workspace_id/);
+  assert.match(calls[0].sql, /t\.context->>'to_stage' = 'In Review'/);
+  assert.match(calls[0].sql, /COALESCE\(a\.model, a\.runtime_config->>'model'\) = 'gpt-5\.6-sol'/);
+  assert.match(calls[0].sql, /COALESCE\(a\.thinking_level, a\.runtime_config->>'reasoning_effort'\) = 'low'/);
+  assert.match(calls[0].sql, /ORDER BY t\.completed_at DESC NULLS LAST/);
+});
+
+test('verdict route never uses deployment-configured checker identity', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.doesNotMatch(source, /RELAY_QC_ACTOR_ID/);
+  assert.match(source, /checker_id: qcTask\.agent_id/);
+  assert.match(source, /payload\.callsign/);
+  assert.match(source, /qc_task_sha_mismatch/);
+  assert.match(source, /idempotency_conflict/);
+});
 
 test('only a named CI/CD return is eligible for a repair authorization', () => {
   assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
