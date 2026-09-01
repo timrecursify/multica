@@ -24,7 +24,8 @@ const {
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
   selectStageOwner,
-  applyDisposition
+  applyDisposition,
+  consumeParkedQcRecovery
 } = require('./multica-bridge.cjs');
 
 test('Parked evidence QC return is a canonical consumed-release-only edge', () => {
@@ -41,6 +42,28 @@ test('Parked evidence QC return is a canonical consumed-release-only edge', () =
 test('Parked evidence return selects the canonical In Review QC owner', () => {
   assert.equal(ownerStageForTransition('Parked', 'In Review'), 'In Progress');
   assert.equal(ownerStageForTransition('Parked', 'Spec'), 'Registered');
+});
+
+test('exact #23696 recovery marker bypasses one capped QC admission, then is consumed', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', status: 'Parked' };
+  const reason = 'runtime_evidence_verified:task:223e4567-e89b-42d3-a456-426614174000';
+  let writes = 0;
+  const client = { query: async (sql, values) => {
+    writes += 1; assert.match(sql, /- 'parked_qc_recovery'/); assert.deepEqual(values, [issue.id, 'task:223e4567-e89b-42d3-a456-426614174000']);
+    return { rowCount: writes === 1 ? 1 : 0, rows: writes === 1 ? [{ id: issue.id }] : [] };
+  } };
+  assert.equal(await consumeParkedQcRecovery(client, issue, 'In Review', reason, true), true);
+  assert.equal(await consumeParkedQcRecovery(client, issue, 'In Review', reason, true), false);
+  assert.equal(await consumeParkedQcRecovery(client, issue, 'In Review', reason, false), false);
+  assert.equal(await consumeParkedQcRecovery(client, issue, 'Queue', reason, true), false);
+});
+
+test('ordinary capped Parked to In Review has no recovery bypass', () => {
+  const { stageCycleAdmission } = require('./guardrails.cjs');
+  assert.equal(stageCycleAdmission(2).ok, false);
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /!cycle\.ok && !cicdReturn && !parkedQcRecovery/);
+  assert.match(source, /consumeParkedQcRecovery\(\s*client, issue, to_stage, reason, parkedEvidenceQcRelease/);
 });
 
 const validVerdict = Object.freeze({
