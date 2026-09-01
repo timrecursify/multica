@@ -64,13 +64,18 @@ function namedBlocker(text) {
 function isSolLowDiagnosisAgent(agent) {
   const cfg = agent && agent.runtime_config && typeof agent.runtime_config === 'object'
     ? agent.runtime_config : {};
+  const name = String((agent && agent.name) || '').toLowerCase();
   const model = String((agent && agent.model) || '').toLowerCase();
   const configuredModel = cfg.model == null ? model : String(cfg.model).toLowerCase();
-  const role = [agent && agent.name, cfg.role, cfg.lane, cfg.agent_role]
+  const configuredEffort = cfg.reasoning_effort == null
+    ? (/(?:^|-)sol-low(?:-|$)/.test(name) ? 'low' : '')
+    : String(cfg.reasoning_effort).toLowerCase();
+  const role = [name, cfg.role, cfg.lane, cfg.agent_role]
     .filter(Boolean).join(' ').toLowerCase();
   const solLowModel = model === 'gpt-5.6-sol' && configuredModel === 'gpt-5.6-sol' &&
-    cfg.reasoning_effort === 'low';
-  return solLowModel && /qc|scop|diagnos/.test(role) &&
+    configuredEffort === 'low';
+  const canonicalWorkspaceSeat = /^(?:gsp|ppp)-/.test(name);
+  return canonicalWorkspaceSeat && solLowModel && /qc|scop|diagnos/.test(role) &&
     cfg.parked_diagnosis !== false;
 }
 
@@ -123,10 +128,10 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   // makes a repeated rejection idempotent without hiding the first diagnosis.
   if (!evidence.skip_reason_comment) await client.query(
     `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
-     SELECT $1, $2, 'system', $3, $4, 'system'
+     SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
       WHERE NOT EXISTS (
-        SELECT 1 FROM comment WHERE issue_id = $1 AND content LIKE $5
-          AND content LIKE $6
+        SELECT 1 FROM comment WHERE issue_id = $1::uuid AND content LIKE $5::text
+          AND content LIKE $6::text
       )`,
     [issue.id, issue.workspace_id, ZERO_UUID, content, `${PARK_REASON_MARKER}%`,
       `%reason_code: ${evidence.reason || evidence.reason_code || 'unknown'}%`]
@@ -149,17 +154,17 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
     await client.query(
       `UPDATE issue
           SET metadata = COALESCE(metadata, '{}'::jsonb) ||
-                jsonb_build_object('parked_blocker', $2),
+                jsonb_build_object('parked_blocker', $2::text),
               updated_at = NOW()
-        WHERE id = $1 AND status = 'Parked'`,
+        WHERE id = $1::uuid AND status = 'Parked'`,
       [issue.id, blocker]
     );
     await client.query(
       `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
-       SELECT $1, $2, 'system', $3, $4, 'system'
+       SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
         WHERE NOT EXISTS (
           SELECT 1 FROM comment
-           WHERE issue_id = $1 AND content LIKE $5
+           WHERE issue_id = $1::uuid AND content LIKE $5::text
         )`,
       [issue.id, issue.workspace_id, ZERO_UUID,
         `${PARK_BLOCKER_MARKER}\nparked_diagnosis_blocker: ${blocker}\n` +
@@ -178,12 +183,12 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
        trigger_summary, force_fresh_session, originator_source,
        trigger_evidence_kind, attempt, max_attempts
      )
-     SELECT $1, $2, 'queued', $3, $4, $5::jsonb,
+     SELECT $1::uuid, $2::uuid, 'queued', $3::integer, $4::uuid, $5::jsonb,
             'Sol-low parked-ticket diagnosis (no builder dispatch)', TRUE,
             'unattributed', 'relay_disposition', 1, 1
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue
-        WHERE issue_id = $2 AND context->>'kind' = $6
+        WHERE issue_id = $2::uuid AND context->>'kind' = $6::text
       )
       ON CONFLICT DO NOTHING
       RETURNING id`,
