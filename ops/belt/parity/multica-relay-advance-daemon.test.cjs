@@ -180,10 +180,62 @@ test('runtime-evidence recovery is one-shot, typed, and stays on relay authority
   assert.doesNotMatch(diagnosis, /UPDATE issue SET status/);
 });
 
-test('evidence recovery replays only an unchanged 409 release rejection', () => {
+test('diagnosis release retries every non-2xx response and records the attempt', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  assert.match(source, /!response\.ok && response\.status === 409/);
-  assert.match(source, /context - 'diagnosis_processed'\s*- 'runtime_evidence_recovery_v2_consumed'/);
+  assert.match(source, /if \(!response\.ok\)/);
+  assert.match(source, /diagnosis_release_attempts/);
+  assert.match(source, /- 'diagnosis_processed'\s*- 'runtime_evidence_recovery_v2_consumed'/);
+});
+
+test('diagnosis release stops retrying at five failures and saves the relay error', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /if \(nextAttempts >= 5\)/);
+  assert.match(source, /'diagnosis_release_error', \$3::text/);
+  assert.match(source, /status=\$\{response\.status\}; body=\$\{response\.body/);
+  assert.match(source, /fetch_error=\$\{err\.message\}/);
+});
+
+test('a 500 diagnosis release is retried on the next tick', async () => {
+  const task = { id: '123e4567-e89b-42d3-a456-426614174001', issue_id: '223e4567-e89b-42d3-a456-426614174001',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174001', number: 43, status: 'Parked', context: {},
+    result: 'outcome: fixable' };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM issue_spec')) return { rows: [{ id: 'spec-1' }] };
+    if (sql.includes("'diagnosis_release_attempts'")) task.context.diagnosis_release_attempts = values[1];
+    return { rows: [] };
+  }, release() {} };
+  let posts = 0;
+  const options = { diagnosisPool: { connect: async () => client }, relayPost: async () => {
+    posts += 1;
+    return { ok: false, status: 500, body: 'bridge failed' };
+  } };
+  await processParkedDiagnoses(options);
+  await processParkedDiagnoses(options);
+  assert.equal(posts, 2);
+  assert.equal(task.context.diagnosis_release_attempts, 2);
+  assert.ok(queries.some(({ sql }) => sql.includes("- 'diagnosis_processed'")));
+});
+
+test('the fifth failed diagnosis release remains processed with its error', async () => {
+  const task = { id: '123e4567-e89b-42d3-a456-426614174002', issue_id: '223e4567-e89b-42d3-a456-426614174002',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174002', number: 44,
+    context: { diagnosis_release_attempts: 4 }, result: 'outcome: fixable' };
+  const queries = [];
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+    if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+    if (sql.includes('FROM issue_spec')) return { rows: [{ id: 'spec-1' }] };
+    return { rows: [] };
+  }, release() {} };
+  await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+    relayPost: async () => ({ ok: false, status: 502, body: 'bad gateway' }) });
+  const bounded = queries.find(({ sql }) => sql.includes("'diagnosis_release_error'"));
+  assert.deepEqual(bounded.values.slice(1), [5, 'status=502; body=bad gateway']);
 });
 
 test('canonical evidence rejects a parked-diagnosis citation', () => {

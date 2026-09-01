@@ -968,12 +968,19 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
       WHERE p.workspace_id = $1 AND p.stage_name = $2 AND p.enabled = true
       ORDER BY active_task_count, p.last_selected_at NULLS FIRST, p.agent_id`, [workspaceId, toStage]);
   if (result.rows.length === 0) return null;
-  const eligible = result.rows.filter((row) => row.archived_at === null &&
+  const identityEligible = result.rows.filter((row) => row.archived_at === null &&
     ["idle", "working"].includes(row.agent_status) && row.selected_runtime_id &&
-    Number(row.active_task_count) < Number(row.max_concurrent_tasks) &&
     instructionCompatibility(row.instructions, toStage).ok);
-  if (eligible.length === 0) throw new Error(`No eligible stage owner in pool: ${workspaceId}/${toStage}`);
-  const selected = eligible[0];
+  if (identityEligible.length === 0) throw new Error(`No eligible stage owner in pool: ${workspaceId}/${toStage}`);
+  identityEligible.sort((left, right) => Number(left.active_task_count) - Number(right.active_task_count) ||
+    String(left.last_selected_at || '').localeCompare(String(right.last_selected_at || '')) ||
+    String(left.agent_id).localeCompare(String(right.agent_id)));
+  const eligible = identityEligible.filter((row) =>
+    Number(row.active_task_count) < Number(row.max_concurrent_tasks));
+  // A pool is still a valid owner when every member is busy. Queue the task on
+  // its least-loaded compatible member instead of rejecting the relay advance.
+  // The SQL order preserves the normal round-robin choice for below-cap rows.
+  const selected = eligible[0] || identityEligible[0];
   await client.query(
     `UPDATE relay_stage_agent_pool SET last_selected_at = NOW()
       WHERE workspace_id = $1 AND stage_name = $2 AND agent_id = $3`,

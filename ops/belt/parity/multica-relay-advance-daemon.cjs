@@ -611,8 +611,9 @@ function postToRelay(payload) {
         try {
           const parsed = JSON.parse(data);
           resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
-            status: res.statusCode, error: parsed.error });
-        } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202, status: res.statusCode }); }
+            status: res.statusCode, error: parsed.error, body: data });
+        } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
+          status: res.statusCode, body: data }); }
       });
     });
 
@@ -1124,6 +1125,28 @@ function diagnosisText(result) {
     .filter(Boolean).join('\n');
 }
 
+async function recordDiagnosisReleaseFailure(client, taskId, context, failure) {
+  const attempts = Number.parseInt(context?.diagnosis_release_attempts || '0', 10) || 0;
+  const nextAttempts = attempts + 1;
+  const error = String(failure).slice(0, 2000);
+  if (nextAttempts >= 5) {
+    await client.query(
+      `UPDATE agent_task_queue
+          SET context = COALESCE(context, '{}'::jsonb) ||
+                jsonb_build_object('diagnosis_processed', true,
+                  'diagnosis_release_attempts', $2::int,
+                  'diagnosis_release_error', $3::text)
+        WHERE id = $1::uuid`, [taskId, nextAttempts, error]);
+    return;
+  }
+  await client.query(
+    `UPDATE agent_task_queue
+        SET context = (COALESCE(context, '{}'::jsonb) - 'diagnosis_processed'
+              - 'runtime_evidence_recovery_v2_consumed') ||
+            jsonb_build_object('diagnosis_release_attempts', $2::int)
+      WHERE id = $1::uuid`, [taskId, nextAttempts]);
+}
+
 async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postToRelay } = {}) {
   const client = await diagnosisPool.connect();
   try {
@@ -1266,20 +1289,21 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
       const nextStage = action.action === 'release' ? action.nextStage
         : action.action === 'close' ? action.status : null;
       if (nextStage) {
-        const response = await relayPost({ issue_id: task.issue_id, to_stage: nextStage,
-          agent_token: RELAY_AGENT_SECRET,
-          ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
-          ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
-        if (!response.ok && response.status === 409) {
-          // Keep the diagnosis retryable when the bridge is unavailable. The
-          // bridge owns terminal transitions and must record the gate result.
-          await client.query(
-            `UPDATE agent_task_queue
-                SET context = context - 'diagnosis_processed'
-                    - 'runtime_evidence_recovery_v2_consumed'
-              WHERE id = $1::uuid`, [task.id]);
+        try {
+          const response = await relayPost({ issue_id: task.issue_id, to_stage: nextStage,
+            agent_token: RELAY_AGENT_SECRET,
+            ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
+            ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
+          if (!response.ok) {
+            await recordDiagnosisReleaseFailure(client, task.id, task.context,
+              `status=${response.status}; body=${response.body || response.error || ''}`);
+          }
+          console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
+        } catch (err) {
+          await recordDiagnosisReleaseFailure(client, task.id, task.context,
+            `fetch_error=${err.message}`);
+          console.error(`${LOG_PREFIX} [diagnosis] #${task.number}: relay error: ${err.message}`);
         }
-        console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
       } else {
         console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome}`);
       }

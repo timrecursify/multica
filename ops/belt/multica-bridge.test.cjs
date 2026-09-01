@@ -487,11 +487,20 @@ test('configured stage pool fails closed when its members are incompatible', asy
     /No eligible stage owner in pool/);
 });
 
-test('configured stage pool does not overfill an agent concurrency limit', async () => {
-  const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
-    ? { rows: [] } : { rows: [scoper({ active_task_count: 1, max_concurrent_tasks: 1 })] } };
-  await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
-    /No eligible stage owner in pool/);
+test('configured stage pool queues on the least-loaded member when every member is at capacity', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    return { rows: [
+      scoper({ agent_id: 'more-loaded', active_task_count: 3, max_concurrent_tasks: 3 }),
+      scoper({ agent_id: 'least-loaded', active_task_count: 2, max_concurrent_tasks: 2,
+        last_selected_at: '2026-01-01T00:00:00Z' })
+    ] };
+  } };
+  const owner = await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec');
+  assert.equal(owner.agent_id, 'least-loaded');
+  assert.match(calls[2].sql, /SET last_selected_at = NOW/);
 });
 
 test('empty stage pool preserves the canonical relay owner fallback', async () => {
@@ -558,8 +567,7 @@ test('nine one-slot builders fill fairly and a tenth waits until capacity frees'
     selected.push((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id);
   }
   assert.equal(new Set(selected).size, 9);
-  await assert.rejects(selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue'),
-    /No eligible stage owner/);
+  assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
   active.delete(selected[0]);
   assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
 });
