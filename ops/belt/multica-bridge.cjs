@@ -262,20 +262,28 @@ async function replaceStageTask(client, task) {
 // idempotent for retries of the same transition.
 async function ensureCompletedRelayLog(client, issueId, fromStage, toStage) {
   const completed = await client.query(
-    `UPDATE relay_run_log
-        SET status = 'completed'
-      WHERE issue_id = $1
-        AND from_stage = $2
-        AND to_stage = $3
-        AND status = 'pending'
-        AND NOT EXISTS (
-          SELECT 1 FROM relay_run_log
-           WHERE issue_id = $1
-             AND from_stage = $2
-             AND to_stage = $3
-             AND status = 'completed'
-        )
-      RETURNING id`,
+    `WITH candidate AS (
+      SELECT id FROM relay_run_log
+       WHERE issue_id = $1
+         AND from_stage = $2
+         AND to_stage = $3
+         AND status = 'pending'
+         AND NOT EXISTS (
+           SELECT 1 FROM relay_run_log
+            WHERE issue_id = $1
+              AND from_stage = $2
+              AND to_stage = $3
+              AND status = 'completed'
+         )
+       ORDER BY id
+       LIMIT 1
+       FOR UPDATE
+    )
+    UPDATE relay_run_log
+       SET status = 'completed'
+      FROM candidate
+     WHERE relay_run_log.id = candidate.id
+     RETURNING relay_run_log.id`,
     [issueId, fromStage, toStage]
   );
   if (completed.rows[0]?.id) return completed.rows[0].id;
