@@ -10,7 +10,8 @@ const {
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,
-  assertRoutableStageOwners
+  assertRoutableStageOwners,
+  crossStageExecutionAdmission
 } = require("./guardrails.cjs");
 
 // Relay configuration is supplied by the host environment.
@@ -353,6 +354,11 @@ async function relayAdvance(req, res, body) {
     client = new Client({ connectionString: MULTICA_DB });
     await client.connect();
     await client.query("BEGIN");
+    // Every relay execution admission for an issue takes this transaction lock,
+    // including the recovery daemon. A partial unique index would either miss
+    // waiting/deferred tasks or incorrectly constrain manual tasks; this lock
+    // serializes precisely the belt-owned execution transition.
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [issue_id]);
 
     const dispositionStages = new Set(["Parked", "Rejected"]);
     const issueResult = await client.query(
@@ -720,6 +726,49 @@ async function relayAdvance(req, res, body) {
         res.end(JSON.stringify({ error: lifetime.reason, disposition: lifetime.disposition,
           disposition_applied: moved, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
           ceiling: lifetime.ceiling }));
+        return;
+      }
+    }
+
+    // Never advance an issue into another execution lane while a previous
+    // relay execution is live. The previous stage-local predicate allowed
+    // Spec -> Queue and Queue -> In Progress to coexist, paying two workers
+    // for the same flight. The issue row lock serializes bridge callers; this
+    // read locks the live rows so the decision and later insert are atomic.
+    // Manual and terminal/disposition destinations stay available because they
+    // create no paid execution task.
+    if (isExecutionStage(to_stage)) {
+      const liveRows = await client.query(
+        `SELECT id, issue_id, status,
+                jsonb_build_object(
+                  'source', context->>'source',
+                  'to_stage', context->>'to_stage'
+                ) AS context
+           FROM agent_task_queue
+          WHERE issue_id = $1
+            AND status IN ('queued', 'dispatched', 'running',
+                           'waiting_local_directory', 'deferred')
+            AND context ? 'to_stage'
+          FOR UPDATE`,
+        [issue.id]
+      );
+      const admission = crossStageExecutionAdmission(liveRows.rows, issue.id);
+      if (!admission.ok) {
+        await client.query('COMMIT');
+        console.info(JSON.stringify({
+          event: 'relay_advance_deferred', issue_id: issue.id,
+          from_stage: issue.status, to_stage, ...admission
+        }));
+        // 202 is an intentional, bounded defer rather than a rejection. The
+        // advance daemon keeps the task-correlated relay log pending and
+        // retries only after the predecessor can become terminal.
+        res.writeHead(202, { 'Content-Type': 'application/json', 'Retry-After': '15' });
+        res.end(JSON.stringify({
+          error: admission.reason,
+          message: 'a prior relay execution is still active; no stage change or task was created',
+          retry_after_seconds: 15,
+          ...admission
+        }));
         return;
       }
     }

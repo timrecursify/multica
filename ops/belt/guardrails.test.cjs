@@ -3,6 +3,7 @@ const test = require('node:test');
 const fs = require('node:fs');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
+  crossStageExecutionAdmission,
   retryAdmission, spendPreflight, stageCycleAdmission, lifetimeTaskAdmission,
   isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
   quotaCircuitAdmission
@@ -33,6 +34,35 @@ test('active tasks deduplicate by issue and target stage', () => {
   assert.equal(hasActiveTaskForIssueStage(tasks, 'i', 'Queue'), true);
   assert.equal(hasActiveTaskForIssueStage(tasks, 'i', 'In Review'), true);
   assert.equal(hasActiveTaskForIssueStage(tasks, 'i', 'Spec'), false);
+});
+
+test('cross-stage admission defers a second relay execution until its predecessor is terminal', () => {
+  const activeSpec = [{ id: 'f06c', issue_id: 'GSP1158', status: 'running',
+    context: { source: 'relay-advance', from_stage: 'Spec', to_stage: 'Queue' } }];
+  assert.deepEqual(crossStageExecutionAdmission(activeSpec, 'GSP1158'), {
+    ok: false,
+    reason: 'prior_execution_active',
+    active_task_ids: ['f06c'],
+    active_stages: ['Queue']
+  });
+  assert.deepEqual(crossStageExecutionAdmission([{ ...activeSpec[0], status: 'completed' }], 'GSP1158'),
+    { ok: true });
+});
+
+test('cross-stage admission ignores manual and non-execution tasks', () => {
+  const tasks = [
+    { id: 'manual', issue_id: 'i', status: 'running', context: { source: 'manual', to_stage: 'Queue' } },
+    { id: 'review', issue_id: 'i', status: 'queued', context: { source: 'relay-advance', to_stage: 'Human Review' } }
+  ];
+  assert.deepEqual(crossStageExecutionAdmission(tasks, 'i'), { ok: true });
+});
+
+test('both concurrent relay creation paths take the same issue admission lock', () => {
+  for (const file of ['ops/belt/multica-bridge.cjs', 'ops/belt/parity/multica-relay-advance-daemon.cjs']) {
+    const source = fs.readFileSync(file, 'utf8');
+    assert.match(source, /pg_advisory_xact_lock\(hashtextextended\(\$1::text, 804\)\)/);
+    assert.match(source, /crossStageExecutionAdmission/);
+  }
 });
 
 test('infra retry stops when queue loses headroom and never spends attempt', () => {
@@ -97,6 +127,8 @@ test('human and disposition stages never execute tasks', () => {
   assert.equal(isExecutionStage('Human Review'), false);
   assert.equal(isExecutionStage('Parked'), false);
   assert.equal(isExecutionStage('Rejected'), false);
+  assert.equal(isExecutionStage('Done'), false);
+  assert.equal(isExecutionStage('Archived'), false);
 });
 
 test('startup rejects routable stages without an owner', () => {
