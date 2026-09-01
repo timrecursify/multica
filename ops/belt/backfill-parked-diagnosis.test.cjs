@@ -13,6 +13,12 @@ test('batch size is bounded at 25 and mode is explicit', () => {
   assert.throws(() => parseArgs(['--dry-run', '--apply']), /exactly one/);
   assert.throws(() => parseArgs(['--dry-run', '--retry-runtime-evidence']), /requires --apply/);
   assert.equal(parseArgs(['--apply', '--retry-runtime-evidence']).retryRuntimeEvidence, true);
+  assert.deepEqual(parseArgs(['--apply', '--recover-runtime-evidence-issue',
+    '123e4567-e89b-12d3-a456-426614174000']).recoverRuntimeEvidenceIssues,
+  ['123e4567-e89b-12d3-a456-426614174000']);
+  assert.throws(() => parseArgs(['--apply', '--recover-runtime-evidence-issue', 'bad']), /requires a UUID/);
+  assert.throws(() => parseArgs(['--dry-run', '--recover-runtime-evidence-issue',
+    '123e4567-e89b-12d3-a456-426614174000']), /requires --apply/);
   assert.equal(MAX_BATCH, 25);
 });
 
@@ -49,6 +55,22 @@ test('correction mode has an explicit held-completed candidate predicate and one
   assert.match(sql, /i\.metadata->>'parked_blocker' = 'runtime_evidence_unverified'/);
   assert.match(sql, /LOWER\(completed\.status\) = 'completed'/);
   assert.match(sql, /retried\.context->>'evidence_correction_retry' = 'true'/);
+});
+
+test('recovery v2 selects only operator-supplied v1-consumed evidence rows', async () => {
+  const seen = [];
+  await run({ connect: async () => ({ query: async (sql) => {
+    seen.push(sql); return { rows: [], rowCount: 0 };
+  }, release() {} }) }, parseArgs(['--apply', '--recover-runtime-evidence-issue',
+    '123e4567-e89b-12d3-a456-426614174000']));
+  const sql = seen.find((statement) => statement.includes('WITH ranked AS'));
+  assert.match(sql, /i\.id = ANY\(\$2::uuid\[\]\)/);
+  assert.match(sql, /runtime_evidence_recovery_consumed' = 'true'/);
+  assert.match(sql, /runtime_evidence_recovery_v2_requested' = 'true'/);
+  assert.match(sql, /runtime_evidence_unverified/);
+  const source = fs.readFileSync(require.resolve('./backfill-parked-diagnosis.cjs'), 'utf8');
+  assert.match(source, /SET context = COALESCE\(context, '\{\}'::jsonb\) \|\|/);
+  assert.match(source, /runtime_evidence_recovery_v2_requested/);
 });
 
 test('selection allows temporary blockers and retryable diagnoses before the batch limit', async () => {

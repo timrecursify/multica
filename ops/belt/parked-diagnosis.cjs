@@ -54,11 +54,7 @@ function parseRuntimeEvidenceReference(value) {
 }
 
 function isConcreteRuntimeEvidence(value) {
-  const evidence = String(value || '').trim();
-  return evidence.length >= 8 && (
-    /(?:^|\s)[\w./-]+:\d+(?:\s|$)/.test(evidence) ||
-    /\b(?:sha|commit|status|http|output|command)\s*[=:]/i.test(evidence)
-  );
+  return parseRuntimeEvidenceReference(value) !== null;
 }
 
 function namedBlocker(text) {

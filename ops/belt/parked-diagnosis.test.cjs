@@ -65,9 +65,13 @@ test('validated Parked outcomes map to bounded state actions', () => {
 });
 
 test('diagnosis evidence and owner validation fail closed', () => {
-  assert.equal(diagnosisEvidence('outcome: already_fixed\nruntime_evidence: relay.log:42'), 'relay.log:42');
+  const uuid = '123e4567-e89b-12d3-a456-426614174000';
+  assert.equal(diagnosisEvidence('outcome: already_fixed\nruntime_evidence: task:' + uuid), 'task:' + uuid);
   assert.equal(namedBlocker('outcome: genuinely_blocked\nblocker: billing hold'), 'billing hold');
-  assert.equal(isConcreteRuntimeEvidence('relay.log:42'), true);
+  assert.equal(isConcreteRuntimeEvidence('task:' + uuid), true);
+  assert.equal(isConcreteRuntimeEvidence('QC:' + uuid.toUpperCase()), true);
+  assert.equal(isConcreteRuntimeEvidence('activity:' + uuid), true);
+  assert.equal(isConcreteRuntimeEvidence('relay.log:42'), false);
   assert.equal(isConcreteRuntimeEvidence('looks good'), false);
   const parkedInstructions = 'Parked diagnosis role: classify fixable, already_fixed, duplicate, or genuinely_blocked outcomes.';
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol', instructions: parkedInstructions, runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } }), true);
