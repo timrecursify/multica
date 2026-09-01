@@ -82,6 +82,23 @@ async function verifiedParkedEvidenceRelease(client, issue, toStage, reason) {
   };
   return (await client.query(sql[reference.kind], [reference.id, issue.id])).rowCount === 1;
 }
+// The operator recovery tool records this marker only after its exact failed
+// relay-requeue lineage and same-issue runtime evidence checks succeed. Consume
+// it before the retry ceiling is evaluated: it admits one stranded QC task,
+// not a general Parked escape hatch.
+async function consumeParkedQcRecovery(client, issue, toStage, reason, evidenceRelease) {
+  if (!evidenceRelease || issue.status !== 'Parked' || toStage !== 'In Review') return false;
+  const match = String(reason || '').match(/^runtime_evidence_verified:(.+)$/);
+  const evidence = match && parseRuntimeEvidenceReference(match[1]);
+  if (!evidence) return false;
+  const consumed = await client.query(
+    `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) - 'parked_qc_recovery', updated_at = NOW()
+      WHERE id = $1::uuid AND status = 'Parked' AND metadata->>'parked_release_once' = 'true'
+        AND metadata->'parked_qc_recovery'->>'canonical_evidence' = $2::text
+        AND metadata->'parked_qc_recovery'->>'failed_task_id' ~* '^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$'
+      RETURNING id`, [issue.id, `${evidence.kind}:${evidence.id}`]);
+  return consumed.rowCount === 1;
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
@@ -1154,7 +1171,10 @@ async function relayAdvance(req, res, body) {
         [issue.id, to_stage, releaseAt]
       );
       const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
-      if (!cycle.ok && !cicdReturn) {
+      const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
+        client, issue, to_stage, reason, parkedEvidenceQcRelease
+      );
+      if (!cycle.ok && !cicdReturn && !parkedQcRecovery) {
         const moved = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
           target_stage: to_stage, historical_tasks: history.rows[0]?.n || 0,
           ceiling: cycle.ceiling
@@ -1463,5 +1483,6 @@ module.exports = {
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
   selectStageOwner,
-  applyDisposition
+  applyDisposition,
+  consumeParkedQcRecovery
 };
