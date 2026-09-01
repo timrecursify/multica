@@ -38,18 +38,35 @@ run() {
 }
 require_abs() { [[ "$1" = /* ]] || fail "$2 must be an absolute path"; }
 
+canonical_path() {
+  command -v realpath >/dev/null 2>&1 || fail "realpath is required for path containment checks"
+  realpath -e -- "$1" 2>/dev/null || fail "$2 does not resolve to an existing path"
+}
+
 validate_release() {
   require_abs "$RELEASE_DIR" MULTICA_RELEASE_DIR
   [[ -d "$RELEASE_DIR" && ! -L "$RELEASE_DIR" ]] || fail "MULTICA_RELEASE_DIR is not a real directory"
-  local name="${RELEASE_DIR##*/}"
-  [[ "$name" != current && "$name" != latest && "$name" != main ]] || fail "MULTICA_RELEASE_DIR must be immutable, not $name"
+  RELEASE_CANONICAL="$(canonical_path "$RELEASE_DIR" MULTICA_RELEASE_DIR)"
+  [[ "$RELEASE_CANONICAL" == "$RELEASE_DIR" ]] || fail "MULTICA_RELEASE_DIR must be a canonical path"
+  local name="${RELEASE_CANONICAL##*/}"
+  [[ "$name" =~ ^[0-9a-f]{40}$ ]] || fail "MULTICA_RELEASE_DIR must be a SHA-named immutable release"
 }
 
 validate_binary() {
   [[ -n "$DAEMON_BIN" ]] || DAEMON_BIN="$RELEASE_DIR/multica"
   require_abs "$DAEMON_BIN" MULTICA_DAEMON_BIN
-  [[ "$DAEMON_BIN" == "$RELEASE_DIR/"* ]] || fail "daemon binary must come from MULTICA_RELEASE_DIR"
   [[ -f "$DAEMON_BIN" && -x "$DAEMON_BIN" && ! -L "$DAEMON_BIN" ]] || fail "daemon binary is not an executable regular file"
+  local binary_canonical; binary_canonical="$(canonical_path "$DAEMON_BIN" MULTICA_DAEMON_BIN)"
+  [[ "$binary_canonical" == "$RELEASE_CANONICAL/"* ]] || fail "daemon binary must come from MULTICA_RELEASE_DIR"
+  [[ "$binary_canonical" == "$DAEMON_BIN" ]] || fail "MULTICA_DAEMON_BIN must be a canonical path"
+}
+
+validate_release_file() {
+  local path="$1" label="$2"
+  [[ -f "$path" && ! -L "$path" ]] || fail "$label is not a regular release file"
+  local canonical; canonical="$(canonical_path "$path" "$label")"
+  [[ "$canonical" == "$RELEASE_CANONICAL/"* ]] || fail "$label must come from MULTICA_RELEASE_DIR"
+  [[ "$canonical" == "$path" ]] || fail "$label must use a canonical path"
 }
 
 discover_codex() {
@@ -108,7 +125,8 @@ validate_env_values() {
 
 preflight() {
   validate_release
-  [[ -f "$RELEASE_DIR/ops/ppp/systemd/$UNIT" && ! -L "$RELEASE_DIR/ops/ppp/systemd/$UNIT" && -f "$RELEASE_DIR/ops/ppp/multica-daemon-ppp.sh" && ! -L "$RELEASE_DIR/ops/ppp/multica-daemon-ppp.sh" ]] || fail "release is missing PPP daemon artifacts"
+  validate_release_file "$RELEASE_DIR/ops/ppp/systemd/$UNIT" "PPP systemd unit"
+  validate_release_file "$RELEASE_DIR/ops/ppp/multica-daemon-ppp.sh" "PPP daemon wrapper"
   validate_binary
   read_env || true
   WORKSPACES_ROOT="${WORKSPACES_ROOT:-/var/lib/multica-ppp/workspaces}"

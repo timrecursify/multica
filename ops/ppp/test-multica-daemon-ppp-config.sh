@@ -58,6 +58,31 @@ test_placeholder_environment_is_rejected() {
   grep -Fq 'refusing placeholder environment file' "$WORK/err"
 }
 
+test_release_name_is_immutable_sha() {
+  common_env
+  local mutable="$WORK/releases/not-a-release"
+  mkdir -p "$mutable"
+  cp -a "$RELEASE/." "$mutable/"
+  export MULTICA_RELEASE_DIR="$mutable" MULTICA_DAEMON_BIN="$mutable/multica"
+  if bash "$ROOT/install-multica-daemon-ppp.sh" >"$WORK/out" 2>"$WORK/err"; then return 1; fi
+  grep -Fq 'must be a SHA-named immutable release' "$WORK/err"
+}
+
+test_binary_containment_is_canonical() {
+  common_env
+  local sibling="$WORK/releases/${SHA}-evil" escape="$WORK/releases/outside"
+  mkdir -p "$sibling" "$escape"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$sibling/multica"
+  printf '#!/usr/bin/env bash\nexit 0\n' >"$escape/multica"
+  chmod 0755 "$sibling/multica" "$escape/multica"
+  export MULTICA_DAEMON_BIN="$sibling/multica"
+  if bash "$ROOT/install-multica-daemon-ppp.sh" >"$WORK/out" 2>"$WORK/err"; then return 1; fi
+  grep -Fq 'daemon binary must come from MULTICA_RELEASE_DIR' "$WORK/err"
+  export MULTICA_DAEMON_BIN="$RELEASE/../outside/multica"
+  if bash "$ROOT/install-multica-daemon-ppp.sh" >"$WORK/out" 2>"$WORK/err"; then return 1; fi
+  grep -Fq 'daemon binary must come from MULTICA_RELEASE_DIR' "$WORK/err"
+}
+
 test_install_rollback_restores_files() {
   common_env
   mkdir -p "$WORK/home/bin" "$WORK/home/.config/systemd/user"
@@ -98,6 +123,8 @@ test_success_and_lock() {
 
 test_missing_prerequisite_fails_closed
 test_placeholder_environment_is_rejected
+test_release_name_is_immutable_sha
+test_binary_containment_is_canonical
 test_install_rollback_restores_files
 test_active_uninstall_refuses_without_confirmation
 test_success_and_lock
