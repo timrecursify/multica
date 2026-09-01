@@ -608,7 +608,7 @@ async function ssoBridge(req, res) {
 async function canonicalStageOwner(client, workspaceId, ownerStage) {
   const result = await client.query(
     `SELECT rsc.agent_id, rsc.agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
-            a.instructions, a.model, a.max_concurrent_tasks, a.runtime_config,
+            a.instructions, a.model, a.thinking_level, a.max_concurrent_tasks, a.runtime_config,
             (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
             COALESCE(a.runtime_id, (
               SELECT ar.id FROM agent_runtime ar

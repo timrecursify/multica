@@ -32,6 +32,9 @@ test('belt routing allows DeepSeek/Terra builders and Sol-low QC/spec only', () 
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
   assert.equal(beltRoutingAdmission({ name: 'ppp-spec', model: 'gpt-5.6-terra', thinking_level: 'low' }).reason, 'qc_spec_requires_sol_low');
+  const configOnly = beltRoutingAdmission({ id: 'agent-1', name: 'gsp-build', model: 'gpt-5.6-luna', thinking_level: '', runtime_config: { model: 'gpt-5.6-terra', reasoning_effort: 'low' } });
+  assert.equal(configOnly.reason, 'belt_low_reasoning_effort_required');
+  assert.deepEqual({ agent_name: configOnly.agent_name, agent_id: configOnly.agent_id, model: configOnly.model, effort: configOnly.effort }, { agent_name: 'gsp-build', agent_id: 'agent-1', model: 'gpt-5.6-luna', effort: '' });
 });
 
 test('active tasks deduplicate by issue and target stage', () => {

@@ -138,17 +138,16 @@ function spendPreflight(agent, selectedRuntime = {}) {
 }
 
 function beltRoutingAdmission(agent, selectedRuntime = {}) {
-  const cfg = agent?.runtime_config && typeof agent.runtime_config === 'object' ? agent.runtime_config : {};
   const name = String(agent?.name || agent?.agent_name || '').toLowerCase();
-  const role = String(cfg.role || '').toLowerCase();
-  const model = String(selectedRuntime.model || agent?.model || cfg.model || '').toLowerCase();
-  const effort = String(agent?.thinking_level || cfg.reasoning_effort || '').toLowerCase();
-  const build = role === 'build' || name.includes('build');
-  const qcOrSpec = role === 'qc' || role === 'spec' || name.includes('qc') || name.includes('spec');
+  const model = String(agent?.model || '').toLowerCase();
+  const effort = String(agent?.thinking_level || '').toLowerCase();
+  const details = { agent_name: agent?.name || agent?.agent_name || null, agent_id: agent?.id || agent?.agent_id || null, model, effort, expected_effort: 'low' };
+  const build = name.includes('build');
+  const qcOrSpec = name.includes('qc') || name.includes('spec');
   if (!build && !qcOrSpec) return { ok: true };
-  if (effort !== 'low') return { ok: false, reason: 'belt_low_reasoning_effort_required' };
-  if (build && !(/^deepseek[/:]/.test(model) || model === 'gpt-5.6-terra')) return { ok: false, reason: 'builder_requires_deepseek_or_terra' };
-  if (qcOrSpec && model !== 'gpt-5.6-sol') return { ok: false, reason: 'qc_spec_requires_sol_low' };
+  if (effort !== 'low') return { ok: false, reason: 'belt_low_reasoning_effort_required', ...details };
+  if (build && !(/^deepseek[/:]/.test(model) || model === 'gpt-5.6-terra')) return { ok: false, reason: 'builder_requires_deepseek_or_terra', ...details, expected_model: 'deepseek/*|gpt-5.6-terra' };
+  if (qcOrSpec && model !== 'gpt-5.6-sol') return { ok: false, reason: 'qc_spec_requires_sol_low', ...details, expected_model: 'gpt-5.6-sol' };
   return { ok: true };
 }
 
