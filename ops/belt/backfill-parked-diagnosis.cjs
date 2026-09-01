@@ -42,9 +42,9 @@ async function inspect(client, issue) {
   const task = await client.query(
     `SELECT id, status FROM agent_task_queue
       WHERE issue_id = $1 AND context->>'kind' = $2
-      ORDER BY created_at ASC LIMIT 1`, [issue.id, PARK_DIAGNOSIS_KIND]);
+      ORDER BY created_at ASC`, [issue.id, PARK_DIAGNOSIS_KIND]);
   if (task.rowCount) {
-    const status = task.rows[0].status;
+    const status = task.rows.some((row) => row.status === 'completed') ? 'completed' : task.rows[0].status;
     return { kind: 'skip',
       reason: status === 'completed' ? 'completed_parked_diagnosis' : 'nonterminal_parked_diagnosis',
       task_id: task.rows[0].id };
