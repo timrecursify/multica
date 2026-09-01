@@ -359,7 +359,8 @@ async function findAndAdvanceTasks() {
     // genuinely completed tasks; a failed task must never move work forward.
     // No completed_at window: eligibility is the task's terminal state, so a
     // daemon outage delays an advance instead of stranding it forever.
-    const query = `SELECT rrl.id AS log_id, atq.issue_id, atq.status AS task_status,
+    const query = `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id,
+             atq.status AS task_status,
              atq.result AS task_result, atq.error AS task_error,
              atq.agent_id AS task_agent_id, atq.started_at AS task_started_at,
              atq.completed_at AS task_completed_at,
@@ -432,11 +433,9 @@ async function findAndAdvanceTasks() {
         if (!completion.ok) {
           // Process exit 0 is not a work-product guarantee. A completed task
           // carrying an explicit blocker/FAIL (or no result at all) must not
-          // advance into a successor lane and buy another paid task.
-          const parked = await applyDisposition(client,
-            { ...row, stage: row.to_stage }, completion.disposition, completion.reason,
-            { target_stage: row.to_stage, completion_reason: completion.reason });
-          console.log(`${LOG_PREFIX} [completion-admission] PARK: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, disposition_applied=${parked}`);
+          // buy another same-lane attempt. The bridge changes hands to re-spec.
+          const escalation = await requestRetryEscalation(row, completion.reason);
+          console.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
           await markRelayLogFailedById(client, row.log_id);
           continue;
         }
@@ -491,7 +490,8 @@ async function recoveryAdvanceTasks() {
   try {
 
     // Get the latest relay_run_log per issue using LATERAL subquery
-    const query = `SELECT DISTINCT atq.issue_id, atq.status as task_status,
+    const query = `SELECT DISTINCT atq.id AS task_id, atq.issue_id,
+             atq.status as task_status,
              atq.result AS task_result, atq.error AS task_error,
              i.workspace_id, i.priority, i.status as to_stage, rsc.next_stage
       FROM agent_task_queue atq
@@ -522,10 +522,8 @@ async function recoveryAdvanceTasks() {
         const completion = completionAdmission(row.task_result ??
           (row.task_error ? { error: row.task_error } : null));
         if (!completion.ok) {
-          const parked = await applyDisposition(client,
-            { ...row, stage: row.to_stage }, completion.disposition, completion.reason,
-            { target_stage: row.to_stage, completion_reason: completion.reason });
-          console.log(`${LOG_PREFIX} [recovery] PARK: issue=${row.issue_id}, reason=${completion.reason}, disposition_applied=${parked}`);
+          const escalation = await requestRetryEscalation(row, completion.reason);
+          console.log(`${LOG_PREFIX} [recovery] RESPEC: issue=${row.issue_id}, reason=${completion.reason}, relay=${escalation.status}`);
           await markRelayLogFailed(client, row.issue_id);
           continue;
         }
@@ -582,6 +580,19 @@ function postToRelay(payload) {
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     req.end(body);
+  });
+}
+
+function requestRetryEscalation(row, reason) {
+  const taskId = row.task_id || row.dead_task_id;
+  const triggerStage = row.to_stage || row.stage;
+  return postToRelay({
+    issue_id: row.issue_id,
+    to_stage: 'Spec',
+    agent_token: RELAY_AGENT_SECRET,
+    reason: `retry_escalation:${reason}`,
+    retry_escalation_task_id: taskId,
+    retry_escalation_stage: triggerStage
   });
 }
 
@@ -865,12 +876,10 @@ async function requeueStrandedTasks() {
         if (!completion.ok) {
           // The predecessor reached process status=completed but did not
           // produce admissible work. Re-dispatching it would buy a duplicate
-          // paid task (the GSP #1229 shape), so hold it for diagnosis/operator
-          // action instead of treating it as an ordinary missing artifact.
-          const parked = await applyDisposition(client,
-            { ...row, stage: row.stage }, completion.disposition, completion.reason,
-            { target_stage: row.stage, completion_reason: completion.reason });
-          console.log(`${LOG_PREFIX} [requeue] PARK #${row.number}: completed predecessor failed completion admission (${completion.reason}), disposition_applied=${parked}`);
+          // paid task (the GSP #1229 shape), so change hands to Sol-low re-spec
+          // instead of treating it as an ordinary missing artifact.
+          const escalation = await requestRetryEscalation(row, completion.reason);
+          console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: completed predecessor failed completion admission (${completion.reason}); relay=${escalation.status}`);
           continue;
         }
       }
@@ -985,12 +994,9 @@ async function requeueStrandedTasks() {
         );
         const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
         if (!cycle.ok) {
-          const moved = await applyDisposition(client, row, cycle.disposition, cycle.reason, {
-            target_stage: row.stage, historical_tasks: history.rows[0]?.n || 0,
-            ceiling: cycle.ceiling
-          });
-          await client.query('COMMIT');
-          console.log(`${LOG_PREFIX} [requeue] PARKED #${row.number}: ${cycle.reason}; applied=${moved}`);
+          await client.query('ROLLBACK');
+          const escalation = await requestRetryEscalation(row, cycle.reason);
+          console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${cycle.reason}; relay=${escalation.status}`);
           continue;
         }
         const lifetimeHistory = await client.query(
@@ -1001,11 +1007,9 @@ async function requeueStrandedTasks() {
         );
         const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
         if (!lifetime.ok) {
-          const moved = await applyDisposition(client, row, lifetime.disposition, lifetime.reason, {
-            historical_tasks: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling
-          });
-          await client.query('COMMIT');
-          console.log(`${LOG_PREFIX} [requeue] PARKED #${row.number}: ${lifetime.reason}; applied=${moved}`);
+          await client.query('ROLLBACK');
+          const escalation = await requestRetryEscalation(row, lifetime.reason);
+          console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${lifetime.reason}; relay=${escalation.status}`);
           continue;
         }
         const context = JSON.stringify({

@@ -31,8 +31,47 @@ const {
   issueImplementationArtifact,
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
-  latestQcNoArtifactSignal
+  latestQcNoArtifactSignal,
+  retryEscalationReason,
+  verifiedRetryEscalation
 } = require('./multica-bridge.cjs');
+
+test('retry escalation accepts only named bounded triggers', () => {
+  assert.equal(retryEscalationReason('retry_escalation:completion_failed'), 'completion_failed');
+  assert.equal(retryEscalationReason('retry_escalation:stage_cycle_limit'), 'stage_cycle_limit');
+  assert.equal(retryEscalationReason('retry_escalation:delete_everything'), null);
+  assert.equal(retryEscalationReason('completion_failed'), null);
+});
+
+test('completion escalation is bound to one exact completed failed task', async () => {
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review', metadata: {} };
+  const client = { query: async (sql, values) => {
+    assert.match(sql, /t\.context->>'to_stage' = \$4::text OR EXISTS/);
+    assert.match(sql, /r\.task_id = t\.id AND r\.issue_id = t\.issue_id/);
+    assert.deepEqual(values, [taskId, issue.id, issue.workspace_id, issue.status]);
+    return { rows: [{ status: 'completed', result: { output: 'QC VERDICT: FAIL' }, error: null }] };
+  } };
+  const result = await verifiedRetryEscalation(client, issue, {
+    to_stage: 'Spec', reason: 'retry_escalation:completion_failed',
+    retry_escalation_task_id: taskId, retry_escalation_stage: issue.status
+  });
+  assert.deepEqual(result, { reason: 'completion_failed', trigger_stage: 'In Review',
+    source_task_id: taskId });
+});
+
+test('retry escalation refuses a consumed source task', async () => {
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review',
+    metadata: { retry_escalation: { source_task_id: taskId } } };
+  const client = { query: async () => { throw new Error('must not query'); } };
+  assert.equal(await verifiedRetryEscalation(client, issue, {
+    to_stage: 'Spec', reason: 'retry_escalation:completion_failed',
+    retry_escalation_task_id: taskId, retry_escalation_stage: issue.status
+  }), false);
+});
 
 test('Parked evidence QC return is a canonical consumed-release-only edge', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
@@ -177,8 +216,10 @@ test('technical QC block cannot route to Human Review and exact re-scope bypasse
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /technical_human_review_forbidden/);
   assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
-  assert.match(source, /!cycle\.ok && !cicdReturn && !parkedQcRecovery && !noArtifactRescope/);
-  assert.match(source, /!lifetime\.ok && !cicdReturn && !noArtifactRescope/);
+  assert.match(source,
+    /!cycle\.ok && !cicdReturn && !parkedQcRecovery &&\s+!noArtifactRescope && !retryEscalation/);
+  assert.match(source,
+    /!lifetime\.ok && !cicdReturn && !noArtifactRescope && !retryEscalation/);
   assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
   assert.match(source, /operator_rescope_issue_id: issue\.id/);
 });
@@ -650,7 +691,8 @@ test('release admission is explicit, one-use, and resets task history by time', 
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /parked_release_once === true/);
-  assert.match(source, /if \(!parkedRelease && !parkedEvidenceQcRelease && !parkedDiagnosisDone &&\s+!noArtifactRescope && !allowedStages\.includes/);
+  assert.match(source,
+    /if \(!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&\s+!parkedDiagnosisDone && !noArtifactRescope && !allowedStages\.includes/);
   assert.match(source, /reason: "parked_release_required"/);
   assert.match(source, /created_at >= \$3/);
   assert.match(source, /created_at >= \$2/);
@@ -659,11 +701,13 @@ test('release admission is explicit, one-use, and resets task history by time', 
   assert.match(source, /if \(!bindingSpec && parkedRelease\) \{[\s\S]*?to_stage = "Spec"/);
 });
 
-test('lifetime rejection emits structured evidence', () => {
+test('lifetime ceiling emits a named, deadline-bound re-spec escalation', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source,
-    /event: "relay_advance_rejected",\s+reason: lifetime\.reason,[\s\S]*disposition_applied: moved/);
+  assert.match(source, /event: "relay_retry_escalated",\s+reason: lifetime\.reason/);
+  assert.match(source, /escalation_owner: stage\.agent_name/);
+  assert.match(source, /deadline: retryEscalation\.deadline/);
+  assert.match(source, /action, details\)\s+VALUES \(\$1::uuid, \$2::uuid, 'system', 'relay_retry_escalated'/);
 });
 
 test('parking records a reason and hands off one Sol-low diagnosis', () => {
