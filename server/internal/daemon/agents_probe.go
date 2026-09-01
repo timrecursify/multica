@@ -32,6 +32,25 @@ var (
 	shellResolvedAt   time.Time
 )
 
+// configuredAgentAllowlist returns the optional provider allowlist used by
+// supervised deployments that must expose only a specific runtime family.
+// An unset or blank value keeps the normal discovery behaviour. Values are
+// comma-separated provider IDs (for example, "codex").
+func configuredAgentAllowlist() map[string]struct{} {
+	raw := strings.TrimSpace(os.Getenv("MULTICA_DAEMON_ALLOWED_PROVIDERS"))
+	if raw == "" {
+		return nil
+	}
+	allowed := make(map[string]struct{})
+	for _, item := range strings.Split(raw, ",") {
+		provider := strings.ToLower(strings.TrimSpace(item))
+		if provider != "" {
+			allowed[provider] = struct{}{}
+		}
+	}
+	return allowed
+}
+
 // shellResolveEnvKey fingerprints the environment that determines what a login
 // shell resolves. A change to any of these invalidates the cache immediately,
 // independent of the TTL — the cached answer was for a different environment.
@@ -248,6 +267,13 @@ var probeAgentCLIs = func() map[string]AgentEntry {
 	// here would only advertise a knob that silently does nothing.
 	if e, ok := probe("MULTICA_QWENPAW_PATH", "qwenpaw", ""); ok {
 		agents["qwenpaw"] = e
+	}
+	if allowed := configuredAgentAllowlist(); len(allowed) > 0 {
+		for provider := range agents {
+			if _, ok := allowed[provider]; !ok {
+				delete(agents, provider)
+			}
+		}
 	}
 	return agents
 }
