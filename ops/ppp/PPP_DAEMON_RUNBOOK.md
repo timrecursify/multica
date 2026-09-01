@@ -13,6 +13,7 @@ SHA="$(git rev-parse HEAD)"
 make build
 sudo install -d -m 0755 "/opt/multica/releases/$SHA/ops/ppp/systemd"
 sudo install -m 0755 server/bin/multica "/opt/multica/releases/$SHA/multica"
+sudo install -m 0755 ops/ppp/install-multica-daemon-ppp.sh "/opt/multica/releases/$SHA/ops/ppp/install-multica-daemon-ppp.sh"
 sudo install -m 0755 ops/ppp/multica-daemon-ppp.sh "/opt/multica/releases/$SHA/ops/ppp/multica-daemon-ppp.sh"
 sudo install -m 0644 ops/ppp/systemd/multica-daemon-ppp.service "/opt/multica/releases/$SHA/ops/ppp/systemd/multica-daemon-ppp.service"
 ```
