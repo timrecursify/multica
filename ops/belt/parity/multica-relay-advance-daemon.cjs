@@ -80,7 +80,10 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
         SET status = 'cancelled', completed_at = NOW(),
             prepare_lease_expires_at = NULL, failure_reason = $2
       WHERE issue_id = $1
-        AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')`,
+        -- Never interrupt a paid task already executing. Cross-stage
+        -- admission defers successors until running predecessors are
+        -- terminal; only unstarted work may be retired by a disposition.
+        AND status IN ('queued','dispatched','waiting_local_directory','deferred')`,
     [row.issue_id, reason]
   );
   if (changed.rowCount > 0) {
