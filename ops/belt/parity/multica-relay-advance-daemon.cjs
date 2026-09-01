@@ -10,7 +10,7 @@ const {
   crossStageExecutionAdmission
 } = require('../guardrails.cjs');
 const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
-  namedBlocker, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
+  namedBlocker, isConcreteRuntimeEvidence, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -880,7 +880,7 @@ async function processParkedDiagnoses() {
       // can rerun the single diagnosis task deliberately.
       const outcome = parsedOutcome || 'genuinely_blocked';
       const missingOutcome = !parsedOutcome;
-      const invalidAlreadyFixed = outcome === 'already_fixed' && !evidence;
+      const invalidAlreadyFixed = outcome === 'already_fixed' && !isConcreteRuntimeEvidence(evidence);
       const invalidBlocked = outcome === 'genuinely_blocked' && !blocker;
       const duplicate = text.match(/duplicate[_ ](?:of|issue)\s*[:#]?\s*([0-9a-f-]{8,}|\d+)/i)?.[1] || null;
       let duplicateIssueId = null;
@@ -914,7 +914,7 @@ async function processParkedDiagnoses() {
                     '{parked_release_at}', to_jsonb(NOW()), true),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
-      } else if (outcome === 'already_fixed' && evidence) {
+      } else if (outcome === 'already_fixed' && isConcreteRuntimeEvidence(evidence)) {
         await client.query(
           `UPDATE issue SET status = 'Done', updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
