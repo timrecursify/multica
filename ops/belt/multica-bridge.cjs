@@ -275,7 +275,7 @@ async function ensureCompletedRelayLog(client, issueId, fromStage, toStage) {
               AND to_stage = $3
               AND status = 'completed'
          )
-       ORDER BY id
+       ORDER BY created_at, id
        LIMIT 1
        FOR UPDATE
     )

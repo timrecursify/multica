@@ -130,7 +130,7 @@ test('deploy close upgrades a pending relay row exactly once', async () => {
   assert.equal(id, 41);
   assert.equal(calls.length, 1);
   assert.match(calls[0].sql, /SET status = 'completed'/);
-  assert.match(calls[0].sql, /ORDER BY id\s+LIMIT 1/);
+  assert.match(calls[0].sql, /ORDER BY created_at, id\s+LIMIT 1/);
   assert.deepEqual(calls[0].values,
     ['issue-1', 'CI\/CD & Deploy', 'Done']);
 });
