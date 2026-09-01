@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Belt config guard.
+# shellcheck disable=SC2016 # Literal shell fragments are checked below.
+# shellcheck disable=SC2009 # The full command line is required for flag validation.
 #
 # Doctrine (Tim, 2026-08-30): sentinel fixes what code can fix and files a P0
 # ticket for what it cannot. It never raises an alert for a human to action.
@@ -147,10 +149,11 @@ guard_wrapper() {
 # process: a restart that happened while the file was drifted leaves a correct
 # file and a wrong process, which the file check alone cannot see.
 tower_concurrency_state() {
-  local live="$1"
+  local live="$1" want_concurrency
+  IFS='|' read -r want_concurrency < <(daemon_launch_config)
   if [[ ! "$live" =~ (^|[[:space:]])--max-concurrent-tasks= ]]; then
     printf '%s\n' missing
-  elif [[ "$live" =~ (^|[[:space:]])--max-concurrent-tasks=${WANT_CONCURRENCY}([[:space:]]|$) ]]; then
+  elif [[ "$live" =~ (^|[[:space:]])--max-concurrent-tasks=${want_concurrency}([[:space:]]|$) ]]; then
     printf '%s\n' correct
   else
     printf '%s\n' mismatched
