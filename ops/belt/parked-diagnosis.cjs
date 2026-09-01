@@ -86,7 +86,7 @@ async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = 
     task: `SELECT 1 FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id
              WHERE t.id = $1 AND t.issue_id = $2 AND t.id IS DISTINCT FROM $3
                AND t.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'
-               AND t.status IN ('completed','failed','cancelled')`,
+               AND t.status = 'completed'`,
     qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1 AND v.issue_id = $2`,
     activity: `SELECT 1 FROM activity_log WHERE id = $1 AND issue_id = $2`
   };
