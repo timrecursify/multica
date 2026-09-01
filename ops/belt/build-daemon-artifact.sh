@@ -6,9 +6,29 @@ set -euo pipefail
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 output_arg="${1:?usage: $0 OUTPUT_DIR}"
 case "$output_arg" in
-  /*) output_dir="$output_arg" ;;
-  *) output_dir="$(pwd -P)/$output_arg" ;;
+  /*) requested_dir="$output_arg" ;;
+  *) requested_dir="$root_dir/$output_arg" ;;
 esac
+
+output_dir="$(realpath -m -- "$requested_dir")"
+case "$output_dir" in "$root_dir"/*) ;; *)
+  printf 'artifact output must remain below repository root: %s\n' "$output_arg" >&2
+  exit 64
+esac
+if [[ "$output_arg" == /* && "$requested_dir" != "$output_dir" ]]; then
+  printf 'absolute artifact output must be canonical: %s\n' "$output_arg" >&2
+  exit 64
+fi
+path_cursor="/"
+IFS=/ read -r -a path_parts <<<"$requested_dir"
+for path_part in "${path_parts[@]}"; do
+  [[ -z "$path_part" ]] && continue
+  path_cursor="${path_cursor%/}/$path_part"
+  if [[ -L "$path_cursor" ]]; then
+    printf 'artifact output must not traverse symlinks: %s\n' "$output_arg" >&2
+    exit 64
+  fi
+done
 source_sha="$(git -C "$root_dir" rev-parse HEAD)"
 case "$source_sha" in [0-9a-f][0-9a-f]*) ;; *) exit 64 ;; esac
 
