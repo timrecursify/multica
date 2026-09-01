@@ -45,6 +45,7 @@ declare -a sources=(
   "$root_dir/multica-bundle.py"
   "$root_dir/RUNBOOK_SPEC_WORKER.md"
   "$root_dir/RUNBOOK_BUILD_WORKER.md"
+  "$root_dir/RUNBOOK_QC_WORKER.md"
   "$root_dir/WORKER_COMMON.md"
   "$root_dir/relay-completion-admission.cjs"
 )
@@ -63,6 +64,7 @@ declare -a targets=(
   "$runtime_root/tools/multica-bundle.py"
   "$runtime_root/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
   "$runtime_root/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
+  "$runtime_root/multica-doctrine/RUNBOOK_QC_WORKER.md"
   "$runtime_root/multica-doctrine/WORKER_COMMON.md"
   "$runtime_root/gsp-multica/relay-completion-admission.cjs"
 )

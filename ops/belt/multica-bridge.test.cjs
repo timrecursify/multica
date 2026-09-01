@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
+const { qcCompletionAdvance } = require('./parity/multica-relay-advance-daemon.cjs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
@@ -421,6 +422,48 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   } finally {
     setTestClientFactory(null);
   }
+});
+
+test('runbook-shaped PASS and BLOCKED verdicts bridge into daemon dispositions', async () => {
+  const attempts = [];
+  const verdicts = [];
+  const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'qc-agent',
+    agent_name: 'qc-sol-low', context: {}, result: qcResult() };
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
+    if (/FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/INSERT INTO qc_attempt/.test(sql)) attempts.push(values);
+    if (/INSERT INTO qc_verdict/.test(sql)) verdicts.push(values);
+    return { rows: [] };
+  } };
+  const post = async (payload) => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
+    return res;
+  };
+  setTestClientFactory(() => client);
+  try {
+    const pass = { ...validVerdict, idem_key: 'qc-runbook-pass-0001' };
+    task.result = qcResult(pass);
+    assert.equal((await post(pass)).status, 201);
+    const values = attempts[0];
+    const row = { task_id: task.id, to_stage: 'In Review', next_stage: 'CI/CD & Deploy', task_status: 'completed',
+      task_agent_id: task.agent_id, task_agent_model: 'gpt-5.6-sol', task_agent_effort: 'low',
+      qc_verdict_checker_id: task.agent_id, qc_verdict: 'PASS', qc_verdict_work_product_md5: pass.work_product_md5,
+      qc_attempt_verdict: values[2], qc_attempt_work_product_md5: values[3], qc_attempt_bound_sha: values[4],
+      qc_attempt_observed_sha: values[5], qc_attempt_qualifying: values[7], qc_attempt_evidence_task_id: task.id,
+      qc_attempt_evidence_agent_id: task.agent_id, qc_attempt_evidence_agent_model: 'gpt-5.6-sol', qc_attempt_evidence_agent_effort: 'low' };
+    assert.equal(qcCompletionAdvance(row).ok, true);
+    const blocked = { ...pass, verdict: 'FAIL', failure_class: 'evidence', qualifying: false,
+      idem_key: 'qc-runbook-blocked-0001', notes: 'BLOCKED: add the pull request and full SHA.' };
+    task.result = qcResult(blocked);
+    assert.equal((await post(blocked)).status, 201);
+    assert.equal(verdicts[1][3], 'FAIL');
+    assert.match(verdicts[1][5], /BLOCKED: add the pull request and full SHA\./);
+    assert.equal(qcCompletionAdvance({ ...row, qc_verdict: 'FAIL' }).reason, 'completed_sol_low_pass_required');
+  } finally { setTestClientFactory(null); }
 });
 
 test('only a named CI/CD return is eligible for a repair authorization', () => {
