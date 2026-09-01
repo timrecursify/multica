@@ -1,48 +1,21 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-process.env.JWT_SECRET = process.env.JWT_SECRET || 'test';
-process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
-process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test';
-process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test';
-const { parseArgs, recover } = require('./recover-in-review-qc.cjs');
-test('requires exact UUID operator scope', () => {
-  const id = '123e4567-e89b-12d3-a456-426614174000';
-  assert.deepEqual(parseArgs(['--apply', '--issue', id, '--issue', id]).issueIds, [id, id]);
-  assert.throws(() => parseArgs(['--apply', '--issue', 'bad']), /UUID/);
-  assert.throws(() => parseArgs(['--issue', id]), /--apply/);
+const { parseArgs, reserveRecovery, recover } = require('./recover-in-review-qc.cjs');
+const issue = '123e4567-e89b-12d3-a456-426614174000'; const task = '223e4567-e89b-12d3-a456-426614174000';
+test('requires exact operator UUIDs', () => {
+  assert.deepEqual(parseArgs(['--apply', '--issue', issue, '--failed-task', task]), { apply: true, issueId: issue, failedTaskId: task });
+  assert.throws(() => parseArgs(['--apply', '--issue', issue]), /failed-task UUID/);
 });
-test('recovery admits the observed #1009/#23696 failed-orphan shape only', () => {
+test('DB gate is exact and has no direct issue status mutation', async () => {
   const source = require('node:fs').readFileSync(require.resolve('./recover-in-review-qc.cjs'), 'utf8');
-  assert.match(source, /i\.status = 'In Review'/);
-  assert.match(source, /task_usage u WHERE u\.task_id = wrong\.id/);
-  assert.doesNotMatch(source, /task_usage u WHERE u\.issue_id = i\.id/);
-  assert.match(source, /wrong\.status = 'failed' AND wrong\.started_at IS NULL/);
-  assert.match(source, /wrong\.failure_reason = 'operator_orphan_repair'/);
-  assert.match(source, /live\.status IN/);
-  assert.match(source, /selectOwner\(client, row\.workspace_id, 'In Progress', 'In Review'\)/);
-  assert.match(source, /replaceStageTask/);
+  for (const text of ["i.status = 'Parked'", "failed.issue_id = i.id", "failed.failure_reason = 'cancelled'", "failed.started_at IS NOT NULL", "failed.completed_at IS NOT NULL", "u.task_id = failed.id", "cfg.next_stage = 'In Review'", "'gpt-5.6-sol'", "'low'", "'evidence_correction_retry'", "live.context->>'to_stage' = 'In Review'", "runtime_evidence_verified:"]) assert.match(source, new RegExp(text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  assert.doesNotMatch(source, /SET status =/);
+  let writes = 0; const client = { query: async (sql) => { if (/^UPDATE issue/.test(sql.trim())) writes++; return { rows: [], rowCount: 0 }; } };
+  assert.equal(await reserveRecovery(client, issue, task, async () => true), null); assert.equal(writes, 0);
 });
-
-test('recover executes the bounded DB-shaped predicate then creates one QC successor', async () => {
-  const calls = []; const owners = []; const replacements = [];
-  const client = { query: async (sql, values) => {
-    calls.push({ sql, values });
-    return { rows: [{ id: values[0], workspace_id: 'workspace-1', priority: 'high' }] };
-  } };
-  const id = '123e4567-e89b-12d3-a456-426614174000';
-  const task = await recover(client, id, {
-    selectStageOwner: async (...args) => { owners.push(args); return { agent_id: 'qc-1', selected_runtime_id: 'runtime-1' }; },
-    replaceStageTask: async (...args) => { replacements.push(args); return { taskId: 'new-qc' }; }
-  });
-  assert.equal(task.taskId, 'new-qc');
-  assert.equal(calls.length, 1);
-  assert.match(calls[0].sql, /u\.task_id = wrong\.id/);
-  assert.doesNotMatch(calls[0].sql, /u\.issue_id = i\.id/);
-  assert.deepEqual(owners[0].slice(1), ['workspace-1', 'In Progress', 'In Review']);
-  assert.equal(replacements[0][1].agentId, 'qc-1');
-  assert.equal(replacements[0][1].toStage, 'In Review');
-  const refused = await recover({ query: async () => ({ rows: [] }) }, id, {
-    selectStageOwner: async () => { throw new Error('must not select'); }, replaceStageTask: async () => { throw new Error('must not insert'); }
-  });
-  assert.equal(refused, null, 'wrong status, started/used, or active successor are SQL-refused');
+test('relay failure clears release flag but retains recovery marker', async () => {
+  const calls = []; let read = true;
+  const client = { query: async (sql) => { calls.push(sql); if (read) { read = false; return { rows: [{ id: issue, diagnosis_id: task, diagnosis_result: 'runtime_evidence: task:323e4567-e89b-12d3-a456-426614174000' }], rowCount: 1 }; } return { rows: [{ id: issue }], rowCount: 1 }; } };
+  await assert.rejects(recover(client, issue, task, { verifyRuntimeEvidence: async () => true, relayAdvance: async () => ({ ok: false, status: 503 }) }), /relay rejected/);
+  assert.match(calls.at(-1), /- 'parked_release_once'/); assert.doesNotMatch(calls.at(-1), /- 'parked_qc_recovery'/);
 });
