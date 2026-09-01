@@ -144,6 +144,6 @@ test('apply path is row-locked and delegates idempotency to the shared insert gu
   assert.match(source, /FOR UPDATE/);
   assert.match(source, /status = 'Parked'/g);
   const contract = fs.readFileSync(require.resolve('./parked-diagnosis.cjs'), 'utf8');
-  assert.match(contract, /WHERE NOT EXISTS \([\s\S]*context->>'kind' = \$6/);
+  assert.match(contract, /WHERE NOT EXISTS \([\s\S]*context->>'kind' = \$7/);
   assert.match(contract, /ON CONFLICT DO NOTHING/);
 });

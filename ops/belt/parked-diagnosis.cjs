@@ -206,20 +206,20 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
     stage: issue.status, attempts, ceiling: evidence.ceiling });
   const task = await client.query(
     `INSERT INTO agent_task_queue (
-       agent_id, issue_id, status, priority, runtime_id, context,
+       agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
        trigger_summary, force_fresh_session, originator_source,
        trigger_evidence_kind, attempt, max_attempts
      )
-     SELECT $1::uuid, $2::uuid, 'queued', $3::integer, $4::uuid, $5::jsonb,
+     SELECT $1::uuid, $2::uuid, $3::uuid, 'queued', $4::integer, $5::uuid, $6::jsonb,
             'Sol-low parked-ticket diagnosis (no builder dispatch)', TRUE,
             'unattributed', 'relay_disposition', 1, 1
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue
-        WHERE issue_id = $2::uuid AND context->>'kind' = $6::text
+        WHERE issue_id = $2::uuid AND context->>'kind' = $7::text
       )
       ON CONFLICT DO NOTHING
       RETURNING id`,
-    [ownerRow.id, issue.id,
+    [ownerRow.id, issue.id, issue.workspace_id,
       PRIORITY[String(issue.priority || 'none').toLowerCase()] ?? (Number(issue.priority) || 0),
       ownerRow.runtime_id,
       JSON.stringify(context), PARK_DIAGNOSIS_KIND]
