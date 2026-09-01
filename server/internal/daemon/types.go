@@ -261,6 +261,7 @@ type TaskResult struct {
 	SessionID     string `json:"session_id,omitempty"` // Claude session ID for future resumption
 	WorkDir       string `json:"work_dir,omitempty"`   // working directory used during execution
 	EnvRoot       string `json:"-"`                    // env root dir for writing GC metadata (not sent to server)
+	TempDir       string `json:"-"`                    // task-local temp dir; removed after terminal callback
 	FailureReason string `json:"-"`                    // classifier forwarded to FailTask on the blocked path; empty falls back to 'agent_error'
 	// SessionRolloutMissing is set when the daemon withheld this task's Codex
 	// session because its rollout was not in the store (MUL-5305). Forwarded to
