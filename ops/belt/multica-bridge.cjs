@@ -638,13 +638,14 @@ async function canonicalStageOwner(client, workspaceId, ownerStage) {
   return result.rows[0] || null;
 }
 
-async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
-  if (toStage !== "Spec") return null;
+async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
+  // Selection and the rotation update share the relay transaction. The advisory
+  // lock makes equal-load choices stable under concurrent advances.
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, ownerStage]);
   const result = await client.query(
     `SELECT p.agent_id, a.name AS agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
             a.status AS agent_status, a.instructions, a.model, a.thinking_level,
-            a.max_concurrent_tasks, a.runtime_config,
+            a.max_concurrent_tasks, a.runtime_config, p.last_selected_at,
             COALESCE(own_runtime.provider, online_runtime.provider) AS selected_runtime_provider,
             COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id,
             COALESCE(active.task_count, 0)::int AS active_task_count
@@ -663,19 +664,24 @@ async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
             AND atq.status IN ('queued','dispatched','running','waiting_local_directory','deferred')
        ) active ON true
       WHERE p.workspace_id = $1 AND p.stage_name = $2 AND p.enabled = true
-      ORDER BY active_task_count, p.agent_id`, [workspaceId, toStage]);
+      ORDER BY active_task_count, p.last_selected_at NULLS FIRST, p.agent_id`, [workspaceId, toStage]);
   if (result.rows.length === 0) return null;
   const eligible = result.rows.filter((row) => row.archived_at === null &&
-    ["idle", "working"].includes(row.agent_status) && row.model === "gpt-5.6-sol" &&
-    row.thinking_level === "low" && row.selected_runtime_id &&
+    ["idle", "working"].includes(row.agent_status) && row.selected_runtime_id &&
     Number(row.active_task_count) < Number(row.max_concurrent_tasks) &&
     instructionCompatibility(row.instructions, toStage).ok);
-  if (eligible.length === 0) throw new Error(`No eligible Sol-low scoper in pool: ${workspaceId}/${ownerStage}`);
-  return eligible[0];
+  if (eligible.length === 0) throw new Error(`No eligible stage owner in pool: ${workspaceId}/${toStage}`);
+  const selected = eligible[0];
+  await client.query(
+    `UPDATE relay_stage_agent_pool SET last_selected_at = NOW()
+      WHERE workspace_id = $1 AND stage_name = $2 AND agent_id = $3`,
+    [workspaceId, toStage, selected.agent_id]
+  );
+  return selected;
 }
 
 async function selectStageOwner(client, workspaceId, ownerStage, toStage) {
-  const pooled = await selectScoperPoolOwner(client, workspaceId, ownerStage, toStage);
+  const pooled = await selectPoolOwner(client, workspaceId, ownerStage, toStage);
   return pooled || canonicalStageOwner(client, workspaceId, ownerStage);
 }
 
@@ -1462,6 +1468,7 @@ module.exports = {
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
+  selectPoolOwner,
   selectStageOwner,
   applyDisposition
 };
