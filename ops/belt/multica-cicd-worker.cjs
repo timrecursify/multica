@@ -34,11 +34,12 @@ let gh = function github(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
 };
 
-let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason) {
+let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: relayToken,
       ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}),
-      ...(reason ? { reason } : {}) });
+      ...(reason ? { reason } : {}),
+      ...(parkedAudit ? { parked_audit: parkedAudit } : {}) });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);

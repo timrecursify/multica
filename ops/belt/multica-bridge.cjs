@@ -15,6 +15,7 @@ const {
 } = require("./guardrails.cjs");
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
+const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -117,6 +118,14 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
     [disposition, issue.id]
   );
   if (changed.rowCount > 0 && disposition === 'Parked') {
+    await recordParkedEntry(client, {
+      issueId: issue.id,
+      fromStage: issue.status,
+      trigger: reason,
+      intendedStage: evidence.target_stage || null,
+      attempts: evidence.historical_tasks || 0,
+      taskCount: evidence.task_count || evidence.historical_tasks || 0
+    });
     const diagnosisTaskId = await recordParkAndQueueDiagnosis(client, issue,
       { ...evidence, reason });
     if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
@@ -588,7 +597,7 @@ async function selectStageOwner(client, workspaceId, ownerStage, toStage) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token, current_work_product_md5, reason } = body;
+    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -615,6 +624,7 @@ async function relayAdvance(req, res, body) {
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [issue_id]);
 
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
+    let parkedAudit = to_stage === "Parked" ? parked_audit : null;
     const terminalStages = new Set(["Done", "Cancelled", "Archived"]);
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
@@ -758,6 +768,12 @@ async function relayAdvance(req, res, body) {
           redirected_to: "Parked"
         }));
         to_stage = "Parked";
+        parkedAudit = {
+          trigger: "qc_bounce_ceiling",
+          intendedStage: "In Progress",
+          attempts: n,
+          taskCount: n
+        };
       }
     }
 
@@ -1066,6 +1082,17 @@ async function relayAdvance(req, res, body) {
     let taskId = null;
     let relayLogId = null;
 
+    if (to_stage === "Parked" && result.rowCount > 0) {
+      relayLogId = await recordParkedEntry(client, {
+        issueId: issue.id,
+        fromStage: issue.status,
+        trigger: parkedAudit?.trigger || "relay_advance",
+        intendedStage: parkedAudit?.intendedStage || null,
+        attempts: parkedAudit?.attempts || 0,
+        taskCount: parkedAudit?.taskCount || 0
+      });
+    }
+
     if (terminalStages.has(to_stage)) {
       relayLogId = await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
@@ -1220,5 +1247,6 @@ module.exports = {
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
-  selectStageOwner
+  selectStageOwner,
+  applyDisposition
 };

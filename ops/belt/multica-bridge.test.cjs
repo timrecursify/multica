@@ -18,7 +18,8 @@ const {
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
-  selectStageOwner
+  selectStageOwner,
+  applyDisposition
 } = require('./multica-bridge.cjs');
 
 test('only a named CI/CD return is eligible for a repair authorization', () => {
@@ -394,6 +395,36 @@ test('parking records a reason and hands off one Sol-low diagnosis', () => {
   assert.match(source, /recordParkAndQueueDiagnosis/);
   assert.match(source, /disposition === 'Parked'/);
   assert.match(source, /context->>'kind', ''\) <> 'parked_diagnosis'/);
+});
+
+test('Parked dispositions create a dedicated relay audit row before diagnosis', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('UPDATE issue SET status')) {
+      return { rowCount: 1, rows: [{ id: 'issue-1' }] };
+    }
+    if (sql.includes('INSERT INTO relay_run_log')) return { rows: [{ id: 'parked-log' }] };
+    if (sql.includes('FROM agent a')) return { rows: [] };
+    return { rows: [] };
+  } };
+  const moved = await applyDisposition(client, { id: 'issue-1', workspace_id: 'workspace-1',
+    status: 'In Review', priority: 'high' }, 'Parked', 'stage_cycle_limit', {
+    target_stage: 'In Progress', historical_tasks: 2
+  });
+
+  assert.equal(moved, true);
+  assert.match(calls[1].sql, /parked_audit/);
+  assert.deepEqual(JSON.parse(calls[1].values[2]), {
+    trigger: 'stage_cycle_limit', intended_stage: 'In Progress', attempts: 2, task_count: 2
+  });
+});
+
+test('every direct Parked transition is routed through the dedicated audit writer', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /if \(to_stage === "Parked" && result\.rowCount > 0\)/);
+  assert.match(source, /trigger: parkedAudit\?\.trigger \|\| "relay_advance"/);
+  assert.match(source, /trigger: "qc_bounce_ceiling"/);
 });
 
 test('relay request maps snake-case stage into successor task input', () => {
