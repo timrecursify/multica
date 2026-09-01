@@ -44,13 +44,23 @@ function advanceRow(evidenceResult = `QC PASS exact SHA ${SHA}`) {
   };
 }
 
-function advanceHarness(row, currentPass = { verdict: 'PASS', work_product_md5: MD5 }) {
+function advanceHarness(row, currentPass = { verdict: 'PASS', work_product_md5: MD5 },
+  missingVerdicts = []) {
   const queries = [];
   const logs = [];
   const payloads = [];
   const client = {
     async query(sql, values) {
       queries.push({ sql, values });
+      if (sql.includes('to_stage = ANY($1)')) {
+        return { rowCount: 0, rows: [] };
+      }
+      if (sql.includes('qc_verdict_missing_after_task_created')) {
+        return { rowCount: 1, rows: [] };
+      }
+      if (sql.includes('SELECT 1 FROM qc_verdict verdict')) {
+        return { rows: missingVerdicts };
+      }
       if (sql.includes('SELECT rrl.id AS log_id')) return { rows: [row] };
       if (sql.includes('SELECT verdict, work_product_md5 FROM qc_verdict')) {
         return { rows: currentPass ? [currentPass] : [] };
@@ -150,6 +160,44 @@ test('terminal-source relay logs are completed without requesting a successor', 
   assert.ok(harness.logs.some((line) => line.includes('TERMINAL:')));
 });
 
+test('completed In Review task without a later verdict fails and escalates to Spec', async () => {
+  const missing = { log_id: 'missing-log', task_id: 'missing-task', issue_id: 'missing-issue',
+    to_stage: 'In Review' };
+  const harness = advanceHarness(advanceRow(), { verdict: 'PASS', work_product_md5: MD5 }, [missing]);
+  await harness.run();
+  assert.ok(harness.payloads.some((payload) => payload.issue_id === 'missing-issue' &&
+    payload.to_stage === 'Spec' &&
+    payload.reason === 'retry_escalation:qc_verdict_missing_after_task_created'));
+  const failure = harness.queries.find(({ sql }) =>
+    sql.includes('qc_verdict_missing_after_task_created'));
+  assert.ok(failure);
+  assert.deepEqual(failure.values, ['missing-log']);
+});
+
+test('Cancelled relay row closes before issue-status admission', async () => {
+  const harness = advanceHarness(advanceRow());
+  await harness.run();
+  const terminal = harness.queries.find(({ sql }) =>
+    sql.includes("to_stage = ANY($1)"));
+  assert.ok(terminal);
+  assert.deepEqual(terminal.values, [['Done', 'Cancelled', 'Archived']]);
+});
+
+test('25 dead In Review rows are excluded before the 20-row advance window', async () => {
+  const missing = Array.from({ length: 25 }, (_, index) => ({
+    log_id: `missing-${index}`, task_id: `task-${index}`, issue_id: `issue-${index}`,
+    to_stage: 'In Review'
+  }));
+  const harness = advanceHarness(advanceRow(), { verdict: 'PASS', work_product_md5: MD5 }, missing);
+  await harness.run();
+  assert.equal(harness.payloads.filter((payload) => payload.to_stage === 'Spec').length, 25);
+  assert.ok(harness.payloads.some((payload) => payload.to_stage === 'CI/CD & Deploy'));
+  const advanceQuery = harness.queries.find(({ sql }) => sql.includes('SELECT rrl.id AS log_id') &&
+    sql.includes('LIMIT 20'));
+  assert.match(advanceQuery.sql, /rrl\.to_stage = 'In Review'/);
+  assert.match(advanceQuery.sql, /missing_verdict\.created_at >= atq\.created_at/);
+});
+
 test('permanently mismatched evidence is held after the bounded retry limit', async () => {
   const harness = advanceHarness(advanceRow('QC result contains no bound SHA'));
   await harness.run();
@@ -160,7 +208,8 @@ test('permanently mismatched evidence is held after the bounded retry limit', as
   assert.ok(hold);
   assert.match(hold.sql, /THEN 'rejected'/);
   assert.deepEqual(hold.values, ['relay-log-1', 3]);
-  assert.ok(!harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'")));
+  assert.ok(!harness.queries.some(({ sql }) => sql.includes("SET status = 'completed'") &&
+    !sql.includes('to_stage = ANY($1)')));
 });
 
 test('PASS bounce deploys or holds, and never selects Spec', () => {

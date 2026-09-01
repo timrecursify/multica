@@ -300,6 +300,18 @@ async function markRelayLogFailedById(client, logId) {
   }
 }
 
+async function failMissingQcVerdict(client, logId) {
+  return client.query(
+    `UPDATE relay_run_log
+        SET status = 'failed',
+            parked_audit = jsonb_set(
+              COALESCE(parked_audit, '{}'::jsonb),
+              '{reason}', to_jsonb('qc_verdict_missing_after_task_created'::text))
+      WHERE id = $1 AND status = 'pending'`,
+    [logId]
+  );
+}
+
 async function holdQcEvidenceMismatch(client, logId) {
   return client.query(
     `UPDATE relay_run_log
@@ -423,6 +435,42 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   const client = await dbPool.connect();
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
+    // Terminal arrivals are ledger-only. They cannot require a matching issue
+    // status because an operator or another path may already have moved it.
+    const terminal = await client.query(
+      `UPDATE relay_run_log
+          SET status = 'completed'
+        WHERE status = 'pending'
+          AND to_stage = ANY($1)`,
+      [[...TERMINAL_STAGES]]
+    );
+    if (terminal.rowCount > 0) {
+      logger.log(`${LOG_PREFIX} Closed ${terminal.rowCount} terminal relay log(s)`);
+    }
+
+    // A completed QC task without a verdict created after the task was queued
+    // cannot become admissible. Exclude it from the work window below, close
+    // it with durable evidence, and hand it to the normal re-spec path.
+    const missingVerdicts = await client.query(
+      `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id, rrl.to_stage
+         FROM relay_run_log rrl
+         INNER JOIN agent_task_queue atq ON atq.id = rrl.task_id
+        WHERE rrl.status = 'pending'
+          AND rrl.to_stage = 'In Review'
+          AND atq.status = 'completed'
+          AND NOT EXISTS (
+            SELECT 1 FROM qc_verdict verdict
+             WHERE verdict.issue_id = atq.issue_id
+               AND verdict.created_at >= atq.created_at
+          )`
+    );
+    for (const row of missingVerdicts.rows) {
+      const escalation = await requestRetryEscalation(row,
+        'qc_verdict_missing_after_task_created', postRelay);
+      await failMissingQcVerdict(client, row.log_id);
+      logger.log(`${LOG_PREFIX} [qc-verdict-missing] RESPEC: issue=${row.issue_id}, ` +
+        `relay=${row.log_id}, status=${escalation.status}`);
+    }
 
     // Correlate strictly on the task that owns the relay log. Advance only
     // genuinely completed tasks; a failed task must never move work forward.
@@ -507,6 +555,14 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
+        AND NOT (
+          rrl.to_stage = 'In Review'
+          AND NOT EXISTS (
+            SELECT 1 FROM qc_verdict missing_verdict
+             WHERE missing_verdict.issue_id = atq.issue_id
+               AND missing_verdict.created_at >= atq.created_at
+          )
+        )
       ORDER BY rrl.created_at ASC
       LIMIT 20`;
 
@@ -724,10 +780,10 @@ function postToRelay(payload) {
   });
 }
 
-function requestRetryEscalation(row, reason) {
+function requestRetryEscalation(row, reason, relay = postToRelay) {
   const taskId = row.task_id || row.dead_task_id;
   const triggerStage = row.to_stage || row.stage;
-  return postToRelay({
+  return relay({
     issue_id: row.issue_id,
     to_stage: 'Spec',
     agent_token: RELAY_AGENT_SECRET,
