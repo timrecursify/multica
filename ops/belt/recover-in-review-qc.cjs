@@ -27,7 +27,8 @@ async function recover(client, issueId) {
           AND live.status IN ('queued','dispatched','running','waiting_local_directory','deferred'))
         AND EXISTS (SELECT 1 FROM agent_task_queue wrong WHERE wrong.issue_id = i.id
           AND wrong.context->>'from_stage' = 'Parked' AND wrong.context->>'to_stage' = 'In Review'
-          AND wrong.status = 'cancelled' AND wrong.started_at IS NULL)
+          AND wrong.status = 'failed' AND wrong.started_at IS NULL
+          AND wrong.failure_reason = 'operator_orphan_repair')
       FOR UPDATE`, [issueId]);
   const row = issue.rows[0];
   if (!row) return null;
@@ -37,7 +38,7 @@ async function recover(client, issueId) {
     fromStage: 'Parked', toStage: 'In Review', agentId: owner.agent_id,
     runtimeId: owner.selected_runtime_id, priority: ({ urgent: 4, high: 3, medium: 2, low: 1 }[row.priority] || 0),
     context: JSON.stringify({ source: 'operator-qc-recovery', from_stage: 'Parked', to_stage: 'In Review' }),
-    triggerSummary: 'Operator recovery: cancelled unstarted Parked -> In Review successor' });
+    triggerSummary: 'Operator recovery: failed unstarted Parked -> In Review successor' });
 }
 
 async function main() {

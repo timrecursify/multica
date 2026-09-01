@@ -11,11 +11,12 @@ test('requires exact UUID operator scope', () => {
   assert.throws(() => parseArgs(['--apply', '--issue', 'bad']), /UUID/);
   assert.throws(() => parseArgs(['--issue', id]), /--apply/);
 });
-test('recovery contract excludes started, usage, wrong status, and duplicate QC', () => {
+test('recovery admits the observed #1009/#23696 failed-orphan shape only', () => {
   const source = require('node:fs').readFileSync(require.resolve('./recover-in-review-qc.cjs'), 'utf8');
   assert.match(source, /i\.status = 'In Review'/);
   assert.match(source, /task_usage/);
-  assert.match(source, /wrong\.started_at IS NULL/);
+  assert.match(source, /wrong\.status = 'failed' AND wrong\.started_at IS NULL/);
+  assert.match(source, /wrong\.failure_reason = 'operator_orphan_repair'/);
   assert.match(source, /live\.status IN/);
   assert.match(source, /selectStageOwner\(client, row\.workspace_id, 'In Progress', 'In Review'\)/);
   assert.match(source, /replaceStageTask/);
