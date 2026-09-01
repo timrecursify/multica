@@ -4610,6 +4610,46 @@ func (d *Daemon) watchTaskCancellation(ctx context.Context, taskID string, pollI
 	return cancelled
 }
 
+func (d *Daemon) cleanupTaskTempDir(task Task, result TaskResult, terminalized bool, taskLog *slog.Logger) {
+	d.cleanupTaskTempDirWith(task, result, terminalized, taskLog, os.RemoveAll)
+}
+
+func (d *Daemon) cleanupTaskTempDirWith(task Task, result TaskResult, terminalized bool, taskLog *slog.Logger, remove func(string) error) {
+	if result.TempDir == "" {
+		return
+	}
+	if terminalized {
+		d.cleanupTerminalTaskTempDir(task, result.TempDir, taskLog, remove)
+		return
+	}
+	if err := remove(result.TempDir); err != nil {
+		taskLog.Warn("task temp dir cleanup failed", "path", result.TempDir, "error", err)
+	}
+}
+
+func (d *Daemon) cleanupTerminalTaskTempDir(task Task, tempDir string, taskLog *slog.Logger, remove func(string) error) {
+	if err := writeTaskTempTerminalMarker(tempDir, task.ID, task.WorkspaceID, time.Now().UTC()); err != nil {
+		taskLog.Warn("task temp terminal marker write failed", "path", tempDir, "error", err)
+	} else if err := removeTaskTempDirContents(tempDir, remove); err != nil {
+		taskLog.Warn("task temp dir cleanup failed", "path", tempDir, "error", err)
+		// A best-effort remover may already have removed the marker while
+		// failing on a root-owned child. Recreate it after the failed pass so
+		// Sentinel retains authorization to retry this terminal directory.
+		if markerErr := writeTaskTempTerminalMarker(tempDir, task.ID, task.WorkspaceID, time.Now().UTC()); markerErr != nil {
+			taskLog.Warn("task temp terminal marker restore failed", "path", tempDir, "error", markerErr)
+		}
+		return
+	} else if err := remove(filepath.Join(tempDir, taskTempTerminalMarkerFile)); err != nil {
+		taskLog.Warn("task temp marker cleanup failed", "path", tempDir, "error", err)
+		return
+	} else if err := remove(tempDir); err != nil {
+		taskLog.Warn("task temp dir cleanup failed", "path", tempDir, "error", err)
+		if markerErr := writeTaskTempTerminalMarker(tempDir, task.ID, task.WorkspaceID, time.Now().UTC()); markerErr != nil {
+			taskLog.Warn("task temp terminal marker restore failed", "path", tempDir, "error", markerErr)
+		}
+	}
+}
+
 func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	d.mu.Lock()
 	rt, tracked := d.runtimeIndex[task.RuntimeID]
@@ -4742,9 +4782,11 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// runner.run has returned, so the transcript flush is complete —
 		// tell the server it can settle its deferred chat finalization
 		// (#5219). Best-effort: the sweeper grace period covers a lost ack.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID); ackErr != nil {
+		ackErr := d.client.AckTaskCancelled(ctx, task.ID)
+		if ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
+		d.cleanupTaskTempDir(task, result, ackErr == nil, taskLog)
 		return
 	default:
 	}
@@ -4757,14 +4799,16 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		// classifier so the failure_reason column reflects the actual
 		// shape of the failure (provider 5xx, network, process crash,
 		// …) rather than the coarse legacy "agent_error" bucket.
-		if failErr := d.reportTerminalTask(ctx, terminalTaskReport{
+		failErr := d.reportTerminalTask(ctx, terminalTaskReport{
 			kind:          terminalTaskReportFail,
 			taskID:        task.ID,
 			errorMessage:  err.Error(),
 			failureReason: taskRunFailureReason(err),
-		}); failErr != nil {
+		})
+		if failErr != nil {
 			taskLog.Error("fail task callback failed", "error", failErr)
 		}
+		d.cleanupTaskTempDir(task, result, failErr == nil, taskLog)
 		return
 	}
 
@@ -4779,13 +4823,16 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 		taskLog.Info("task cancelled during execution, discarding result", "status", status, "error", err)
 		// Same contract as the poll-cancelled path above: the transcript is
 		// flushed, so let the server settle its deferred chat finalization.
-		if ackErr := d.client.AckTaskCancelled(ctx, task.ID); ackErr != nil {
+		ackErr := d.client.AckTaskCancelled(ctx, task.ID)
+		if ackErr != nil {
 			taskLog.Warn("cancel ack failed; server sweeper will finalize", "error", ackErr)
 		}
+		d.cleanupTaskTempDir(task, result, ackErr == nil, taskLog)
 		return
 	}
 
-	d.reportTaskResult(ctx, task.ID, result, taskLog)
+	terminalized := d.reportTaskResult(ctx, task.ID, result, taskLog)
+	d.cleanupTaskTempDir(task, result, terminalized, taskLog)
 
 	// Write GC metadata after the task finishes so the periodic GC loop
 	// can look up the parent record (issue / chat session / autopilot run /
@@ -4976,7 +5023,10 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 	return release, false
 }
 
-// reportTaskResult writes the final task disposition back to the server.
+// reportTaskResult writes the final task disposition back to the server and
+// reports whether the server accepted a terminal callback. The caller uses
+// that acknowledgement to decide when a temp-directory terminal marker is
+// safe to publish.
 //
 // Fail closed: only an explicit "completed" status is reported as success.
 // Anything else — "blocked", "cancelled", or any future status we forget to
@@ -4986,7 +5036,7 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 // the agent may have built a real session before getting stuck, and we want
 // the next chat turn to resume there rather than start over and "forget"
 // the conversation.
-func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result TaskResult, taskLog *slog.Logger) {
+func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result TaskResult, taskLog *slog.Logger) bool {
 	switch result.Status {
 	case "completed":
 		taskLog.Info("task completed", "status", result.Status)
@@ -5001,7 +5051,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			retiredSessionID:      result.RetiredSessionID,
 		})
 		if err == nil {
-			return
+			return true
 		}
 		// CompleteTask retries transient errors internally. A transient
 		// error reaching us here means the schedule was exhausted while
@@ -5016,7 +5066,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		// left is a concrete failure.
 		if isTransientError(err) {
 			taskLog.Error("complete task failed after retries; leaving task in running rather than falling back to fail", "error", err)
-			return
+			return false
 		}
 		taskLog.Error("complete task rejected by server, falling back to fail", "error", err)
 		// MUL-2946: this fallback fires when a server-side complete
@@ -5039,7 +5089,10 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			retiredSessionID:      result.RetiredSessionID,
 		}); failErr != nil {
 			taskLog.Error("fail task fallback also failed", "error", failErr)
+		} else {
+			return true
 		}
+		return false
 	default:
 		failureReason := result.FailureReason
 		if failureReason == "" {
@@ -5071,7 +5124,9 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			retiredSessionID:      result.RetiredSessionID,
 		}); err != nil {
 			taskLog.Error("report failed task failed", "error", err)
+			return false
 		}
+		return true
 	}
 }
 
@@ -5627,7 +5682,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		// Collapse every deadline shape (context deadline, HTTP cancellation,
 		// or the explicit waitForExecutionEnvironment cause) into one sentinel
 		// that handleTask can classify as a retryable platform timeout.
-		taskResult = TaskResult{}
+		tempDir := taskResult.TempDir
+		taskResult = TaskResult{TempDir: tempDir}
 		returnErr = fmt.Errorf("%w after %s", errTaskPrepareTimeout, prepareTimeout)
 	}()
 
@@ -5945,11 +6001,10 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("prepare task temp dir: %w", err)
 	}
-	defer func() {
-		if cerr := os.RemoveAll(taskTempDir); cerr != nil {
-			taskLog.Warn("task temp dir cleanup failed", "path", taskTempDir, "error", cerr)
-		}
-	}()
+	// Carry this path to handleTask. It must be marked only after the server
+	// accepts the terminal callback; a local result alone is not proof that the
+	// task was terminalized remotely.
+	defer func() { taskResult.TempDir = taskTempDir }()
 
 	// Issue #3999 race A: now that env.WorkDir is on disk, transition the
 	// server-side state machine dispatched (or waiting_local_directory) →
