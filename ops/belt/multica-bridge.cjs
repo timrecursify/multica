@@ -512,7 +512,7 @@ async function relayAdvance(req, res, body) {
     // serializes precisely the belt-owned execution transition.
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [issue_id]);
 
-    const dispositionStages = new Set(["Parked", "Rejected"]);
+    const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
