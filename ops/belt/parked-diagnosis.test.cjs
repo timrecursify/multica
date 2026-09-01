@@ -52,6 +52,8 @@ test('validated Parked outcomes map to bounded state actions', () => {
     { action: 'release', status: 'Parked', nextStage: 'Queue' });
   assert.deepEqual(diagnosisOutcomeAction({ outcome: 'already_fixed', evidenceVerified: true }),
     { action: 'close', status: 'Done' });
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'already_fixed', evidenceVerified: false, needsQC: true }),
+    { action: 'release', status: 'Parked', nextStage: 'In Review' });
   assert.deepEqual(diagnosisOutcomeAction({ outcome: 'duplicate', duplicateIssueId: 'survivor' }),
     { action: 'close', status: 'Cancelled', duplicateIssueId: 'survivor' });
   assert.deepEqual(diagnosisOutcomeAction({ outcome: 'genuinely_blocked', blocker: 'billing' }),
@@ -150,6 +152,26 @@ test('runtime evidence accepts only canonical durable-reference grammar', () => 
     `note task:${uuid}`, `task:${uuid.replace(/-/g, '')}`, 'relay.log:42']) {
     assert.equal(parseRuntimeEvidenceReference(invalid), null, invalid);
   }
+});
+
+test('recovery classifies #1009 and PPP-23696 for QC, and rejects #23734 parked diagnosis evidence', async () => {
+  const issueId = '123e4567-e89b-12d3-a456-426614174000';
+  const citedTask = '123e4567-e89b-12d3-a456-426614174001';
+  const validClient = { query: async (sql) => {
+    assert.match(sql, /context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
+    return { rowCount: 1 };
+  } };
+  for (const ticket of ['#1009', 'PPP-23696']) {
+    assert.equal(await verifyRuntimeEvidence(validClient, issueId, `task:${citedTask}`, 'retry'), true, ticket);
+    assert.deepEqual(diagnosisOutcomeAction({ outcome: 'already_fixed', needsQC: true }),
+      { action: 'release', status: 'Parked', nextStage: 'In Review' }, ticket);
+  }
+  const parkedDiagnosisClient = { query: async (sql) => {
+    assert.match(sql, /context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
+    return { rowCount: 0 };
+  } };
+  assert.equal(await verifyRuntimeEvidence(parkedDiagnosisClient, issueId, `task:${citedTask}`, 'retry'), false,
+    'PPP-23734 parked_diagnosis citation');
 });
 
 test('missing Sol-low owner persists a named blocker instead of parking silently', async () => {
