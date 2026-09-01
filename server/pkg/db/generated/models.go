@@ -926,10 +926,33 @@ type QuickAction struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RelayStageAgentPool struct {
+	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
+	StageName      string             `json:"stage_name"`
+	AgentID        pgtype.UUID        `json:"agent_id"`
+	Enabled        bool               `json:"enabled"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+	LastSelectedAt pgtype.Timestamptz `json:"last_selected_at"`
+}
+
 type RelayStageConfig struct {
-	ID        int32       `json:"id"`
-	StageName string      `json:"stage_name"`
-	NextStage pgtype.Text `json:"next_stage"`
+	ID            int32              `json:"id"`
+	StageName     string             `json:"stage_name"`
+	NextStage     pgtype.Text        `json:"next_stage"`
+	AgentID       pgtype.UUID        `json:"agent_id"`
+	AgentName     pgtype.Text        `json:"agent_name"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	AltNextStages []string           `json:"alt_next_stages"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+}
+
+type RelayStagePool struct {
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
+	StageName     string             `json:"stage_name"`
+	Enabled       bool               `json:"enabled"`
+	LegacyAgentID pgtype.UUID        `json:"legacy_agent_id"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
 type RuntimeProfile struct {
