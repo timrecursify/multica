@@ -256,6 +256,46 @@ async function replaceStageTask(client, task) {
   return { taskId, relayLogId: log.rows[0]?.id || null };
 }
 
+// Terminal transitions do not create a successor task, so they cannot use the
+// task-backed relay log path above. Keep one completed audit row for the deploy
+// close; the issue row lock held by relayAdvance makes the update/insert pair
+// idempotent for retries of the same transition.
+async function ensureCompletedRelayLog(client, issueId, fromStage, toStage) {
+  const completed = await client.query(
+    `UPDATE relay_run_log
+        SET status = 'completed'
+      WHERE issue_id = $1
+        AND from_stage = $2
+        AND to_stage = $3
+        AND status = 'pending'
+        AND NOT EXISTS (
+          SELECT 1 FROM relay_run_log
+           WHERE issue_id = $1
+             AND from_stage = $2
+             AND to_stage = $3
+             AND status = 'completed'
+        )
+      RETURNING id`,
+    [issueId, fromStage, toStage]
+  );
+  if (completed.rows[0]?.id) return completed.rows[0].id;
+
+  const inserted = await client.query(
+    `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status)
+     SELECT $1, $2, $3, 'completed'
+      WHERE NOT EXISTS (
+        SELECT 1 FROM relay_run_log
+         WHERE issue_id = $1
+           AND from_stage = $2
+           AND to_stage = $3
+           AND status = 'completed'
+      )
+     RETURNING id`,
+    [issueId, fromStage, toStage]
+  );
+  return inserted.rows[0]?.id || null;
+}
+
 async function existingStageTask(client, issueId, toStage) {
   const existing = await client.query(
     `SELECT id FROM agent_task_queue
@@ -817,6 +857,12 @@ async function relayAdvance(req, res, body) {
     let taskId = null;
     let relayLogId = null;
 
+    if (issue.status === 'CI/CD & Deploy' && to_stage === 'Done') {
+      relayLogId = await ensureCompletedRelayLog(
+        client, issue_id, issue.status, to_stage
+      );
+    }
+
     // A bundled child must never be dispatched on its own. Its MEGA parent IS
     // the unit of work: dispatching the child too pays for the same fix twice
     // and, on 2026-08-31, tripled in-flight by re-dispatching 235 children that
@@ -950,4 +996,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { existingStageTask, replaceStageTask };
+module.exports = { existingStageTask, replaceStageTask, ensureCompletedRelayLog };
