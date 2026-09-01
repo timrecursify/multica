@@ -131,11 +131,11 @@ async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = 
   const { kind, id } = reference;
   const queries = {
     task: `SELECT 1 FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id
-             WHERE t.id = $1 AND t.issue_id = $2 AND t.id IS DISTINCT FROM $3
+             WHERE t.id = $1::uuid AND t.issue_id = $2::uuid AND t.id IS DISTINCT FROM $3::uuid
                AND t.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'
                AND t.status = 'completed'`,
-    qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1 AND v.issue_id = $2`,
-    activity: `SELECT 1 FROM activity_log WHERE id = $1 AND issue_id = $2`
+    qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1::uuid AND v.issue_id = $2::uuid`,
+    activity: `SELECT 1 FROM activity_log WHERE id = $1::uuid AND issue_id = $2::uuid`
   };
   const values = kind === 'task' ? [id, issueId, excludeTaskId] : [id, issueId];
   const result = await client.query(queries[kind], values);
@@ -145,7 +145,7 @@ async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = 
 async function currentPassWorkProductMD5(client, issueId) {
   const result = await client.query(
     `SELECT verdict, work_product_md5 FROM qc_verdict
-      WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issueId]);
+      WHERE issue_id = $1::uuid ORDER BY created_at DESC LIMIT 1`, [issueId]);
   const verdict = result.rows[0];
   if (verdict?.verdict !== 'PASS' || typeof verdict.work_product_md5 !== 'string' ||
       !verdict.work_product_md5.trim()) return null;
