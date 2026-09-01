@@ -2779,9 +2779,16 @@ func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T
 		t.Fatalf("setup: create foreign issue: %v", err)
 	}
 
-	// Construct the inconsistent task: runtime_id belongs to testWorkspace,
-	// but issue_id is in foreignWorkspace. This is the data shape a routing
-	// bug would produce.
+	// Construct a legacy inconsistent task before the workspace invariant was
+	// installed. Production inserts are now rejected by its trigger; disabling
+	// it here intentionally models an already-poisoned historical row so the
+	// claim-time defense remains exercised.
+	if _, err := testPool.Exec(ctx, `ALTER TABLE agent_task_queue DISABLE TRIGGER agent_task_queue_enforce_workspace_trigger`); err != nil {
+		t.Fatalf("disable workspace trigger for legacy fixture: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `ALTER TABLE agent_task_queue ENABLE TRIGGER agent_task_queue_enforce_workspace_trigger`)
+	})
 	var taskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
