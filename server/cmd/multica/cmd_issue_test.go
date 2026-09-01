@@ -2800,6 +2800,27 @@ func TestValidateIssueStatus(t *testing.T) {
 	}
 }
 
+func TestTerminalIssueStatusIsRelayOwned(t *testing.T) {
+	for _, status := range []string{"done", "cancelled", "Done", "Cancelled", "Archived"} {
+		if !isTerminalIssueStatus(status) {
+			t.Errorf("terminal status %q must be relay-owned", status)
+		}
+	}
+	for _, status := range []string{"Queue", "In Progress", "Human Review", "Blocked", "dead_letter"} {
+		if isTerminalIssueStatus(status) {
+			t.Errorf("non-terminal status %q must remain CLI-eligible", status)
+		}
+		if err := validateDirectIssueStatusWrite(status); err != nil {
+			t.Errorf("direct non-terminal write %q rejected: %v", status, err)
+		}
+	}
+	for _, status := range []string{"done", "cancelled", "Done", "Cancelled", "Archived"} {
+		if err := validateDirectIssueStatusWrite(status); err == nil {
+			t.Errorf("direct terminal write %q must be rejected", status)
+		}
+	}
+}
+
 func TestValidateIssuePriority(t *testing.T) {
 	expected := map[string]bool{
 		"urgent": true,
@@ -2838,6 +2859,34 @@ func TestRunIssueCreateRejectsInvalidStatusBeforeRequest(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "valid values") {
 		t.Fatalf("expected valid values error, got: %v", err)
+	}
+}
+
+func TestTerminalStatusesAreRejectedByEveryDirectCLIWritePath(t *testing.T) {
+	for _, status := range []string{"done", "cancelled", "Done", "Cancelled", "Archived"} {
+		t.Run(status+"/create", func(t *testing.T) {
+			cmd := newIssueCreateTestCmd()
+			_ = cmd.Flags().Set("title", "Terminal status")
+			_ = cmd.Flags().Set("status", status)
+			if err := runIssueCreate(cmd, nil); err == nil || !strings.Contains(err.Error(), "relay-owned") {
+				t.Fatalf("runIssueCreate(%q) error = %v, want relay-owned rejection", status, err)
+			}
+		})
+		t.Run(status+"/update", func(t *testing.T) {
+			cmd := &cobra.Command{Use: "update"}
+			cmd.Flags().String("status", "", "")
+			cmd.Flags().String("priority", "", "")
+			_ = cmd.Flags().Set("status", status)
+			if err := runIssueUpdate(cmd, []string{"MUL-1"}); err == nil || !strings.Contains(err.Error(), "relay-owned") {
+				t.Fatalf("runIssueUpdate(%q) error = %v, want relay-owned rejection", status, err)
+			}
+		})
+		t.Run(status+"/status", func(t *testing.T) {
+			cmd := &cobra.Command{Use: "status"}
+			if err := runIssueStatus(cmd, []string{"MUL-1", status}); err == nil || !strings.Contains(err.Error(), "relay-owned") {
+				t.Fatalf("runIssueStatus(%q) error = %v, want relay-owned rejection", status, err)
+			}
+		})
 	}
 }
 
