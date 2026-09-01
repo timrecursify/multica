@@ -10,7 +10,8 @@ const {
   crossStageExecutionAdmission
 } = require('../guardrails.cjs');
 const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
-  namedBlocker, isConcreteRuntimeEvidence, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
+  namedBlocker, isConcreteRuntimeEvidence, verifyRuntimeEvidence,
+  PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -77,6 +78,13 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
       WHERE id = $2 AND status <> $1 RETURNING id`,
     [disposition, row.issue_id]
   );
+  if (changed.rowCount > 0 && disposition === 'Parked') {
+    const diagnosisTaskId = await recordParkAndQueueDiagnosis(client,
+      { id: row.issue_id, workspace_id: row.workspace_id, status: row.stage,
+        priority: row.priority }, { ...evidence, reason,
+        failure_reason: row.failure_reason });
+    if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
+  }
   await client.query(
     `UPDATE agent_task_queue
         SET status = 'cancelled', completed_at = NOW(),
@@ -89,13 +97,6 @@ async function applyDisposition(client, row, disposition, reason, evidence = {})
     [row.issue_id, reason]
   );
   if (changed.rowCount > 0) {
-    if (disposition === 'Parked') {
-      const diagnosisTaskId = await recordParkAndQueueDiagnosis(client,
-        { id: row.issue_id, workspace_id: row.workspace_id, status: row.stage,
-          priority: row.priority }, { ...evidence, reason,
-          failure_reason: row.failure_reason });
-      if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
-    }
     await client.query(
       `INSERT INTO activity_log
          (workspace_id, issue_id, actor_type, action, details)
@@ -880,7 +881,9 @@ async function processParkedDiagnoses() {
       // can rerun the single diagnosis task deliberately.
       const outcome = parsedOutcome || 'genuinely_blocked';
       const missingOutcome = !parsedOutcome;
-      const invalidAlreadyFixed = outcome === 'already_fixed' && !isConcreteRuntimeEvidence(evidence);
+      const evidenceVerified = outcome === 'already_fixed' && isConcreteRuntimeEvidence(evidence)
+        ? await verifyRuntimeEvidence(client, task.issue_id, evidence, task.id) : false;
+      const invalidAlreadyFixed = outcome === 'already_fixed' && !evidenceVerified;
       const invalidBlocked = outcome === 'genuinely_blocked' && !blocker;
       const duplicate = text.match(/duplicate[_ ](?:of|issue)\s*[:#]?\s*([0-9a-f-]{8,}|\d+)/i)?.[1] || null;
       let duplicateIssueId = null;
@@ -915,7 +918,7 @@ async function processParkedDiagnoses() {
                     '{parked_release_at}', to_jsonb(NOW()), true),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
-      } else if (outcome === 'already_fixed' && isConcreteRuntimeEvidence(evidence)) {
+      } else if (outcome === 'already_fixed' && evidenceVerified) {
         await client.query(
           `UPDATE issue SET status = 'Done', updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
@@ -938,7 +941,7 @@ async function processParkedDiagnoses() {
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id,
             missingOutcome ? 'Sol-low diagnosis response omitted an explicit outcome'
-              : invalidAlreadyFixed ? 'already_fixed response omitted concrete runtime_evidence'
+              : invalidAlreadyFixed ? 'runtime_evidence_unverified'
               : invalidBlocked ? 'genuinely_blocked response omitted a named blocker'
               : invalidDuplicate ? 'duplicate response did not resolve a same-workspace duplicate_of target'
               : `Sol-low diagnosis: ${blocker}`]);

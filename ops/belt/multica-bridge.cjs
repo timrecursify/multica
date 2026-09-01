@@ -80,6 +80,11 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
       WHERE id = $2 AND status <> $1 RETURNING id`,
     [disposition, issue.id]
   );
+  if (changed.rowCount > 0 && disposition === 'Parked') {
+    const diagnosisTaskId = await recordParkAndQueueDiagnosis(client, issue,
+      { ...evidence, reason });
+    if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
+  }
   await client.query(
     `UPDATE agent_task_queue
         SET status = 'cancelled', completed_at = NOW(),
@@ -92,11 +97,6 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
     [issue.id, reason]
   );
   if (changed.rowCount > 0) {
-    if (disposition === 'Parked') {
-      const diagnosisTaskId = await recordParkAndQueueDiagnosis(client, issue,
-        { ...evidence, reason });
-      if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
-    }
     await client.query(
       `INSERT INTO activity_log
          (workspace_id, issue_id, actor_type, action, details)
