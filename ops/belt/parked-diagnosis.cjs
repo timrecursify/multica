@@ -129,6 +129,16 @@ async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = 
   return result.rowCount > 0;
 }
 
+async function currentPassWorkProductMD5(client, issueId) {
+  const result = await client.query(
+    `SELECT verdict, work_product_md5 FROM qc_verdict
+      WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issueId]);
+  const verdict = result.rows[0];
+  if (verdict?.verdict !== 'PASS' || typeof verdict.work_product_md5 !== 'string' ||
+      !verdict.work_product_md5.trim()) return null;
+  return verdict.work_product_md5;
+}
+
 async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
   const attempts = evidence.historical_tasks ?? evidence.rejection_count ?? evidence.attempt_count;
   const history = await client.query(
@@ -239,6 +249,7 @@ module.exports = {
   diagnosisOutcomeAction,
   isConcreteRuntimeEvidence,
   isSolLowDiagnosisAgent,
+  currentPassWorkProductMD5,
   namedBlocker,
   parseDiagnosisOutcome,
   recordParkAndQueueDiagnosis,

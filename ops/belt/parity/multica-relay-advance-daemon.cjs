@@ -10,7 +10,7 @@ const {
   crossStageExecutionAdmission
 } = require('../guardrails.cjs');
 const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
-  namedBlocker, isConcreteRuntimeEvidence, verifyRuntimeEvidence,
+  namedBlocker, isConcreteRuntimeEvidence, verifyRuntimeEvidence, currentPassWorkProductMD5,
   diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 const { completionAdmission } = require('../relay-completion-admission.cjs');
 
@@ -936,7 +936,9 @@ async function processParkedDiagnoses() {
       const missingOutcome = !parsedOutcome;
       const evidenceVerified = outcome === 'already_fixed' && isConcreteRuntimeEvidence(evidence)
         ? await verifyRuntimeEvidence(client, task.issue_id, evidence, task.id) : false;
-      const invalidAlreadyFixed = outcome === 'already_fixed' && !evidenceVerified;
+      const completionMD5 = outcome === 'already_fixed' && evidenceVerified
+        ? await currentPassWorkProductMD5(client, task.issue_id) : null;
+      const invalidAlreadyFixed = outcome === 'already_fixed' && !completionMD5;
       const invalidBlocked = outcome === 'genuinely_blocked' && !blocker;
       const duplicate = text.match(/duplicate[_ ](?:of|issue)\s*[:#]?\s*([0-9a-f-]{8,}|\d+)/i)?.[1] || null;
       let duplicateIssueId = null;
@@ -951,7 +953,7 @@ async function processParkedDiagnoses() {
         duplicateIssueId = target.rows[0]?.id || null;
       }
       const invalidDuplicate = outcome === 'duplicate' && !duplicateIssueId;
-      const action = diagnosisOutcomeAction({ outcome, evidenceVerified, duplicateIssueId,
+      const action = diagnosisOutcomeAction({ outcome, evidenceVerified: Boolean(completionMD5), duplicateIssueId,
         blocker, missingOutcome, invalidAlreadyFixed, invalidDuplicate });
       const content = `<!-- multica-diagnosis-outcome -->\nSol-low diagnosis outcome: ${outcome}.\n${missingOutcome ? 'blocker: diagnosis response omitted an explicit outcome.\n' : ''}${invalidAlreadyFixed ? 'blocker: already_fixed requires concrete runtime_evidence.\n' : ''}${invalidBlocked ? 'blocker: genuinely_blocked requires a named blocker.\n' : ''}${invalidDuplicate ? 'blocker: duplicate requires an existing same-workspace duplicate_of target.\n' : ''}${evidence ? `runtime_evidence: ${evidence}\n` : ''}${blocker ? `blocker: ${blocker}\n` : ''}${text.slice(0, 2000)}`;
       await client.query(
@@ -973,14 +975,9 @@ async function processParkedDiagnoses() {
                     '{parked_release_at}', to_jsonb(NOW()), true),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
-      } else if (action.action === 'close' && action.status === 'Done') {
-        await client.query(
-          `UPDATE issue SET status = 'Done', updated_at = NOW()
-             WHERE id = $1 AND status = 'Parked'`, [task.issue_id]);
       } else if (action.action === 'close' && action.status === 'Cancelled') {
         await client.query(
-          `UPDATE issue SET status = 'Cancelled',
-                  metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2::uuid),
+          `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2::uuid),
                   updated_at = NOW()
              WHERE id = $1 AND status = 'Parked'`, [task.issue_id, duplicateIssueId]);
       } else {
@@ -996,17 +993,21 @@ async function processParkedDiagnoses() {
             SET context = COALESCE(context, '{}'::jsonb) || '{"diagnosis_processed":true}'::jsonb
           WHERE id = $1`, [task.id]);
       await client.query('COMMIT');
-      if (outcome === 'fixable') {
-        const response = await postToRelay({ issue_id: task.issue_id, to_stage: 'Queue', agent_token: RELAY_AGENT_SECRET });
+      const nextStage = action.action === 'release' ? action.nextStage
+        : action.action === 'close' ? action.status : null;
+      if (nextStage) {
+        const response = await postToRelay({ issue_id: task.issue_id, to_stage: nextStage,
+          agent_token: RELAY_AGENT_SECRET,
+          ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}) });
         if (!response.ok) {
-          // Keep the diagnosis retryable when the bridge is unavailable; the
-          // release marker is harmless and the bridge consumes it once.
+          // Keep the diagnosis retryable when the bridge is unavailable. The
+          // bridge owns terminal transitions and must record the gate result.
           await client.query(
             `UPDATE agent_task_queue
                 SET context = context - 'diagnosis_processed'
               WHERE id = $1`, [task.id]);
         }
-        console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: fixable -> Queue; relay=${response.status}`);
+        console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
       } else {
         console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome}`);
       }

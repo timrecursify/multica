@@ -12,6 +12,7 @@ const {
   replaceStageTask,
   ownerStageForTransition,
   ensureCompletedRelayLog,
+  completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff
 } = require('./multica-bridge.cjs');
@@ -260,24 +261,30 @@ test('deploy close inserts one completed relay row when no pending row exists', 
   assert.match(calls[1].sql, /INSERT INTO relay_run_log/);
 });
 
-test('deploy close retry does not duplicate an existing completed row', async () => {
+test('terminal close retry reuses the existing completed row', async () => {
   const calls = [];
   const client = { query: async (sql, values) => {
     calls.push({ sql, values });
-    return { rows: [] };
+    return calls.length === 3 ? { rows: [{ id: 43 }] } : { rows: [] };
   } };
 
   const id = await ensureCompletedRelayLog(client, 'issue-3', 'CI/CD & Deploy', 'Done');
 
-  assert.equal(id, null);
-  assert.equal(calls.length, 2);
+  assert.equal(id, 43);
+  assert.equal(calls.length, 3);
+  assert.match(calls[2].sql, /status = 'completed'/);
+});
+
+test('terminal already-applied replay returns its completed relay log ID', async () => {
+  const client = { query: async () => ({ rows: [{ id: 44 }] }) };
+  assert.equal(await completedTerminalRelayLog(client, 'issue-4', 'Cancelled'), 44);
 });
 
 test('release admission is explicit, one-use, and resets task history by time', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /parked_release_once === true/);
-  assert.match(source, /if \(!parkedRelease && !allowedStages\.includes/);
+  assert.match(source, /if \(!parkedRelease && !parkedDiagnosisDone && !allowedStages\.includes/);
   assert.match(source, /reason: "parked_release_required"/);
   assert.match(source, /created_at >= \$3/);
   assert.match(source, /created_at >= \$2/);
@@ -313,4 +320,14 @@ test('relay stage lookups bind configuration and owners to the issue workspace',
   assert.match(source, /a\.workspace_id = rsc\.workspace_id/);
   assert.match(source, /Relay owner workspace mismatch/);
   assert.match(source, /ORDER BY rsc\.workspace_id, rsc\.id/);
+});
+
+test('terminal relay transitions are logged and Parked Done remains relay-only and PASS-gated', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /const terminalStages = new Set\(\["Done", "Cancelled", "Archived"\]\)/);
+  assert.match(source, /const parkedDiagnosisDone = issue\.status === "Parked" && to_stage === "Done"/);
+  assert.match(source, /to_stage === "Done"/);
+  assert.match(source, /work_product_mismatch/);
+  assert.match(source, /if \(terminalStages\.has\(to_stage\)\)/);
+  assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
 });

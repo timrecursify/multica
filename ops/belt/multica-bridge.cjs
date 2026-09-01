@@ -381,7 +381,23 @@ async function ensureCompletedRelayLog(client, issueId, fromStage, toStage) {
      RETURNING id`,
     [issueId, fromStage, toStage]
   );
-  return inserted.rows[0]?.id || null;
+  if (inserted.rows[0]?.id) return inserted.rows[0].id;
+  const existing = await client.query(
+    `SELECT id FROM relay_run_log
+      WHERE issue_id = $1 AND from_stage = $2 AND to_stage = $3
+        AND status = 'completed'
+      ORDER BY created_at DESC, id DESC LIMIT 1`,
+    [issueId, fromStage, toStage]
+  );
+  return existing.rows[0]?.id || null;
+}
+
+async function completedTerminalRelayLog(client, issueId, toStage) {
+  const existing = await client.query(
+    `SELECT id FROM relay_run_log
+      WHERE issue_id = $1 AND to_stage = $2 AND status = 'completed'
+      ORDER BY created_at DESC, id DESC LIMIT 1`, [issueId, toStage]);
+  return existing.rows[0]?.id || null;
 }
 
 async function existingStageTask(client, issueId, toStage) {
@@ -512,7 +528,8 @@ async function relayAdvance(req, res, body) {
     // serializes precisely the belt-owned execution transition.
     await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [issue_id]);
 
-    const dispositionStages = new Set(["Parked", "Rejected"]);
+    const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
+    const terminalStages = new Set(["Done", "Cancelled", "Archived"]);
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -540,16 +557,23 @@ async function relayAdvance(req, res, body) {
     }
     const parkedRelease = issue.status === "Parked" && to_stage === "Queue" &&
       issue.metadata?.parked_release_once === true;
+    // Parked -> Done is reserved for the relay's already-fixed diagnosis
+    // outcome. It still reaches the current PASS + work-product-hash gate
+    // below; the relay secret is the authority boundary for this exception.
+    const parkedDiagnosisDone = issue.status === "Parked" && to_stage === "Done";
     const releaseAt = issue.metadata?.parked_release_at || null;
     if (issue.status === to_stage) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
+      const relayLogId = terminalStages.has(to_stage)
+        ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
         success: true,
         issue: { id: issue.id, status: issue.status },
         transition: "already_applied",
-        task_id: taskId
+        task_id: taskId,
+        relay_log_id: relayLogId
       }));
       return;
     }
@@ -594,7 +618,7 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    if (!parkedRelease && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
+    if (!parkedRelease && !parkedDiagnosisDone && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
@@ -969,7 +993,7 @@ async function relayAdvance(req, res, body) {
     let taskId = null;
     let relayLogId = null;
 
-    if (issue.status === 'CI/CD & Deploy' && to_stage === 'Done') {
+    if (terminalStages.has(to_stage)) {
       relayLogId = await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
@@ -1116,6 +1140,7 @@ module.exports = {
   replaceStageTask,
   ownerStageForTransition,
   ensureCompletedRelayLog,
+  completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff
 };

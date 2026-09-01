@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const test = require('node:test');
 
 const {
@@ -8,6 +9,7 @@ const {
   diagnosisEvidence,
   namedBlocker,
   isConcreteRuntimeEvidence,
+  currentPassWorkProductMD5,
   verifyRuntimeEvidence,
   recordParkAndQueueDiagnosis,
   diagnosisOutcomeAction,
@@ -72,18 +74,44 @@ test('diagnosis evidence and owner validation fail closed', () => {
 });
 
 test('diagnosis processing is workspace-scoped and serializes concurrent ticks', () => {
-  const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /FOR UPDATE OF t SKIP LOCKED/);
   assert.match(source, /WHERE workspace_id = \$1 AND id <> \$2/);
   assert.match(source, /t\.context->>'kind' = \$2/);
   assert.match(source, /context->>'no_builder'/);
   assert.match(source, /diagnosisOutcomeAction\(\{ outcome/);
-  assert.match(source, /action\.status === 'Done'/);
-  assert.match(source, /action\.status === 'Cancelled'/);
   assert.match(source, /action\.action === 'release'/);
+  assert.match(source, /action\.action === 'close' \? action\.status : null/);
+  assert.match(source, /current_work_product_md5: completionMD5/);
+  assert.doesNotMatch(source, /UPDATE issue SET status = 'Done'/);
+  assert.doesNotMatch(source, /UPDATE issue SET status = 'Cancelled'/);
   assert.match(source, /SELECT \$1::uuid, \$2::uuid, 'system', \$3::uuid, \$4::text, 'system'/);
   assert.match(source, /jsonb_build_object\('parked_blocker', \$2::text\)/);
+});
+
+test('already-fixed completion forwards only the current PASS work-product hash', async () => {
+  const pass = await currentPassWorkProductMD5({ query: async () => ({ rows: [
+    { verdict: 'PASS', work_product_md5: 'a1b2c3' }
+  ] }) }, 'issue-1');
+  assert.equal(pass, 'a1b2c3');
+  for (const verdict of [
+    { verdict: 'FAIL', work_product_md5: 'a1b2c3' },
+    { verdict: 'PASS', work_product_md5: '' },
+    undefined,
+  ]) {
+    const hash = await currentPassWorkProductMD5({ query: async () => ({ rows: verdict ? [verdict] : [] }) }, 'issue-1');
+    assert.equal(hash, null);
+  }
+});
+
+test('archiver and duplicate cancellation use relay authority', () => {
+  const relay = fs.readFileSync(require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8');
+  const archiver = fs.readFileSync(require.resolve('./multica-archiver.cjs'), 'utf8');
+  const bridge = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(relay, /action\.action === 'close' \? action\.status : null/);
+  assert.match(archiver, /to_stage: 'Archived'/);
+  assert.match(archiver, /path: '\/relay\/advance'/);
+  assert.match(bridge, /new Set\(\["Parked", "Rejected", "Cancelled"\]\)/);
 });
 
 test('runtime evidence must resolve to an issue-scoped durable row', async () => {
