@@ -160,7 +160,7 @@ export function useIssueStatusBranches({
     () =>
       enabled
         ? statuses.flatMap((status) =>
-            activeCursorState.cursors[status].map((cursor) => ({
+            (activeCursorState.cursors[status] ?? []).map((cursor) => ({
               status,
               cursor,
             })),
