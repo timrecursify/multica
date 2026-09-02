@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -148,25 +149,30 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 
 	cleanedHere := 0
 	issueCandidates := make([]issueGCCandidate, 0, len(taskEntries))
-	for _, entry := range taskEntries {
-		if ctx.Err() != nil {
-			return
+	for start := 0; start < len(taskEntries); start += taskGCBatchSize {
+		end := min(start+taskGCBatchSize, len(taskEntries))
+		for _, entry := range taskEntries[start:end] {
+			if ctx.Err() != nil {
+				return
+			}
+			if !entry.IsDir() {
+				continue
+			}
+			taskDir := filepath.Join(wsDir, entry.Name())
+			if d.isActiveEnvRoot(taskDir) {
+				stats.skipped++
+				continue
+			}
+			meta, metaErr := execenv.ReadGCMeta(taskDir)
+			if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
+				issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
+				continue
+			}
+			action := d.shouldCleanTaskDir(ctx, taskDir)
+			cleanedHere += d.applyGCAction(taskDir, action, stats)
 		}
-		if !entry.IsDir() {
-			continue
-		}
-		taskDir := filepath.Join(wsDir, entry.Name())
-		if d.isActiveEnvRoot(taskDir) {
-			stats.skipped++
-			continue
-		}
-		meta, metaErr := execenv.ReadGCMeta(taskDir)
-		if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
-			issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
-			continue
-		}
-		action := d.shouldCleanTaskDir(ctx, taskDir)
-		cleanedHere += d.applyGCAction(taskDir, action, stats)
+		// Keep a large historical workspace from monopolizing a daemon worker.
+		runtime.Gosched()
 	}
 	cleanedHere += d.gcWorkspaceIssues(ctx, filepath.Base(wsDir), issueCandidates, stats)
 
@@ -179,7 +185,12 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 	}
 }
 
-const issueGCBatchSize = 500
+const (
+	// taskGCBatchSize bounds filesystem and checkout inspection work before
+	// yielding to the daemon's dispatch and heartbeat goroutines.
+	taskGCBatchSize  = 100
+	issueGCBatchSize = 500
+)
 
 type issueGCCandidate struct {
 	taskDir string
@@ -259,12 +270,20 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 	}
 	switch action {
 	case gcActionClean:
+		if !d.reapCheckoutIsSafe(taskDir) {
+			stats.skipped++
+			return 0
+		}
 		bytes := dirSize(taskDir)
 		d.cleanTaskDir(taskDir)
 		stats.cleaned++
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionOrphan:
+		if !d.reapCheckoutIsSafe(taskDir) {
+			stats.skipped++
+			return 0
+		}
 		bytes := dirSize(taskDir)
 		d.cleanTaskDir(taskDir)
 		stats.orphaned++
@@ -282,6 +301,53 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		stats.skipped++
 	}
 	return 0
+}
+
+// reapCheckoutIsSafe retains a candidate for human review unless its checkout
+// is clean, fully pushed to its own upstream branch, and unused by any process.
+func (d *Daemon) reapCheckoutIsSafe(taskDir string) bool {
+	workDir := filepath.Join(taskDir, "workdir")
+	if processUsesPath(taskDir) || !gitWorktreeIsClean(workDir) {
+		d.logger.Warn("gc: quarantine", "dir", taskDir, "reason", "busy or unpushed checkout")
+		return false
+	}
+	return true
+}
+
+func processUsesPath(root string) bool {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return true
+	}
+	root = filepath.Clean(root) + string(os.PathSeparator)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		links := []string{filepath.Join("/proc", entry.Name(), "cwd")}
+		fds, _ := filepath.Glob(filepath.Join("/proc", entry.Name(), "fd", "*"))
+		links = append(links, fds...)
+		for _, link := range links {
+			target, linkErr := os.Readlink(link)
+			if linkErr == nil && strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), root) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func gitWorktreeIsClean(workDir string) bool {
+	status, err := runGitGCCommand(workDir, "status", "--porcelain")
+	if err != nil || status != "" {
+		return false
+	}
+	branch, err := runGitGCCommand(workDir, "branch", "--show-current")
+	if err != nil || branch == "" {
+		return false
+	}
+	out, err := runGitGCCommand(workDir, "rev-list", "origin/"+branch+"..HEAD")
+	return err == nil && strings.TrimSpace(out) == ""
 }
 
 func recordArtifactCleanup(stats *gcStats, removed int, bytes int64, perPattern map[string]int) {
@@ -1020,8 +1086,8 @@ func runGitCommand(barePath string, timeout time.Duration, args ...string) (stri
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmdArgs := append([]string{"-C", barePath}, args...)
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
+	cmdArgs := append([]string{"-c3", "nice", "-n", "19", "git", "-C", barePath}, args...)
+	cmd := exec.CommandContext(ctx, "ionice", cmdArgs...)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
