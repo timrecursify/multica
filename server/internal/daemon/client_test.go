@@ -420,7 +420,7 @@ func TestTerminalReportsCarryRetiredSessionID(t *testing.T) {
 			name:     "complete",
 			endpoint: "/api/daemon/tasks/task-1/complete",
 			call: func(c *Client) error {
-				return c.CompleteTask(context.Background(), "task-1", "done", "", "", "/tmp/wd", false, "POISONED-S")
+				return c.CompleteTask(context.Background(), "task-1", "done", "", "", "", "/tmp/wd", false, "POISONED-S")
 			},
 		},
 		{
@@ -463,8 +463,14 @@ func TestTerminalReportsOmitEmptyRetiredSessionID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := NewClient(srv.URL).CompleteTask(context.Background(), "task-1", "done", "", "sess-1", "/tmp/wd", false, ""); err != nil {
+	if err := NewClient(srv.URL).CompleteTask(context.Background(), "task-1", "done", "", "https://github.com/o/r/pull/7", "sess-1", "/tmp/wd", false, ""); err != nil {
 		t.Fatalf("CompleteTask: %v", err)
+	}
+	if got := body["pr_url"]; got != "https://github.com/o/r/pull/7" {
+		t.Fatalf("pr_url = %v, want exact URL", got)
+	}
+	if _, present := body["branch_name"]; present {
+		t.Fatalf("branch_name must not substitute pr_url: %v", body)
 	}
 	if _, present := body["retired_session_id"]; present {
 		t.Fatalf("retired_session_id must be omitted when nothing was retired, got %v", body)

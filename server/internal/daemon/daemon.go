@@ -189,6 +189,7 @@ type terminalTaskReport struct {
 	taskID        string
 	output        string
 	branchName    string
+	prURL         string
 	errorMessage  string
 	sessionID     string
 	workDir       string
@@ -5041,6 +5042,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			taskID:                taskID,
 			output:                result.Comment,
 			branchName:            result.BranchName,
+			prURL:                 result.PRURL,
 			sessionID:             result.SessionID,
 			workDir:               result.WorkDir,
 			sessionRolloutMissing: result.SessionRolloutMissing,
@@ -5132,7 +5134,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
+		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.prURL, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
 	case terminalTaskReportFail:
 		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID)
 	default:
@@ -6518,6 +6520,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			return TaskResult{
 				Status:    "completed",
 				Comment:   "",
+				PRURL:     result.PRURL,
 				SessionID: result.SessionID,
 				WorkDir:   env.WorkDir,
 				EnvRoot:   env.RootDir,
@@ -6548,6 +6551,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		taskResult = TaskResult{
 			Status:    "completed",
 			Comment:   result.Output,
+			PRURL:     result.PRURL,
 			SessionID: result.SessionID,
 			WorkDir:   env.WorkDir,
 			EnvRoot:   env.RootDir,
@@ -6887,6 +6891,10 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	defer drainCancel()
 
 	var toolCount atomic.Int32
+	var prURLMu sync.Mutex
+	var prURL string
+	prCreationCalls := make(map[string]bool)
+	var prCreationMissingURL bool
 	// lastActivityAt records (as unix nanos) when the drain loop most
 	// recently received a message from the backend. The idle watchdog
 	// reads this to decide whether the agent has gone silent for too long.
@@ -7037,6 +7045,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						mu.Lock()
 						callIDToTool[msg.CallID] = msg.Tool
 						mu.Unlock()
+						if isPullRequestCreationInvocation(msg) {
+							prURLMu.Lock()
+							prCreationCalls[msg.CallID] = true
+							prURLMu.Unlock()
+						}
 					}
 					s := msgSeq.Add(1)
 					mu.Lock()
@@ -7057,6 +7070,16 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					})
 					mu.Unlock()
 				case agent.MessageToolResult:
+					prURLMu.Lock()
+					if prCreationCalls[msg.CallID] {
+						if candidate, ok := pullRequestURLFromCreationResult(msg.Output); ok {
+							prURL = candidate
+							prCreationMissingURL = false
+						} else {
+							prCreationMissingURL = true
+						}
+					}
+					prURLMu.Unlock()
 					// Decrement only when the count would stay >= 0. A stray
 					// tool_result with no matching tool_use (backend bug or
 					// reconnect mid-stream) shouldn't push the counter
@@ -7154,6 +7177,14 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	select {
 	case result := <-session.Result:
 		waitForDrain()
+		prURLMu.Lock()
+		result.PRURL = prURL
+		missingPRURL := prCreationMissingURL
+		prURLMu.Unlock()
+		if missingPRURL {
+			result.Status = "failed"
+			result.Error = "pull request creation returned no URL"
+		}
 		if idleWatchdogFired.Load() {
 			// The backend's wait goroutine (e.g. claude.go) translates the
 			// SIGKILL we delivered via agentCancel into Status="aborted".
@@ -7198,6 +7229,51 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 			Error:  "agent did not produce result within drain timeout",
 		}, toolCount.Load(), nil
 	}
+}
+
+// isPullRequestCreationInvocation identifies the actual creation call rather
+// than inferring it from a URL-shaped result. ACP command tools report the
+// command under either cmd or command; dedicated GitHub tools expose their
+// creation operation in the tool name.
+func isPullRequestCreationInvocation(msg agent.Message) bool {
+	tool := strings.ToLower(strings.ReplaceAll(msg.Tool, "-", "_"))
+	if strings.Contains(tool, "create_pull_request") || strings.Contains(tool, "createpullrequest") {
+		return true
+	}
+	for _, key := range []string{"cmd", "command"} {
+		command, _ := msg.Input[key].(string)
+		fields := strings.Fields(command)
+		for i := 0; i+2 < len(fields); i++ {
+			if fields[i] == "gh" && fields[i+1] == "pr" && fields[i+2] == "create" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pullRequestURLFromCreationResult reads only the result paired with a
+// positively identified creation call. A GitHub CLI creation returns the URL
+// directly; API tools return it in url or html_url JSON fields.
+func pullRequestURLFromCreationResult(raw string) (string, bool) {
+	if url := strings.TrimSpace(raw); strings.HasPrefix(url, "https://") && strings.Contains(url, "/pull/") && !strings.ContainsAny(url, " \t\r\n") {
+		return url, true
+	}
+	var payload struct {
+		URL     string `json:"url"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil {
+		return "", false
+	}
+	url := strings.TrimSpace(payload.URL)
+	if url == "" {
+		url = strings.TrimSpace(payload.HTMLURL)
+	}
+	if !strings.HasPrefix(url, "https://") || !strings.Contains(url, "/pull/") {
+		return "", false
+	}
+	return url, true
 }
 
 // idleWatchdogReason formats the human-facing explanation surfaced on

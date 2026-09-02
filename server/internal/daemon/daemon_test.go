@@ -1621,6 +1621,73 @@ type fakeBackend struct {
 	idx     atomic.Int32
 }
 
+type messageBackend struct {
+	messages []agent.Message
+	result   agent.Result
+}
+
+func (b messageBackend) Execute(_ context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+	msgCh := make(chan agent.Message, len(b.messages))
+	for _, message := range b.messages {
+		msgCh <- message
+	}
+	close(msgCh)
+	resultCh := make(chan agent.Result, 1)
+	resultCh <- b.result
+	return &agent.Session{Messages: msgCh, Result: resultCh}, nil
+}
+
+func TestExecuteAndDrain_PullRequestCreationProvenance(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		messages   []agent.Message
+		wantStatus string
+		wantURL    string
+	}{
+		{
+			name: "creation result propagates",
+			messages: []agent.Message{
+				{Type: agent.MessageToolUse, Tool: "exec_command", CallID: "create", Input: map[string]any{"cmd": "gh pr create --json url"}},
+				{Type: agent.MessageToolResult, CallID: "create", Output: `{"url":"https://github.com/acme/widget/pull/7"}`},
+			},
+			wantStatus: "completed",
+			wantURL:    "https://github.com/acme/widget/pull/7",
+		},
+		{
+			name: "read only url is ignored",
+			messages: []agent.Message{
+				{Type: agent.MessageToolUse, Tool: "exec_command", CallID: "view", Input: map[string]any{"cmd": "gh pr view 7 --json url"}},
+				{Type: agent.MessageToolResult, CallID: "view", Output: `{"url":"https://github.com/acme/widget/pull/7"}`},
+			},
+			wantStatus: "completed",
+		},
+		{
+			name: "creation without url fails closed",
+			messages: []agent.Message{
+				{Type: agent.MessageToolUse, Tool: "exec_command", CallID: "create", Input: map[string]any{"cmd": "gh pr create --json url"}},
+				{Type: agent.MessageToolResult, CallID: "create", Output: `{"url":""}`},
+			},
+			wantStatus: "failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newTestDaemon(t)
+			var seq atomic.Int32
+			result, _, err := d.executeAndDrain(context.Background(), messageBackend{messages: tt.messages, result: agent.Result{Status: "completed"}}, "prompt", agent.ExecOptions{}, slog.Default(), "task-1", "", &seq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != tt.wantStatus || result.PRURL != tt.wantURL {
+				t.Fatalf("result = %+v; want status=%q pr_url=%q", result, tt.wantStatus, tt.wantURL)
+			}
+		})
+	}
+}
+
 func (b *fakeBackend) Execute(_ context.Context, _ string, opts agent.ExecOptions) (*agent.Session, error) {
 	i := int(b.idx.Add(1)) - 1
 	b.calls = append(b.calls, opts)
