@@ -1237,6 +1237,7 @@ async function relayAdvance(req, res, body) {
       !OPERATOR_SECRET_DISABLED &&
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease;
     if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
         OPERATOR_SECRET_DISABLED) {
       await client.query("ROLLBACK");
@@ -1647,7 +1648,7 @@ async function relayAdvance(req, res, body) {
       const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
         client, issue, to_stage, reason, parkedEvidenceQcRelease
       );
-      if (!cycle.ok && !cicdReturn && !parkedQcRecovery &&
+      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
           !noArtifactRescope && !retryEscalation) {
         const sourceTaskId = await retryEscalationSourceTask(
           client, issue, body.relay_source_task_id
@@ -1688,7 +1689,7 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !cicdReturn && !noArtifactRescope && !retryEscalation) {
+      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !retryEscalation) {
         const sourceTaskId = await retryEscalationSourceTask(
           client, issue, body.relay_source_task_id
         );
@@ -1889,8 +1890,12 @@ async function relayAdvance(req, res, body) {
         priority: taskPriority,
         runtimeId: stage.selected_runtime_id,
         context,
-        relayAudit: explicitTerminalExit ? JSON.stringify({
-          terminal_exit: { operator_marker: true, reason: reason.trim() }
+        relayAudit: operatorCapBypass ? JSON.stringify({
+          ...(explicitTerminalExit ? {
+            terminal_exit: { operator_marker: true, reason: reason.trim() }
+          } : {}),
+          operator_cap_bypass: true,
+          reason: reason.trim()
         }) : null,
         triggerSummary: retryEscalation
           ? `Sol-low re-spec escalation: ${retryEscalation.reason}`

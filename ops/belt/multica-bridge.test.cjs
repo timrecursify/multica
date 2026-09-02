@@ -230,7 +230,7 @@ test('ordinary capped Parked to In Review has no recovery bypass', () => {
   const { stageCycleAdmission } = require('./guardrails.cjs');
   assert.equal(stageCycleAdmission(2).ok, false);
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /!cycle\.ok && !cicdReturn && !parkedQcRecovery/);
+  assert.match(source, /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery/);
   assert.match(source, /consumeParkedQcRecovery\(\s*client, issue, to_stage, reason, parkedEvidenceQcRelease/);
 });
 
@@ -340,9 +340,9 @@ test('technical QC block cannot route to Human Review and exact re-scope bypasse
   assert.match(source, /technical_human_review_forbidden/);
   assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
   assert.match(source,
-    /!cycle\.ok && !cicdReturn && !parkedQcRecovery &&\s+!noArtifactRescope && !retryEscalation/);
+    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&\s+!noArtifactRescope && !retryEscalation/);
   assert.match(source,
-    /!lifetime\.ok && !cicdReturn && !noArtifactRescope && !retryEscalation/);
+    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !retryEscalation/);
   assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
   assert.match(source, /operator_rescope_issue_id: issue\.id/);
 });
@@ -1191,11 +1191,14 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       work_product_md5 text, created_at timestamptz DEFAULT now());`);
     await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
     await admin.query(`INSERT INTO "${schema}".agent (id, workspace_id, name, runtime_id, status, instructions, model, thinking_level, max_concurrent_tasks)
-      VALUES ($1, $2, 'builder', $3, 'idle', 'In Progress', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
-    await admin.query(`INSERT INTO "${schema}".relay_stage_pool VALUES ($1, 'In Progress', true)`, [workspaceId]);
-    await admin.query(`INSERT INTO "${schema}".relay_stage_agent_pool VALUES ($1, 'In Progress', $2, true, NULL)`, [workspaceId, agentId]);
+      VALUES ($1, $2, 'builder', $3, 'idle', 'In Progress\nCI/CD & Deploy', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_pool VALUES
+      ($1, 'In Progress', true), ($1, 'CI/CD & Deploy', true)`, [workspaceId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_agent_pool VALUES
+      ($1, 'In Progress', $2, true, NULL), ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage) VALUES
-      ($1, 'Human Review', 'In Progress'), ($1, 'In Progress', 'In Review'),
+      ($1, 'Human Review', 'In Progress'), ($1, 'Done', 'CI/CD & Deploy'),
+      ($1, 'CI/CD & Deploy', 'Done'), ($1, 'In Progress', 'In Review'),
       ($1, 'Parked', 'Queue'), ($1, 'Queue', 'In Progress')`, [workspaceId]);
 
     await t.test('releases at the cycle limit, enqueues work, persists metadata, and logs', async () => {
@@ -1246,6 +1249,31 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved' },
         { 'x-relay-operator-secret': 'test-relay-secret' });
       assert.equal(res.status, 403); assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
+    });
+    await t.test('authenticated terminal exit bypasses caps and audits the reason', async () => {
+      const issueId = '99999999-9999-9999-9999-999999999999'; await insertIssue(issueId, 'Done');
+      for (let index = 0; index < 7; index += 1) {
+        await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
+          VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"CI/CD & Deploy"}')`, [agentId, issueId, workspaceId]);
+      }
+      const res = await invoke({ issue_id: issueId, to_stage: 'CI/CD & Deploy', operator_terminal_exit: true,
+        reason: 'PR needs deploy' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'CI/CD & Deploy');
+      const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
+      assert.deepEqual(audit.rows[0].parked_audit, { terminal_exit: { operator_marker: true,
+        reason: 'PR needs deploy' }, operator_cap_bypass: true, reason: 'PR needs deploy' });
+    });
+    await t.test('terminal exit without the operator header remains rejected', async () => {
+      const issueId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'; await insertIssue(issueId, 'Done');
+      for (let index = 0; index < 7; index += 1) {
+        await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
+          VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"CI/CD & Deploy"}')`, [agentId, issueId, workspaceId]);
+      }
+      const res = await invoke({ issue_id: issueId, to_stage: 'CI/CD & Deploy', operator_terminal_exit: true,
+        reason: 'PR needs deploy' });
+      assert.equal(res.status, 409);
+      assert.equal(JSON.parse(res.body).error, 'retry_escalation_source_task_required');
     });
     await t.test('ignores operator_release outside Human Review', async () => {
       const issueId = '88888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
