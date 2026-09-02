@@ -67,6 +67,7 @@ function settingsFor(options = {}) {
     lifetimeTaskLimit: positive(options.lifetimeTaskLimit || process.env.RECONCILE_LIFETIME_TASK_LIMIT, 6),
     defaultMaxAttempts: positive(options.defaultMaxAttempts || process.env.RECONCILE_DEFAULT_MAX_ATTEMPTS, 2),
     issueCooldownMinutes: positive(options.issueCooldownMinutes || process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
+    completedStageCooldownMinutes: positive(options.completedStageCooldownMinutes || process.env.RECONCILE_COMPLETED_STAGE_COOLDOWN_MINUTES, 720),
     budget: options.budget || { created: 0, byAgent: new Map() }
   };
 }
@@ -127,13 +128,16 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     // Burn guard: never re-dispatch the same stage of one issue inside the cooldown window (GSP-1826).
     const recent = (await client.query(
-      `SELECT id FROM agent_task_queue WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
-         AND created_at > NOW() - ($3::int * interval '1 minute') ORDER BY created_at DESC LIMIT 1`,
-      [issue.id, issue.status, options.issueCooldownMinutes]
+      `SELECT id, status FROM agent_task_queue WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
+         AND (created_at > NOW() - ($3::int * interval '1 minute')
+           OR (status = 'completed' AND completed_at > NOW() - ($4::int * interval '1 minute')))
+       ORDER BY created_at DESC LIMIT 1`,
+      [issue.id, issue.status, options.issueCooldownMinutes, options.completedStageCooldownMinutes]
     )).rows[0];
     if (recent) {
       await client.query("COMMIT");
-      return { action: "skipped", reason: "issue_cooldown", taskId: recent.id };
+      const reason = recent.status === "completed" ? "completed_stage_cooldown" : "issue_cooldown";
+      return { action: "skipped", reason, taskId: recent.id };
     }
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
     const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
