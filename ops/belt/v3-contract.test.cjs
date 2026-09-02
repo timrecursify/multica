@@ -3,6 +3,7 @@
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
 const test = require('node:test');
+const { ADVISORY_LOCK_SQL } = require('./reconciler.cjs');
 
 const FROZEN_SHA = 'd8712a3c5afa000baa0e84871d445dd28b49059d';
 const DISPATCHABLE_STATUSES = Object.freeze(['Spec', 'Queue', 'In Progress', 'In Review', 'CI/CD & Deploy']);
@@ -31,6 +32,10 @@ test('expresses zero, one, and duplicate live current-stage tasks', () => {
 test('records every legacy executable queue-insert writer for retirement discovery', () => {
   const output = execFileSync('git', ['grep', '-l', 'INSERT INTO agent_task_queue', '--', 'ops/belt'], { encoding: 'utf8' });
   for (const file of LEGACY_QUEUE_WRITERS) assert.match(output, new RegExp(`^${file}$`, 'm'));
+});
+
+test('pins the reconciler advisory lock namespace', () => {
+  assert.equal(ADVISORY_LOCK_SQL, "SELECT pg_advisory_xact_lock(hashtext('v3-reconciler:' || $1::text))");
 });
 
 module.exports = { DISPATCHABLE_STATUSES, FROZEN_SHA, LEGACY_QUEUE_WRITERS, LIVE_STATUSES, liveTaskCount };
