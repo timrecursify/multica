@@ -1484,6 +1484,17 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(res.status, 200);
       assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'In Review');
     });
+    await t.test('admits the exact sk advance Rejected PASS reopen request shape', async () => {
+      const issueId = 'aeaeaeae-aeae-aeae-aeae-aeaeaeaeaeae'; await insertIssue(issueId, 'Rejected');
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
+        VALUES ($1, $2, 'PASS', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      // _multica_advance posts only these JSON fields; it has no operator flag,
+      // reason field, or x-relay-operator-secret header.
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review',
+        current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'In Review');
+    });
     await t.test('refuses a Rejected terminal exit without the operator secret', async () => {
       const issueId = 'acacacac-acac-acac-acac-acacacacacac'; await insertIssue(issueId, 'Rejected');
       const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true, reason: 'reopen' });
