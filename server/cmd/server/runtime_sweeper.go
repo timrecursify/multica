@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"log/slog"
 	"time"
 
@@ -157,6 +158,22 @@ func sweepStaleRuntimes(ctx context.Context, queries *db.Queries, liveness handl
 	for _, row := range staleRows {
 		wsID := util.UUIDToString(row.WorkspaceID)
 		workspaces[wsID] = true
+		details, _ := json.Marshal(map[string]any{
+			"runtime_id":  util.UUIDToString(row.ID),
+			"daemon_id":   row.DaemonID.String,
+			"provider":    row.Provider,
+			"from_status": "online",
+			"to_status":   "offline",
+			"cause":       "stale_sweep",
+		})
+		if _, err := queries.CreateActivity(ctx, db.CreateActivityParams{
+			WorkspaceID: row.WorkspaceID,
+			ActorType:   util.StrToText("system"),
+			Action:      "runtime_status_changed",
+			Details:     details,
+		}); err != nil {
+			slog.Warn("runtime sweeper: failed to record runtime transition", "runtime_id", util.UUIDToString(row.ID), "error", err)
+		}
 	}
 
 	// Drop liveness records for confirmed-offline runtimes so a future
