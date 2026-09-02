@@ -1511,11 +1511,15 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
         reason: 'reopen', current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' }, { 'x-relay-operator-secret': 'test-operator-secret' });
       assert.equal(res.status, 409);
     });
-    await t.test('ignores operator_release outside Human Review', async () => {
+    await t.test('authenticated operator release exits Parked and audits the reason', async () => {
       const issueId = '88888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
       const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true, reason: 'approved' },
         { 'x-relay-operator-secret': 'test-operator-secret' });
-      assert.equal(res.status, 409); assert.equal(JSON.parse(res.body).error, 'parked_release_required');
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'Queue');
+      const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
+      assert.deepEqual(audit.rows[0].parked_audit, { parked_release: { operator_marker: true,
+        reason: 'approved' }, operator_cap_bypass: true, reason: 'approved' });
     });
   } finally {
     setTestClientFactory(null);

@@ -1366,7 +1366,15 @@ async function relayAdvance(req, res, body) {
       !OPERATOR_SECRET_DISABLED &&
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
-    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease || explicitOperatorCapRelease;
+    const explicitParkedReleaseRequested = issue.status === "Parked" &&
+      ["Queue", "Spec"].includes(to_stage) && operator_release === true &&
+      typeof reason === "string" && reason.trim() !== "";
+    const explicitParkedRelease = explicitParkedReleaseRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease ||
+      explicitOperatorCapRelease || explicitParkedRelease;
     if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
         OPERATOR_SECRET_DISABLED) {
       await client.query("ROLLBACK");
@@ -1408,6 +1416,15 @@ async function relayAdvance(req, res, body) {
     const rejectedPassCliReopen = issue.status === "Rejected" &&
       to_stage === "In Review" &&
       await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
+    if (explicitParkedReleaseRequested && !explicitParkedRelease) {
+      await client.query("ROLLBACK");
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "parked_release_operator_secret_conflict",
+        message: "operator parked releases require a valid operator secret"
+      }));
+      return;
+    }
     if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit &&
         !rejectedPassCliReopen) {
       await client.query("ROLLBACK");
@@ -1418,8 +1435,8 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
-    const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
-      issue.metadata?.parked_release_once === true;
+    const parkedRelease = (issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
+      issue.metadata?.parked_release_once === true) || explicitParkedRelease;
     const parkedEvidenceQcRelease = await verifiedParkedEvidenceRelease(client, issue, to_stage, reason);
     // Parked -> Done is reserved for the relay's already-fixed diagnosis
     // outcome. It still reaches the current PASS + work-product-hash gate
@@ -2044,6 +2061,9 @@ async function relayAdvance(req, res, body) {
           } : {}),
           ...(explicitOperatorCapRelease ? {
             operator_cap_release: { operator_marker: true, reason: reason.trim() }
+          } : {}),
+          ...(explicitParkedRelease ? {
+            parked_release: { operator_marker: true, reason: reason.trim() }
           } : {}),
           operator_cap_bypass: true,
           reason: reason.trim()
