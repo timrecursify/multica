@@ -51,6 +51,7 @@ the SHA in `.sha`. Do not infer these values from the managed workdir.
 - Request only a transition allowed by `relay_stage_config` for the current
   stage. From `Spec`, use `Queue` (or `Cancelled`); from `In Progress`, use
   `In Review` (or `Queue`).
+- For tickets already satisfied by current source, migrated duplicates, or a canonical issue that is `Cancelled`, comment with repository HEAD SHA and `path:line` evidence; from `Spec`, advance to `Cancelled`, or from `In Progress`, advance to `In Review` so QC closes it. Never open a PR that reimplements working code.
 - For a money or structural decision, add a `HUMAN-REVIEW-NEEDED` comment with
   the reason and evidence. If Human Review is not an allowed exit, advance to
   the normal next stage: `Queue` from `Spec` and `In Review` from `In Progress`.
