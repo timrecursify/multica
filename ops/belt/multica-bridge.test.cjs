@@ -68,7 +68,10 @@ test('comment-reply tasks do not consume lifetime or stage-cycle cap history', a
     await admin.query(`CREATE TABLE ${schema}.agent_task_queue (
       id uuid PRIMARY KEY DEFAULT gen_random_uuid(), agent_id uuid NOT NULL, issue_id uuid NOT NULL,
       workspace_id uuid NOT NULL, context jsonb NOT NULL DEFAULT '{}'::jsonb,
-      trigger_comment_id uuid, created_at timestamptz NOT NULL DEFAULT now()
+      trigger_comment_id uuid, status text NOT NULL DEFAULT 'queued', started_at timestamptz,
+      completed_at timestamptz, created_at timestamptz NOT NULL DEFAULT now()
+    ); CREATE TABLE ${schema}.qc_verdict (
+      issue_id uuid NOT NULL, checker_id uuid NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
     )`);
     const task = async (issueId, stage, reply, kind = null) => admin.query(
       `INSERT INTO ${schema}.agent_task_queue (agent_id, issue_id, workspace_id, context, trigger_comment_id)
@@ -1155,6 +1158,7 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
   if (!databaseUrl || databaseUrl === 'postgres://test') return t.skip('integration test requires a real DATABASE_URL');
   const { Client } = require('pg');
   const admin = new Client({ connectionString: databaseUrl });
+  let countClient;
   const schema = `relay_human_review_release_${Date.now()}`;
   const workspaceId = '11111111-1111-1111-1111-111111111111';
   const agentId = '22222222-2222-2222-2222-222222222222';
@@ -1178,6 +1182,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
   try {
     await admin.connect();
     await admin.query(`CREATE SCHEMA ${schema}`);
+    countClient = new Client({ connectionString: databaseUrl });
+    await countClient.connect();
+    await countClient.query(`SET search_path TO ${schema}`);
     await admin.query(`CREATE TABLE "${schema}".issue (id uuid PRIMARY KEY, workspace_id uuid NOT NULL,
       status text NOT NULL, description text DEFAULT '', parent_issue_id uuid, title text NOT NULL,
       priority text NOT NULL, metadata jsonb, updated_at timestamptz DEFAULT now());
@@ -1241,16 +1248,21 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
         VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}', now() - interval '1 minute', now()),
                ($1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}', now() - interval '1 minute', now())`,
       [agentId, issueId, workspaceId]);
-      assert.equal(await capEscalationVerified(client, { id: issueId, metadata: {} },
+      assert.equal(await capEscalationVerified(countClient, { id: issueId, metadata: {} },
         'stage_cycle_limit', 'In Review'), false);
-      assert.equal(await capEscalationVerified(client, { id: issueId, metadata: {} },
+      assert.equal(await capEscalationVerified(countClient, { id: issueId, metadata: {} },
         'lifetime_task_limit', 'In Review'), false);
       await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, created_at)
         VALUES ($1, $2, 'PASS', now() - interval '30 seconds'),
                ($1, $2, 'FAIL', now() - interval '30 seconds')`, [issueId, agentId]);
-      assert.equal(await capEscalationVerified(client, { id: issueId, metadata: {} },
+      assert.equal(await capEscalationVerified(countClient, { id: issueId, metadata: {} },
         'stage_cycle_limit', 'In Review'), true);
-      assert.equal(await capEscalationVerified(client, { id: issueId, metadata: {} },
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context, started_at, completed_at)
+        SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}',
+          now() - interval '1 minute', now() FROM generate_series(1, 4)`,
+      [agentId, issueId, workspaceId]);
+      assert.equal(await capEscalationVerified(countClient, { id: issueId, metadata: {} },
         'lifetime_task_limit', 'In Review'), true);
     });
     await t.test('persists caller CI/CD parking evidence in the relay audit row', async () => {
@@ -1266,7 +1278,7 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(log.rows[0].parked_audit.trigger, 'relay_advance');
     });
     await t.test('rejects a missing operator header without a task', async () => {
-      const issueId = '55555555-5555-5555-5555-555555555555'; await insertIssue(issueId);
+      const issueId = '56555555-5555-5555-5555-555555555555'; await insertIssue(issueId);
       const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved' });
       assert.equal(res.status, 403); assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
       assert.equal((await admin.query(`SELECT count(*)::int AS n FROM "${schema}".agent_task_queue WHERE issue_id = $1`, [issueId])).rows[0].n, 0);
@@ -1317,6 +1329,7 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
     });
   } finally {
     setTestClientFactory(null);
+    await countClient?.end();
     await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
     await admin.end();
   }
