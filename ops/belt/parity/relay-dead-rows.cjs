@@ -150,6 +150,7 @@ async function closeDeadRelayRows(client, { terminalStages, requestRetryEscalati
                     ON evidence_task.issue_id = attempt.issue_id
                    AND evidence_task.id::text = substring(
                          attempt.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+                   AND evidence_task.status = 'completed'
             INNER JOIN agent evidence_agent
                     ON evidence_agent.id = evidence_task.agent_id
            WHERE verdict.issue_id = atq.issue_id

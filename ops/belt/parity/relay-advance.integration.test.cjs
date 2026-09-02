@@ -302,6 +302,39 @@ test('formal PASS evidence preserves a later redundant relay row without RESPEC'
   } finally { await db.close(); }
 });
 
+test('non-completed formal evidence cannot preserve a redundant relay row', async () => {
+  for (const status of ['running', 'failed', 'cancelled']) {
+    const db = await deadRowsDb();
+    const posts = [];
+    const evidenceTask = '11111111-1111-4111-8111-111111111111';
+    try {
+      await db.admin.query(`INSERT INTO ${db.schema}.issue (id, workspace_id, number)
+        VALUES ('nonterminal-pass-issue', 'workspace-1', 4)`);
+      await db.admin.query(`INSERT INTO ${db.schema}.agent_task_queue
+        (id, issue_id, agent_id, status, created_at)
+        VALUES ($1, 'nonterminal-pass-issue', 'fixture-agent', $2, now() - interval '2 minutes'),
+               ('redundant-task', 'nonterminal-pass-issue', 'fixture-agent', 'completed', now())`,
+      [evidenceTask, status]);
+      await db.admin.query(`INSERT INTO ${db.schema}.qc_verdict
+        (issue_id, created_at, checker_id, verdict, work_product_md5)
+        VALUES ('nonterminal-pass-issue', now() - interval '1 minute', 'fixture-agent', 'PASS', $1)`, [MD5]);
+      await db.admin.query(`INSERT INTO ${db.schema}.qc_attempt
+        (issue_id, verdict, qualifying, work_product_md5, bound_sha, observed_head, notes)
+        VALUES ('nonterminal-pass-issue', 'PASS', true, $1, $2, $2, $3)`,
+      [MD5, SHA, `relay_task_id=${evidenceTask}`]);
+      await db.admin.query(`INSERT INTO ${db.schema}.relay_run_log
+        (id, issue_id, task_id, to_stage, status)
+        VALUES ('redundant-log', 'nonterminal-pass-issue', 'redundant-task', 'In Review', 'pending')`);
+
+      await closeDeadRowsTick(db.dbPool, async (payload) => { posts.push(payload); return { status: 200 }; });
+      const persisted = await db.admin.query(`SELECT status, parked_audit->>'reason' AS reason
+        FROM ${db.schema}.relay_run_log WHERE id = 'redundant-log'`);
+      assert.deepEqual(persisted.rows, [{ status: 'failed', reason: 'qc_verdict_missing_after_task_created' }]);
+      assert.deepEqual(posts, [{ issue_id: 'nonterminal-pass-issue', reason: 'qc_verdict_missing_after_task_created' }]);
+    } finally { await db.close(); }
+  }
+});
+
 test('persistent Cancelled and 25 dead rows close without starving a later row', async () => {
   const db = await deadRowsDb();
   const posts = [];
@@ -445,6 +478,22 @@ test('PASS replay without a verdict work-product MD5 is skipped', async () => {
   await harness.run();
   assert.equal(harness.payloads.length, 0);
   assert.ok(harness.logs.some((line) => line.includes('pass_without_md5')));
+});
+
+test('strict PASS with non-completed evidence task is not advanced', async () => {
+  const row = { ...advanceRow(),
+    qc_attempt_verdict: 'PASS', qc_attempt_qualifying: true,
+    qc_attempt_work_product_md5: MD5, qc_attempt_bound_sha: SHA,
+    qc_attempt_observed_sha: SHA,
+    qc_attempt_evidence_task_id: '11111111-1111-4111-8111-111111111111',
+    qc_attempt_evidence_task_status: 'running',
+    qc_attempt_evidence_agent_id: 'qc-agent',
+    qc_attempt_evidence_agent_model: 'gpt-5.6-sol',
+    qc_attempt_evidence_agent_effort: 'low' };
+  const harness = advanceHarness(row);
+  await harness.run();
+  assert.deepEqual(harness.payloads, []);
+  assert.ok(harness.logs.some((line) => line.includes('qc_attempt_mismatch')));
 });
 
 test('dispatch-on-exit closes terminal arrivals without a follow-on relay', async () => {
