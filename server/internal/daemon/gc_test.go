@@ -108,6 +108,21 @@ func TestShouldCleanTaskDir_CancelledIssueOverTTL(t *testing.T) {
 	}
 }
 
+func TestGCDecisionIssueResult_CanonicalTerminalStatus(t *testing.T) {
+	t.Parallel()
+	d := newGCTestDaemon(t, http.NewServeMux())
+	for _, status := range []string{"Done", "Cancelled", "done", "cancelled"} {
+		t.Run(status, func(t *testing.T) {
+			got := d.gcDecisionIssueResult("/unused", &execenv.GCMeta{IssueID: "issue"}, IssueGCCheckResult{
+				Found: true, Status: status, UpdatedAt: time.Now().Add(-6 * 24 * time.Hour),
+			})
+			if got != gcActionClean {
+				t.Fatalf("%s: got %v", status, got)
+			}
+		})
+	}
+}
+
 func TestShouldCleanTaskDir_IssueTaskRequiresItsOwnTerminalTTL(t *testing.T) {
 	t.Parallel()
 	const taskID = "22222222-2222-2222-2222-222222222223"

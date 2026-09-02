@@ -159,7 +159,7 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 	}
 
 	cleanedHere := 0
-	issueCandidates := make([]issueGCCandidate, 0, len(taskEntries))
+	issueCandidates := make([]issueGCCandidate, 0, min(len(taskEntries), d.gcCandidateBatch()))
 	for _, entry := range taskEntries {
 		if ctx.Err() != nil {
 			return
@@ -174,7 +174,11 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 		}
 		meta, metaErr := execenv.ReadGCMeta(taskDir)
 		if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
-			issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
+			if len(issueCandidates) < d.gcCandidateBatch() {
+				issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
+			} else {
+				stats.skipped++
+			}
 			continue
 		}
 		action := d.shouldCleanTaskDir(ctx, taskDir)
@@ -195,6 +199,13 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 // have a larger batch, but at most this many issue environments are inspected
 // in one workspace pass.
 const issueGCBatchSize = 100
+
+func (d *Daemon) gcCandidateBatch() int {
+	if d.cfg.GCCandidateBatch > 0 {
+		return d.cfg.GCCandidateBatch
+	}
+	return DefaultGCCandidateBatch
+}
 
 type issueGCCandidate struct {
 	taskDir string
@@ -263,15 +274,36 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 			action = d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
 		}
 		action = d.applyLocalDirectoryGCOverride(candidate.meta, action)
-		if action == gcActionClean {
-			if reason := d.safeIssueRemoval(candidate.taskDir); reason != "" {
-				d.recordGCQuarantine(candidate.taskDir, candidate.meta.TaskID, reason, stats)
-				continue
-			}
+		if action == gcActionClean && strings.TrimSpace(candidate.meta.TaskID) != "" {
+			cleaned += d.applySafeIssueGCAction(candidate.taskDir, candidate.meta.TaskID, stats)
+		} else {
+			cleaned += d.applyGCAction(candidate.taskDir, action, stats)
 		}
-		cleaned += d.applyGCAction(candidate.taskDir, action, stats)
 	}
 	return cleaned
+}
+
+// applySafeIssueGCAction keeps the reservation over the last process/Git
+// inspection and RemoveAll, closing the check-then-delete window.
+func (d *Daemon) applySafeIssueGCAction(taskDir, taskID string, stats *gcStats) int {
+	release, ok := d.reserveEnvRootForGC(taskDir)
+	if !ok {
+		stats.skipped++
+		return 0
+	}
+	defer release()
+	if reason := d.safeIssueRemoval(taskDir); reason != "" {
+		d.recordGCQuarantine(taskDir, taskID, reason, stats)
+		return 0
+	}
+	bytes := dirSize(taskDir)
+	if !d.cleanTaskDir(taskDir) {
+		stats.removalFailed++
+		return 0
+	}
+	stats.cleaned++
+	stats.bytesReclaimed += bytes
+	return 1
 }
 
 // applyGCAction performs one decision and updates cycle stats. Each mutation
@@ -626,7 +658,7 @@ func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, res
 		return d.orphanByMTime(taskDir, "issue not accessible")
 	}
 
-	if (result.Status == "done" || result.Status == "cancelled") &&
+	if (strings.EqualFold(result.Status, "done") || strings.EqualFold(result.Status, "cancelled")) &&
 		time.Since(result.UpdatedAt) > d.cfg.GCTTL {
 		d.logger.Info("gc: eligible for cleanup",
 			"dir", filepath.Base(taskDir),

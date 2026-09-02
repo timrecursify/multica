@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,6 +67,7 @@ const (
 	DefaultHealthPort                     = 19514
 	DefaultMaxConcurrentTasks             = 20
 	DefaultGCInterval                     = 2 * time.Hour
+	DefaultGCCandidateBatch               = 100
 	DefaultGCTTL                          = 24 * time.Hour      // 1 day — AI-coding issues rarely stay open long
 	DefaultGCOrphanTTL                    = 72 * time.Hour      // 3 days — orphans with no meta (crashes, pre-GC leftovers)
 	DefaultGCArtifactTTL                  = 12 * time.Hour      // 12h — drop regenerable artifacts on completed but still-open issues
@@ -101,6 +103,7 @@ type Config struct {
 	MaxConcurrentTasks             int                   // max tasks running in parallel (default: 20)
 	GCEnabled                      bool                  // enable periodic workspace garbage collection (default: true)
 	GCInterval                     time.Duration         // how often the GC loop runs (default: 2h)
+	GCCandidateBatch               int                   // maximum expensive issue-environment decisions per workspace GC pass
 	GCTTL                          time.Duration         // clean dirs whose issue is done/cancelled and updated_at < now()-TTL (default: 24h)
 	GCOrphanTTL                    time.Duration         // clean orphan dirs with no meta, or dirs whose issue gc-check returns 404, once they exceed this age (default: 72h). The 404 path uses the same TTL — a scoped-down token can't instantly wipe live workspaces.
 	GCArtifactTTL                  time.Duration         // when a task has been completed for at least this long but its issue is still open, drop regenerable artifacts (default: 12h, set 0 to disable)
@@ -408,6 +411,14 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	gcCandidateBatch := DefaultGCCandidateBatch
+	if v := os.Getenv("MULTICA_GC_CANDIDATE_BATCH"); v != "" {
+		if n, err := strconv.Atoi(v); err != nil || n < 1 {
+			return Config{}, fmt.Errorf("MULTICA_GC_CANDIDATE_BATCH must be a positive integer")
+		} else {
+			gcCandidateBatch = n
+		}
+	}
 	gcTTL, err := durationFromEnv("MULTICA_GC_TTL", DefaultGCTTL)
 	if err != nil {
 		return Config{}, err
@@ -482,6 +493,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		KeepEnvAfterTask:               keepEnv,
 		GCEnabled:                      gcEnabled,
 		GCInterval:                     gcInterval,
+		GCCandidateBatch:               gcCandidateBatch,
 		GCTTL:                          gcTTL,
 		GCOrphanTTL:                    gcOrphanTTL,
 		GCArtifactTTL:                  gcArtifactTTL,
