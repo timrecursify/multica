@@ -37,12 +37,13 @@ let gh = function github(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
 };
 
-let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit) {
+let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: relayToken,
       ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}),
       ...(reason ? { reason } : {}),
-      ...(parkedAudit ? { parked_audit: parkedAudit } : {}) });
+      ...(parkedAudit ? { parked_audit: parkedAudit } : {}),
+      ...(evidence ? { evidence } : {}) });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);
@@ -67,25 +68,76 @@ function receiptFor(sha) {
 }
 
 async function humanReview(issue, reason) {
-  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Human Review', actor: 'system',
-    evidence: { namedBlocker: reason } });
+  const evidence = { blocker: reason, namedBlocker: true };
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Human Review', actor: 'operator', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Human Review: ${verdict.code}`);
-  await relay(issue.id, 'Human Review', null, reason);
+  await relay(issue.id, 'Human Review', null, reason, null, evidence);
   log(`HUMAN REVIEW #${issue.number} — ${reason}`);
 }
 
-async function routeFinishedPR(issue, note, mergedSha) {
+function receiptEvidence(sha) {
+  try {
+    const receipt = readReceipt(sha);
+    if (receipt?.source_sha === sha && receipt.health === 'ok' && typeof receipt.release === 'string') {
+      return { receipt, mismatch: false };
+    }
+    return { receipt: null, mismatch: true };
+  } catch (_) { return { receipt: null, mismatch: false }; }
+}
+
+function deployWorkflowNames(repo, sha) {
+  try {
+    return JSON.parse(gh(['api', `repos/${repo}/contents/.github/workflows?ref=${sha}`]))
+      .map(entry => entry.name).filter(name => /^deploy-.*\.ya?ml$/i.test(name));
+  } catch (_) { return []; }
+}
+
+function successfulDeployRun(repo, sha, workflow) {
+  try {
+    const runs = JSON.parse(gh(['run', 'list', '--repo', repo, '--commit', sha, '--workflow', workflow,
+      '--status', 'success', '--json', 'databaseId,conclusion,name']));
+    const run = runs.find(candidate => candidate.conclusion === 'success');
+    return run ? { kind: 'github_deploy_run', sha, workflow, run } : null;
+  } catch (_) { return null; }
+}
+
+function mergeDeployEvidence(repo, sha) {
+  const receipt = receiptEvidence(sha);
+  if (receipt.mismatch) return { mismatch: true };
+  if (receipt.receipt) return { evidence: receipt.receipt };
+  const workflows = deployWorkflowNames(repo, sha);
+  if (!workflows.length) return { evidence: { kind: 'merge_is_deploy', sha } };
+  for (const workflow of workflows) {
+    const run = successfulDeployRun(repo, sha, workflow);
+    if (run) return { evidence: run };
+  }
+  return { pending: true };
+}
+
+async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   const latest = await latestVerdict(issue.id);
-  const receipt = receiptFor(mergedSha);
-  if (!latest || !latest.work_product_md5 || latest.bound_sha !== mergedSha || !receipt) {
-    await humanReview(issue, `${note}; exact-SHA release receipt at reviewed SHA is required`);
+  const ci = ciState(pr.repo, pr.headSha || mergedSha, pr.createdAt);
+  if (ci !== 'green') {
+    if (ci === 'absent' || ['red', 'mixed', 'unknown'].includes(ci)) {
+      await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
+    } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
     return;
   }
-  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Done', actor: 'system', evidence: {
-    ciSuccess: true, mergeDeployReceipt: receipt, reviewedSha: latest.bound_sha, qualifyingPass: true
-  } });
+  if (!latest || !latest.work_product_md5 || latest.verdict !== 'PASS') {
+    await returnIssueToBuild(issue, `${note}; latest QC PASS evidence is absent`);
+    return;
+  }
+  const deploy = mergeDeployEvidence(pr.repo, mergedSha);
+  if (deploy.mismatch) {
+    await humanReview(issue, `${note}; release receipt exists but does not match ${mergedSha}`);
+    return;
+  }
+  if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return; }
+  const reviewedSha = latest.bound_sha || mergedSha;
+  const evidence = { ciSuccess: true, mergeDeployReceipt: deploy.evidence, reviewedSha, qualifyingPass: true };
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Done', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Done: ${verdict.code}`);
-  await relay(issue.id, 'Done', latest.work_product_md5);
+  await relay(issue.id, 'Done', latest.work_product_md5, null, null, evidence);
   log(`DONE #${issue.number} — ${note}`);
 }
 
@@ -94,10 +146,10 @@ async function escalateCi(issue, pr, ci) {
 }
 
 async function returnIssueToBuild(issue, reason) {
-  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'In Progress', actor: 'system',
-    evidence: { ciFailureOrAbsent: true, mergeConflictEvidence: reason } });
+  const evidence = { ciFailureOrAbsent: true, mergeConflictEvidence: reason };
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'In Progress', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected In Progress: ${verdict.code}`);
-  await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${reason}`);
+  await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${reason}`, null, evidence);
   log(`RETURN #${issue.number} ${reason}`);
 }
 
@@ -190,7 +242,7 @@ async function sweep() {
         }
       }
       if (!prs.length) {
-        await humanReview(issue, hasBarePR ? 'ambiguous PR reference, no repository' : 'no PR referenced');
+        await returnIssueToBuild(issue, hasBarePR ? 'ambiguous PR reference, no repository' : 'no PR referenced');
         continue;
       }
 
@@ -202,18 +254,19 @@ async function sweep() {
       }
       const closed = states.filter(s2 => s2.info.state === 'CLOSED');
       if (closed.length) {
-        const first = closed[0];
-        await humanReview(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '));
+        await returnIssueToBuild(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '));
         continue;
       }
       const openStates = states.filter(s2 => s2.info.state !== 'MERGED');
       if (!openStates.length) {
         const mergedSha = states[0].info.mergeCommit?.oid;
         if (states.length !== 1 || !/^[0-9a-f]{40}$/.test(mergedSha || '')) {
-          await humanReview(issue, 'exactly one merged PR with a full merge SHA is required');
+          await returnIssueToBuild(issue, 'exactly one merged PR with a full merge SHA is required');
           continue;
         }
-        await routeFinishedPR(issue, 'merged PR has exact-SHA release receipt', mergedSha);
+        await routeFinishedPR(issue, 'merged PR', mergedSha, {
+          repo: states[0].pr.repo, headSha: states[0].info.headRefOid, createdAt: states[0].info.createdAt
+        });
         continue;
       }
       if (openStates.length > 1) {
@@ -268,4 +321,4 @@ function setTestDependencies(dependencies) {
 }
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
-  routeFinishedPR, receiptFor, setTestDependencies, sweep };
+  routeFinishedPR, receiptFor, mergeDeployEvidence, setTestDependencies, sweep };
