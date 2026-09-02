@@ -70,6 +70,7 @@ function settingsFor(options = {}) {
     issueCooldownMinutes: positive(options.issueCooldownMinutes || process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
     completedStageCooldownMinutes: positive(options.completedStageCooldownMinutes || process.env.RECONCILE_COMPLETED_STAGE_COOLDOWN_MINUTES, 720),
     typedOutcomes: options.typedOutcomes ?? process.env.RECONCILE_TYPED_OUTCOMES === "1",
+    skipStages: new Set(String(options.skipStages ?? process.env.RECONCILE_SKIP_STAGES ?? "").split(",").map((v) => v.trim()).filter(Boolean)),
     budget: options.budget || { created: 0, byAgent: new Map() }
   };
 }
@@ -102,6 +103,11 @@ async function reconcileIssue(client, issueId, options = {}) {
     if (!issue || issue.parent_issue_id || !DISPATCHABLE.has(issue.status)) {
       await client.query("COMMIT");
       return { action: "skipped" };
+    }
+    if (options.skipStages.has(issue.status)) {
+      // Operator-disabled stage (e.g. Spec handled off-belt). No task, no state change.
+      await client.query("COMMIT");
+      return { action: "skipped", reason: "stage_disabled" };
     }
     const live = (await client.query(liveTasksSql(), [issue.id, LIVE])).rows;
     const stale = live.filter((task) => UNSTARTED.includes(task.status) && task.context?.to_stage !== issue.status);
