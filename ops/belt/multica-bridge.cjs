@@ -134,10 +134,17 @@ async function rerunParkedDiagnosis(client, payload) {
   }
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 805))", [payload.issue_id]);
   const issue = await client.query(
-    `SELECT id, workspace_id, status, priority FROM issue WHERE id = $1::uuid FOR UPDATE`,
+    `SELECT id, workspace_id, status, priority, metadata FROM issue WHERE id = $1::uuid FOR UPDATE`,
     [payload.issue_id]);
   if (issue.rowCount === 0) return { ok: false, error: 'issue_not_found' };
   if (issue.rows[0].status !== 'Parked') return { ok: false, error: 'parked_issue_required' };
+  // Historical bundled children are retained for traceability, but their
+  // work is owned by the canonical bundle. Trying to enqueue a diagnosis on a
+  // child used to reach the helper and fail on legacy queue data; make that
+  // ticket-state conflict explicit and leave the child untouched.
+  if (issue.rows[0].metadata?.bundled_into_id || issue.rows[0].metadata?.bundled_into) {
+    return { ok: false, error: 'bundled_issue_requires_canonical_parent' };
+  }
   const prior = await client.query(
     `SELECT id FROM agent_task_queue
       WHERE issue_id = $1::uuid AND context->>'kind' = 'parked_diagnosis'
