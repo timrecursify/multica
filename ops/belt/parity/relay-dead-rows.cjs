@@ -78,7 +78,9 @@ async function rescopeCompletedNoArtifactQc(client, { postRelay, logger = consol
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
-      WHERE i.status = 'In Review' AND t.status = 'completed'
+      WHERE i.status = 'In Review'
+        AND NOT (i.metadata ? 'no_artifact_rescope_consumed_at')
+        AND t.status = 'completed'
         AND t.context->>'to_stage' = 'In Review'
         AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
         AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
@@ -100,7 +102,7 @@ async function rescopeCompletedNoArtifactQc(client, { postRelay, logger = consol
       converted.add(task.id);
       logger.log(`${logPrefix} [qc-no-artifact-rescoped] task=${task.id}`);
     } else if (result && result.status === 409) {
-      logger.log(`${logPrefix} [qc-no-artifact-rescope-skip] task=${task.id} status=409`);
+      logger.log(`${logPrefix} [qc-no-artifact-skipped] task=${task.id} status=409`);
     }
   }
   return converted;
