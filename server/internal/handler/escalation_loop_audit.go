@@ -38,6 +38,34 @@ type escalationAuditRow struct {
 	Exceptions []string `json:"exceptions,omitempty"`
 }
 
+type escalationAuditBuckets struct {
+	ZeroGenuine          []string `json:"zero_genuine_fails"`
+	DefectMajorityMixed  []string `json:"defect_majority_mixed"`
+	GenuineMajorityMixed []string `json:"genuine_majority_or_equal_mixed"`
+	Exceptions           []string `json:"exceptions"`
+}
+
+func escalationAuditBucketReport(rows []escalationAuditRow) (escalationAuditBuckets, bool) {
+	buckets := escalationAuditBuckets{}
+	complete := true
+	for _, row := range rows {
+		name := fmt.Sprintf("%s-%d", row.Workspace, row.Issue)
+		if len(row.Exceptions) != 0 {
+			buckets.Exceptions = append(buckets.Exceptions, name)
+			complete = false
+			continue
+		}
+		if row.Genuine == 0 {
+			buckets.ZeroGenuine = append(buckets.ZeroGenuine, name)
+		} else if row.Defect > row.Genuine {
+			buckets.DefectMajorityMixed = append(buckets.DefectMajorityMixed, name)
+		} else {
+			buckets.GenuineMajorityMixed = append(buckets.GenuineMajorityMixed, name)
+		}
+	}
+	return buckets, complete
+}
+
 func (h *Handler) EscalationLoopAudit(w http.ResponseWriter, r *http.Request) {
 	// Membership in both fixed workspaces is required before any data is read.
 	if _, ok := h.requireWorkspaceMember(w, r, escalationAuditGSP, "audit not found"); !ok {
@@ -125,5 +153,24 @@ func (h *Handler) EscalationLoopAudit(w http.ResponseWriter, r *http.Request) {
 		}
 		return out[i].Issue < out[j].Issue
 	})
-	writeJSON(w, 200, map[string]any{"snapshot": snapshot, "expected": map[string]int{"total": 94, "gsp": 65, "ppp": 29}, "actual": map[string]int{"total": len(out), "gsp": gsp, "ppp": ppp}, "population_drift": len(out) != 94 || gsp != 65 || ppp != 29, "aggregate_countable_attempts": total, "tickets": out, "exceptions": exceptions, "cap": "2/6 unchanged; human-only reset/unpark; cap does not gate dispatch; see GSP-1548"})
+	buckets, complete := escalationAuditBucketReport(out)
+	recommendations := map[string]string{
+		"zero_genuine_fails":              "Human review may consider these historical loop victims; keep caps at 2/6 and do not reset or unpark automatically.",
+		"defect_majority_mixed":           "Human review should inspect the genuine failures before any remediation; the cap does not gate dispatch.",
+		"genuine_majority_or_equal_mixed": "Treat these as likely implementation-failure candidates pending human review; no automatic reset or unpark.",
+		"exceptions":                      "Do not make a cap recommendation while judged non-implementation outcomes remain unreconciled.",
+	}
+	writeJSON(w, 200, map[string]any{
+		"snapshot":                     snapshot,
+		"expected":                     map[string]int{"total": 94, "gsp": 65, "ppp": 29},
+		"actual":                       map[string]int{"total": len(out), "gsp": gsp, "ppp": ppp},
+		"population_drift":             map[string]any{"present": len(out) != 94 || gsp != 65 || ppp != 29, "baseline_ticket_identity_comparison": "unavailable: no baseline identities are stored"},
+		"aggregate_countable_attempts": total,
+		"tickets":                      out,
+		"exceptions":                   exceptions,
+		"buckets":                      buckets,
+		"recommendations":              recommendations,
+		"classification_reconciled":    complete,
+		"cap":                          "2/6 unchanged; human-only reset/unpark; cap does not gate dispatch; see GSP-1548",
+	})
 }
