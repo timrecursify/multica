@@ -4,15 +4,15 @@
 // process cannot create an alternate authority path.
 const fs = require('fs');
 const http = require('http');
-const { Pool } = require('pg');
 const LIMIT = Number(process.env.MERGED_PR_RECOVERY_LIMIT || 50);
-const cursor = process.env.MERGED_PR_RECOVERY_CURSOR || '';
+const INTERVAL_MS = Number(process.env.MERGED_PR_RECOVERY_INTERVAL_MS || 300000);
+const WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f';
 const envPath = process.env.MULTICA_REMOTE_BRIDGE_ENV || '/home/newadmin/.secrets/multica-remote/remote-bridge.env';
 const env = fs.readFileSync(envPath, 'utf8');
 const value = key => env.split('\n').find(line => line.startsWith(`${key}=`))?.slice(key.length + 1).trim();
 const token = value('RELAY_AGENT_SECRET');
 const operatorSecret = value('RELAY_OPERATOR_SECRET');
-const pool = new Pool({ connectionString: value('DATABASE_URL') });
+let pool;
 
 function advance(issue, sha) {
   return new Promise(resolve => {
@@ -26,8 +26,23 @@ function advance(issue, sha) {
   });
 }
 
-async function sweep() {
-  const candidates = await pool.query(
+async function durableCursor(db) {
+  const result = await db.query(`SELECT details->>'cursor' AS cursor FROM activity_log
+    WHERE workspace_id=$1 AND issue_id IS NULL AND action='merged_pr_recovery_cursor'
+    ORDER BY created_at DESC, id DESC LIMIT 1`, [WORKSPACE_ID]);
+  return result.rows[0]?.cursor || '';
+}
+async function recordCursor(db, cursor) {
+  await db.query(`INSERT INTO activity_log (workspace_id, actor_type, action, details)
+    VALUES ($1, 'system', 'merged_pr_recovery_cursor', jsonb_build_object('cursor', $2::text))`,
+    [WORKSPACE_ID, cursor]);
+}
+async function sweep(db = pool) {
+  await db.query('BEGIN');
+  try {
+  await db.query("SELECT pg_advisory_xact_lock(hashtext('merged_pr_recovery_cursor'))");
+  const cursor = await durableCursor(db);
+  const candidates = await db.query(
     `WITH linked AS (
        SELECT link.issue_id, pr.head_sha
          FROM issue_pull_request link JOIN github_pull_request pr ON pr.id=link.pull_request_id
@@ -53,8 +68,21 @@ async function sweep() {
     console.log(JSON.stringify({ event: 'merged_pr_recovery', issue_id: issue.id, number: issue.number,
       sha: issue.head_sha, status: result.status, outcome: result.body.slice(0, 240) }));
   }
-  console.log(JSON.stringify({ event: 'merged_pr_recovery_cursor',
-    next_cursor: candidates.rows.at(-1)?.id || cursor, exhausted: candidates.rows.length < LIMIT }));
+  const nextCursor = candidates.rows.length < LIMIT ? '' : candidates.rows.at(-1).id;
+  await recordCursor(db, nextCursor);
+  await db.query('COMMIT');
+  console.log(JSON.stringify({ event: 'merged_pr_recovery_cursor', next_cursor: nextCursor,
+    exhausted: candidates.rows.length < LIMIT }));
+  } catch (error) { await db.query('ROLLBACK').catch(() => {}); throw error; }
 }
-if (require.main === module) sweep().finally(() => pool.end());
-module.exports = { sweep };
+function initializeRuntime() {
+  const { Pool } = require('pg');
+  pool = new Pool({ connectionString: value('DATABASE_URL'), max: 1,
+    application_name: 'merged-pr-recovery-sweep' });
+}
+if (require.main === module) {
+  initializeRuntime();
+  sweep().catch(error => console.error('[merged-pr-recovery]', error.message));
+  setInterval(() => sweep().catch(error => console.error('[merged-pr-recovery]', error.message)), INTERVAL_MS);
+}
+module.exports = { sweep, durableCursor, recordCursor };

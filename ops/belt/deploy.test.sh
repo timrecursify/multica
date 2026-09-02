@@ -25,6 +25,7 @@ declare -a files=(
   "multica-cicd-worker.cjs"
   "cicd-deploy-evidence.cjs"
   "multica-archiver.cjs"
+  "merged-pr-recovery-sweep.cjs"
   "tools/belt-config-guard.sh"
   "gsp-multica/fleet/multica-daemon-wrapper.sh"
   "gsp-multica/fleet/ecosystem.gsp-belt.config.js"
