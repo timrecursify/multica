@@ -354,9 +354,9 @@ test('technical QC block cannot route to Human Review and exact re-scope bypasse
   assert.match(source, /technical_human_review_forbidden/);
   assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
   assert.match(source,
-    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !escalationLoop &&\s+!noArtifactRescope && !retryEscalation/);
+    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope/);
   assert.match(source,
-    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !escalationLoop && !retryEscalation/);
+    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope/);
   assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
   assert.match(source, /operator_rescope_issue_id: issue\.id/);
   assert.match(source, /if \(noArtifactRescope && to_stage === "In Progress"\) \{\s+to_stage = "Spec";/);
@@ -1416,13 +1416,13 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
   }
 });
 
-test('lifetime ceiling emits a named, deadline-bound re-spec escalation', () => {
+test('lifetime ceiling applies an auditable terminal rejection instead of a re-spec escalation', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /event: "relay_retry_escalated",\s+reason: lifetime\.reason/);
-  assert.match(source, /escalation_owner: stage\.agent_name/);
-  assert.match(source, /deadline: retryEscalation\.deadline/);
-  assert.match(source, /action, details\)\s+VALUES \(\$1::uuid, \$2::uuid, 'system', 'relay_retry_escalated'/);
+  assert.match(source, /applyDisposition\(client, issue, lifetime\.disposition, lifetime\.reason/);
+  assert.match(source, /task_count: taskCount, target_stage: to_stage/);
+  assert.match(source, /disposition: lifetime\.disposition, disposition_applied: applied/);
+  assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
 });
 
 test('parking records a reason and hands off one Sol-low diagnosis', () => {

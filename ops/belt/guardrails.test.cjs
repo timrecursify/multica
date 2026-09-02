@@ -127,12 +127,12 @@ test('quota pauses self-clear after fifteen minutes without an exhausted workspa
     'quota_paused flip agent="DeepSeek Builder" timestamp=2026-09-01T12:00:00.000Z value=true');
 });
 
-test('stage cycle breaker escalates repeated task creation to Sol-low re-spec', () => {
+test('stage cycle breaker rejects repeated task creation at its exact ceiling', () => {
   assert.deepEqual(stageCycleAdmission(0), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(2), {
     ok: false, reason: 'stage_cycle_limit', ceiling: 2,
-    disposition: 'Spec', escalation: 'sol_low_respec'
+    disposition: 'Rejected'
   });
 });
 
@@ -160,7 +160,7 @@ test('lifetime ceiling bounds paid work across stage changes', () => {
   assert.deepEqual(lifetimeTaskAdmission(5), { ok: true, ceiling: 6 });
   assert.deepEqual(lifetimeTaskAdmission(6), {
     ok: false, reason: 'lifetime_task_limit', ceiling: 6,
-    disposition: 'Spec', escalation: 'sol_low_respec'
+    disposition: 'Rejected'
   });
 });
 

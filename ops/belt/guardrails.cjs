@@ -171,7 +171,7 @@ function stageCycleAdmission(taskCount, limit = 2) {
   if (!Number.isInteger(ceiling) || ceiling < 1) return { ok: false, reason: 'invalid_stage_cycle_limit' };
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Spec', escalation: 'sol_low_respec' };
+    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Rejected' };
 }
 
 function budgetCountPredicate(taskAlias = '') {
@@ -196,7 +196,7 @@ function lifetimeTaskAdmission(taskCount, limit = 6) {
   }
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Spec', escalation: 'sol_low_respec' };
+    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Rejected' };
 }
 
 function isExecutionStage(stage) {

@@ -1184,7 +1184,7 @@ async function relayVerdict(req, res, payload) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
+    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit, cap_refusal,
       operator_rescope_issue_id, operator_terminal_exit, operator_release } = body;
     
     // Validate agent token
@@ -1231,6 +1231,25 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    // Recovery has already counted the cap history, but status changes must
+    // remain relay-owned.  This authenticated receipt uses the same atomic
+    // disposition authority as synchronous admission and is replay-safe.
+    if (to_stage === 'Rejected' && cap_refusal &&
+        ['stage_cycle_limit', 'lifetime_task_limit'].includes(cap_refusal.reason) &&
+        Number.isInteger(cap_refusal.ceiling) && Number.isInteger(cap_refusal.task_count)) {
+      const applied = await applyDisposition(client, issue, 'Rejected', cap_refusal.reason, {
+        ceiling: cap_refusal.ceiling,
+        task_count: cap_refusal.task_count,
+        target_stage: cap_refusal.target_stage || null,
+        trigger_stage: cap_refusal.trigger_stage || issue.status
+      });
+      await client.query('COMMIT');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: 'Rejected' },
+        disposition: 'Rejected', disposition_applied: applied, reason: cap_refusal.reason,
+        ceiling: cap_refusal.ceiling, task_count: cap_refusal.task_count }));
+      return;
+    }
     const noArtifactRescope = await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
@@ -1714,43 +1733,18 @@ async function relayAdvance(req, res, body) {
       const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
         client, issue, to_stage, reason, parkedEvidenceQcRelease
       );
-      if (!cycle.ok && !operatorCapBypass && retryEscalationLoop(issue, issue.status)) {
-        escalationLoop = true;
-        parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
-          attempts: 2, taskCount: 2 };
-        to_stage = "Parked";
-      }
-      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !escalationLoop &&
-          !noArtifactRescope && !retryEscalation) {
-        const sourceTaskId = await retryEscalationSourceTask(
-          client, issue, body.relay_source_task_id
-        );
-        if (!sourceTaskId) {
-          await client.query("ROLLBACK");
-          res.writeHead(409, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
-            reason: cycle.reason }));
-          return;
-        }
-        retryEscalation = {
-          reason: cycle.reason, trigger_stage: issue.status,
-          attempts: history.rows[0]?.n || 0, ceiling: cycle.ceiling,
-          source_task_id: sourceTaskId, deadline: escalationDeadline()
-        };
-        to_stage = cycle.disposition;
-        stage = await selectRetryEscalationOwner(client, issue);
-        retryEscalation.owner = stage.agent_name;
-        console.warn(JSON.stringify({
-          event: "relay_retry_escalated",
-          reason: cycle.reason,
-          issue_id: issue.id,
-          target_stage: to_stage,
-          historical_tasks: history.rows[0]?.n || 0,
-          ceiling: cycle.ceiling,
-          disposition: cycle.disposition,
-          escalation_owner: stage.agent_name,
-          deadline: retryEscalation.deadline
-        }));
+      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope) {
+        const taskCount = history.rows[0]?.n || 0;
+        const applied = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
+          ceiling: cycle.ceiling, task_count: taskCount, target_stage: to_stage,
+          trigger_stage: issue.status
+        });
+        await client.query('COMMIT');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: cycle.disposition },
+          disposition: cycle.disposition, disposition_applied: applied, reason: cycle.reason,
+          ceiling: cycle.ceiling, task_count: taskCount }));
+        return;
       }
       const lifetimeHistory = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
@@ -1762,42 +1756,18 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !operatorCapBypass && retryEscalationLoop(issue, issue.status)) {
-        escalationLoop = true;
-        parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
-          attempts: 2, taskCount: 2 };
-        to_stage = "Parked";
-      }
-      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !escalationLoop && !retryEscalation) {
-        const sourceTaskId = await retryEscalationSourceTask(
-          client, issue, body.relay_source_task_id
-        );
-        if (!sourceTaskId) {
-          await client.query("ROLLBACK");
-          res.writeHead(409, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
-            reason: lifetime.reason }));
-          return;
-        }
-        retryEscalation = {
-          reason: lifetime.reason, trigger_stage: issue.status,
-          attempts: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling,
-          source_task_id: sourceTaskId, deadline: escalationDeadline()
-        };
-        to_stage = lifetime.disposition;
-        stage = await selectRetryEscalationOwner(client, issue);
-        retryEscalation.owner = stage.agent_name;
-        console.warn(JSON.stringify({
-          event: "relay_retry_escalated",
-          reason: lifetime.reason,
-          issue_id: issue.id,
-          target_stage: to_stage,
-          historical_tasks: lifetimeHistory.rows[0]?.n || 0,
-          ceiling: lifetime.ceiling,
-          disposition: lifetime.disposition,
-          escalation_owner: stage.agent_name,
-          deadline: retryEscalation.deadline
-        }));
+      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope) {
+        const taskCount = lifetimeHistory.rows[0]?.n || 0;
+        const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
+          ceiling: lifetime.ceiling, task_count: taskCount, target_stage: to_stage,
+          trigger_stage: issue.status
+        });
+        await client.query('COMMIT');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: lifetime.disposition },
+          disposition: lifetime.disposition, disposition_applied: applied, reason: lifetime.reason,
+          ceiling: lifetime.ceiling, task_count: taskCount }));
+        return;
       }
     }
 

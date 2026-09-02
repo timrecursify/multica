@@ -882,6 +882,22 @@ function requestRetryEscalation(row, reason, relay = postToRelay) {
   });
 }
 
+function requestCapDisposition(row, admission, relay = postToRelay, taskCount = null) {
+  return relay({
+    issue_id: row.issue_id,
+    to_stage: admission.disposition,
+    agent_token: RELAY_AGENT_SECRET,
+    cap_refusal: {
+      reason: admission.reason,
+      ceiling: admission.ceiling,
+      task_count: Number(taskCount ?? row.stage_task_count ?? row.lifetime_task_count ??
+        row.stage_history_count ?? row.lifetime_history_count ?? row.history_count ?? 0),
+      target_stage: row.stage,
+      trigger_stage: row.stage
+    }
+  });
+}
+
 
 async function findAndAdvanceRegistered() {
   const client = await pool.connect();
@@ -1126,8 +1142,11 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
 
     const exhausted = candidates.rows.filter((row) => row.exhaustion_reason);
     for (const row of exhausted) {
-      const escalation = await requestRetryEscalation(row, row.exhaustion_reason, postRelay);
-      console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${row.exhaustion_reason}; relay=${escalation.status}`);
+      const admission = row.exhaustion_reason === 'stage_cycle_limit'
+        ? stageCycleAdmission(row.stage_task_count, STAGE_CYCLE_LIMIT)
+        : lifetimeTaskAdmission(row.lifetime_task_count, LIFETIME_TASK_LIMIT);
+      const disposition = await requestCapDisposition(row, admission, postRelay);
+      console.log(`${LOG_PREFIX} [requeue] REJECTED #${row.number}: ${admission.reason}; relay=${disposition.status}`);
     }
     const admissible = candidates.rows.filter((row) => !row.exhaustion_reason);
     if (admissible.length === 0) return;
@@ -1318,8 +1337,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
         const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
         if (!cycle.ok) {
           await client.query('ROLLBACK');
-          const escalation = await requestRetryEscalation(row, cycle.reason, postRelay);
-          console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${cycle.reason}; relay=${escalation.status}`);
+          const disposition = await requestCapDisposition(row, cycle, postRelay, history.rows[0]?.n || 0);
+          console.log(`${LOG_PREFIX} [requeue] REJECTED #${row.number}: ${cycle.reason}; relay=${disposition.status}`);
           continue;
         }
         const lifetimeHistory = await client.query(
@@ -1333,8 +1352,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
         const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
         if (!lifetime.ok) {
           await client.query('ROLLBACK');
-          const escalation = await requestRetryEscalation(row, lifetime.reason, postRelay);
-          console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${lifetime.reason}; relay=${escalation.status}`);
+          const disposition = await requestCapDisposition(row, lifetime, postRelay, lifetimeHistory.rows[0]?.n || 0);
+          console.log(`${LOG_PREFIX} [requeue] REJECTED #${row.number}: ${lifetime.reason}; relay=${disposition.status}`);
           continue;
         }
         const context = JSON.stringify({
