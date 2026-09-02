@@ -105,6 +105,22 @@ function testHumanReviewIsNotDispatchable() {
   assert.doesNotMatch(sweep, /Human Review/);
 }
 
+function testMergedBeltPRUsesReceiptDeploy() {
+  const deploys = [];
+  worker.setTestDependencies({
+    gh: args => {
+      assert.deepEqual(args, ['api', 'repos/timrecursify/multica/pulls/267/files?per_page=100']);
+      return JSON.stringify([{ filename: 'ops/belt/multica-cicd-worker.cjs' }]);
+    },
+    deployBelt: sourceCommit => deploys.push(sourceCommit),
+  });
+  worker.deployMergedBeltPRs([{
+    pr: { repo: 'timrecursify/multica', num: '267' },
+    info: { mergeCommit: { oid: 'a'.repeat(40) } },
+  }]);
+  assert.deepEqual(deploys, ['a'.repeat(40)]);
+}
+
 async function testCompletionAdmission() {
   const calls = [];
   const retries = new Map();
@@ -171,6 +187,7 @@ async function testCompletionAdmission() {
   testConsecutiveFailures();
   testAbsentCi();
   testHumanReviewIsNotDispatchable();
+  testMergedBeltPRUsesReceiptDeploy();
   await testCompletionAdmission();
   console.log('multica-cicd-worker tests passed');
 })().catch(error => {
