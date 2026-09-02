@@ -1665,6 +1665,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancelFunc = cancel
 	d.rootCtx = ctx
+	if dir, err := cli.ProfileDir(d.cfg.Profile); err != nil {
+		return fmt.Errorf("resolve codex lease directory: %w", err)
+	} else {
+		agent.RecoverCodexProcessLeases(filepath.Join(dir, "codex-process-leases"), d.logger)
+	}
 
 	// Bind health port early to detect another running daemon.
 	healthLn, err := d.listenHealth()
@@ -1750,6 +1755,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.gcLoop(ctx)
 	go d.autoUpdateLoop(ctx)
 	go d.tokenRenewalLoop(ctx)
+	go d.codexLeaseSweepLoop(ctx)
 
 	// Preflight succeeded and the background loops are up: the daemon has
 	// registered its runtimes and can now claim and run tasks. Flip /health
@@ -1761,6 +1767,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 	err = d.pollLoop(ctx, taskWakeups)
 	d.logger.Debug("daemon main loop returning", "error", err)
 	return err
+}
+
+func (d *Daemon) codexLeaseSweepLoop(ctx context.Context) {
+	dir, err := cli.ProfileDir(d.cfg.Profile)
+	if err != nil {
+		return
+	}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			agent.RecoverCodexProcessLeases(filepath.Join(dir, "codex-process-leases"), d.logger)
+		}
+	}
+}
+
+func codexLeaseDir(profile string) string {
+	dir, err := cli.ProfileDir(profile)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "codex-process-leases")
 }
 
 // RestartBinary returns the path to the new binary if the daemon needs to restart
@@ -6152,6 +6183,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		RuntimeID:      task.RuntimeID,
 		DaemonVersion:  d.cfg.CLIVersion,
 		CodexVersion:   codexVersion,
+		CodexLeaseDir:  codexLeaseDir(d.cfg.Profile),
+		DaemonID:       d.cfg.DaemonID,
 		BuiltinRuntime: !usesCustomProfileCommand,
 	})
 	if err != nil {
