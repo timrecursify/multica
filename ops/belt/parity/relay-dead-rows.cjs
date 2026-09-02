@@ -18,7 +18,8 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
         AND NOT EXISTS (
           SELECT 1 FROM qc_verdict verdict WHERE verdict.issue_id = t.issue_id
             AND verdict.created_at >= t.created_at)
-      ORDER BY t.issue_id, t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC`
+      ORDER BY t.issue_id, t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
+      LIMIT 100`
   );
   const converted = new Set();
   const seenIssues = new Set();

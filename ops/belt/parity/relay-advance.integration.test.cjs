@@ -65,9 +65,19 @@ async function deadRowsDb() {
     id text PRIMARY KEY, issue_id text NOT NULL, task_id text NOT NULL, to_stage text NOT NULL,
     status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now())`);
   await admin.query(`CREATE TABLE ${schema}.agent_task_queue (
-    id text PRIMARY KEY, issue_id text NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL)`);
+    id text PRIMARY KEY, issue_id text NOT NULL, agent_id text, workspace_id text NOT NULL DEFAULT 'workspace-1',
+    status text NOT NULL, context jsonb, result jsonb, completed_at timestamptz, created_at timestamptz NOT NULL)`);
+  await admin.query(`CREATE TABLE ${schema}.issue (
+    id text PRIMARY KEY, workspace_id text NOT NULL, number integer NOT NULL)`);
+  await admin.query(`CREATE TABLE ${schema}.agent (
+    id text PRIMARY KEY, workspace_id text NOT NULL, name text NOT NULL, model text,
+    thinking_level text, runtime_config jsonb)`);
   await admin.query(`CREATE TABLE ${schema}.qc_verdict (
     issue_id text NOT NULL, created_at timestamptz NOT NULL)`);
+  await admin.query(`INSERT INTO ${schema}.issue (id, workspace_id, number)
+    VALUES ('fixture-issue', 'workspace-1', 1)`);
+  await admin.query(`INSERT INTO ${schema}.agent (id, workspace_id, name, model, thinking_level, runtime_config)
+    VALUES ('fixture-agent', 'workspace-1', 'fixture-agent', 'gpt-5.6-sol', 'low', '{}'::jsonb)`);
   const dbPool = {
     async connect() {
       const client = await admin.connect();
