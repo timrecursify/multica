@@ -290,10 +290,12 @@ test('operator re-scope admits only the exact issue UUID and completed Sol-low N
   } };
   assert.equal(await noArtifactRescopeAdmission(client, issue, 'Spec', issue.id), true);
   assert.equal(calls.length, 2);
+  assert.equal(await noArtifactRescopeAdmission(client, issue, 'In Progress', null), true);
+  assert.equal(calls.length, 4);
   assert.equal(await noArtifactRescopeAdmission(client, issue, 'Spec',
     '223e4567-e89b-42d3-a456-426614174000'), false);
   assert.equal(await noArtifactRescopeAdmission(client, issue, 'In Progress', issue.id), false);
-  assert.equal(calls.length, 2, 'invalid operator requests must do no evidence queries');
+  assert.equal(calls.length, 4, 'invalid operator requests must do no evidence queries');
   assert.equal(await noArtifactRescopeAdmission(client, { ...issue, status: 'Human Review' },
     'Spec', issue.id), true);
 });
@@ -354,6 +356,9 @@ test('technical QC block cannot route to Human Review and exact re-scope bypasse
     /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !escalationLoop && !retryEscalation/);
   assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
   assert.match(source, /operator_rescope_issue_id: issue\.id/);
+  assert.match(source, /if \(noArtifactRescope && to_stage === "In Progress"\) \{\s+to_stage = "Spec";/);
+  assert.match(source, /let retryEscalation = noArtifactRescope \? null/);
+  assert.match(source, /to_stage === "Spec" && !noArtifactRescope/);
 });
 
 const validVerdict = Object.freeze({
