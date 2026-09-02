@@ -115,6 +115,18 @@ bash ops/gsp-belt/scripts/belt-fingerprint.sh --checkout <reviewed-checkout> --r
 bash ops/gsp-belt/scripts/belt-guard-check.sh --checkout <reviewed-checkout> --release <release-dir>
 ```
 
+## Runtime provenance
+
+After a cutover, report the exact commit and the resolved PM2 script path for
+each of the five belt apps without exposing environment values:
+
+```bash
+bash <release-dir>/ops/gsp-belt/scripts/belt-status.sh --release <release-dir>
+```
+
+It exits non-zero if an app is offline or resolves outside that immutable
+release.
+
 ## Tests
 
 ```bash

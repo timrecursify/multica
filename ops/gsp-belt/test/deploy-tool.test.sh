@@ -7,6 +7,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEPLOY="$ROOT/deploy/gsp-belt-deploy.sh"
+STATUS="$ROOT/scripts/belt-status.sh"
 FAKE="$ROOT/test/fake-pm2.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -113,6 +114,13 @@ for a in apps:
     assert a['pm2_env']['pm_exec_path'].startswith(rel), (a['name'], a['pm2_env']['pm_exec_path'])
 print("PASS: all apps resolve into selected release")
 PY
+if PM2="$FAKE" "$STATUS" --release "$RELEASE1" >"$WORK/status.log"; then
+  grep -q "release commit = $goodsha" "$WORK/status.log"
+  grep -q "status: all five apps resolve to release commit $goodsha" "$WORK/status.log"
+  echo "PASS: runtime status reports selected commit and all five app paths"
+else
+  echo "FAIL: runtime status did not validate deployed app paths"; cat "$WORK/status.log"; exit 1
+fi
 
 # --- (f) simulated reload failure triggers automatic rollback ---
 export FAKE_FAIL_FLAG="$WORK/failflag"

@@ -143,6 +143,7 @@ done
 # ---- install immutable release (idempotent, deterministic) ----
 mkdir -p "$release_dir/ops/gsp-belt"
 cp -R "$source_tree/ops/gsp-belt/." "$release_dir/ops/gsp-belt/"
+printf '{"commit_sha":"%s"}\n' "$commit_sha" > "$release_dir/.gsp-belt-release.json"
 rm -f "$release_dir/$RENDERED_ECO_REL"
 gsp_release="$release_dir/ops/gsp-belt"
 sed "s|__GSP_BELT_RELEASE__|$gsp_release|g" \
