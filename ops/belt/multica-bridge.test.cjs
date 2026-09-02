@@ -36,6 +36,8 @@ const {
   recordBookkeepingHandoff,
   validateRelayVerdict,
   hasCurrentPassWorkProduct,
+  relayRedirect,
+  passVerdictRescopeForbidden,
   latestCompletedSolLowQcTask,
   qcTaskEvidenceMismatch,
   relayVerdict,
@@ -65,6 +67,21 @@ const {
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
+
+test('relay receipts identify a changed destination and preserve its cause', () => {
+  assert.equal(relayRedirect('CI/CD & Deploy', 'CI/CD & Deploy', null), null);
+  assert.deepEqual(relayRedirect('CI/CD & Deploy', 'Spec', { reason: 'lifetime_task_limit' }), {
+    redirected: true,
+    requested_stage: 'CI/CD & Deploy',
+    status: 'Spec',
+    reason: 'retry_escalation'
+  });
+  assert.equal(relayRedirect('Queue', 'Parked', null).reason, 'relay_stage_policy');
+  const specRedirect = relayRedirect('CI/CD & Deploy', 'Spec', { reason: 'lifetime_task_limit' });
+  assert.equal(passVerdictRescopeForbidden(specRedirect, { verdict: 'PASS' }), true);
+  assert.equal(passVerdictRescopeForbidden(specRedirect, { verdict: 'FAIL' }), false);
+  assert.equal(passVerdictRescopeForbidden(relayRedirect('Spec', 'CI/CD & Deploy', null), { verdict: 'PASS' }), false);
+});
 
 test('comment-reply tasks do not consume lifetime or stage-cycle cap history', async (t) => {
   const databaseUrl = process.env.DATABASE_URL;

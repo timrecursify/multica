@@ -264,6 +264,20 @@ function qcBounceDecision(latestVerdict, expectedStage) {
   return { action: "deploy", toStage: expectedStage };
 }
 
+function relayRedirect(requestedStage, effectiveStage, retryEscalation) {
+  if (requestedStage === effectiveStage) return null;
+  return {
+    redirected: true,
+    requested_stage: requestedStage,
+    status: effectiveStage,
+    reason: retryEscalation ? "retry_escalation" : "relay_stage_policy"
+  };
+}
+
+function passVerdictRescopeForbidden(redirect, latestVerdict) {
+  return Boolean(redirect && redirect.status === "Spec" && latestVerdict?.verdict === "PASS");
+}
+
 async function latestQcVerdict(client, issueId) {
   const result = await client.query(
     `SELECT verdict, work_product_md5
@@ -1226,6 +1240,7 @@ async function relayAdvance(req, res, body) {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit, cap_refusal,
       routing_classification,
       operator_rescope_issue_id, operator_terminal_exit, operator_release, operator_cap_release } = body;
+    const requestedStage = to_stage;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -1937,6 +1952,14 @@ async function relayAdvance(req, res, body) {
       }
     }
 
+    const redirect = relayRedirect(requestedStage, to_stage, retryEscalation);
+    if (passVerdictRescopeForbidden(redirect, await latestQcVerdict(client, issue.id))) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "pass_verdict_rescope_forbidden", ...redirect }));
+      return;
+    }
+
     const result = await client.query(
       `UPDATE "issue"
        SET status = $1,
@@ -1997,7 +2020,8 @@ async function relayAdvance(req, res, body) {
         success: true,
         issue: result.rows[0],
         task_id: null,
-        relay_log_id: relayLogId
+        relay_log_id: relayLogId,
+        ...redirect
       }));
       return;
     }
@@ -2092,7 +2116,8 @@ async function relayAdvance(req, res, body) {
       success: true,
       issue: result.rows[0],
       task_id: taskId,
-      relay_log_id: relayLogId
+      relay_log_id: relayLogId,
+      ...redirect
     }));
   } catch (err) {
     if (client) {
@@ -2229,6 +2254,8 @@ module.exports = {
   validateRelayVerdict,
   qcBounceDecision,
   hasCurrentPassWorkProduct,
+  relayRedirect,
+  passVerdictRescopeForbidden,
   latestCompletedSolLowQcTask,
   qcTaskEvidence,
   qcTaskEvidenceMismatch,
