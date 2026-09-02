@@ -522,6 +522,69 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   }
 });
 
+test('PASS replay writes once, but an older bound task cannot replace a newer FAIL', async () => {
+  const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'pass-agent',
+    agent_name: 'qc-sol-low-pass', context: {}, result: qcResult(), completed_at: '2026-01-01T00:00:00Z' };
+  const prior = { issue_id: validVerdict.issue_id, checker_name: task.agent_name,
+    verdict: 'PASS', work_product_md5: validVerdict.work_product_md5,
+    bound_sha: validVerdict.bound_sha, observed_head: validVerdict.observed_sha,
+    failure_class: validVerdict.failure_class, qualifying: validVerdict.qualifying,
+    model: validVerdict.model, effort: validVerdict.effort };
+  let verdict = null;
+  let writes = 0;
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [prior] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
+    if (/FROM qc_verdict/.test(sql)) return { rows: verdict ? [verdict] : [] };
+    if (/INSERT INTO qc_verdict/.test(sql)) {
+      writes += 1;
+      verdict = { issue_id: values[0], checker_id: values[1], notes: values[5], created_at: '2026-01-01T00:01:00Z' };
+    }
+    if (/UPDATE qc_verdict/.test(sql)) writes += 1;
+    return { rows: [] };
+  } };
+  const post = async () => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...validVerdict, qc_task_id: task.id });
+    return { ...res, json: JSON.parse(res.body) };
+  };
+  setTestClientFactory(() => client);
+  try {
+    assert.equal((await post()).status, 200);
+    assert.equal((await post()).status, 200);
+    assert.equal(writes, 1, 'a second PASS replay must not duplicate its verdict row');
+    verdict = { issue_id: validVerdict.issue_id, checker_id: 'fail-agent', notes: 'relay_task_id=newer-task',
+      created_at: '2026-01-02T00:00:00Z' };
+    const result = await post();
+    assert.equal(result.status, 409);
+    assert.equal(result.json.error, 'qc_verdict_newer_than_bound_qc_task');
+    assert.equal(writes, 1, 'the older PASS replay must not overwrite the newer FAIL');
+  } finally { setTestClientFactory(null); }
+});
+
+test('FAIL replay does not write a qc_verdict row', async () => {
+  const fail = { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false };
+  const task = { id: '22222222-2222-4222-8222-222222222222', agent_id: 'fail-agent',
+    agent_name: 'qc-sol-low-fail', context: {}, result: qcResult(fail), completed_at: '2026-01-01T00:00:00Z' };
+  const prior = { issue_id: fail.issue_id, checker_name: task.agent_name, verdict: fail.verdict,
+    work_product_md5: fail.work_product_md5, bound_sha: fail.bound_sha, observed_head: fail.observed_sha,
+    failure_class: fail.failure_class, qualifying: fail.qualifying, model: fail.model, effort: fail.effort };
+  let verdictWrites = 0;
+  const client = { async connect() {}, async end() {}, async query(sql) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [prior] };
+    if (/INSERT INTO qc_verdict|UPDATE qc_verdict/.test(sql)) verdictWrites += 1;
+    return { rows: [] };
+  } };
+  const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...fail, qc_task_id: task.id });
+    assert.equal(res.status, 200);
+    assert.equal(verdictWrites, 0);
+  } finally { setTestClientFactory(null); }
+});
+
 test('runbook-shaped verdicts advance through the relay handler', async () => {
   const attempts = [];
   const verdicts = [];
