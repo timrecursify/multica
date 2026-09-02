@@ -4831,9 +4831,9 @@ func TestCodexLegacyPatchApplyStatusFallsBackToSuccess(t *testing.T) {
 		wantSub string
 	}{
 		{
-			name:    "success true without status",
+			name:    "success true without evidence fails closed",
 			event:   `{"jsonrpc":"2.0","method":"codex/event","params":{"msg":{"type":"patch_apply_end","call_id":"p1","stdout":"","stderr":"","success":true,"changes":{"a.txt":{"type":"add","content":"x"}}}}}`,
-			wantSub: "completed",
+			wantSub: "failed",
 		},
 		{
 			name:    "success false without status",
@@ -4861,6 +4861,9 @@ func TestCodexLegacyPatchApplyStatusFallsBackToSuccess(t *testing.T) {
 			}
 			if !strings.Contains(messages[0].Output, tc.wantSub) {
 				t.Fatalf("expected output to contain %q, got %q", tc.wantSub, messages[0].Output)
+			}
+			if tc.name == "success true without evidence fails closed" && !strings.Contains(messages[0].Output, "without application evidence") {
+				t.Fatalf("expected actionable diagnostic, got %q", messages[0].Output)
 			}
 		})
 	}
