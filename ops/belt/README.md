@@ -47,14 +47,19 @@ as `python3 /home/newadmin/tools/multica-bundle.py`.
 
 ## Deploy and verify
 
-`./deploy.sh` is dry-run by default. Use `./deploy.sh --apply` only when an
-operator has approved changing the live runtime. It preflights every file,
+`./deploy.sh` is dry-run by default. It requires an explicit full immutable
+commit: `./deploy.sh --dry-run --source-commit <40-char-commit>`. Use
+`./deploy.sh --apply --source-commit <40-char-commit>` only when an operator
+has approved changing the live runtime. It archives that exact commit into
+private staging before it preflights every file,
 creates all backups before copying, and restores touched targets on a partial
 failure. A successful apply prints `./deploy.sh --rollback <UTC timestamp>`;
 that command restores the matching backup set. No process is restarted.
 
-`./verify.sh` compares every repository copy with its runtime path and exits
-non-zero when any file is missing or differs.
+`./verify.sh <40-char-commit>` compares runtime files only with blobs staged
+from that commit and exits non-zero when any file is missing or differs.
+Source resolution, checkout, or pull failures are terminal: do not copy files
+or restart a process after any such failure.
 
 ## Parked-ticket diagnosis backfill
 
