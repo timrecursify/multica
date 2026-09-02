@@ -23,6 +23,13 @@ BEGIN
         RAISE EXCEPTION 'agent task workspace invariant violated: agent workspace is missing';
     END IF;
 
+    -- A caller may carry a workspace assertion from a relay or creation path;
+    -- never silently rewrite a conflicting assertion into an apparently-valid
+    -- active task.
+    IF NEW.workspace_id IS NOT NULL AND NEW.workspace_id <> agent_workspace THEN
+        RAISE EXCEPTION 'agent task workspace invariant violated: task workspace differs from agent workspace';
+    END IF;
+
     -- Always persist the agent-owned workspace, including historical rows.
     NEW.workspace_id := agent_workspace;
 
