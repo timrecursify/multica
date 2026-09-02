@@ -128,7 +128,7 @@ const RERUN_IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 
 // This deliberately reads only the canonical link tables.  issue.pr_url and
 // comment text are presentation/provenance data, not authority to skip work.
-async function mergedPrEvidence(client, issue, evidence) {
+async function mergedPrEvidence(client, issue, evidence, dependencies = {}) {
   const sha = evidence && evidence.sha;
   if (!SHA_RE.test(String(sha || ''))) return { ok: false, reason: 'invalid_sha' };
   const linked = await client.query(
@@ -145,8 +145,9 @@ async function mergedPrEvidence(client, issue, evidence) {
   try {
     // gh uses the installation/user credential already configured for the belt.
     const repo = pr.repository;
-    const defaultBranch = execFileSync('gh', ['api', `repos/${repo}`, '--jq', '.default_branch'], { encoding: 'utf8', timeout: 20000 }).trim();
-    const relation = execFileSync('gh', ['api', `repos/${repo}/compare/${sha}...${defaultBranch}`, '--jq', '.status'], { encoding: 'utf8', timeout: 20000 }).trim();
+    const gh = dependencies.execFileSync || execFileSync;
+    const defaultBranch = gh('gh', ['api', `repos/${repo}`, '--jq', '.default_branch'], { encoding: 'utf8', timeout: 20000 }).trim();
+    const relation = gh('gh', ['api', `repos/${repo}/compare/${sha}...${defaultBranch}`, '--jq', '.status'], { encoding: 'utf8', timeout: 20000 }).trim();
     if (!['ahead', 'identical'].includes(relation)) return { ok: false, reason: 'sha_not_on_default_branch' };
     return { ok: true, pr: { ...pr, default_branch: defaultBranch, verified_at: new Date().toISOString(), sha } };
   } catch (_) { return { ok: false, reason: 'github_verification_failed' }; }
