@@ -393,7 +393,7 @@ test('In Progress -> In Review dispatch requires canonical implementation eviden
   };
 
   const valid = await invoke({ pr_url: prUrl, bound_sha: sha });
-  assert.equal(valid.res.status, 200);
+  assert.equal(valid.res.status, 200, valid.res.body);
   assert.equal(JSON.parse(valid.res.body).task_id, 'qc-task-1');
   const inserts = valid.calls.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue ('));
   assert.equal(inserts.length, 1);
@@ -479,7 +479,7 @@ test('Human Review guard reads only the latest active-or-completed Sol-low QC fl
   assert.match(calls[0].sql, /t\.status IN \('queued','dispatched','running'/);
   assert.match(calls[0].sql, /LEFT JOIN LATERAL/);
   assert.match(calls[0].sql, /ORDER BY t\.created_at DESC, t\.id DESC LIMIT 1/);
-  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1']);
+  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1', ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
 });
 
 test('technical QC block cannot route to Human Review and exact re-scope bypasses configured edge and caps', () => {
@@ -550,12 +550,12 @@ test('verdict checker identity is selected from the completed same-workspace Sol
   } };
   const task = await latestCompletedSolLowQcTask(client, 'issue-1', 'workspace-1');
   assert.equal(task.agent_id, 'agent-1');
-  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1', null]);
+  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1', null, ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
   assert.match(calls[0].sql, /i\.workspace_id = t\.workspace_id/);
   assert.match(calls[0].sql, /a\.workspace_id = i\.workspace_id/);
   assert.match(calls[0].sql, /t\.context->>'to_stage' = 'In Review'/);
-  assert.match(calls[0].sql, /COALESCE\(a\.model, a\.runtime_config->>'model'\) = 'gpt-5\.6-sol'/);
-  assert.match(calls[0].sql, /COALESCE\(a\.thinking_level, a\.runtime_config->>'reasoning_effort'\) = 'low'/);
+  assert.match(calls[0].sql, /COALESCE\(a\.model, a\.runtime_config->>'model'\) = ANY\(\$4::text\[\]\)/);
+  assert.match(calls[0].sql, /COALESCE\(a\.thinking_level, a\.runtime_config->>'reasoning_effort'\) = \$5::text/);
   assert.match(calls[0].sql, /ORDER BY t\.completed_at DESC NULLS LAST/);
 });
 
@@ -566,7 +566,7 @@ test('completed In Review rerun task is admitted for the QC verdict', async () =
     agent_name: 'qc-sol-low'
   };
   const client = { query: async (sql, values) => {
-    assert.deepEqual(values, ['issue-in-review', 'workspace-for-issue', null]);
+    assert.deepEqual(values, ['issue-in-review', 'workspace-for-issue', null, ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
     assert.match(sql, /i\.workspace_id = t\.workspace_id/);
     assert.match(sql, /t\.context->>'to_stage' = 'In Review'/);
     return { rows: [rerunTask] };
@@ -579,7 +579,7 @@ test('completed In Review rerun task is admitted for the QC verdict', async () =
 
 test('explicit QC task binding selects that completed task instead of the newest one', async () => {
   const client = { query: async (sql, values) => {
-    assert.deepEqual(values, ['issue-1', 'workspace-1', '11111111-1111-4111-8111-111111111111']);
+    assert.deepEqual(values, ['issue-1', 'workspace-1', '11111111-1111-4111-8111-111111111111', ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
     assert.match(sql, /\$3::uuid IS NULL OR t\.id = \$3::uuid/);
     return { rows: [{ id: values[2] }] };
   } };
@@ -648,7 +648,8 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
     task = { ...task, id: explicitTaskId, result: qcResult() };
     result = await call({ ...validVerdict, idem_key: 'qc-explicit-task-binding', qc_task_id: explicitTaskId });
     assert.equal(result.status, 201);
-    assert.deepEqual(taskQueryValues, [validVerdict.issue_id, 'workspace-1', explicitTaskId]);
+    assert.deepEqual(taskQueryValues, [validVerdict.issue_id, 'workspace-1', explicitTaskId,
+      ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
     assert.match(writes.at(-1)[5], new RegExp(`relay_task_id=${explicitTaskId}`));
   } finally {
     setTestClientFactory(null);
@@ -1728,7 +1729,7 @@ test('QC bounce ceiling changes hands to an exact Sol-low Spec task, never Parke
 
 test('retry escalation requires an explicit Sol-low owner and never stores null lineage', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /owner\.model !== "gpt-5\.6-sol" \|\| owner\.thinking_level !== "low"/);
+  assert.match(source, /!isQcLane\(owner\.model, owner\.thinking_level\)/);
   assert.doesNotMatch(source, /source_task_id: null/);
 });
 

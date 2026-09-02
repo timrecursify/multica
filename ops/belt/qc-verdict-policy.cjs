@@ -1,4 +1,5 @@
 "use strict";
+const { isQcLane } = require("./qc-lane.cjs");
 
 // QC verdicts are authoritative only when their evidence is bound to the
 // authenticated task that produced it.  The bridge's legacy marker remains
@@ -54,7 +55,7 @@ function internalBinding(task, actor) {
   if (!task.id || !task.issue_id || !task.workspace_id || actor?.type !== "worker" ||
       actor.authenticated_task_id !== task.id) return { ok: false, reason: "authenticated_task_required" };
   const lane = taskLane(task);
-  if (lane.model !== "gpt-5.6-sol" || lane.effort !== "low") {
+  if (!isQcLane(lane.model, lane.effort)) {
     return { ok: false, reason: "completed_sol_low_qc_required" };
   }
   const parsed = readTaskEvidence(task);

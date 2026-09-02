@@ -20,6 +20,7 @@ const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const { currentStrictPass } = require("./qc-strict-evidence.cjs");
 const { evaluate } = require("./transition-policy.cjs");
 const { validateQcVerdict } = require("./qc-verdict-policy.cjs");
+const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require("./qc-lane.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -253,7 +254,7 @@ function validateRelayVerdict(payload) {
   if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
   if (!FAILURE_CLASSES.has(payload.failure_class)) return "invalid_failure_class";
   if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
-  if (payload.model !== "gpt-5.6-sol" || payload.effort !== "low") return "invalid_qc_lane";
+  if (!isQcLane(payload.model, payload.effort)) return "invalid_qc_lane";
   if (typeof payload.idem_key !== "string" || !IDEM_KEY_RE.test(payload.idem_key)) return "invalid_idem_key";
   return null;
 }
@@ -308,12 +309,12 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explici
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
       WHERE t.issue_id = $1 AND i.workspace_id = $2 AND t.status = 'completed'
         AND t.context->>'to_stage' = 'In Review'
-        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($4::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $5::text
         AND ($3::uuid IS NULL OR t.id = $3::uuid)
       ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
       LIMIT 1 FOR UPDATE`,
-    [issueId, workspaceId, explicitTaskId]
+    [issueId, workspaceId, explicitTaskId, qcLaneModelsSqlArray(), QC_LANE_EFFORT]
   );
   return result.rows[0] || null;
 }
@@ -401,9 +402,9 @@ async function latestQcNoArtifactSignal(client, issue) {
       WHERE t.issue_id = $1 AND t.workspace_id = $2
         AND t.context->>'to_stage' = 'In Review'
         AND t.status IN ('queued','dispatched','running','waiting_local_directory','deferred','completed')
-        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
-      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id]);
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($3::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $4::text
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id, qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
   const row = latest.rows[0];
   return Boolean(row && (isNoArtifactQcBlock(taskResultText(row.result)) ||
     isNoArtifactQcBlock(row.content)));
@@ -423,7 +424,7 @@ function qcTaskEvidence(task) {
       !SHA_RE.test(String(evidence.observed_sha || "")) ||
       String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase() ||
       !FAILURE_CLASSES.has(evidence.failure_class) || typeof evidence.qualifying !== "boolean" ||
-      evidence.model !== "gpt-5.6-sol" || evidence.effort !== "low") return null;
+      !isQcLane(evidence.model, evidence.effort)) return null;
   return evidence;
 }
 
@@ -532,7 +533,7 @@ function escalationDeadline() {
 }
 
 async function recordRetryEscalation(client, issue, escalation) {
-  const details = { ...escalation, target_stage: "Spec", model: "gpt-5.6-sol", effort: "low" };
+  const details = { ...escalation, target_stage: "Spec", model: qcLaneModelsSqlArray()[0], effort: QC_LANE_EFFORT };
   await client.query(
     `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
           jsonb_build_object('retry_escalation', $2::jsonb, 'retry_escalation_at', to_jsonb(NOW())),
@@ -556,7 +557,7 @@ async function selectRetryEscalationOwner(client, issue) {
   if (!owner?.agent_id || !owner.owner_id || owner.archived_at || !owner.selected_runtime_id) {
     throw new Error(`No active Sol-low re-spec owner for workspace ${issue.workspace_id}`);
   }
-  if (owner.model !== "gpt-5.6-sol" || owner.thinking_level !== "low") {
+  if (!isQcLane(owner.model, owner.thinking_level)) {
     throw new Error(`Sol-low re-spec owner has invalid lane: ${owner.agent_name}`);
   }
   const compatibility = instructionCompatibility(owner.instructions, "Spec");
