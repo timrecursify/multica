@@ -40,6 +40,33 @@ test("restart is idempotent when the current-stage task is live", async () => {
   assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
+test("two reconciler sessions converge on one task", async () => {
+  const shared = { live: [], lock: Promise.resolve(), sequence: 0 };
+  const session = () => {
+    let unlock;
+    return { query: async (sql, values = []) => {
+      if (sql.includes("pg_advisory_xact_lock")) {
+        const prior = shared.lock;
+        shared.lock = new Promise((resolve) => { unlock = resolve; });
+        await prior;
+        return { rows: [] };
+      }
+      if (sql === "COMMIT") { unlock?.(); return { rows: [] }; }
+      if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [issue] };
+      if (sql.includes("FROM agent_task_queue") && sql.includes("FOR UPDATE")) return { rows: shared.live };
+      if (sql.includes("FROM relay_stage_agent_pool")) return { rows: [{ agent_id: "33333333-3333-4333-8333-333333333333" }] };
+      if (sql.includes("INSERT INTO agent_task_queue")) {
+        const row = { id: `task-${++shared.sequence}`, status: "queued", context: JSON.parse(values[4]) };
+        shared.live.push(row); return { rows: [row] };
+      }
+      return { rows: [] };
+    }};
+  };
+  const results = await Promise.all([reconcileIssue(session(), issue.id, { evaluate: ok }), reconcileIssue(session(), issue.id, { evaluate: ok })]);
+  assert.deepEqual(results.map((result) => result.action), ["created", "already_live"]);
+  assert.equal(shared.live.length, 1);
+});
+
 test("duplicate live task fails closed into Human Review", async () => {
   const db = harness({ live: ["a", "b"].map((id) => ({ id, status: "queued", context: taskContext("Queue") })) });
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), { action: "human_review", reason: "duplicate_live_task" });
