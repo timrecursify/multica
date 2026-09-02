@@ -254,9 +254,34 @@ function validateRelayVerdict(payload) {
   if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
   if (!FAILURE_CLASSES.has(payload.failure_class)) return "invalid_failure_class";
   if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
+  if (payload.qualifying === true && ["evidence", "tool", "access"].includes(payload.failure_class)) return "nonqualifying_failure_class";
   if (!isQcLane(payload.model, payload.effort)) return "invalid_qc_lane";
   if (typeof payload.idem_key !== "string" || !IDEM_KEY_RE.test(payload.idem_key)) return "invalid_idem_key";
   return null;
+}
+
+const PPP_23189_REPAIRS = Object.freeze([
+  { id: 10107, idem_key: "ppp-23189-5dff98e0-evidence-fail" },
+  { id: 10125, idem_key: "qc-23189-5dff98e0b5f4d048241d2f4fb17ae21adff56ac4-FAIL" },
+  { id: 10350, idem_key: "qc-23189-41aa105a9f58215c809da54976568d9bdbe654c6-FAIL" }
+]);
+
+async function repairPpp23189Qualifying(client) {
+  const receipt = [];
+  for (const target of PPP_23189_REPAIRS) {
+    const result = await client.query(`SELECT id, issue_id, verdict, failure_class, qualifying, idem_key
+      FROM qc_attempt WHERE id = $1 AND idem_key = $2 FOR UPDATE`, [target.id, target.idem_key]);
+    if (result.rowCount !== 1) throw new Error(`qc_repair_preimage_missing:${target.id}`);
+    const row = result.rows[0];
+    if (row.issue_id !== "023cd68d-a287-48e9-a056-ea0975afe615" || row.verdict !== "FAIL" || row.failure_class !== "evidence" || ![true, false].includes(row.qualifying))
+      throw new Error(`qc_repair_preimage_mismatch:${target.id}`);
+    if (row.qualifying === true) {
+      await client.query("UPDATE qc_attempt SET qualifying = false WHERE id = $1", [target.id]);
+      receipt.push(`${target.id}:changed`);
+    } else receipt.push(`${target.id}:already_repaired`);
+  }
+  console.log(JSON.stringify({ event: "qc_qualifying_repair", issue_id: "023cd68d-a287-48e9-a056-ea0975afe615", receipt }));
+  return receipt;
 }
 
 function qcBounceDecision(latestVerdict, expectedStage) {
@@ -2194,6 +2219,18 @@ async function assertRoutableStagesHaveOwners() {
 
 async function start() {
   await assertRoutableStagesHaveOwners();
+  const client = new Client({ connectionString: MULTICA_DB });
+  await client.connect();
+  try {
+    await client.query("BEGIN");
+    await repairPpp23189Qualifying(client);
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    await client.end();
+    throw err;
+  }
+  await client.end();
   server.listen(PORT, "127.0.0.1", () => {
   console.log(`GSP Multica relay bridge listening on 127.0.0.1:${PORT}`);
   console.log(`SSO workspace: ${SSO_WORKSPACE_ID}`);
@@ -2218,6 +2255,7 @@ module.exports = {
   isBookkeepingTransition,
   recordBookkeepingHandoff,
   validateRelayVerdict,
+  repairPpp23189Qualifying,
   qcBounceDecision,
   hasCurrentPassWorkProduct,
   relayRedirect,
