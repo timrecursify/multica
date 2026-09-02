@@ -78,7 +78,7 @@ test('requeue candidate SQL binds the stage array with a real PostgreSQL client'
   assert.ok(start >= 0 && end > start, 'requeue candidate SQL must be present');
   const sql = source.slice(start + 1, end);
   assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
-  assert.match(sql, /LIMIT \$1::int/);
+  assert.match(sql, /WHERE rn <= \$1::int/);
   const params = [3, ['Queue', 'In Progress', 'Spec', 'In Review'], 120, 2, 6];
   const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
   try {
@@ -247,7 +247,7 @@ function strandedHarness(fixtures) {
   const dispatchedIssueIds = new Set();
   const client = { query: async (sql, values = []) => {
     queries.push({ sql, values });
-    if (sql.includes('WITH stranded AS') && sql.includes('LIMIT $1')) {
+    if (sql.includes('WITH stranded AS') && sql.includes('WHERE rn <= $1')) {
       const eligible = fixtures.filter((row) => row.eligible !== false &&
         !(row.consume_after_record && consumedClosedRow) && !dispatchedIssueIds.has(row.issue_id));
       const exhausted = eligible.filter((row) => (row.stage_history_count ?? row.history_count ?? 1) >= values[3] ||
@@ -255,8 +255,10 @@ function strandedHarness(fixtures) {
         .map((row) => ({ ...row, exhaustion_reason: (row.stage_history_count ?? row.history_count ?? 1) >= values[3]
           ? 'stage_cycle_limit' : 'lifetime_task_limit' }));
       const admitted = eligible.filter((row) => !exhausted.some((exhaustedRow) => exhaustedRow.issue_id === row.issue_id))
-        .sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at))
-        .slice(0, values[0]);
+        .sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at) ||
+          a.issue_id.localeCompare(b.issue_id))
+        .filter((row, _, rows) => rows.filter((candidate) => candidate.agent_id === row.agent_id)
+          .findIndex((candidate) => candidate.issue_id === row.issue_id) < values[0]);
       return { rows: admitted.concat(exhausted) };
     }
     if (sql.includes('COALESCE(a.max_concurrent_tasks')) {
@@ -489,7 +491,7 @@ test('live task on another stage fixture is excluded for every stage', () => {
   assert.doesNotMatch(source, /COALESCE\(q\.context->>'to_stage', ''\) = i\.status/);
 });
 
-test('five eligible fixtures dispatch exactly the three oldest globally', async () => {
+test('five eligible fixtures dispatch the oldest-created candidate from each owner partition', async () => {
   const fixtures = [
     strandedFixture({ number: 5, issue_id: '223e4567-e89b-42d3-a456-426614174005', agent_id: '423e4567-e89b-42d3-a456-426614174005', issue_created_at: '2026-09-01T00:05:00Z' }),
     strandedFixture({ number: 1, issue_id: '223e4567-e89b-42d3-a456-426614174001', agent_id: '423e4567-e89b-42d3-a456-426614174001', issue_created_at: '2026-09-01T00:01:00Z' }),
@@ -500,12 +502,12 @@ test('five eligible fixtures dispatch exactly the three oldest globally', async 
   const harness = strandedHarness(fixtures);
   await harness.run();
   const dispatched = harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
-  assert.equal(dispatched.length, 3);
-  assert.deepEqual(dispatched.map(({ values }) => values[1]), fixtures.slice(1, 2)
-    .concat(fixtures.slice(3, 5)).map((row) => row.issue_id));
+  assert.equal(dispatched.length, 5);
+  assert.deepEqual(dispatched.map(({ values }) => values[1]), fixtures.slice().sort((a, b) =>
+    a.issue_created_at.localeCompare(b.issue_created_at)).map((row) => row.issue_id));
   const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
-  assert.match(candidateQuery.sql, /ORDER BY issue_created_at ASC\s+LIMIT \$1/);
-  assert.doesNotMatch(candidateQuery.sql, /ROW_NUMBER\(\) OVER/);
+  assert.match(candidateQuery.sql, /PARTITION BY agent_id ORDER BY issue_created_at ASC, issue_id ASC/);
+  assert.match(candidateQuery.sql, /ORDER BY issue_created_at ASC, issue_id ASC/);
 });
 
 test('over-limit rows escalate outside the batch while three admissible rows dispatch', async () => {
@@ -701,6 +703,16 @@ test('stranded-task recovery admits only unconsumed failed completed predecessor
   assert.match(requeue, /closed_log\.status = 'failed'/);
   assert.match(requeue, /requeue_of_relay_log: row\.closed_relay_log_id/);
   assert.match(requeue, /closed relay row already requeued/);
+});
+
+test('stranded-task recovery orders each owner partition by immutable creation time', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('async function processParkedDiagnoses'));
+  assert.match(requeue, /PARTITION BY agent_id ORDER BY issue_created_at ASC, issue_id ASC/);
+  assert.match(requeue, /i\.created_at AS issue_created_at/);
+  assert.match(requeue, /ORDER BY issue_created_at ASC, issue_id ASC/);
+  assert.doesNotMatch(requeue, /PARTITION BY agent_id ORDER BY .*updated_at/);
 });
 
 test('Registered recovery applies the same completion gate', () => {

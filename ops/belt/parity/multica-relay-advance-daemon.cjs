@@ -969,6 +969,9 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
   const client = await dbPool.connect();
   try {
     const candidates = await client.query(
+      // The per-owner ranking prevents an old backlog in one lane from
+      // monopolising recovery. Each owner gets its own oldest-created-first
+      // slice; the per-agent capacity check below still decides dispatch.
       `WITH stranded AS (
         SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage,
               i.created_at AS issue_created_at, i.metadata,
@@ -1099,17 +1102,24 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
                   NULLIF(stranded.metadata->>'retry_escalation_at', ''))::timestamptz)
           ) AS lifetime_task_count
         FROM stranded
-      )
-      (SELECT budgeted.*, NULL::text AS exhaustion_reason
-         FROM budgeted
+      ), ranked AS (
+        SELECT budgeted.*, ROW_NUMBER() OVER (
+          PARTITION BY agent_id ORDER BY issue_created_at ASC, issue_id ASC
+        ) AS rn
+        FROM budgeted
         WHERE stage_task_count < $4::int AND lifetime_task_count < $5::int
-        ORDER BY issue_created_at ASC
-        LIMIT $1::int)
-      UNION ALL
-      (SELECT budgeted.*, CASE WHEN stage_task_count >= $4::int
-            THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
-         FROM budgeted
-        WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int)`,
+      )
+      SELECT * FROM (
+        SELECT ranked.*, NULL::text AS exhaustion_reason
+          FROM ranked
+         WHERE rn <= $1::int
+        UNION ALL
+        SELECT budgeted.*, CASE WHEN stage_task_count >= $4::int
+              THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
+          FROM budgeted
+         WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int
+      ) candidates
+      ORDER BY issue_created_at ASC, issue_id ASC`,
       [REQUEUE_BATCH, REQUEUE_STAGES, QUEUED_TASK_TTL_MINUTES,
         STAGE_CYCLE_LIMIT, LIFETIME_TASK_LIMIT]
     );
