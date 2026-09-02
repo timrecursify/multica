@@ -43,7 +43,7 @@ export type IssueStatusPagination = Record<
 
 interface StatusCursorState {
   identity: string;
-  cursors: Record<IssueStatus, Array<string | null>>;
+  cursors: Record<string, Array<string | null>>;
 }
 
 interface StatusPageTarget {
@@ -74,10 +74,7 @@ function initialCursorState(
   statuses: readonly IssueStatus[],
 ): StatusCursorState {
   const cursors = Object.fromEntries(
-    ALL_STATUSES.map((status) => [
-      status,
-      statuses.includes(status) ? [null] : [],
-    ]),
+    statuses.map((status) => [status, [null]]),
   ) as StatusCursorState["cursors"];
   return { identity, cursors };
 }
@@ -91,7 +88,7 @@ function rebaseCursorState(
     state.identity === identity ? state : initialCursorState(identity, statuses);
   let cursors: StatusCursorState["cursors"] | null = null;
   for (const status of statuses) {
-    if (current.cursors[status].length > 0) continue;
+    if ((current.cursors[status] ?? []).length > 0) continue;
     cursors ??= { ...current.cursors };
     cursors[status] = [null];
   }
@@ -104,9 +101,7 @@ function statusCountsFromFacets(
   const counts = new Map<IssueStatus, number>();
   const statusFacet = facets?.facets.find((facet) => facet.kind === "status");
   for (const value of statusFacet?.values ?? []) {
-    if (ALL_STATUSES.includes(value.key as IssueStatus)) {
-      counts.set(value.key as IssueStatus, value.count);
-    }
+    counts.set(value.key as IssueStatus, value.count);
   }
   return counts;
 }
@@ -374,7 +369,7 @@ export function useIssueStatusBranches({
 
   const pagination = useMemo<IssueStatusPagination>(() => {
     return Object.fromEntries(
-      ALL_STATUSES.map((status) => {
+      statuses.map((status) => {
         const branch = branchData.get(status);
         const loaded = branch?.rows.length ?? 0;
         const total = counts.get(status) ?? loaded;
