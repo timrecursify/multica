@@ -2,12 +2,13 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -67,9 +68,14 @@ type gcStats struct {
 	// hermesMemoryStoresReclaimed is counted separately from storesReclaimed:
 	// the two stores hold different things on different TTLs, so folding them
 	// into one number would make either figure unreadable for an operator.
-	hermesMemoryStoresReclaimed int            // per-agent Hermes memory stores reclaimed past their TTL
-	repoCachesReclaimed         int            // bare repo caches under .repos evicted past their TTL
-	bytesReclaimed              int64          // total bytes freed in this cycle
+	hermesMemoryStoresReclaimed int   // per-agent Hermes memory stores reclaimed past their TTL
+	repoCachesReclaimed         int   // bare repo caches under .repos evicted past their TTL
+	bytesReclaimed              int64 // total bytes freed in this cycle
+	quarantinedDirty            int
+	quarantinedUnpushed         int
+	quarantinedUnknown          int
+	processHeld                 int
+	removalFailed               int
 	byPattern                   map[string]int // configured basename or managed path label -> reclaim count
 }
 
@@ -134,6 +140,11 @@ func (d *Daemon) runGC(ctx context.Context) {
 			"hermes_memory_stores_reclaimed", stats.hermesMemoryStoresReclaimed,
 			"repo_caches_reclaimed", stats.repoCachesReclaimed,
 			"bytes_reclaimed", stats.bytesReclaimed,
+			"quarantined_dirty", stats.quarantinedDirty,
+			"quarantined_unpushed", stats.quarantinedUnpushed,
+			"quarantined_unknown", stats.quarantinedUnknown,
+			"process_held", stats.processHeld,
+			"removal_failed", stats.removalFailed,
 			"by_pattern", stats.byPattern,
 		)
 	}
@@ -149,30 +160,25 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 
 	cleanedHere := 0
 	issueCandidates := make([]issueGCCandidate, 0, len(taskEntries))
-	for start := 0; start < len(taskEntries); start += taskGCBatchSize {
-		end := min(start+taskGCBatchSize, len(taskEntries))
-		for _, entry := range taskEntries[start:end] {
-			if ctx.Err() != nil {
-				return
-			}
-			if !entry.IsDir() {
-				continue
-			}
-			taskDir := filepath.Join(wsDir, entry.Name())
-			if d.isActiveEnvRoot(taskDir) {
-				stats.skipped++
-				continue
-			}
-			meta, metaErr := execenv.ReadGCMeta(taskDir)
-			if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
-				issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
-				continue
-			}
-			action := d.shouldCleanTaskDir(ctx, taskDir)
-			cleanedHere += d.applyGCAction(taskDir, action, stats)
+	for _, entry := range taskEntries {
+		if ctx.Err() != nil {
+			return
 		}
-		// Keep a large historical workspace from monopolizing a daemon worker.
-		runtime.Gosched()
+		if !entry.IsDir() {
+			continue
+		}
+		taskDir := filepath.Join(wsDir, entry.Name())
+		if d.isActiveEnvRoot(taskDir) {
+			stats.skipped++
+			continue
+		}
+		meta, metaErr := execenv.ReadGCMeta(taskDir)
+		if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
+			issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
+			continue
+		}
+		action := d.shouldCleanTaskDir(ctx, taskDir)
+		cleanedHere += d.applyGCAction(taskDir, action, stats)
 	}
 	cleanedHere += d.gcWorkspaceIssues(ctx, filepath.Base(wsDir), issueCandidates, stats)
 
@@ -185,12 +191,10 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 	}
 }
 
-const (
-	// taskGCBatchSize bounds filesystem and checkout inspection work before
-	// yielding to the daemon's dispatch and heartbeat goroutines.
-	taskGCBatchSize  = 100
-	issueGCBatchSize = 500
-)
+// Keep expensive process and Git inspection bounded.  The remote lookup may
+// have a larger batch, but at most this many issue environments are inspected
+// in one workspace pass.
+const issueGCBatchSize = 100
 
 type issueGCCandidate struct {
 	taskDir string
@@ -245,12 +249,26 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 		}
 		issueID := strings.TrimSpace(candidate.meta.IssueID)
 		result, ok := results[issueID]
-		if !ok || result.Err != nil {
+		if strings.TrimSpace(candidate.meta.TaskID) == "" && (!ok || result.Err != nil) {
 			stats.skipped++
 			continue
 		}
-		action := d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
+		// Exact task metadata takes precedence over the issue batch result: an
+		// issue may be reopened, while this directory belongs to one task.
+		// Legacy metadata keeps the batched issue lookup for compatibility.
+		action := gcActionSkip
+		if strings.TrimSpace(candidate.meta.TaskID) != "" {
+			action = d.gcDecisionIssue(ctx, candidate.taskDir, candidate.meta)
+		} else {
+			action = d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
+		}
 		action = d.applyLocalDirectoryGCOverride(candidate.meta, action)
+		if action == gcActionClean {
+			if reason := d.safeIssueRemoval(candidate.taskDir); reason != "" {
+				d.recordGCQuarantine(candidate.taskDir, candidate.meta.TaskID, reason, stats)
+				continue
+			}
+		}
 		cleaned += d.applyGCAction(candidate.taskDir, action, stats)
 	}
 	return cleaned
@@ -270,23 +288,16 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 	}
 	switch action {
 	case gcActionClean:
-		if !d.reapCheckoutIsSafe(taskDir) {
-			stats.skipped++
-			return 0
-		}
 		bytes := dirSize(taskDir)
 		if !d.cleanTaskDir(taskDir) {
 			stats.skipped++
+			stats.removalFailed++
 			return 0
 		}
 		stats.cleaned++
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionOrphan:
-		if !d.reapCheckoutIsSafe(taskDir) {
-			stats.skipped++
-			return 0
-		}
 		bytes := dirSize(taskDir)
 		if !d.cleanTaskDir(taskDir) {
 			stats.skipped++
@@ -309,51 +320,111 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 	return 0
 }
 
-// reapCheckoutIsSafe retains a candidate for human review unless its checkout
-// is clean, fully pushed to its own upstream branch, and unused by any process.
-func (d *Daemon) reapCheckoutIsSafe(taskDir string) bool {
-	workDir := filepath.Join(taskDir, "workdir")
-	if processUsesPath(taskDir) || !gitWorktreeIsClean(workDir) {
-		d.logger.Warn("gc: quarantine", "dir", taskDir, "reason", "busy or unpushed checkout")
-		return false
+// safeIssueRemoval is deliberately fail-closed.  It is only used for the new
+// exact-task issue path; chat, autopilot and legacy/orphan semantics retain
+// their existing contracts.  A non-Git workdir is fine, but a checkout must be
+// clean and fully pushed to its own configured origin branch.
+func (d *Daemon) safeIssueRemoval(taskDir string) string {
+	if processReferencesPath(taskDir) {
+		return "process-held"
 	}
-	return true
+	workdir := filepath.Join(taskDir, "workdir")
+	if _, err := os.Stat(filepath.Join(workdir, ".git")); err != nil {
+		return "" // no checkout to inspect
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	run := func(args ...string) (string, error) {
+		cmd := exec.CommandContext(ctx, "ionice", append([]string{"-c3", "nice", "-n19", "git", "-C", workdir}, args...)...)
+		out, err := cmd.Output()
+		return strings.TrimSpace(string(out)), err
+	}
+	if out, err := run("status", "--porcelain", "--ignore-submodules=none"); err != nil || out != "" {
+		return "dirty"
+	}
+	branch, err := run("symbolic-ref", "--quiet", "--short", "HEAD")
+	if err != nil || branch == "" {
+		return "check-failed"
+	}
+	if _, err = run("rev-parse", "--verify", "origin/"+branch); err != nil {
+		return "check-failed"
+	}
+	if out, err := run("rev-list", "origin/"+branch+"..HEAD"); err != nil || out != "" {
+		return "unpushed"
+	}
+	return ""
 }
 
-func processUsesPath(root string) bool {
-	entries, err := os.ReadDir("/proc")
+// processReferencesPath obtains a bounded snapshot of cwd and fd links. Any
+// unreadable proc entry is treated as a reference: permission and race errors
+// must not turn into deletion permission.
+func processReferencesPath(root string) bool {
+	proc, err := os.ReadDir("/proc")
 	if err != nil {
 		return true
 	}
-	root = filepath.Clean(root) + string(os.PathSeparator)
-	for _, entry := range entries {
-		if !entry.IsDir() {
+	root, err = filepath.Abs(root)
+	if err != nil {
+		return true
+	}
+	for _, p := range proc {
+		if _, err := strconv.Atoi(p.Name()); err != nil {
 			continue
 		}
-		links := []string{filepath.Join("/proc", entry.Name(), "cwd")}
-		fds, _ := filepath.Glob(filepath.Join("/proc", entry.Name(), "fd", "*"))
-		links = append(links, fds...)
-		for _, link := range links {
-			target, linkErr := os.Readlink(link)
-			if linkErr == nil && strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), root) {
+		for _, name := range []string{"cwd", "fd"} {
+			base := filepath.Join("/proc", p.Name(), name)
+			if name == "cwd" {
+				target, err := os.Readlink(base)
+				if err != nil || target == root || strings.HasPrefix(target, root+string(os.PathSeparator)) {
+					return true
+				}
+				continue
+			}
+			entries, err := os.ReadDir(base)
+			if err != nil {
 				return true
+			}
+			for _, entry := range entries {
+				link := filepath.Join(base, entry.Name())
+				target, err := os.Readlink(link)
+				if err != nil {
+					return true
+				}
+				if target == root || strings.HasPrefix(target, root+string(os.PathSeparator)) {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
 
-func gitWorktreeIsClean(workDir string) bool {
-	status, err := runGitGCCommand(workDir, "status", "--porcelain")
-	if err != nil || status != "" {
-		return false
+func (d *Daemon) recordGCQuarantine(taskDir, taskID, reason string, stats *gcStats) {
+	switch reason {
+	case "dirty":
+		stats.quarantinedDirty++
+	case "unpushed":
+		stats.quarantinedUnpushed++
+	case "process-held":
+		stats.processHeld++
+	default:
+		stats.quarantinedUnknown++
 	}
-	branch, err := runGitGCCommand(workDir, "branch", "--show-current")
-	if err != nil || branch == "" {
-		return false
+	entry := struct {
+		TaskID, Path, Reason string
+		Bytes                int64
+		At                   time.Time
+	}{taskID, taskDir, reason, dirSize(taskDir), time.Now().UTC()}
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return
 	}
-	out, err := runGitGCCommand(workDir, "rev-list", "origin/"+branch+"..HEAD")
-	return err == nil && strings.TrimSpace(out) == ""
+	f, err := os.OpenFile(filepath.Join(d.cfg.WorkspacesRoot, ".gc-quarantine.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err == nil {
+		_, _ = f.Write(append(data, '\n'))
+		_ = f.Close()
+	}
+	d.logger.Warn("gc: task environment quarantined", "task", taskID, "dir", taskDir, "reason", reason)
 }
 
 func recordArtifactCleanup(stats *gcStats, removed int, bytes int64, perPattern map[string]int) {
@@ -1107,8 +1178,8 @@ func runGitCommand(barePath string, timeout time.Duration, args ...string) (stri
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmdArgs := append([]string{"-c3", "nice", "-n", "19", "git", "-C", barePath}, args...)
-	cmd := exec.CommandContext(ctx, "ionice", cmdArgs...)
+	cmdArgs := append([]string{"-C", barePath}, args...)
+	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
