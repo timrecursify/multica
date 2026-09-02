@@ -111,6 +111,45 @@ func TestBuildSearchQuery_WithNumber(t *testing.T) {
 	}
 }
 
+func TestParseQueryNumberPostgresIntegerBounds(t *testing.T) {
+	tests := []struct {
+		query string
+		want  int
+		ok    bool
+	}{
+		{"42", 42, true},
+		{"MUL-42", 42, true},
+		{"2147483647", 2147483647, true},
+		{"MUL-2147483647", 2147483647, true},
+		{"2147483648", 0, false},
+		{"MUL-2147483648", 0, false},
+		{"33589389651", 0, false},
+		{"999999999999999999999999999999999999", 0, false},
+		{"0", 0, false},
+		{"-42", 0, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			got, ok := parseQueryNumber(tt.query)
+			if got != tt.want || ok != tt.ok {
+				t.Errorf("parseQueryNumber(%q) = (%d, %t), want (%d, %t)", tt.query, got, ok, tt.want, tt.ok)
+			}
+			query, args := buildSearchQuery(linearTestContract, tt.query, []string{tt.query}, got, ok, false)
+			if !tt.ok && strings.Contains(query, "i.number =") {
+				t.Errorf("out-of-range query added issue-number predicate: %s", query)
+			}
+			if !tt.ok {
+				// A single-term text search has exactly phrase, workspace, limit,
+				// and offset parameters. A number comparison would add a seventh.
+				if len(args) != 6 {
+					t.Errorf("out-of-range query has %d parameters, want 6 text-search parameters: %#v", len(args), args)
+				}
+			}
+		})
+	}
+}
+
 func TestBuildSearchQuery_IncludeClosed(t *testing.T) {
 	query, _ := buildSearchQuery(linearTestContract, "test", []string{"test"}, 0, false, true)
 
