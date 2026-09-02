@@ -22,7 +22,7 @@ function receiptContainsMerge(pr, run, read = fs.readdirSync, readFile = fs.read
   try {
     return read(beltReceiptDir).some(name => {
       const receipt = JSON.parse(readFile(`${beltReceiptDir}/${name}`, 'utf8'));
-      return receipt.repo === pr.repo && receipt.source_sha &&
+      return receipt.repo === pr.repo && receipt.outcome !== 'refused' && receipt.source_sha &&
         !run('git', ['-C', multicaCheckout, 'merge-base', '--is-ancestor', pr.mergeCommit.oid, receipt.source_sha]);
     });
   } catch (_) { return false; }

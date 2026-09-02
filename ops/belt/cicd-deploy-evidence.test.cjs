@@ -15,4 +15,6 @@ assert.equal(receiptContainsMerge(merge, (file, args) => args.includes('merge-ba
   () => ['receipt.json'], () => '{"repo":"timrecursify/multica","source_sha":"deployed"}'), true);
 assert.equal(receiptContainsMerge(merge, () => { throw new Error('not ancestor'); },
   () => ['receipt.json'], () => '{"repo":"timrecursify/multica","source_sha":"unrelated"}'), false);
+assert.equal(receiptContainsMerge(merge, () => '',
+  () => ['receipt.json'], () => '{"repo":"timrecursify/multica","source_sha":"deployed","outcome":"refused"}'), false);
 console.log('cicd deploy evidence tests passed');
