@@ -81,7 +81,7 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
-const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived"]);
+const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived", "Rejected"]);
 const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review", "Parked"]);
 
 function isTerminalStage(stage) {
