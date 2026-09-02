@@ -101,10 +101,8 @@ function requeueTriggerSummary(row, coldStart) {
     ? `Relay cold start: never dispatched in ${row.stage}`
     : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`;
   if (row.stage !== 'In Review') return prefix;
-  const result = row.build_task_result || {};
-  const prUrl = result.pr_url || row.metadata?.pr_url;
-  const headSha = result.head_sha || result.bound_sha || row.metadata?.head_sha ||
-    row.metadata?.bound_sha || row.metadata?.commit_sha;
+  const prUrl = row.metadata?.pr_url;
+  const headSha = row.metadata?.bound_sha;
   if (!prUrl || !/^[0-9a-f]{40}$/i.test(headSha || '')) {
     return `${prefix}\nQC input: PR/SHA unknown: issue FAIL verdict per runbook`;
   }

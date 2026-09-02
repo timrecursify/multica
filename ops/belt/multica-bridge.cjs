@@ -319,29 +319,20 @@ function operatorRescopeIssueId(explicitIssueId, reason) {
   return match?.[1] || null;
 }
 
-async function issueImplementationArtifact(client, issueId) {
+function implementationEvidence(metadata) {
+  const prUrl = String(metadata?.pr_url || "");
+  const boundSha = String(metadata?.bound_sha || "");
+  if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9][0-9]*\/?$/.test(prUrl) ||
+      !/^[0-9a-f]{40}$/.test(boundSha)) return null;
+  return { prUrl, boundSha };
+}
+
+async function issueImplementationArtifact(client, issue) {
+  if (implementationEvidence(issue.metadata)) return true;
   const result = await client.query(
-    `SELECT
-       EXISTS (SELECT 1 FROM qc_verdict WHERE issue_id = $1) AS has_qc_verdict,
-       EXISTS (
-         SELECT 1 FROM agent_task_queue
-          WHERE issue_id = $1 AND status = 'completed'
-            AND context->>'to_stage' = 'Queue'
-            AND (
-              NULLIF(BTRIM(COALESCE(result->>'work_product', '')), '') IS NOT NULL
-              OR result::text ~* 'https?://github\\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/pull/[0-9]+'
-              OR result::text ~* '"(implementation_sha|bound_sha|observed_sha)"[^0-9a-f]{0,32}[0-9a-f]{40}'
-            )
-       ) AS has_builder_artifact,
-       EXISTS (
-         SELECT 1 FROM comment
-          WHERE issue_id = $1 AND (
-            content ~* 'https?://github\\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/pull/[0-9]+'
-            OR content ~* '(^|[\r\n])[[:space:]*-]*(implementation[_ ]sha|bound[_ ]sha|observed[_ ]sha)[[:space:]]*[:=][[:space:]]*[0-9a-f]{40}'
-          )
-       ) AS has_comment_artifact`, [issueId]);
+    `SELECT EXISTS (SELECT 1 FROM qc_verdict WHERE issue_id = $1) AS has_qc_verdict`, [issue.id]);
   const row = result.rows[0] || {};
-  return Boolean(row.has_qc_verdict || row.has_builder_artifact || row.has_comment_artifact);
+  return Boolean(row.has_qc_verdict);
 }
 
 async function noArtifactRescopeAdmission(client, issue, toStage, operatorIssueId) {
@@ -354,7 +345,7 @@ async function noArtifactRescopeAdmission(client, issue, toStage, operatorIssueI
   if (issue.metadata?.no_artifact_rescope_consumed_at) return false;
   const task = await latestCompletedSolLowQcTask(client, issue.id, issue.workspace_id);
   if (!task || task.status !== "completed" || !isNoArtifactQcBlock(taskResultText(task.result))) return false;
-  return !await issueImplementationArtifact(client, issue.id);
+  return !await issueImplementationArtifact(client, issue);
 }
 
 async function consumeNoArtifactRescope(client, issue) {
@@ -1229,7 +1220,7 @@ async function relayAdvance(req, res, body) {
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
     let escalationLoop = false;
     const issueResult = await client.query(
-      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
+      `SELECT id, number, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
        WHERE id = $1
        FOR UPDATE`,
@@ -1603,6 +1594,16 @@ async function relayAdvance(req, res, body) {
         `UPDATE "issue" SET description = $1, updated_at = NOW() WHERE id = $2`,
         [descriptionWithSpec(issue.description, bindingSpec), issue.id]
       );
+    }
+
+    const buildEvidence = issue.status === "In Progress" && to_stage === "In Review"
+      ? implementationEvidence(issue.metadata) : null;
+    if (issue.status === "In Progress" && to_stage === "In Review" && !buildEvidence) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "implementation_evidence_required",
+        message: "In Progress -> In Review requires metadata.pr_url (GitHub PR URL) and metadata.bound_sha (lowercase 40-character SHA)" }));
+      return;
     }
 
     const ownerStage = retryEscalation ? "Registered" :
@@ -1998,6 +1999,8 @@ async function relayAdvance(req, res, body) {
         }) : null,
         triggerSummary: retryEscalation
           ? `Sol-low re-spec escalation: ${retryEscalation.reason}`
+          : buildEvidence
+            ? `Relay stage transition: ${issue.status} -> ${to_stage}\nQC input: ticket ${issue.number}; PR ${buildEvidence.prUrl}; bound SHA ${buildEvidence.boundSha}`
           : `Relay stage transition: ${issue.status} -> ${to_stage}`
       });
       taskId = successor.taskId;
@@ -2164,6 +2167,7 @@ module.exports = {
   isNoArtifactQcBlock,
   operatorRescopeIssueId,
   issueImplementationArtifact,
+  implementationEvidence,
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,

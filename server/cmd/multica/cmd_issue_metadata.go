@@ -97,11 +97,17 @@ var issueMetadataDeleteCmd = &cobra.Command{
 	RunE:  runIssueMetadataDelete,
 }
 
+var issueMetadataImplementationEvidenceCmd = &cobra.Command{
+	Use: "implementation-evidence <issue-id>", Short: "Atomically record a build PR URL and bound SHA",
+	Args: exactArgs(1), RunE: runIssueMetadataImplementationEvidence,
+}
+
 func init() {
 	issueMetadataCmd.AddCommand(issueMetadataListCmd)
 	issueMetadataCmd.AddCommand(issueMetadataGetCmd)
 	issueMetadataCmd.AddCommand(issueMetadataSetCmd)
 	issueMetadataCmd.AddCommand(issueMetadataDeleteCmd)
+	issueMetadataCmd.AddCommand(issueMetadataImplementationEvidenceCmd)
 
 	issueMetadataListCmd.Flags().String("output", "table", "Output format: table or json")
 	issueMetadataGetCmd.Flags().String("output", "json", "Output format: table or json")
@@ -112,8 +118,40 @@ func init() {
 	issueMetadataSetCmd.Flags().String("type", "", "Force value type: string, number, or bool (default: auto-infer via JSON parsing)")
 	issueMetadataDeleteCmd.Flags().String("output", "table", "Output format: table or json")
 	issueMetadataDeleteCmd.Flags().String("key", "", "Metadata key (required)")
+	issueMetadataImplementationEvidenceCmd.Flags().String("pr-url", "", "GitHub pull-request URL (required)")
+	issueMetadataImplementationEvidenceCmd.Flags().String("bound-sha", "", "Lowercase 40-character pushed commit SHA (required)")
+	issueMetadataImplementationEvidenceCmd.Flags().String("output", "table", "Output format: table or json")
 
 	issueCmd.AddCommand(issueMetadataCmd)
+}
+
+func runIssueMetadataImplementationEvidence(cmd *cobra.Command, args []string) error {
+	prURL, _ := cmd.Flags().GetString("pr-url")
+	boundSHA, _ := cmd.Flags().GetString("bound-sha")
+	if prURL == "" || boundSHA == "" {
+		return fmt.Errorf("--pr-url and --bound-sha are required")
+	}
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := cli.APIContext(context.Background())
+	defer cancel()
+	issueRef, err := resolveIssueRef(ctx, client, args[0])
+	if err != nil {
+		return fmt.Errorf("resolve issue: %w", err)
+	}
+	var result map[string]any
+	if err := client.PostJSON(ctx, "/api/issues/"+issueRef.ID+"/metadata/implementation-evidence", map[string]string{"pr_url": prURL, "bound_sha": boundSHA}, &result); err != nil {
+		return fmt.Errorf("set implementation evidence: %w", err)
+	}
+	metadata, _ := result["metadata"].(map[string]any)
+	output, _ := cmd.Flags().GetString("output")
+	if output == "json" {
+		return cli.PrintJSON(os.Stdout, metadata)
+	}
+	printMetadataTable(metadata)
+	return nil
 }
 
 // parseMetadataValue converts a CLI --value flag (and optional --type) into

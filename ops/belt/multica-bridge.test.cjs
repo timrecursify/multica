@@ -35,6 +35,7 @@ const {
   isNoArtifactQcBlock,
   operatorRescopeIssueId,
   issueImplementationArtifact,
+  implementationEvidence,
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
@@ -312,17 +313,15 @@ test('operator re-scope request is explicit and bound to one UUID', () => {
   assert.equal(operatorRescopeIssueId(null, 'RETURN:Spec — retry this ticket'), null);
 });
 
-test('artifact lookup rejects any verdict, builder work product, or issue PR/SHA', async () => {
+test('artifact lookup accepts canonical metadata and ignores prose', async () => {
   for (const field of ['has_qc_verdict', 'has_builder_artifact', 'has_comment_artifact']) {
     const client = { query: async (sql, values) => {
       assert.match(sql, /FROM qc_verdict/);
-      assert.match(sql, /context->>'to_stage' = 'Queue'/);
-      assert.match(sql, /FROM comment/);
+      assert.doesNotMatch(sql, /agent_task_queue|comment/);
       assert.deepEqual(values, ['issue-1']);
-      return { rows: [{ has_qc_verdict: false, has_builder_artifact: false,
-        has_comment_artifact: false, [field]: true }] };
+      return { rows: [{ has_qc_verdict: field === 'has_qc_verdict' }] };
     } };
-    assert.equal(await issueImplementationArtifact(client, 'issue-1'), true);
+    assert.equal(await issueImplementationArtifact(client, { id: 'issue-1', metadata: {} }), field === 'has_qc_verdict');
   }
 });
 
