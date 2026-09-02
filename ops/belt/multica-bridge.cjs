@@ -415,7 +415,8 @@ async function retryEscalationSourceTask(client, issue, requestedTaskId = null) 
 }
 
 async function capEscalationVerified(client, issue, trigger, stage) {
-  const since = issue.metadata?.parked_release_at || issue.metadata?.retry_escalation_at || null;
+  const since = issue.metadata?.human_review_release_at ||
+    issue.metadata?.parked_release_at || issue.metadata?.retry_escalation_at || null;
   if (trigger === "stage_cycle_limit") {
     const history = await client.query(
       `SELECT count(*)::int AS n FROM agent_task_queue
@@ -1130,7 +1131,7 @@ async function relayAdvance(req, res, body) {
   let client;
   try {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
-      operator_rescope_issue_id, operator_terminal_exit } = body;
+      operator_rescope_issue_id, operator_terminal_exit, operator_release } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -1228,6 +1229,12 @@ async function relayAdvance(req, res, body) {
       !OPERATOR_SECRET_DISABLED &&
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const explicitHumanReviewReleaseRequested = issue.status === "Human Review" &&
+      operator_release === true && typeof reason === "string" && reason.trim() !== "";
+    const explicitHumanReviewRelease = explicitHumanReviewReleaseRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
     if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
         OPERATOR_SECRET_DISABLED) {
       await client.query("ROLLBACK");
@@ -1235,6 +1242,15 @@ async function relayAdvance(req, res, body) {
       res.end(JSON.stringify({
         error: "terminal_stage_operator_secret_conflict",
         message: "operator terminal exits are disabled because relay secrets are identical"
+      }));
+      return;
+    }
+    if (explicitHumanReviewReleaseRequested && !explicitHumanReviewRelease) {
+      await client.query("ROLLBACK");
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_operator_secret_conflict",
+        message: "operator human review releases require a valid operator secret"
       }));
       return;
     }
@@ -1262,7 +1278,13 @@ async function relayAdvance(req, res, body) {
     const cicdReturn = isCicdReturn(issue.status, to_stage, reason) &&
       !issue.metadata?.cicd_return_consumed_at;
     let cicdReturnCapBypass = false;
-    const releaseAt = issue.metadata?.parked_release_at ||
+    if (explicitHumanReviewRelease) {
+      issue.metadata = { ...(issue.metadata || {}),
+        human_review_release_at: new Date().toISOString(),
+        human_review_release_reason: reason.trim() };
+    }
+    const releaseAt = issue.metadata?.human_review_release_at ||
+      issue.metadata?.parked_release_at ||
       issue.metadata?.retry_escalation_at || null;
     if (issue.status === to_stage && !retryEscalation) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
@@ -1749,14 +1771,19 @@ async function relayAdvance(req, res, body) {
     const result = await client.query(
       `UPDATE "issue"
        SET status = $1,
-           metadata = CASE WHEN $3 THEN
-             jsonb_set(COALESCE(metadata, '{}'::jsonb) - 'parked_release_once',
-                       '{parked_release_at}', to_jsonb(NOW()), true)
+           metadata = CASE
+             WHEN $3 THEN jsonb_set(COALESCE(metadata, '{}'::jsonb) - 'parked_release_once',
+                                    '{parked_release_at}', to_jsonb(NOW()), true)
+             WHEN $4 THEN COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+               'human_review_release_at', $5::timestamptz,
+               'human_review_release_reason', $6::text)
              ELSE metadata END,
            updated_at = NOW()
        WHERE id = $2
        RETURNING id, status`,
-      [to_stage, issue_id, parkedRelease || parkedEvidenceQcRelease]
+      [to_stage, issue_id, parkedRelease || parkedEvidenceQcRelease,
+        explicitHumanReviewRelease, issue.metadata?.human_review_release_at || null,
+        explicitHumanReviewRelease ? reason.trim() : null]
     );
     if (parkedRelease || parkedEvidenceQcRelease) {
       console.warn(JSON.stringify({ event: "parked_release_consumed",
