@@ -1519,7 +1519,7 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
         SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}'
           FROM generate_series(1, 7)`, [agentId, issueId, workspaceId]);
       const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true,
-        reason: 'reopen verified PASS', current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+        reason: 'reopen verified PASS' }, { 'x-relay-operator-secret': 'test-operator-secret' });
       assert.equal(res.status, 200);
       assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'In Review');
       const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log
@@ -1770,6 +1770,7 @@ test('terminal exits preserve the configured archiver path and require an authen
   assert.match(source, /x-relay-operator-secret/);
   assert.match(source, /reason\.trim\(\) !== ""/);
   assert.match(source, /terminal_stage_operator_marker_required/);
+  assert.match(source, /!rejectedPassTerminalExit &&\s+!explicitTerminalExit/);
   assert.match(source, /terminal_exit: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
   assert.match(source, /parked_audit/);
   assert.match(source, /terminalExit: explicitTerminalExit/);
