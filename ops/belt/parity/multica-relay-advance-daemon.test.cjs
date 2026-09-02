@@ -11,13 +11,13 @@ const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?ss
 
 test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async (t) => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  const start = source.indexOf('`SELECT i.id AS issue_id');
+  const start = source.indexOf('`WITH stranded AS (');
   const end = source.indexOf('`', start + 1);
   assert.ok(start >= 0 && end > start, 'requeue candidate SQL must be present');
   const sql = source.slice(start + 1, end);
   assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
   assert.match(sql, /LIMIT \$1::int/);
-  const params = [3, ['Queue', 'In Progress', 'Spec', 'In Review'], 120];
+  const params = [3, ['Queue', 'In Progress', 'Spec', 'In Review'], 120, 2, 6];
   const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
   try {
     await client.connect();
@@ -146,13 +146,20 @@ function strandedHarness(fixtures) {
   const queries = [];
   const relayPosts = [];
   let consumedClosedRow = false;
+  const dispatchedIssueIds = new Set();
   const client = { query: async (sql, values = []) => {
     queries.push({ sql, values });
-    if (sql.includes('FROM issue i') && sql.includes('LIMIT $1')) {
-      return { rows: fixtures.filter((row) => row.eligible !== false &&
-        !(row.consume_after_record && consumedClosedRow))
+    if (sql.includes('WITH stranded AS') && sql.includes('LIMIT $1')) {
+      const eligible = fixtures.filter((row) => row.eligible !== false &&
+        !(row.consume_after_record && consumedClosedRow) && !dispatchedIssueIds.has(row.issue_id));
+      const exhausted = eligible.filter((row) => (row.stage_history_count ?? row.history_count ?? 1) >= values[3] ||
+        (row.lifetime_history_count ?? row.history_count ?? 1) >= values[4])
+        .map((row) => ({ ...row, exhaustion_reason: (row.stage_history_count ?? row.history_count ?? 1) >= values[3]
+          ? 'stage_cycle_limit' : 'lifetime_task_limit' }));
+      const admitted = eligible.filter((row) => !exhausted.some((exhaustedRow) => exhaustedRow.issue_id === row.issue_id))
         .sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at))
-        .slice(0, values[0]) };
+        .slice(0, values[0]);
+      return { rows: admitted.concat(exhausted) };
     }
     if (sql.includes('COALESCE(a.max_concurrent_tasks')) {
       return { rows: fixtures.map((row) => ({ agent_id: row.agent_id, cap: 1, in_flight: 0 })) };
@@ -173,6 +180,7 @@ function strandedHarness(fixtures) {
     if (sql.includes('FROM agent_task_queue') && sql.includes('FOR UPDATE')) return { rows: [] };
     if (sql.includes('count(*)::int AS n')) return { rows: [{ n: fixtures[0].history_count ?? 1 }] };
     if (sql.includes('INSERT INTO agent_task_queue')) {
+      dispatchedIssueIds.add(values[1]);
       return { rows: [{ id: '623e4567-e89b-42d3-a456-426614174000' }] };
     }
     if (sql.includes('UPDATE relay_run_log') && sql.includes("requeue_task_id")) {
@@ -398,8 +406,49 @@ test('five eligible fixtures dispatch exactly the three oldest globally', async 
   assert.deepEqual(dispatched.map(({ values }) => values[1]), fixtures.slice(1, 2)
     .concat(fixtures.slice(3, 5)).map((row) => row.issue_id));
   const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
-  assert.match(candidateQuery.sql, /ORDER BY i\.created_at ASC\s+LIMIT \$1/);
+  assert.match(candidateQuery.sql, /ORDER BY issue_created_at ASC\s+LIMIT \$1/);
   assert.doesNotMatch(candidateQuery.sql, /ROW_NUMBER\(\) OVER/);
+});
+
+test('over-limit rows escalate outside the batch while three admissible rows dispatch', async () => {
+  const overLimit = [1, 2, 3].map((number) => strandedFixture({
+    number, issue_id: `223e4567-e89b-42d3-a456-42661417410${number}`,
+    agent_id: `423e4567-e89b-42d3-a456-42661417410${number}`,
+    issue_created_at: `2026-09-01T00:0${number}:00Z`, lifetime_history_count: 6
+  }));
+  const admissible = [4, 5, 6].map((number) => strandedFixture({
+    number, issue_id: `223e4567-e89b-42d3-a456-42661417410${number}`,
+    agent_id: `423e4567-e89b-42d3-a456-42661417410${number}`,
+    issue_created_at: `2026-09-01T00:0${number}:00Z`
+  }));
+  const harness = strandedHarness(overLimit.concat(admissible));
+  await harness.run();
+  const dispatched = harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.deepEqual(dispatched.map(({ values }) => values[1]), admissible.map(({ issue_id }) => issue_id));
+  assert.deepEqual(harness.relayPosts.map(({ issue_id, reason }) => ({ issue_id, reason })),
+    overLimit.map(({ issue_id }) => ({ issue_id, reason: 'retry_escalation:lifetime_task_limit' })));
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /\$\{budgetCountPredicate\('stage_history'\)\}/);
+  assert.match(source, /\$\{budgetCountPredicate\('lifetime_history'\)\}/);
+});
+
+test('over-limit rows cannot starve the next requeue sweep', async () => {
+  const overLimit = [1, 2, 3].map((number) => strandedFixture({
+    number, issue_id: `223e4567-e89b-42d3-a456-42661417420${number}`,
+    agent_id: `423e4567-e89b-42d3-a456-42661417420${number}`,
+    issue_created_at: `2026-09-01T00:0${number}:00Z`, lifetime_history_count: 6
+  }));
+  const admissible = [4, 5, 6, 7, 8, 9].map((number) => strandedFixture({
+    number, issue_id: `223e4567-e89b-42d3-a456-42661417420${number}`,
+    agent_id: `423e4567-e89b-42d3-a456-42661417420${number}`,
+    issue_created_at: `2026-09-01T00:${String(number).padStart(2, '0')}:00Z`
+  }));
+  const harness = strandedHarness(overLimit.concat(admissible));
+  await harness.run();
+  await harness.run();
+  const dispatched = harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.deepEqual(dispatched.map(({ values }) => values[1]), admissible.map(({ issue_id }) => issue_id));
+  assert.equal(harness.relayPosts.length, 6, 'each exhausted row remains on the existing respec path');
 });
 
 const QC_ROW = {
@@ -538,8 +587,8 @@ test('retry ceilings leave the daemon through relay authority instead of direct 
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
     source.indexOf('function diagnosisText'));
-  assert.match(requeue, /requestRetryEscalation\(row, cycle\.reason\)/);
-  assert.match(requeue, /requestRetryEscalation\(row, lifetime\.reason\)/);
+  assert.match(requeue, /requestRetryEscalation\(row, cycle\.reason, postRelay\)/);
+  assert.match(requeue, /requestRetryEscalation\(row, lifetime\.reason, postRelay\)/);
   assert.match(requeue,
     /row\.metadata\?\.parked_release_at \|\|\s+row\.metadata\?\.retry_escalation_at \|\| null/);
   assert.doesNotMatch(requeue, /applyDisposition\(client, row, cycle\.disposition/);

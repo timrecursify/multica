@@ -874,7 +874,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
   const client = await dbPool.connect();
   try {
     const candidates = await client.query(
-      `SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage,
+      `WITH stranded AS (
+        SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage,
               i.created_at AS issue_created_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason, t.created_at AS dead_task_created_at,
@@ -978,12 +979,53 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           -- of work, even after the parent has shipped and the child is still
           -- open for disposition.
           AND i.parent_issue_id IS NULL
-        ORDER BY i.created_at ASC
-        LIMIT $1::int`,
-      [REQUEUE_BATCH, REQUEUE_STAGES, QUEUED_TASK_TTL_MINUTES]
+      ), budgeted AS (
+        SELECT stranded.*,
+          (SELECT count(*)::int FROM agent_task_queue stage_history
+            WHERE stage_history.issue_id = stranded.issue_id
+              AND stage_history.context->>'to_stage' = stranded.stage
+              AND stage_history.trigger_comment_id IS NULL
+              AND COALESCE(stage_history.context->>'kind', '') <> 'retry_escalation'
+              ${budgetCountPredicate('stage_history')}
+              AND (COALESCE(NULLIF(stranded.metadata->>'parked_release_at', ''),
+                            NULLIF(stranded.metadata->>'retry_escalation_at', '')) IS NULL
+                OR stage_history.created_at >= COALESCE(
+                  NULLIF(stranded.metadata->>'parked_release_at', ''),
+                  NULLIF(stranded.metadata->>'retry_escalation_at', ''))::timestamptz)
+          ) AS stage_task_count,
+          (SELECT count(*)::int FROM agent_task_queue lifetime_history
+            WHERE lifetime_history.issue_id = stranded.issue_id
+              AND lifetime_history.trigger_comment_id IS NULL
+              ${budgetCountPredicate('lifetime_history')}
+              AND (COALESCE(NULLIF(stranded.metadata->>'parked_release_at', ''),
+                            NULLIF(stranded.metadata->>'retry_escalation_at', '')) IS NULL
+                OR lifetime_history.created_at >= COALESCE(
+                  NULLIF(stranded.metadata->>'parked_release_at', ''),
+                  NULLIF(stranded.metadata->>'retry_escalation_at', ''))::timestamptz)
+          ) AS lifetime_task_count
+        FROM stranded
+      )
+      (SELECT budgeted.*, NULL::text AS exhaustion_reason
+         FROM budgeted
+        WHERE stage_task_count < $4::int AND lifetime_task_count < $5::int
+        ORDER BY issue_created_at ASC
+        LIMIT $1::int)
+      UNION ALL
+      (SELECT budgeted.*, CASE WHEN stage_task_count >= $4::int
+            THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
+         FROM budgeted
+        WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int)`,
+      [REQUEUE_BATCH, REQUEUE_STAGES, QUEUED_TASK_TTL_MINUTES,
+        STAGE_CYCLE_LIMIT, LIFETIME_TASK_LIMIT]
     );
 
-    if (candidates.rows.length === 0) return;
+    const exhausted = candidates.rows.filter((row) => row.exhaustion_reason);
+    for (const row of exhausted) {
+      const escalation = await requestRetryEscalation(row, row.exhaustion_reason, postRelay);
+      console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${row.exhaustion_reason}; relay=${escalation.status}`);
+    }
+    const admissible = candidates.rows.filter((row) => !row.exhaustion_reason);
+    if (admissible.length === 0) return;
 
     // Backpressure, scoped per owning agent. Each agent carries its own
     // authoritative concurrency ceiling in `agent.max_concurrent_tasks` (build
@@ -1023,14 +1065,14 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
          LEFT JOIN agent_task_queue q ON q.agent_id = a.id
         WHERE a.id = ANY($2::uuid[])
         GROUP BY a.id, a.max_concurrent_tasks`,
-      [MAX_CONCURRENT, [...new Set(candidates.rows.map((c) => c.agent_id))]]
+      [MAX_CONCURRENT, [...new Set(admissible.map((c) => c.agent_id))]]
     );
     const slotsByAgent = new Map(loadRows.map((r) => [r.agent_id, r.cap - r.in_flight]));
     const loadByAgent = new Map(loadRows.map((r) => [r.agent_id, r]));
 
     const admitted = [];
     const heldByAgent = new Map();
-    for (const row of candidates.rows) {
+    for (const row of admissible) {
       const free = slotsByAgent.get(row.agent_id) ?? 0;
       if (free > 0) {
         admitted.push(row);
@@ -1171,7 +1213,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
         const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
         if (!cycle.ok) {
           await client.query('ROLLBACK');
-          const escalation = await requestRetryEscalation(row, cycle.reason);
+          const escalation = await requestRetryEscalation(row, cycle.reason, postRelay);
           console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${cycle.reason}; relay=${escalation.status}`);
           continue;
         }
@@ -1186,7 +1228,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
         const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
         if (!lifetime.ok) {
           await client.query('ROLLBACK');
-          const escalation = await requestRetryEscalation(row, lifetime.reason);
+          const escalation = await requestRetryEscalation(row, lifetime.reason, postRelay);
           console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${lifetime.reason}; relay=${escalation.status}`);
           continue;
         }
