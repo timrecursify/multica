@@ -684,7 +684,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
       ORDER BY rrl.created_at ASC
-      LIMIT 20`;
+      LIMIT 100`;
 
     const result = await client.query(query, ['pending']);
 
@@ -747,6 +747,15 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
             logger.log(`${LOG_PREFIX} QC evidence mismatch: issue=${row.issue_id}, ` +
               `relay=${row.log_id}, attempt=${state?.mismatch_count || 'unknown'}, ` +
               `status=${state?.status || 'unknown'}`);
+          }
+          if (['completed_sol_low_pass_required', 'qc_attempt_binding_required'].includes(qcAdvance.reason)) {
+            // A finished QC task with no bound PASS cannot advance; close its ledger row.
+            // The reconciler dispatches the next QC attempt with its own row.
+            await markRelayLogFailedById(client, row.log_id);
+          }
+          if (qcAdvance.reason === 'manual_gated_stage') {
+            // The CI/CD worker owns this exit; a completed desk task here is a ledger entry, not a trigger.
+            await markRelayLogCompletedById(client, row.log_id);
           }
           logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
           continue;
@@ -858,7 +867,8 @@ async function recoveryAdvanceTasks() {
         }
 
         const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
-          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id };
+          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+          evidence: { registeredIssue: row.issue_id, selectedWorkspace: row.workspace_id || true } };
         const response = await postToRelay(payload);
 
         if (response.ok) {
@@ -1001,7 +1011,8 @@ async function findAndAdvanceRegistered() {
 
     for (const row of result.rows) {
       try {
-        const payload = { issue_id: row.id, to_stage: 'Spec', agent_token: RELAY_AGENT_SECRET };
+        const payload = { issue_id: row.id, to_stage: 'Spec', agent_token: RELAY_AGENT_SECRET,
+          evidence: { registeredIssue: row.id, selectedWorkspace: row.workspace_id || true } };
         const response = await postToRelay(payload);
 
         if (response.ok) {
