@@ -9,15 +9,12 @@
 const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
-const { deployed } = require('./cicd-deploy-evidence.cjs');
 const { currentStrictPass } = require('./qc-strict-evidence.cjs');
-let deployEvidence = deployed;
-let deployBelt = function deployBeltScript(sourceCommit) {
-  execFileSync('bash', [require('path').join(__dirname, 'deploy.sh'), '--apply',
-    '--source-commit', sourceCommit], { encoding: 'utf8', timeout: 900000, maxBuffer: 8e6 });
-};
+const { evaluate } = require('./transition-policy.cjs');
+const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/home/newadmin/gsp-multica-runtime/receipts';
 let pool;
 let relayToken;
+let readReceipt = (sha) => JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/belt-${sha}.json`, 'utf8'));
 
 function initializeRuntime() {
   const { Pool } = require('pg');
@@ -26,7 +23,6 @@ function initializeRuntime() {
   relayToken = env.split('\n').find(l => l.startsWith('RELAY_AGENT_SECRET=')).split('=')[1];
   pool = new Pool({ connectionString: env.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });
 }
-const BOT = 'b8ecc1c4-d58c-4233-a669-7ede7060531c';
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
 const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
@@ -58,49 +54,39 @@ let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reaso
   });
 };
 
-// Each relay hop enqueues a task for the stage owner. This stage is that task's
-// consumer, so closing it is what finishing the stage means.
-async function closePendingTask(issueId) {
-  await pool.query(
-    `UPDATE agent_task_queue SET status='completed'
-      WHERE issue_id=$1 AND status IN ('queued','dispatched')
-        AND context->>'to_stage'='CI/CD & Deploy'`, [issueId]);
-}
-
 async function latestVerdict(issueId) {
   return currentStrictPass(pool, issueId);
 }
 
-async function routeFinishedPR(issue, note) {
+function receiptFor(sha) {
+  try {
+    const receipt = readReceipt(sha);
+    return receipt?.source_sha === sha && receipt.health === 'ok' && typeof receipt.release === 'string'
+      ? receipt : null;
+  } catch (_) { return null; }
+}
+
+async function humanReview(issue, reason) {
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Human Review', actor: 'system',
+    evidence: { namedBlocker: reason } });
+  if (!verdict.ok) throw new Error(`transition policy rejected Human Review: ${verdict.code}`);
+  await relay(issue.id, 'Human Review', null, reason);
+  log(`HUMAN REVIEW #${issue.number} — ${reason}`);
+}
+
+async function routeFinishedPR(issue, note, mergedSha) {
   const latest = await latestVerdict(issue.id);
-  if (!latest || !latest.work_product_md5) {
-    await returnIssueToBuild(issue, `${note}; current QC lacks strict SHA-bound evidence`);
+  const receipt = receiptFor(mergedSha);
+  if (!latest || !latest.work_product_md5 || latest.bound_sha !== mergedSha || !receipt) {
+    await humanReview(issue, `${note}; exact-SHA release receipt at reviewed SHA is required`);
     return;
   }
-  await relay(issue.id, 'Done', latest.work_product_md5);
-  await closePendingTask(issue.id);
-  log(`DONE #${issue.number} — ${note}`);
-}
-
-async function park(issue, reason, prState = null, prUrl = null) {
-  await relay(issue.id, 'Parked', null, reason, { cicd_worker: {
-    reason, pr_state: prState, pr_url: prUrl, checked_at: new Date().toISOString()
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Done', actor: 'system', evidence: {
+    ciSuccess: true, mergeDeployReceipt: receipt, reviewedSha: latest.bound_sha, qualifyingPass: true
   } });
-  await closePendingTask(issue.id);
-  log(`PARKED #${issue.number} — ${reason}`);
-}
-
-async function deployPending(issue, reason) {
-  // Stored on issue.metadata so a daemon restart cannot reset the ceiling.
-  const saved = await pool.query(
-    `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
-       'cicd_deploy_wait_polls', (COALESCE(metadata->>'cicd_deploy_wait_polls', '0')::int + 1)::text), updated_at=NOW()
-     WHERE id=$1 RETURNING metadata->>'cicd_deploy_wait_polls' AS count`, [issue.id]);
-  const count = Number(saved.rows[0]?.count || 0);
-  if (count >= CI_FAILURE_POLLS) return park(issue, `${reason}; deploy evidence retry ceiling ${CI_FAILURE_POLLS}`);
-  await pool.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
-    VALUES ($1, $2, 'agent', $3, $4, 'comment')`, [issue.id, issue.workspace_id, BOT, `${reason}; retry ${count}/${CI_FAILURE_POLLS}`]);
-  log(`HOLD #${issue.number} ${reason}; retry ${count}/${CI_FAILURE_POLLS}`);
+  if (!verdict.ok) throw new Error(`transition policy rejected Done: ${verdict.code}`);
+  await relay(issue.id, 'Done', latest.work_product_md5);
+  log(`DONE #${issue.number} — ${note}`);
 }
 
 async function escalateCi(issue, pr, ci) {
@@ -108,8 +94,10 @@ async function escalateCi(issue, pr, ci) {
 }
 
 async function returnIssueToBuild(issue, reason) {
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'In Progress', actor: 'system',
+    evidence: { ciFailureOrAbsent: true, mergeConflictEvidence: reason } });
+  if (!verdict.ok) throw new Error(`transition policy rejected In Progress: ${verdict.code}`);
   await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${reason}`);
-  await closePendingTask(issue.id);
   log(`RETURN #${issue.number} ${reason}`);
 }
 
@@ -152,24 +140,6 @@ function hasBarePRReference(work) {
   return /\bPR\s*#\d+/i.test(work || '');
 }
 
-function beltPaths(pr) {
-  if (pr.repo !== 'timrecursify/multica') return false;
-  const files = JSON.parse(gh(['api', `repos/${pr.repo}/pulls/${pr.num}/files?per_page=100`]));
-  return files.some(file => file.filename.startsWith('ops/belt/'));
-}
-
-function deployMergedBeltPRs(states) {
-  for (const state of states) {
-    if (!beltPaths(state.pr)) continue;
-    const sourceCommit = state.info.mergeCommit?.oid;
-    if (!/^[0-9a-f]{40}$/.test(sourceCommit || '')) {
-      throw new Error(`merged belt PR ${state.pr.repo}#${state.pr.num} lacks a full merge commit SHA`);
-    }
-    deployBelt(sourceCommit);
-    log(`DEPLOYED ${state.pr.repo}#${state.pr.num} via ops/belt/deploy.sh`);
-  }
-}
-
 // Green means every completed run on THIS head SHA succeeded. A run list
 // filtered by status alone can return a success from an older SHA of the same
 // branch, which is how a red PR reads as green.
@@ -189,46 +159,6 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
   } catch (e) { return 'unknown'; }
 }
 
-
-// The reviewer gate refuses to merge without a MERGE-INTENT comment bound to the
-// head SHA under review, and nothing mirrored Multica's QC into GitHub, so eight
-// PPP pull requests sat green-blocked with a PASS recorded here and no evidence
-// there. Mirroring is only honest when it asserts what Multica actually checked:
-// qc_verdict stores work_product_md5, NOT a git SHA, so a PASS alone proves
-// nothing about a given head. A verdict is mirrored only when one of the QC
-// worker's own comments cites the pull request's CURRENT head SHA. If the branch
-// moved after review, that match fails and nothing is posted -- the stale-verdict
-// case, where a re-push outruns QC and a merge would ship unreviewed code.
-async function mirrorVerdictToPR(issue, pr, headSha) {
-  const v = await pool.query(
-    `SELECT verdict FROM qc_verdict WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1`,
-    [issue.id]);
-  if (!v.rows.length || v.rows[0].verdict !== 'PASS') return false;
-
-  const bound = await pool.query(
-    `SELECT 1 FROM comment WHERE issue_id=$1 AND content LIKE '%' || $2 || '%' LIMIT 1`,
-    [issue.id, headSha]);
-  if (!bound.rows.length) {
-    log(`NO-MIRROR #${issue.number} ${pr.repo}#${pr.num}: PASS not bound to head ${headSha.slice(0,12)}`);
-    return false;
-  }
-
-  const existing = gh(['pr', 'view', pr.num, '-R', pr.repo, '--json', 'comments',
-                       '-q', '.comments[].body']);
-  if (existing.includes('MERGE-INTENT:')) return true;
-
-  const body = [
-    '## QC VERDICT: PASS',
-    '',
-    `Mirrored from Multica issue #${issue.number}. Bound head SHA: \`${headSha}\``,
-    'This verdict VOIDS on any new push.',
-    '',
-    `MERGE-INTENT: multica-cicd-worker MULT-${issue.number}`
-  ].join('\n');
-  gh(['pr', 'comment', pr.num, '-R', pr.repo, '--body', body]);
-  log(`MIRRORED #${issue.number} -> ${pr.repo}#${pr.num} (head ${headSha.slice(0,12)})`);
-  return true;
-}
 
 async function sweep() {
   const { rows } = await pool.query(
@@ -260,7 +190,7 @@ async function sweep() {
         }
       }
       if (!prs.length) {
-        await park(issue, hasBarePR ? 'ambiguous PR reference, no repository' : 'no PR referenced');
+        await humanReview(issue, hasBarePR ? 'ambiguous PR reference, no repository' : 'no PR referenced');
         continue;
       }
 
@@ -273,20 +203,17 @@ async function sweep() {
       const closed = states.filter(s2 => s2.info.state === 'CLOSED');
       if (closed.length) {
         const first = closed[0];
-        await park(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '),
-          first.info.state, `https://github.com/${first.pr.repo}/pull/${first.pr.num}`);
+        await humanReview(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '));
         continue;
       }
       const openStates = states.filter(s2 => s2.info.state !== 'MERGED');
       if (!openStates.length) {
-        let missing = states.filter(s2 => !deployEvidence({ ...s2.pr, ...s2.info }));
-        deployMergedBeltPRs(missing);
-        missing = states.filter(s2 => !deployEvidence({ ...s2.pr, ...s2.info }));
-        if (!missing.length) { await routeFinishedPR(issue, 'all referenced PRs merged and deployed'); continue; }
-        const reason = `deploy evidence pending for ${missing.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', ')}`;
-        const exit = await pool.query(`SELECT 1 FROM relay_stage_config WHERE workspace_id=$1 AND stage_name='Deploy pending'`, [issue.workspace_id]);
-        if (exit.rows.length) { await relay(issue.id, 'Deploy pending', null, reason); await closePendingTask(issue.id); }
-        else await deployPending(issue, reason);
+        const mergedSha = states[0].info.mergeCommit?.oid;
+        if (states.length !== 1 || !/^[0-9a-f]{40}$/.test(mergedSha || '')) {
+          await humanReview(issue, 'exactly one merged PR with a full merge SHA is required');
+          continue;
+        }
+        await routeFinishedPR(issue, 'merged PR has exact-SHA release receipt', mergedSha);
         continue;
       }
       if (openStates.length > 1) {
@@ -314,20 +241,7 @@ async function sweep() {
         continue;
       }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
-      try { await mirrorVerdictToPR(issue, pr, info.headRefOid); }
-      catch (e) { log(`MIRROR-ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0,140)}`); }
-
-      try {
-        gh(['pr', 'merge', pr.num, '-R', pr.repo, '--squash', '--delete-branch']);
-        // Closing is intentionally deferred to the next poll. If relay or task
-        // cleanup fails then, the PR is already observed as MERGED and this
-        // worker cannot issue a second merge command.
-        log(`MERGED #${issue.number} ${pr.repo}#${pr.num}; close on next poll`);
-      } catch (e) {
-        // A required check the fleet must not weaken (the reviewer gate) blocks
-        // the merge. That is the gate doing its job; report and move on.
-        log(`BLOCKED #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n').find(l => l.trim()) || e.message}`.slice(0, 300));
-      }
+      log(`HOLD #${issue.number} ${pr.repo}#${pr.num} CI is green; merge is operator-owned`);
     } catch (e) {
       log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
     }
@@ -350,9 +264,8 @@ function setTestDependencies(dependencies) {
   if (dependencies.pool) pool = dependencies.pool;
   if (dependencies.relay) relay = dependencies.relay;
   if (dependencies.gh) gh = dependencies.gh;
-  if (dependencies.deployed) deployEvidence = dependencies.deployed;
-  if (dependencies.deployBelt) deployBelt = dependencies.deployBelt;
+  if (dependencies.readReceipt) readReceipt = dependencies.readReceipt;
 }
 
-module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, park,
-  routeFinishedPR, setTestDependencies, sweep, deployPending, deployMergedBeltPRs };
+module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
+  routeFinishedPR, receiptFor, setTestDependencies, sweep };
