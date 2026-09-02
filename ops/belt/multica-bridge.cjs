@@ -328,9 +328,12 @@ async function issueImplementationArtifact(client, issueId) {
 }
 
 async function noArtifactRescopeAdmission(client, issue, toStage, operatorIssueId) {
-  if (toStage !== "Spec" || !["In Review", "Human Review"].includes(issue.status)) return false;
-  if (!UUID_RE.test(String(operatorIssueId || "")) ||
-      String(operatorIssueId).toLowerCase() !== String(issue.id).toLowerCase()) return false;
+  if (!["In Review", "Human Review"].includes(issue.status)) return false;
+  const qcReturn = issue.status === "In Review" && toStage === "In Progress" &&
+    operatorIssueId == null;
+  const operatorReturn = toStage === "Spec" && UUID_RE.test(String(operatorIssueId || "")) &&
+    String(operatorIssueId).toLowerCase() === String(issue.id).toLowerCase();
+  if (!qcReturn && !operatorReturn) return false;
   if (issue.metadata?.no_artifact_rescope_consumed_at) return false;
   const task = await latestCompletedSolLowQcTask(client, issue.id, issue.workspace_id);
   if (!task || task.status !== "completed" || !isNoArtifactQcBlock(taskResultText(task.result))) return false;
@@ -1181,6 +1184,9 @@ async function relayAdvance(req, res, body) {
     const noArtifactRescope = await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
+    if (noArtifactRescope && to_stage === "In Progress") {
+      to_stage = "Spec";
+    }
     if (issue.status === "In Review" && to_stage === "Human Review" &&
         await latestQcNoArtifactSignal(client, issue)) {
       await client.query("ROLLBACK");
@@ -1198,7 +1204,8 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
-    let retryEscalation = await verifiedRetryEscalation(client, issue, body);
+    let retryEscalation = noArtifactRescope ? null :
+      await verifiedRetryEscalation(client, issue, body);
     if (retryEscalation === false) {
       await client.query("ROLLBACK");
       console.warn(JSON.stringify({ event: "relay_advance_rejected",
@@ -1342,7 +1349,7 @@ async function relayAdvance(req, res, body) {
     const expectedStage = transitionResult.rows[0]?.next_stage;
     const altStages = transitionResult.rows[0]?.alt_next_stages || [];
     const allowedStages = [expectedStage].concat(altStages).filter(Boolean);
-    if (issue.status === "In Review" && to_stage === "Spec") {
+    if (issue.status === "In Review" && to_stage === "Spec" && !noArtifactRescope) {
       const decision = qcBounceDecision(await latestQcVerdict(client, issue_id), expectedStage);
       if (decision.action === "hold") {
         await client.query("ROLLBACK");

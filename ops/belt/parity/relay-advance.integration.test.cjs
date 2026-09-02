@@ -295,7 +295,7 @@ test('PASS bounce deploys or holds, and never selects Spec', () => {
   assert.deepEqual(qcBounceDecision({ verdict: 'FAIL', work_product_md5: MD5 },
     'CI/CD & Deploy'), { action: 'escalate' });
   const source = fs.readFileSync(require.resolve('../multica-bridge.cjs'), 'utf8');
-  const guard = source.slice(source.indexOf('if (issue.status === "In Review" && to_stage === "Spec")'),
+  const guard = source.slice(source.indexOf('if (issue.status === "In Review" && to_stage === "Spec"'),
     source.indexOf('// Parked and Rejected are terminal'));
   assert.match(guard, /qc_pass_rescope_suppressed/);
   assert.match(guard, /to_stage = decision\.toStage/);
