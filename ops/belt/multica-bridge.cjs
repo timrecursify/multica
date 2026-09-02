@@ -1245,7 +1245,7 @@ async function relayAdvance(req, res, body) {
       actor: relayActor(req, issue.status, requestedStage), evidence: transitionEvidence(body) });
     if (!policy.ok) {
       await client.query("ROLLBACK");
-      console.log(`[relay/advance] denied #${issue.number} ${issue.status} -> ${requestedStage} actor=${relayActor(req, issue.status, requestedStage)} code=${policy.code} evidence=${Object.keys(transitionEvidence(body)).join(",") || "-"}`);
+      console.log(`[relay/advance] denied #${issue.number} ${issue.status} -> ${requestedStage} actor=${relayActor(req, issue.status, requestedStage)} code=${policy.code} evidence=${Object.keys(transitionEvidence(body)).join(",") || "-"} reason=${JSON.stringify(String(body.reason || "").slice(0, 80))}`);
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: policy.code }));
       return;
