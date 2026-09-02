@@ -66,6 +66,7 @@ function settingsFor(options = {}) {
     maxCreatePerAgent: positive(options.maxCreatePerAgent || process.env.RECONCILE_MAX_CREATE_PER_AGENT, 3),
     lifetimeTaskLimit: positive(options.lifetimeTaskLimit || process.env.RECONCILE_LIFETIME_TASK_LIMIT, 6),
     defaultMaxAttempts: positive(options.defaultMaxAttempts || process.env.RECONCILE_DEFAULT_MAX_ATTEMPTS, 2),
+    issueCooldownMinutes: positive(options.issueCooldownMinutes || process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
     budget: options.budget || { created: 0, byAgent: new Map() }
   };
 }
@@ -123,6 +124,16 @@ async function reconcileIssue(client, issueId, options = {}) {
     if (current.length === 1) {
       await client.query("COMMIT");
       return { action: "already_live", taskId: current[0].id };
+    }
+    // Burn guard: never re-dispatch the same stage of one issue inside the cooldown window (GSP-1826).
+    const recent = (await client.query(
+      `SELECT id FROM agent_task_queue WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
+         AND created_at > NOW() - ($3::int * interval '1 minute') ORDER BY created_at DESC LIMIT 1`,
+      [issue.id, issue.status, options.issueCooldownMinutes]
+    )).rows[0];
+    if (recent) {
+      await client.query("COMMIT");
+      return { action: "skipped", reason: "issue_cooldown", taskId: recent.id };
     }
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
     const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
