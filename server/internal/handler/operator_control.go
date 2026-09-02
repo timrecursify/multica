@@ -136,17 +136,48 @@ func (h *Handler) UpdateWorkspaceOperatorAgent(w http.ResponseWriter, r *http.Re
 		writeErrorCode(w, http.StatusBadRequest, "invalid_input", "invalid request body: "+err.Error())
 		return
 	}
-
-	updated := target
-	apply := func(params db.UpdateAgentParams) {
-		params.ID = target.ID
-		updated, err = h.Queries.UpdateAgent(r.Context(), params)
-	}
+	// Validate the complete request before opening a write transaction. This
+	// prevents a valid early field from being persisted when a later field is
+	// malformed or unsupported.
 	if req.MaxConcurrentTasks != nil {
 		if err := validateAgentMaxConcurrentTasks(*req.MaxConcurrentTasks); err != nil {
 			writeErrorCode(w, http.StatusBadRequest, "invalid_input", err.Error())
 			return
 		}
+	}
+	provider := ""
+	if req.ThinkingLevel != nil && *req.ThinkingLevel != "" || req.ServiceTier != nil && *req.ServiceTier != "" {
+		var providerOK bool
+		provider, providerOK = h.resolveAgentProvider(r, workspaceID, target.RuntimeID)
+		if !providerOK {
+			writeError(w, http.StatusInternalServerError, "failed to resolve runtime provider")
+			return
+		}
+	}
+	if req.ThinkingLevel != nil && *req.ThinkingLevel != "" && !agent.IsKnownThinkingValue(provider, *req.ThinkingLevel) {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_input",
+			"thinking_level "+*req.ThinkingLevel+" is not recognised for runtime provider "+provider)
+		return
+	}
+	if req.ServiceTier != nil && *req.ServiceTier != "" && !agent.IsKnownServiceTier(provider, *req.ServiceTier) {
+		writeErrorCode(w, http.StatusBadRequest, "invalid_input",
+			"service_tier "+*req.ServiceTier+" is not recognised for runtime provider "+provider)
+		return
+	}
+	tx, err := h.TxStarter.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to start agent update")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	queries := h.Queries.WithTx(tx)
+
+	updated := target
+	apply := func(params db.UpdateAgentParams) {
+		params.ID = target.ID
+		updated, err = queries.UpdateAgent(r.Context(), params)
+	}
+	if req.MaxConcurrentTasks != nil {
 		params := db.UpdateAgentParams{ID: target.ID}
 		params.MaxConcurrentTasks = pgtype.Int4{Int32: *req.MaxConcurrentTasks, Valid: true}
 		apply(params)
@@ -166,18 +197,8 @@ func (h *Handler) UpdateWorkspaceOperatorAgent(w http.ResponseWriter, r *http.Re
 	}
 	if req.ThinkingLevel != nil {
 		if *req.ThinkingLevel == "" {
-			updated, err = h.Queries.ClearAgentThinkingLevel(r.Context(), target.ID)
+			updated, err = queries.ClearAgentThinkingLevel(r.Context(), target.ID)
 		} else {
-			provider, ok := h.resolveAgentProvider(r, workspaceID, target.RuntimeID)
-			if !ok {
-				writeError(w, http.StatusInternalServerError, "failed to resolve runtime provider")
-				return
-			}
-			if !agent.IsKnownThinkingValue(provider, *req.ThinkingLevel) {
-				writeErrorCode(w, http.StatusBadRequest, "invalid_input",
-					"thinking_level "+*req.ThinkingLevel+" is not recognised for runtime provider "+provider)
-				return
-			}
 			params := db.UpdateAgentParams{ID: target.ID}
 			params.ThinkingLevel = pgtype.Text{String: *req.ThinkingLevel, Valid: true}
 			apply(params)
@@ -189,18 +210,8 @@ func (h *Handler) UpdateWorkspaceOperatorAgent(w http.ResponseWriter, r *http.Re
 	}
 	if req.ServiceTier != nil {
 		if *req.ServiceTier == "" {
-			updated, err = h.Queries.ClearAgentServiceTier(r.Context(), target.ID)
+			updated, err = queries.ClearAgentServiceTier(r.Context(), target.ID)
 		} else {
-			provider, ok := h.resolveAgentProvider(r, workspaceID, target.RuntimeID)
-			if !ok {
-				writeError(w, http.StatusInternalServerError, "failed to resolve runtime provider")
-				return
-			}
-			if !agent.IsKnownServiceTier(provider, *req.ServiceTier) {
-				writeErrorCode(w, http.StatusBadRequest, "invalid_input",
-					"service_tier "+*req.ServiceTier+" is not recognised for runtime provider "+provider)
-				return
-			}
 			params := db.UpdateAgentParams{ID: target.ID}
 			params.ServiceTier = pgtype.Text{String: *req.ServiceTier, Valid: true}
 			apply(params)
@@ -212,18 +223,22 @@ func (h *Handler) UpdateWorkspaceOperatorAgent(w http.ResponseWriter, r *http.Re
 	}
 	if req.Archived != nil {
 		if *req.Archived && !updated.ArchivedAt.Valid {
-			updated, err = h.Queries.ArchiveAgent(r.Context(), db.ArchiveAgentParams{ID: target.ID, ArchivedBy: target.OwnerID})
+			updated, err = queries.ArchiveAgent(r.Context(), db.ArchiveAgentParams{ID: target.ID, ArchivedBy: target.OwnerID})
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to archive agent")
 				return
 			}
 		} else if !*req.Archived && updated.ArchivedAt.Valid {
-			updated, err = h.Queries.RestoreAgent(r.Context(), target.ID)
+			updated, err = queries.RestoreAgent(r.Context(), target.ID)
 			if err != nil {
 				writeError(w, http.StatusInternalServerError, "failed to restore agent")
 				return
 			}
 		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to commit agent update")
+		return
 	}
 
 	writeJSON(w, http.StatusOK, operatorAgentViewOf(updated))
