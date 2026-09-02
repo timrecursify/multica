@@ -110,6 +110,7 @@ OUTCOME: FAILED
 
 - `ADVANCED`: you produced the stage's deliverable (spec, PR, verdict, deploy receipt).
 - `BLOCKED`: you could not, and name why. `human` means a person must decide or supply something; `sha` means no implementation commit or PR exists to act on; `ci` means checks are queued or red; `dependency` means another issue must reach Done first; `quota` means the provider refused.
+- A relay refusal (`409 evidence_missing`, `transition_denied`, `relay POST failed`) after you delivered the stage's work product is NOT a block. Do not call `sk multica advance`; the belt advances the stage from your task result. Report `OUTCOME: ADVANCED` and cite the work product (PR URL, comment id, SHA).
 - `NO_OP`: the deliverable already exists (already merged, already deployed). Say where.
 - `FAILED`: you stopped for any other reason.
 
