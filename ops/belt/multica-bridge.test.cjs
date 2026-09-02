@@ -1449,6 +1449,28 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(res.status, 409);
       assert.equal(JSON.parse(res.body).error, 'retry_escalation_source_task_required');
     });
+    await t.test('admits a PASS Rejected terminal exit with the bound MD5', async () => {
+      const issueId = 'abababab-abab-abab-abab-abababababab'; await insertIssue(issueId, 'Rejected');
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
+        VALUES ($1, $2, 'PASS', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true,
+        reason: 'reopen verified PASS', current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'In Review');
+    });
+    await t.test('refuses a Rejected terminal exit without the operator secret', async () => {
+      const issueId = 'acacacac-acac-acac-acac-acacacacacac'; await insertIssue(issueId, 'Rejected');
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true, reason: 'reopen' });
+      assert.equal(res.status, 409);
+    });
+    await t.test('refuses a Rejected terminal exit when the latest verdict is FAIL', async () => {
+      const issueId = 'adadadad-adad-adad-adad-adadadadadad'; await insertIssue(issueId, 'Rejected');
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
+        VALUES ($1, $2, 'FAIL', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true,
+        reason: 'reopen', current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 409);
+    });
     await t.test('ignores operator_release outside Human Review', async () => {
       const issueId = '88888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
       const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true, reason: 'approved' },
