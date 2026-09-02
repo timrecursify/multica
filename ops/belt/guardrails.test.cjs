@@ -5,9 +5,30 @@ const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
   crossStageExecutionAdmission,
   retryAdmission, spendPreflight, beltRoutingAdmission, stageCycleAdmission, lifetimeTaskAdmission,
+  completedTaskMadeProgress, noProgressAdmission,
   isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
   quotaCircuitAdmission, QUOTA_PAUSE_MAX_AGE_MS, quotaPauseClearance, quotaPauseFlipLogLine
 } = require('./guardrails.cjs');
+
+test('completed task progress accepts each durable artifact and operator exemptions', () => {
+  const completed = { status: 'completed', context: { to_stage: 'Queue' } };
+  for (const field of ['has_completed_relay', 'has_linked_pr', 'has_result_pr',
+    'has_qc_verdict', 'has_binding_spec']) {
+    assert.equal(completedTaskMadeProgress({ ...completed, [field]: true }), true, field);
+  }
+  assert.equal(completedTaskMadeProgress(completed), false);
+  assert.equal(completedTaskMadeProgress({ ...completed,
+    context: { to_stage: 'Queue', operator_rescope: true } }), true);
+  assert.equal(completedTaskMadeProgress({ ...completed,
+    context: { to_stage: 'Human Review' } }), true);
+});
+
+test('no-progress admission parks at the existing stage-cycle limit', () => {
+  const tasks = Array.from({ length: 2 }, () => ({ status: 'completed',
+    context: { to_stage: 'In Review' } }));
+  assert.deepEqual(noProgressAdmission(tasks, 2), { ok: false, reason: 'no_progress',
+    consecutive: 2, ceiling: 2, disposition: 'Parked' });
+});
 
 test('any bundled child is withheld, regardless of parent state', () => {
   assert.equal(isBundledChild({ parent_issue_id: 'p', title: 'child' }), true);

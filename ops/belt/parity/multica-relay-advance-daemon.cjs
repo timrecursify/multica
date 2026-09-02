@@ -7,6 +7,7 @@ const {
   stageCycleAdmission,
   lifetimeTaskAdmission,
   quotaCircuitAdmission,
+  noProgressAdmission,
   crossStageExecutionAdmission,
   quotaPauseClearance,
   quotaPauseFlipLogLine
@@ -141,8 +142,23 @@ const QUEUED_TASK_TTL_MINUTES = Number.parseInt(process.env.MULTICA_QUEUED_TASK_
 const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || '2', 10);
 const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMIT || '6', 10);
 const QUOTA_FAILURE_LIMIT = Number.parseInt(process.env.RELAY_QUOTA_FAILURE_LIMIT || '3', 10);
+const NO_PROGRESS_LANES_SQL = `WITH ranked AS (
+  SELECT t.*, row_number() OVER (PARTITION BY t.agent_id ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC) AS rn
+    FROM agent_task_queue t JOIN agent a ON a.id = t.agent_id
+   WHERE t.status = 'completed' AND t.trigger_comment_id IS NULL
+     AND COALESCE(t.context->>'kind', '') <> 'retry_escalation'
+     AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
+)
+SELECT t.id, t.agent_id, t.issue_id, t.status, t.context,
+       EXISTS (SELECT 1 FROM relay_run_log r WHERE r.task_id = t.id AND r.status = 'completed') AS has_completed_relay,
+       EXISTS (SELECT 1 FROM issue_pull_request ipr WHERE ipr.issue_id = t.issue_id AND ipr.linked_at >= t.created_at) AS has_linked_pr,
+       NULLIF(BTRIM(COALESCE(t.result->>'pr_url', '')), '') IS NOT NULL AS has_result_pr,
+       EXISTS (SELECT 1 FROM qc_verdict q WHERE q.issue_id = t.issue_id AND q.created_at >= t.created_at) AS has_qc_verdict,
+       EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = t.issue_id AND c.created_at >= t.created_at
+         AND c.content LIKE '%## Spec%' AND c.content LIKE '%## Evidence%') AS has_binding_spec
+  FROM ranked t WHERE t.rn <= $1 ORDER BY t.agent_id, t.rn`;
 
-async function pauseQuotaLane(client, row, consecutiveFailures) {
+async function pauseQuotaLane(client, row, consecutiveFailures, reason = 'provider_quota_limit') {
   const paused = await client.query(
     `UPDATE agent
         SET runtime_config = COALESCE(runtime_config, '{}'::jsonb) || jsonb_build_object(
@@ -165,12 +181,32 @@ async function pauseQuotaLane(client, row, consecutiveFailures) {
          FROM issue WHERE id = $1`,
       [row.issue_id, JSON.stringify({ agent_id: pause.id, agent_name: pause.agent_name,
         timestamp: pause.paused_at,
-        reason: 'provider_quota_limit', consecutive_failures: consecutiveFailures,
+        reason, consecutive_failures: consecutiveFailures,
         ceiling: QUOTA_FAILURE_LIMIT })]
     );
     return pause;
   }
   return null;
+}
+
+async function pauseNoProgressLanes({ dbPool = pool } = {}) {
+  const client = await dbPool.connect();
+  try {
+    const result = await client.query(NO_PROGRESS_LANES_SQL, [QUOTA_FAILURE_LIMIT]);
+    const lanes = Map.groupBy(result.rows, (row) => row.agent_id);
+    for (const tasks of lanes.values()) {
+      const admission = noProgressAdmission(tasks, QUOTA_FAILURE_LIMIT);
+      if (admission.ok) continue;
+      await client.query('BEGIN');
+      const paused = await pauseQuotaLane(client, tasks[0], admission.consecutive,
+        'no_progress_streak');
+      await client.query('COMMIT');
+      if (paused) console.log(`[lane-breaker] paused agent=${paused.agent_name} reason=no_progress_streak`);
+    }
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    console.error(`${LOG_PREFIX} [lane-breaker] error: ${err.message}`);
+  } finally { client.release(); }
 }
 
 function logQuotaPauseFlip({ agent_name: agentName, timestamp, paused }) {
@@ -1444,6 +1480,7 @@ function startDaemon() {
   setInterval(recoveryAdvanceTasks, 120000);
   setInterval(cleanupStalePendingRows, 300000);
   setInterval(requeueStrandedTasks, 60000);
+  setInterval(pauseNoProgressLanes, 60000);
   setInterval(processParkedDiagnoses, 30000);
   setInterval(reconcileQuotaPauses, 60000);
   advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
@@ -1451,9 +1488,11 @@ function startDaemon() {
   cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
   reconcileQuotaPauses().catch(err => console.error(`${LOG_PREFIX} Error in quota-pause reconciliation: ${err.message}`));
+  pauseNoProgressLanes().catch(err => console.error(`${LOG_PREFIX} Error in lane breaker: ${err.message}`));
 }
 
 if (require.main === module) startDaemon();
 
 module.exports = { advanceTick, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
-  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon };
+  reconcileQuotaPauses, pauseNoProgressLanes, processParkedDiagnoses, requeueStrandedTasks,
+  requeueTriggerSummary, startDaemon };
