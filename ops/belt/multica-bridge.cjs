@@ -436,7 +436,7 @@ function qcTaskEvidenceMismatch(task, payload) {
   if (String(evidence.bound_sha || "").toLowerCase() !== payload.bound_sha.toLowerCase() ||
       String(evidence.observed_sha || "").toLowerCase() !== payload.observed_sha.toLowerCase()) return "qc_task_sha_mismatch";
   if (evidence.failure_class !== payload.failure_class || evidence.qualifying !== payload.qualifying ||
-      evidence.model !== payload.model || evidence.effort !== payload.effort) return "qc_task_evidence_mismatch";
+      !isQcLane(payload.model, payload.effort)) return "qc_task_evidence_mismatch";
   return null;
 }
 
