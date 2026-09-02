@@ -1003,6 +1003,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
               t.updated_at AS dead_task_updated_at,
               t.result AS dead_task_result, t.error AS dead_task_error,
               closed_log.id AS closed_relay_log_id,
+              marker_log.id AS requeue_marker_log_id,
               build.result AS build_task_result,
               r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
               r.model, r.thinking_level, r.max_concurrent_tasks, r.runtime_config, r.archived_at, r.agent_name,
@@ -1028,6 +1029,16 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
            SELECT id, status, parked_audit FROM relay_run_log
             WHERE task_id = t.id ORDER BY created_at DESC, id DESC LIMIT 1
          ) closed_log ON true
+         -- A marker belongs to the relay row that created this task, not
+         -- necessarily to the latest row.  Keep that lineage so a terminal
+         -- no-progress replacement can rotate the marker atomically.
+         LEFT JOIN LATERAL (
+           SELECT id FROM relay_run_log
+            WHERE issue_id = i.id
+              AND status = 'failed'
+              AND parked_audit->>'requeue_task_id' = t.id::text
+            ORDER BY created_at DESC, id DESC LIMIT 1
+         ) marker_log ON true
          LEFT JOIN LATERAL (
            SELECT result FROM agent_task_queue
             WHERE issue_id = i.id AND status = 'completed'
@@ -1055,10 +1066,9 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
             OR (
               t.status = 'completed'
               AND (
-                -- Preserve the one-shot retry of a relay row that explicitly
-                -- failed before the worker completed.
-                (closed_log.status = 'failed'
-                 AND closed_log.parked_audit->>'requeue_task_id' IS NULL)
+                -- A failed relay row is recoverable.  Its marker is rotated
+                -- below when it already points at this terminal task.
+                (closed_log.status = 'failed')
                 -- A completed worker can also fail to advance the stage: QC
                 -- may not record a verdict, and build stages may not write a
                 -- completed relay row. Wait the existing queue TTL so a
@@ -1374,7 +1384,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           from_stage: row.from_stage,
           to_stage: row.stage,
           requeue_of_task: row.dead_task_id,
-          requeue_of_relay_log: row.closed_relay_log_id,
+          requeue_of_relay_log: row.requeue_marker_log_id || row.closed_relay_log_id,
           dead_task_reason: row.failure_reason
         });
         const task = await client.query(
@@ -1407,7 +1417,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           console.log(`${LOG_PREFIX} [requeue] SKIPPED #${row.number}: insert produced no row (conflict or trigger); still stranded in '${row.stage}'`);
           continue;
         }
-        if (row.closed_relay_log_id) {
+        const markerLogId = row.requeue_marker_log_id || row.closed_relay_log_id;
+        if (markerLogId) {
           const recorded = await client.query(
             `UPDATE relay_run_log
                 SET parked_audit = jsonb_set(
@@ -1415,13 +1426,14 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
                   '{requeue_task_id}', to_jsonb($2::text))
               WHERE id = $1
                 AND status = 'failed'
-                AND parked_audit->>'requeue_task_id' IS NULL
+                AND (parked_audit->>'requeue_task_id' IS NULL
+                  OR parked_audit->>'requeue_task_id' = $3::text)
               RETURNING id`,
-            [row.closed_relay_log_id, task.rows[0].id]
+            [markerLogId, task.rows[0].id, row.dead_task_id]
           );
           if (recorded.rows.length === 0) {
             await client.query('ROLLBACK');
-            console.log(`${LOG_PREFIX} [requeue] SKIPPED #${row.number}: closed relay row already requeued`);
+            console.log(`${LOG_PREFIX} [requeue] DEFERRED #${row.number}: retry marker changed while admitting replacement`);
             continue;
           }
         }

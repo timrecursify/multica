@@ -20,7 +20,7 @@ Paths below are relative to that root and must stay inside it at deploy time.
 | `ops/gsp-belt/fleet/multica-fleet-daemon.sh` | `<release>/ops/gsp-belt/fleet/multica-fleet-daemon.sh` | `gsp-multica-fleet` | Fleet daemon entry |
 | `ops/gsp-belt/fleet/multica-relay-local.sh` | `<release>/ops/gsp-belt/fleet/multica-relay-local.sh` | (manual / local relay) | Bridge on `:5006` |
 | `ops/gsp-belt/fleet/ecosystem.gsp-belt.config.js.in` | rendered → `<release>/ops/gsp-belt/fleet/ecosystem.gsp-belt.config.js` | all apps above | Tracked template; deploy renders with release path |
-| `ops/gsp-belt/relay/multica-relay-advance-daemon.cjs` | `<release>/ops/gsp-belt/relay/multica-relay-advance-daemon.cjs` | `multica-relay-advance` | Requeue + advance pass |
+| `ops/belt/parity/multica-relay-advance-daemon.cjs` | `/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs` | `multica-relay-advance` | Requeue + advance pass; deployed by `ops/belt/deploy.sh` |
 | `ops/gsp-belt/relay/multica-relay-advance-launcher.cjs` | `<release>/ops/gsp-belt/relay/multica-relay-advance-launcher.cjs` | `multica-relay-advance` | Renders env from operator `.env` |
 | `ops/gsp-belt/relay/multica-relay-advance-wrapper.sh` | `<release>/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh` | `multica-relay-advance` | PM2 entry |
 | Not run by PM2 — migration/parity SQL kept for provenance | `<release>/ops/gsp-belt/sql/*.sql` | (`noc2`/`prod` parity; seed) | Read-only, applied separately |
@@ -37,7 +37,7 @@ current running baseline, not the spec's stale citation.
 | File | SHA-256 (current running baseline, 2026-08-31 ~14:57Z) |
 | --- | --- |
 | `ops/gsp-belt/bridge/multica-bridge.cjs` | `9387e6a885aa0c1a70791ed3f5f9e43280ae90c5c1a1e32a61925d57369f38a5` |
-| `ops/gsp-belt/relay/multica-relay-advance-daemon.cjs` | `7edb2154ddfde9705e7d632f8b02511ae182a2d84b412eb62b3b2d9f0e2fcfad` |
+| `ops/belt/parity/multica-relay-advance-daemon.cjs` | Verified by `ops/belt/verify.sh` against `/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs` |
 | `ops/gsp-belt/worker/multica-cicd-worker.cjs` | `9220a91cb5a1c0e2b0fe7330d98953546d10a658752f09a39941105ab7f05cc8` |
 | `ops/gsp-belt/worker/multica-archiver.cjs` | `37489eda36e7bc828138e9f279eaf87b5bdb055c3cf43b2eb9988e97c3884893` |
 
