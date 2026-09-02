@@ -98,8 +98,8 @@ test('diagnosis prefers an attributable Sol-low scoper, then the dedicated seat'
     model: 'gpt-5.6-sol', instructions,
     runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } };
   const scoper = { ...dedicated, id: 'scoper', is_original_scoper: true };
-  assert.equal(selectDiagnosisOwner([dedicated, scoper]).id, 'scoper');
-  assert.equal(selectDiagnosisOwner([dedicated, { ...scoper, model: 'gpt-5.6-terra' }]).id,
+  assert.equal(selectDiagnosisOwner([dedicated, scoper]).owner.id, 'scoper');
+  assert.equal(selectDiagnosisOwner([dedicated, { ...scoper, model: 'gpt-5.6-terra' }]).owner.id,
     'dedicated');
 });
 
@@ -208,12 +208,13 @@ test('missing Sol-low owner persists a named blocker instead of parking silently
     if (/UPDATE issue/.test(sql)) return { rowCount: 1, rows: [] };
     return { rowCount: 0, rows: [] };
   } };
-  const taskId = await recordParkAndQueueDiagnosis(client, {
+  const selection = await recordParkAndQueueDiagnosis(client, {
     id: 'issue-1', workspace_id: 'workspace-1', status: 'Queue', priority: 'high'
   }, { reason: 'lifetime_task_limit', attempts: 6, ceiling: 6 });
-  assert.equal(taskId, null);
+  assert.deepEqual(selection, { task_id: null, owner: null, reason: 'diagnosis_owner_absent',
+    candidate_count: 0, aggregate_free_slots: 0 });
   const trace = queries.map(({ sql, values }) => `${sql}\n${JSON.stringify(values)}`).join('\n');
-  assert.match(trace, /no_sol_low_diagnosis_owner/);
+  assert.match(trace, /diagnosis_owner_absent/);
   assert.match(trace, /multica-park-diagnosis-blocker/);
 });
 
@@ -232,10 +233,10 @@ test('queued diagnosis task is scoped to the issue workspace', async () => {
     if (/INSERT INTO agent_task_queue/.test(sql)) return { rows: [{ id: 'task-1' }] };
     return { rowCount: 0, rows: [] };
   } };
-  const taskId = await recordParkAndQueueDiagnosis(client, {
+  const selection = await recordParkAndQueueDiagnosis(client, {
     id: 'issue-1', workspace_id: 'workspace-1', status: 'Parked', priority: 'medium'
   }, { reason: 'stage_cycle_limit', attempts: 2, ceiling: 2 });
-  assert.equal(taskId, 'task-1');
+  assert.equal(selection.task_id, 'task-1');
   const insert = queries.find(({ sql }) => /INSERT INTO agent_task_queue/.test(sql));
   assert.ok(insert, 'diagnosis INSERT was executed');
   assert.match(insert.sql, /agent_id, issue_id, workspace_id, status/);
@@ -248,7 +249,21 @@ test('diagnosis owner selection respects an active-task concurrency cap', () => 
     instructions: 'Parked diagnosis: fixable, already_fixed, duplicate, genuinely_blocked.',
     runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' },
     max_concurrent_tasks: 1, active_task_count: 1 };
-  assert.equal(selectDiagnosisOwner([row]), null);
+  assert.deepEqual(selectDiagnosisOwner([row]), { owner: null, reason: 'diagnosis_owner_at_capacity',
+    candidate_count: 1, aggregate_free_slots: 0 });
+});
+
+test('diagnosis owner selection reports mixed-seat aggregate free slots', () => {
+  const base = { name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol',
+    instructions: 'Parked diagnosis: fixable, already_fixed, duplicate, genuinely_blocked.',
+    runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } };
+  const selection = selectDiagnosisOwner([
+    { ...base, id: 'full', max_concurrent_tasks: 2, active_task_count: 2 },
+    { ...base, id: 'free', max_concurrent_tasks: 3, active_task_count: 1 }
+  ]);
+  assert.equal(selection.owner.id, 'free');
+  assert.equal(selection.aggregate_free_slots, 2);
+  assert.equal(selection.candidate_count, 2);
 });
 
 test('INSERT SELECT parameters carry explicit PostgreSQL types', () => {

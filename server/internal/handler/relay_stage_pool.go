@@ -17,6 +17,21 @@ type relayStagePoolRequest struct {
 	Members []string `json:"members"`
 }
 
+type diagnosisOwnershipReadback struct {
+	Mode        string `json:"mode"`
+	Explanation string `json:"explanation"`
+}
+
+func stagePoolDiagnosisOwnership(stage string) *diagnosisOwnershipReadback {
+	if stage != "Parked" {
+		return nil
+	}
+	return &diagnosisOwnershipReadback{
+		Mode:        "dedicated_workspace_diagnosis_seats",
+		Explanation: "Parked diagnosis reruns select dedicated workspace diagnosis seats independently of this configured build pool.",
+	}
+}
+
 // ListRelayStagePools is the authenticated operator readback.  It reports a
 // dangling legacy binding rather than silently selecting an arbitrary member.
 func (h *Handler) ListRelayStagePools(w http.ResponseWriter, r *http.Request) {
@@ -42,12 +57,13 @@ SELECT p.stage_name, p.enabled, p.legacy_agent_id::text,
 	}
 	defer rows.Close()
 	type response struct {
-		Stage           string          `json:"stage"`
-		Enabled         bool            `json:"enabled"`
-		LegacyAgentID   *string         `json:"legacy_agent_id,omitempty"`
-		LegacyAgentName *string         `json:"legacy_agent_name,omitempty"`
-		LegacyDangling  bool            `json:"legacy_dangling"`
-		Members         json.RawMessage `json:"members"`
+		Stage              string                      `json:"stage"`
+		Enabled            bool                        `json:"enabled"`
+		LegacyAgentID      *string                     `json:"legacy_agent_id,omitempty"`
+		LegacyAgentName    *string                     `json:"legacy_agent_name,omitempty"`
+		LegacyDangling     bool                        `json:"legacy_dangling"`
+		Members            json.RawMessage             `json:"members"`
+		DiagnosisOwnership *diagnosisOwnershipReadback `json:"diagnosis_ownership,omitempty"`
 	}
 	result := []response{}
 	for rows.Next() {
@@ -60,6 +76,7 @@ SELECT p.stage_name, p.enabled, p.legacy_agent_id::text,
 		}
 		item.LegacyAgentID, item.LegacyAgentName = legacyID, legacyName
 		item.LegacyDangling = legacyID != nil && (legacyName == nil || live == nil || !*live)
+		item.DiagnosisOwnership = stagePoolDiagnosisOwnership(item.Stage)
 		result = append(result, item)
 	}
 	if err := rows.Err(); err != nil {

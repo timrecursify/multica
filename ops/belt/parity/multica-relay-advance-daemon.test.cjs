@@ -213,13 +213,13 @@ test('Parked issue creates a diagnosis task against the PostgreSQL test DB', asy
     ) VALUES ($1::uuid, $2::uuid, 'Parked diagnosis integration issue', 'Parked', 'low', $3::uuid, 1)`,
     [issueId, workspaceId, randomUUID()]);
 
-    const taskId = await recordParkAndQueueDiagnosis(client, {
+    const selection = await recordParkAndQueueDiagnosis(client, {
       id: issueId, workspace_id: workspaceId, status: 'Parked', priority: 'low'
     }, { reason: 'integration_test' });
 
-    assert.match(taskId, /^[0-9a-f-]{36}$/i);
+    assert.match(selection.task_id, /^[0-9a-f-]{36}$/i);
     const task = await client.query(`SELECT agent_id, issue_id, status, context->>'kind' AS kind
-      FROM agent_task_queue WHERE id = $1::uuid`, [taskId]);
+      FROM agent_task_queue WHERE id = $1::uuid`, [selection.task_id]);
     assert.deepEqual(task.rows, [{ agent_id: agentId, issue_id: issueId,
       status: 'queued', kind: 'parked_diagnosis' }]);
   } finally {

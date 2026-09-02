@@ -272,13 +272,13 @@ async function run(pool, options) {
         }
         continue;
       }
-      const taskId = await recordParkAndQueueDiagnosis(client, issue, {
+      const selection = await recordParkAndQueueDiagnosis(client, issue, {
         reason: decision.has_reason_comment ? 'backfill_existing_reason' : 'backfill_reason_not_recoverable',
         skip_reason_comment: decision.has_reason_comment,
         evidence_correction_retry: decision.retrying === 'runtime_evidence_correction',
         retry_of_task_id: decision.prior_task_id
       });
-      if (taskId) { counts.queued += 1; ids.queued.push(`${issue.id}:${taskId}`); }
+      if (selection.task_id) { counts.queued += 1; ids.queued.push(`${issue.id}:${selection.task_id}`); }
       else {
         counts.skipped_no_owner += 1;
         ids.skipped_no_owner.push(issue.id);

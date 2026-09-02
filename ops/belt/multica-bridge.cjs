@@ -148,11 +148,14 @@ async function rerunParkedDiagnosis(client, payload) {
       AND context->>'kind' = 'parked_diagnosis'
       AND status IN ('queued','dispatched','running','waiting_local_directory','deferred') LIMIT 1`, [payload.issue_id]);
   if (active.rowCount > 0) return { ok: true, replay: true, task_id: active.rows[0].id };
-  const taskId = await recordParkAndQueueDiagnosis(client, issue.rows[0], {
+  const selection = await recordParkAndQueueDiagnosis(client, issue.rows[0], {
     reason: 'operator_parked_diagnosis_rerun', operator_rerun_idem_key: payload.idempotency_key,
     skip_reason_comment: false
   });
-  return taskId ? { ok: true, replay: false, task_id: taskId } : { ok: false, error: 'diagnosis_owner_or_capacity_unavailable' };
+  return selection.task_id ? { ok: true, replay: false, task_id: selection.task_id,
+    candidate_count: selection.candidate_count, aggregate_free_slots: selection.aggregate_free_slots } :
+    { ok: false, error: selection.reason, candidate_count: selection.candidate_count,
+      aggregate_free_slots: selection.aggregate_free_slots };
 }
 
 // This is deliberately an exact database-error allowlist. A missing runtime
@@ -562,9 +565,9 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
       attempts: evidence.historical_tasks || 0,
       taskCount: evidence.task_count || evidence.historical_tasks || 0
     });
-    const diagnosisTaskId = await recordParkAndQueueDiagnosis(client, issue,
+    const diagnosisSelection = await recordParkAndQueueDiagnosis(client, issue,
       { ...evidence, reason });
-    if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
+    if (diagnosisSelection.task_id) evidence = { ...evidence, diagnosis_task_id: diagnosisSelection.task_id };
   }
   await client.query(
     `UPDATE agent_task_queue
