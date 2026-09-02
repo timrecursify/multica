@@ -102,9 +102,18 @@ function isBuilderDispatchAllowed(context) {
 // to the Sol-low diagnosis lane. Attribution must never widen authority: an
 // ordinary scoper cannot receive a diagnosis task.
 function selectDiagnosisOwner(rows) {
-  const eligible = (rows || []).filter((row) => isSolLowDiagnosisAgent(row) &&
-    Number(row.active_task_count || 0) < Math.max(1, Number(row.max_concurrent_tasks || 1)));
-  return eligible.find((row) => row.is_original_scoper === true) || eligible[0] || null;
+  const candidates = (rows || []).filter(isSolLowDiagnosisAgent);
+  const freeSlots = (row) => Math.max(0, Math.max(1, Number(row.max_concurrent_tasks || 1)) -
+    Number(row.active_task_count || 0));
+  const eligible = candidates.filter((row) => freeSlots(row) > 0);
+  const aggregate_free_slots = candidates.reduce((total, row) => total + freeSlots(row), 0);
+  const owner = eligible.find((row) => row.is_original_scoper === true) || eligible[0] || null;
+  return {
+    owner,
+    reason: owner ? null : (candidates.length ? 'diagnosis_owner_at_capacity' : 'diagnosis_owner_absent'),
+    candidate_count: candidates.length,
+    aggregate_free_slots
+  };
 }
 
 // Convert a validated diagnosis into one bounded state action. Keeping this
@@ -214,9 +223,10 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
       LIMIT 20`,
     [issue.workspace_id, issue.id]
   );
-  const ownerRow = selectDiagnosisOwner(owner.rows);
+  const selection = selectDiagnosisOwner(owner.rows);
+  const ownerRow = selection.owner;
   if (!ownerRow) {
-    const blocker = 'no_sol_low_diagnosis_owner';
+    const blocker = selection.reason;
     await client.query(
       `UPDATE issue
           SET metadata = COALESCE(metadata, '{}'::jsonb) ||
@@ -234,12 +244,16 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
         )`,
       [issue.id, issue.workspace_id, ZERO_UUID,
         `${PARK_BLOCKER_MARKER}\nparked_diagnosis_blocker: ${blocker}\n` +
-        'No eligible Sol-low diagnosis owner is active in this workspace; operator assignment is required.',
+        `candidate_count: ${selection.candidate_count}\naggregate_free_slots: ${selection.aggregate_free_slots}\n` +
+        (blocker === 'diagnosis_owner_at_capacity'
+          ? 'All qualifying Sol-low diagnosis owners are at capacity; retry when capacity frees.'
+          : 'No qualifying Sol-low diagnosis owner is active in this workspace; operator assignment is required.'),
         `${PARK_BLOCKER_MARKER}%`]
     );
     console.warn(JSON.stringify({ event: 'parked_diagnosis_unassigned', issue_id: issue.id,
-      workspace_id: issue.workspace_id, blocker }));
-    return null;
+      workspace_id: issue.workspace_id, blocker, candidate_count: selection.candidate_count,
+      aggregate_free_slots: selection.aggregate_free_slots }));
+    return { task_id: null, ...selection };
   }
   // A previous no-owner hold is temporary once a qualifying diagnosis seat is
   // available. Keep genuinely-blocked tickets protected by their completed
@@ -289,7 +303,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
         : 'Sol-low parked-ticket diagnosis (no builder dispatch)',
       evidence.evidence_correction_retry === true || Boolean(evidence.operator_rerun_idem_key)]
   );
-  return task.rows[0]?.id || null;
+  return { task_id: task.rows[0]?.id || null, ...selection };
 }
 
 module.exports = {
