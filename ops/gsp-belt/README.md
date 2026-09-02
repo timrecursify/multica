@@ -72,40 +72,27 @@ config, or a required env name is missing.
 
 ## Deployment (cutover)
 
-Immutable release selection:
+The legacy `ops/gsp-belt/deploy/gsp-belt-deploy.sh` is disabled. Use the
+receipt-producing belt deploy entrypoint:
 
 ```bash
-# Non-mutating: list every affected app/file, change nothing.
-GSP_BELT_ENV_FILE=/path/to/real.env \
-bash ops/gsp-belt/deploy/gsp-belt-deploy.sh \
-  --ref <commit-or-branch> --checkout <reviewed-checkout> --preflight
-
-# Controlled deployment: copies ops/gsp-belt into <release>, renders the
-# ecosystem pinned to that release, startOrReload's only the five GSP apps,
-# verifies resolved script paths point into the release, and on failure
-# auto-restores the previous ecosystem + reloads.
-GSP_BELT_ENV_FILE=/path/to/real.env \
-bash ops/gsp-belt/deploy/gsp-belt-deploy.sh \
-  --ref <commit-or-branch> --checkout <reviewed-checkout> --release <dir>
+bash ops/belt/deploy.sh --dry-run --source-commit <40-character-commit>
+# Apply copies only from freshly fetched origin/main and writes a receipt.
+bash ops/belt/deploy.sh --apply --source-commit <40-character-commit>
 ```
 
-Operationally the operator sets `DATABASE_URL`, `RELAY_AGENT_SECRET`,
-`GSP_WORKSPACE_ID`, and `MULTICA_WORKSPACE_ID` in the environment or the
-`GSP_BELT_ENV_FILE`; the deploy tool only checks their **names**, never their
-values (values stay in operator-controlled files).
+The deploy script does not accept an arbitrary ref: `--source-commit` is an
+auditable request identifier and the materialized source is `origin/main`.
 
 ## Rollback
 
-Rollback is *selecting a prior ref*:
+Rollback uses the receipt timestamp:
 
 ```bash
-bash ops/gsp-belt/deploy/gsp-belt-deploy.sh \
-  --ref <previous-good-sha> --checkout <reviewed-checkout> --release <prior-release-dir>
+bash ops/belt/deploy.sh --rollback <YYYYMMDDTHHMMSSZ>
 ```
 
-The deploy tool also rolls back automatically on reload/health-verification
-failure by restoring the previously rendered ecosystem. There is no restoration
-from `.bak` files — they are untracked archaeology.
+The deploy tool restores its timestamped backup files on failure.
 
 ## Drift detection
 

@@ -11,6 +11,10 @@ const http = require('http');
 const { execFileSync } = require('child_process');
 const { deployed } = require('./cicd-deploy-evidence.cjs');
 let deployEvidence = deployed;
+let deployBelt = function deployBeltScript(sourceCommit) {
+  execFileSync('bash', [require('path').join(__dirname, 'deploy.sh'), '--apply',
+    '--source-commit', sourceCommit], { encoding: 'utf8', timeout: 900000, maxBuffer: 8e6 });
+};
 let pool;
 let relayToken;
 
@@ -156,6 +160,24 @@ function findAllPRs(work) {
   return bare ? [{ repo: 'timrecursify/ppp', num: bare[1] }] : [];
 }
 
+function beltPaths(pr) {
+  if (pr.repo !== 'timrecursify/multica') return false;
+  const files = JSON.parse(gh(['api', `repos/${pr.repo}/pulls/${pr.num}/files?per_page=100`]));
+  return files.some(file => file.filename.startsWith('ops/belt/'));
+}
+
+function deployMergedBeltPRs(states) {
+  for (const state of states) {
+    if (!beltPaths(state.pr)) continue;
+    const sourceCommit = state.info.mergeCommit?.oid;
+    if (!/^[0-9a-f]{40}$/.test(sourceCommit || '')) {
+      throw new Error(`merged belt PR ${state.pr.repo}#${state.pr.num} lacks a full merge commit SHA`);
+    }
+    deployBelt(sourceCommit);
+    log(`DEPLOYED ${state.pr.repo}#${state.pr.num} via ops/belt/deploy.sh`);
+  }
+}
+
 // Green means every completed run on THIS head SHA succeeded. A run list
 // filtered by status alone can return a success from an older SHA of the same
 // branch, which is how a red PR reads as green.
@@ -259,7 +281,9 @@ async function sweep() {
       }
       const openStates = states.filter(s2 => s2.info.state !== 'MERGED');
       if (!openStates.length) {
-        const missing = states.filter(s2 => !deployEvidence({ ...s2.pr, ...s2.info }));
+        let missing = states.filter(s2 => !deployEvidence({ ...s2.pr, ...s2.info }));
+        deployMergedBeltPRs(missing);
+        missing = states.filter(s2 => !deployEvidence({ ...s2.pr, ...s2.info }));
         if (!missing.length) { await routeFinishedPR(issue, 'all referenced PRs merged and deployed'); continue; }
         const reason = `deploy evidence pending for ${missing.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', ')}`;
         if (missing.some(s2 => s2.pr.repo === 'timrecursify/ppp')) {
@@ -331,7 +355,8 @@ function setTestDependencies(dependencies) {
   if (dependencies.relay) relay = dependencies.relay;
   if (dependencies.gh) gh = dependencies.gh;
   if (dependencies.deployed) deployEvidence = dependencies.deployed;
+  if (dependencies.deployBelt) deployBelt = dependencies.deployBelt;
 }
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, park,
-  routeFinishedPR, setTestDependencies, sweep, deployPending };
+  routeFinishedPR, setTestDependencies, sweep, deployPending, deployMergedBeltPRs };
