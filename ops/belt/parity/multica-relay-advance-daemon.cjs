@@ -109,9 +109,9 @@ function requeueTriggerSummary(row, coldStart) {
 // steady trickle rather than firing every stranded ticket at the vendor at once.
 const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10);
 
-// Only stages whose owning agent is safe to re-run. Deliberately NOT the gated
-// or terminal stages: a stranded task in 'Done' or 'CI/CD & Deploy' must not be
-// re-dispatched, because replaying that agent moves finished work backwards.
+// Only stages whose owning agent is safe to re-run. Deliberately NOT gated or
+// terminal stages. CI/CD & Deploy is an executable stage, so a missing deploy
+// task must receive the same recovery as a missing build or QC task.
 // 'Queue' is where the build lane strands its work. 'Spec' was added 2026-08-31
 // on evidence: 324 tickets (207 GSP + 117 PPP) sat in Spec having NEVER had a
 // task dispatched, so no failure existed for the requeue to find. Their owning
@@ -119,7 +119,7 @@ const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10
 // multica-qc-worker-2, the spec writer) -- the belt knew who owned them and
 // still dispatched nobody. Widen further only with the same kind of evidence.
 const NON_REQUEUE_STAGES = new Set(['Human Review', 'Done', 'Cancelled', 'Archived']);
-const configuredRequeueStages = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec,In Review')
+const configuredRequeueStages = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec,In Review,CI/CD & Deploy')
   .split(',').map(s => s.trim()).filter(Boolean);
 const excludedRequeueStages = configuredRequeueStages.filter((stage) => NON_REQUEUE_STAGES.has(stage));
 const REQUEUE_STAGES = configuredRequeueStages.filter((stage) => !NON_REQUEUE_STAGES.has(stage));
