@@ -84,6 +84,7 @@ test('diagnosis evidence and owner validation fail closed', () => {
   assert.equal(isConcreteRuntimeEvidence('looks good'), false);
   const parkedInstructions = 'Parked diagnosis role: classify fixable, already_fixed, duplicate, or genuinely_blocked outcomes.';
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol', instructions: parkedInstructions, runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } }), true);
+  assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-parked-diagnosis-luna-low-1', model: 'gpt-5.6-luna', instructions: parkedInstructions, runtime_config: { model: 'gpt-5.6-luna', reasoning_effort: 'low', role: 'diagnosis' } }), true);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-low-1', model: 'gpt-5.6-sol', instructions: parkedInstructions, runtime_config: {} }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-parked-diagnosis-sol-low-1', model: 'gpt-5.6-sol', instructions: 'diagnosis only', runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' } }), false);
   assert.equal(isSolLowDiagnosisAgent({ name: 'gsp-qc-sol-1', model: 'gpt-5.6-sol', runtime_config: {} }), false);

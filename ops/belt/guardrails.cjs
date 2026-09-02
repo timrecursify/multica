@@ -13,6 +13,7 @@ const NON_EXECUTION_STAGES = new Set([
 ]);
 const EXTERNAL_TRANSITION_STAGES = new Set(['Done']);
 const QUOTA_PAUSE_MAX_AGE_MS = 15 * 60 * 1000;
+const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('./qc-lane.cjs');
 
 function canonicalStage(stage) {
   return STAGE_ALIASES.get(stage) || stage;
@@ -141,13 +142,13 @@ function beltRoutingAdmission(agent, selectedRuntime = {}) {
   const name = String(agent?.name || agent?.agent_name || '').toLowerCase();
   const model = String(agent?.model || '').toLowerCase();
   const effort = String(agent?.thinking_level || '').toLowerCase();
-  const details = { agent_name: agent?.name || agent?.agent_name || null, agent_id: agent?.id || agent?.agent_id || null, model, effort, expected_effort: 'low' };
+  const details = { agent_name: agent?.name || agent?.agent_name || null, agent_id: agent?.id || agent?.agent_id || null, model, effort, expected_effort: QC_LANE_EFFORT };
   const build = name.includes('build');
   const qcOrSpec = name.includes('qc') || name.includes('spec');
   if (!build && !qcOrSpec) return { ok: true };
-  if (effort !== 'low') return { ok: false, reason: 'belt_low_reasoning_effort_required', ...details };
+  if (effort !== QC_LANE_EFFORT) return { ok: false, reason: 'belt_low_reasoning_effort_required', ...details };
   if (build && !(/^deepseek[/:]/.test(model) || model === 'gpt-5.6-terra')) return { ok: false, reason: 'builder_requires_deepseek_or_terra', ...details, expected_model: 'deepseek/*|gpt-5.6-terra' };
-  if (qcOrSpec && model !== 'gpt-5.6-sol') return { ok: false, reason: 'qc_spec_requires_sol_low', ...details, expected_model: 'gpt-5.6-sol' };
+  if (qcOrSpec && !isQcLane(model, effort)) return { ok: false, reason: 'qc_spec_requires_qc_lane', ...details, expected_model: qcLaneModelsSqlArray().join('|') };
   return { ok: true };
 }
 

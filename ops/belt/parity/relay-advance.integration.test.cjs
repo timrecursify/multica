@@ -24,7 +24,8 @@ function marker(overrides = {}) {
 
 test('completed valid QC marker converts once and preserves its relay task identity', async () => {
   const task = { id: '11111111-1111-4111-8111-111111111111', issue_id: 'issue-1', number: 42,
-    agent_name: 'qc-sol-low', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}` } };
+    agent_name: 'qc-sol-low', agent_model: 'gpt-5.6-sol', agent_effort: 'low',
+    result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}` } };
   const payloads = [];
   const client = { query: async () => ({ rows: [task] }) };
   const converted = await convertCompletedQcEvidence(client, {
@@ -32,7 +33,40 @@ test('completed valid QC marker converts once and preserves its relay task ident
   });
   assert.deepEqual([...converted], [task.id]);
   assert.equal(payloads[0].qc_task_id, task.id);
+  assert.equal(payloads[0].model, 'gpt-5.6-sol');
   assert.equal(payloads[0].idem_key, `qc-42-${SHA}-PASS`);
+});
+
+test('Luna evidence is accepted, uses agent attribution, and records model mismatches', async () => {
+  const task = { id: 'luna-task', issue_id: 'luna-issue', number: 45, agent_name: 'qc-luna-low',
+    agent_model: 'gpt-5.6-luna', agent_effort: 'low',
+    result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}` } };
+  const payloads = [];
+  const logs = [];
+  const queries = [];
+  const converted = await convertCompletedQcEvidence({ query: async (sql, values) => {
+    queries.push({ sql, values });
+    return { rows: [task] };
+  } }, { postRelay: async (payload) => { payloads.push(payload); return { status: 201 }; },
+    logger: { log: (line) => logs.push(line) } });
+  assert.deepEqual([...converted], ['luna-task']);
+  assert.equal(payloads[0].model, 'gpt-5.6-luna');
+  assert.equal(payloads[0].effort, 'low');
+  assert.deepEqual(queries[0].values, [['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
+  assert.match(queries[0].sql, /ANY\(\$1::text\[\]\)/);
+  assert.ok(logs.some((line) => line.includes('[qc-evidence-model-mismatch]')));
+});
+
+test('non-lane evidence model is rejected even when the task agent is a QC-lane model', async () => {
+  const task = { id: 'non-lane-task', issue_id: 'non-lane-issue', number: 46, agent_name: 'qc-luna-low',
+    agent_model: 'gpt-5.6-luna', agent_effort: 'low',
+    result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker({ model: 'gpt-5.6-terra' }))}` } };
+  const posts = [];
+  const converted = await convertCompletedQcEvidence({ query: async () => ({ rows: [task] }) }, {
+    postRelay: async (payload) => { posts.push(payload); return { status: 201 }; }, logger: { log() {} }
+  });
+  assert.deepEqual([...converted], []);
+  assert.deepEqual(posts, []);
 });
 
 test('single-backtick and fenced QC markers convert', async () => {
@@ -145,7 +179,7 @@ test('no-artifact rescope respects RELAY_NOARTIFACT_RESCOPE_BATCH', async () => 
     postRelay: async (payload) => { posts.push(payload); return { status: 200 }; },
     env: { RELAY_REQUEUE_BATCH: '8', RELAY_NOARTIFACT_RESCOPE_BATCH: '1' }, logger: { log() {} }
   });
-  assert.deepEqual(queryValues, [1]);
+  assert.deepEqual(queryValues, [['gpt-5.6-sol', 'gpt-5.6-luna'], 'low', 1]);
   assert.equal(posts.length, 1);
 });
 
