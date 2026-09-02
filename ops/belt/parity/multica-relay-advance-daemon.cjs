@@ -16,6 +16,7 @@ const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
   diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
+const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -26,6 +27,7 @@ const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
 const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
+let advanceTickInFlight = false;
 
 function uniqueFullSha(value) {
   const matches = [...String(value || '').matchAll(FULL_SHA_RE)]
@@ -426,8 +428,14 @@ async function enqueuePassWithoutRelayRows({ dbPool = pool, logger = console } =
 }
 
 async function advanceTick() {
-  await enqueuePassWithoutRelayRows();
-  await findAndAdvanceTasks();
+  if (advanceTickInFlight) return;
+  advanceTickInFlight = true;
+  try {
+    await enqueuePassWithoutRelayRows();
+    await findAndAdvanceTasks();
+  } finally {
+    advanceTickInFlight = false;
+  }
 }
 
 async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
@@ -435,42 +443,8 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   const client = await dbPool.connect();
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
-    // Terminal arrivals are ledger-only. They cannot require a matching issue
-    // status because an operator or another path may already have moved it.
-    const terminal = await client.query(
-      `UPDATE relay_run_log
-          SET status = 'completed'
-        WHERE status = 'pending'
-          AND to_stage = ANY($1)`,
-      [[...TERMINAL_STAGES]]
-    );
-    if (terminal.rowCount > 0) {
-      logger.log(`${LOG_PREFIX} Closed ${terminal.rowCount} terminal relay log(s)`);
-    }
-
-    // A completed QC task without a verdict created after the task was queued
-    // cannot become admissible. Exclude it from the work window below, close
-    // it with durable evidence, and hand it to the normal re-spec path.
-    const missingVerdicts = await client.query(
-      `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id, rrl.to_stage
-         FROM relay_run_log rrl
-         INNER JOIN agent_task_queue atq ON atq.id = rrl.task_id
-        WHERE rrl.status = 'pending'
-          AND rrl.to_stage = 'In Review'
-          AND atq.status = 'completed'
-          AND NOT EXISTS (
-            SELECT 1 FROM qc_verdict verdict
-             WHERE verdict.issue_id = atq.issue_id
-               AND verdict.created_at >= atq.created_at
-          )`
-    );
-    for (const row of missingVerdicts.rows) {
-      const escalation = await requestRetryEscalation(row,
-        'qc_verdict_missing_after_task_created', postRelay);
-      await failMissingQcVerdict(client, row.log_id);
-      logger.log(`${LOG_PREFIX} [qc-verdict-missing] RESPEC: issue=${row.issue_id}, ` +
-        `relay=${row.log_id}, status=${escalation.status}`);
-    }
+    await closeDeadRelayRows(client, { terminalStages: [...TERMINAL_STAGES],
+      requestRetryEscalation, postRelay, logger, logPrefix: LOG_PREFIX });
 
     // Correlate strictly on the task that owns the relay log. Advance only
     // genuinely completed tasks; a failed task must never move work forward.

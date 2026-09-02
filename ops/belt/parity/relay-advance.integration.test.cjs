@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
+const { Pool } = require('pg');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
@@ -10,9 +11,83 @@ process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-wor
 const { qcBounceDecision } = require('../multica-bridge.cjs');
 const { enqueuePassWithoutRelayRows, findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
 const { parseArgs, recover } = require('../recover-stranded-qc-pass.cjs');
+const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 
 const SHA = 'c909401ef7a4a438348eb5ceda33839211721524';
 const MD5 = '76becea4ab970644b7a21220665a1619';
+
+async function deadRowsDb() {
+  const schema = `relay_dead_rows_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const admin = new Pool({ connectionString: process.env.DATABASE_URL });
+  await admin.query(`CREATE SCHEMA ${schema}`);
+  await admin.query(`CREATE TABLE ${schema}.relay_run_log (
+    id text PRIMARY KEY, issue_id text NOT NULL, task_id text NOT NULL, to_stage text NOT NULL,
+    status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now())`);
+  await admin.query(`CREATE TABLE ${schema}.agent_task_queue (
+    id text PRIMARY KEY, issue_id text NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL)`);
+  await admin.query(`CREATE TABLE ${schema}.qc_verdict (
+    issue_id text NOT NULL, created_at timestamptz NOT NULL)`);
+  const dbPool = {
+    async connect() {
+      const client = await admin.connect();
+      await client.query(`SET search_path TO ${schema}, public`);
+      return client;
+    }
+  };
+  return { admin, schema, dbPool, async close() {
+    await admin.query(`DROP SCHEMA ${schema} CASCADE`);
+    await admin.end();
+  } };
+}
+
+async function closeDeadRowsTick(dbPool, postRelay) {
+  const client = await dbPool.connect();
+  try {
+    await closeDeadRelayRows(client, {
+      terminalStages: ['Done', 'Cancelled', 'Archived'],
+      requestRetryEscalation: (row, reason, relay) => relay({ issue_id: row.issue_id, reason }),
+      postRelay,
+      logger: { log() {} }
+    });
+  } finally {
+    client.release();
+  }
+}
+
+test('persistent dead rows claim once across successive and concurrent ticks', async () => {
+  const db = await deadRowsDb();
+  const posts = [];
+  const postRelay = async (payload) => { posts.push(payload); return { ok: true, status: 200 }; };
+  try {
+    await db.admin.query(`INSERT INTO ${db.schema}.agent_task_queue (id, issue_id, status, created_at)
+      VALUES ('task-1', 'issue-1', 'completed', now())`);
+    await db.admin.query(`INSERT INTO ${db.schema}.relay_run_log (id, issue_id, task_id, to_stage, status)
+      VALUES ('log-1', 'issue-1', 'task-1', 'In Review', 'pending')`);
+    await closeDeadRowsTick(db.dbPool, postRelay);
+    await closeDeadRowsTick(db.dbPool, postRelay);
+    await Promise.all([closeDeadRowsTick(db.dbPool, postRelay), closeDeadRowsTick(db.dbPool, postRelay)]);
+    const persisted = await db.admin.query(`SELECT status, parked_audit->>'reason' AS reason FROM ${db.schema}.relay_run_log WHERE id = 'log-1'`);
+    assert.equal(posts.length, 1);
+    assert.deepEqual(persisted.rows, [{ status: 'failed', reason: 'qc_verdict_missing_after_task_created' }]);
+  } finally { await db.close(); }
+});
+
+test('persistent Cancelled and 25 dead rows close without starving a later row', async () => {
+  const db = await deadRowsDb();
+  const posts = [];
+  try {
+    await db.admin.query(`INSERT INTO ${db.schema}.agent_task_queue (id, issue_id, status, created_at)
+      SELECT 'task-' || n, 'issue-' || n, 'completed', now() FROM generate_series(1, 25) n`);
+    await db.admin.query(`INSERT INTO ${db.schema}.relay_run_log (id, issue_id, task_id, to_stage, status)
+      SELECT 'log-' || n, 'issue-' || n, 'task-' || n, 'In Review', 'pending' FROM generate_series(1, 25) n`);
+    await db.admin.query(`INSERT INTO ${db.schema}.relay_run_log (id, issue_id, task_id, to_stage, status)
+      VALUES ('cancelled', 'cancelled-issue', 'cancelled-task', 'Cancelled', 'pending')`);
+    await closeDeadRowsTick(db.dbPool, async (payload) => { posts.push(payload); return { status: 200 }; });
+    const states = await db.admin.query(`SELECT status, count(*)::int AS count FROM ${db.schema}.relay_run_log GROUP BY status ORDER BY status`);
+    assert.deepEqual(states.rows, [{ status: 'completed', count: 1 }, { status: 'failed', count: 25 }]);
+    assert.equal(posts.length, 25);
+  } finally { await db.close(); }
+});
 
 function advanceRow(evidenceResult = `QC PASS exact SHA ${SHA}`) {
   return {
