@@ -163,6 +163,7 @@ const MAX_CONCURRENT = Number.parseInt(process.env.RELAY_MAX_CONCURRENT || '12',
 const QUEUED_TASK_TTL_MINUTES = Number.parseInt(process.env.MULTICA_QUEUED_TASK_TTL_MINUTES || '120', 10);
 const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || '2', 10);
 const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMIT || '6', 10);
+const QC_FAILURE_LIMIT = Number.parseInt(process.env.RELAY_QC_FAILURE_LIMIT || '3', 10);
 const QUOTA_FAILURE_LIMIT = Number.parseInt(process.env.RELAY_QUOTA_FAILURE_LIMIT || '3', 10);
 
 async function pauseQuotaLane(client, row, consecutiveFailures) {
@@ -1139,6 +1140,11 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           AND i.parent_issue_id IS NULL
       ), budgeted AS (
         SELECT stranded.*,
+          (SELECT count(*)::int FROM agent_task_queue qc_failure
+            WHERE qc_failure.issue_id = stranded.issue_id
+              AND qc_failure.context->>'to_stage' = 'In Review'
+              AND qc_failure.status = 'failed'
+          ) AS qc_failure_count,
           (SELECT count(*)::int FROM agent_task_queue stage_history
             WHERE stage_history.issue_id = stranded.issue_id
               AND stage_history.context->>'to_stage' = stranded.stage
@@ -1167,7 +1173,9 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           PARTITION BY agent_id ORDER BY issue_created_at ASC, issue_id ASC
         ) AS rn
         FROM budgeted
-        WHERE stage_task_count < $4::int AND lifetime_task_count < $5::int
+        WHERE (stage = 'In Review' AND qc_failure_count < $6::int)
+           OR (stage <> 'In Review' AND stage_task_count < $4::int
+                                   AND lifetime_task_count < $5::int)
       )
       SELECT * FROM (
         SELECT ranked.*, NULL::text AS exhaustion_reason
@@ -1175,18 +1183,25 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
          WHERE rn <= $1::int
         UNION ALL
         SELECT budgeted.*, NULL::bigint AS rn,
-               CASE WHEN stage_task_count >= $4::int
-              THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
+               CASE WHEN stage = 'In Review' THEN 'qc_failure_limit'
+                    WHEN stage_task_count >= $4::int THEN 'stage_cycle_limit'
+                    ELSE 'lifetime_task_limit' END AS exhaustion_reason
           FROM budgeted
-         WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int
+         WHERE (stage = 'In Review' AND qc_failure_count >= $6::int)
+            OR (stage <> 'In Review' AND
+                (stage_task_count >= $4::int OR lifetime_task_count >= $5::int))
       ) candidates
       ORDER BY issue_created_at ASC, issue_id ASC`,
       [REQUEUE_BATCH, REQUEUE_STAGES, QUEUED_TASK_TTL_MINUTES,
-        STAGE_CYCLE_LIMIT, LIFETIME_TASK_LIMIT]
+        STAGE_CYCLE_LIMIT, LIFETIME_TASK_LIMIT, QC_FAILURE_LIMIT]
     );
 
     const exhausted = candidates.rows.filter((row) => row.exhaustion_reason);
     for (const row of exhausted) {
+      if (row.exhaustion_reason === 'qc_failure_limit') {
+        console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: qc_failure_limit (${row.qc_failure_count}/${QC_FAILURE_LIMIT})`);
+        continue;
+      }
       const admission = row.exhaustion_reason === 'stage_cycle_limit'
         ? stageCycleAdmission(row.stage_task_count, STAGE_CYCLE_LIMIT)
         : lifetimeTaskAdmission(row.lifetime_task_count, LIFETIME_TASK_LIMIT);

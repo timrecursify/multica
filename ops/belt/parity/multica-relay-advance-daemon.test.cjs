@@ -391,6 +391,16 @@ test('zero-task Queue fixture creates attempt one without retry admission', asyn
   assert.equal(harness.queries.some(({ sql }) => sql.includes('max(EXTRACT(epoch')), false);
 });
 
+test('In Review recovery ignores predecessor lifetime spend and holds at three QC failures', async () => {
+  const harness = strandedHarness([strandedFixture({ stage: 'In Review' })]);
+  await harness.run();
+  const candidate = harness.queries.find(({ sql }) => sql.includes('WITH stranded AS'));
+  assert.match(candidate.sql, /qc_failure\.context->>'to_stage' = 'In Review'/);
+  assert.match(candidate.sql, /stage = 'In Review' AND qc_failure_count < \$6::int/);
+  assert.match(candidate.sql, /stage = 'In Review' THEN 'qc_failure_limit'/);
+  assert.equal(candidate.values[5], 3);
+});
+
 test('In Review requeue summary supplies the QC PR URL and full SHA', () => {
   const summary = requeueTriggerSummary(strandedFixture({ stage: 'In Review', number: 159,
     build_task_result: { pr_url: 'https://github.com/timrecursify/multica/pull/1',
