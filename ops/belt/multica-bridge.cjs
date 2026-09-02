@@ -726,9 +726,10 @@ async function replaceStageTask(client, task) {
   throw new Error('task creation is reconciler-owned');
 }
 
-function relayActor(req) {
+function relayActor(req, from, to) {
   return !OPERATOR_SECRET_DISABLED && RELAY_OPERATOR_SECRET &&
-    req.headers['x-relay-operator-secret'] === RELAY_OPERATOR_SECRET ? 'operator' : 'system';
+    req.headers['x-relay-operator-secret'] === RELAY_OPERATOR_SECRET ? 'operator' :
+    (from === 'Spec' && to === 'Queue' ? 'worker' : 'system');
 }
 
 function transitionEvidence(body) {
@@ -1224,7 +1225,7 @@ async function relayAdvance(req, res, body) {
     // The bridge owns only the atomic status change. Reconciliation observes
     // this committed transition and creates the one current-stage task.
     const policy = evaluate({ from: issue.status, to: requestedStage,
-      actor: relayActor(req), evidence: transitionEvidence(body) });
+      actor: relayActor(req, issue.status, requestedStage), evidence: transitionEvidence(body) });
     if (!policy.ok) {
       await client.query("ROLLBACK");
       res.writeHead(409, { "Content-Type": "application/json" });
