@@ -184,6 +184,9 @@ const CostUSDTicksPerUSD = 10_000_000_000
 type Result struct {
 	Status     string // "completed", "failed", "aborted", "timeout", "cancelled"
 	Output     string // final user-facing output selected by the backend
+	// PRURL is the URL returned by a structured pull-request creation result.
+	// It is empty when the task did not open a pull request.
+	PRURL      string
 	Error      string // error message if failed
 	DurationMs int64
 	SessionID  string

@@ -55,6 +55,27 @@ func TestClient_IdentityHeaders_PostJSON(t *testing.T) {
 	}
 }
 
+func TestStructuredPullRequestURLRequiresMachineReadablePullURL(t *testing.T) {
+	tests := []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "url", raw: `{"url":"https://github.com/acme/widget/pull/7"}`, want: "https://github.com/acme/widget/pull/7"},
+		{name: "html_url", raw: `{"html_url":"https://github.com/acme/widget/pull/8"}`, want: "https://github.com/acme/widget/pull/8"},
+		{name: "prose", raw: `Created https://github.com/acme/widget/pull/9`, want: ""},
+		{name: "empty", raw: `{"url":""}`, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := structuredPullRequestURL(tt.raw)
+			if got != tt.want || (ok != (tt.want != "")) {
+				t.Fatalf("structuredPullRequestURL(%q) = %q, %v; want %q, %v", tt.raw, got, ok, tt.want, tt.want != "")
+			}
+		})
+	}
+}
+
 func TestClient_IdentityHeaders_GetJSON(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("X-Client-Platform"); got != "daemon" {
@@ -420,7 +441,7 @@ func TestTerminalReportsCarryRetiredSessionID(t *testing.T) {
 			name:     "complete",
 			endpoint: "/api/daemon/tasks/task-1/complete",
 			call: func(c *Client) error {
-				return c.CompleteTask(context.Background(), "task-1", "done", "", "", "/tmp/wd", false, "POISONED-S")
+				return c.CompleteTask(context.Background(), "task-1", "done", "", "", "", "/tmp/wd", false, "POISONED-S")
 			},
 		},
 		{
@@ -463,8 +484,14 @@ func TestTerminalReportsOmitEmptyRetiredSessionID(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	if err := NewClient(srv.URL).CompleteTask(context.Background(), "task-1", "done", "", "sess-1", "/tmp/wd", false, ""); err != nil {
+	if err := NewClient(srv.URL).CompleteTask(context.Background(), "task-1", "done", "", "https://github.com/o/r/pull/7", "sess-1", "/tmp/wd", false, ""); err != nil {
 		t.Fatalf("CompleteTask: %v", err)
+	}
+	if got := body["pr_url"]; got != "https://github.com/o/r/pull/7" {
+		t.Fatalf("pr_url = %v, want exact URL", got)
+	}
+	if _, present := body["branch_name"]; present {
+		t.Fatalf("branch_name must not substitute pr_url: %v", body)
 	}
 	if _, present := body["retired_session_id"]; present {
 		t.Fatalf("retired_session_id must be omitted when nothing was retired, got %v", body)
