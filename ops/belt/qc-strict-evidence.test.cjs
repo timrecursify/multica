@@ -7,9 +7,11 @@ test('strict evidence requires a bound attempt, completed relay task, and Sol-lo
   assert.match(STRICT_CURRENT_PASS_SQL, /qa\.bound_sha ~\* '\^\[0-9a-f\]\{40\}\$'/);
   assert.match(STRICT_CURRENT_PASS_SQL, /lower\(qa\.bound_sha\)=lower\(qa\.observed_head\)/);
   assert.match(STRICT_CURRENT_PASS_SQL, /t\.status='completed'/);
-  assert.match(STRICT_CURRENT_PASS_SQL, /a\.model='gpt-5\.6-sol'/);
-  const db = { query: async () => ({ rows: [] }) };
+  assert.match(STRICT_CURRENT_PASS_SQL, /a\.model = ANY\(\$2::text\[\]\)/);
+  const calls = [];
+  const db = { query: async (...args) => (calls.push(args), { rows: [] }) };
   assert.equal(await currentStrictPass(db, 'issue'), null);
+  assert.deepEqual(calls[0][1], ['issue', ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
 });
 
 test('row evidence rejects a note-only or mismatched attempt', () => {

@@ -22,6 +22,7 @@ const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
+const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
 const { reconcileCycle } = require('../reconciler.cjs');
 const { recordStageOutcomes } = require('../stage-outcome.cjs');
 const TYPED_OUTCOMES = process.env.RECONCILE_TYPED_OUTCOMES === '1';
@@ -170,8 +171,7 @@ function strictQcAttempt(row, verdictMd5) {
   const evidenceAgentId = row.qc_attempt_evidence_agent_id || row.task_agent_id;
   const ok = row.qc_attempt_verdict === 'PASS' && row.qc_attempt_qualifying === true &&
     row.qc_attempt_evidence_task_status === 'completed' &&
-    row.qc_attempt_evidence_agent_model === 'gpt-5.6-sol' &&
-    row.qc_attempt_evidence_agent_effort === 'low' &&
+    isQcLane(row.qc_attempt_evidence_agent_model, row.qc_attempt_evidence_agent_effort) &&
     row.qc_verdict_checker_id === evidenceAgentId &&
     /^[0-9a-f]{40}$/.test(bound) && bound === observed && md5 === verdictMd5;
   return ok ? { ok: true, boundSha: bound,
@@ -193,7 +193,7 @@ function qcCompletionAdvance(row) {
     evidenceTaskId: strict.evidenceTaskId } : strict;
 }
 
-function completedTaskEvidenceSql({ taskAlias, issueAlias }) {
+function completedTaskEvidenceSql({ taskAlias, issueAlias, modelParam, effortParam }) {
   return {
     columns: `${taskAlias}.status AS task_status,
              ${taskAlias}.result AS task_result, ${taskAlias}.error AS task_error,
@@ -264,9 +264,9 @@ function completedTaskEvidenceSql({ taskAlias, issueAlias }) {
            AND evidence_task.agent_id = verdict.checker_id
            AND evidence_task.status = 'completed'
            AND COALESCE(evidence_agent.model,
-                        evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
+                        evidence_agent.runtime_config->>'model') = ANY($${modelParam}::text[])
            AND COALESCE(evidence_agent.thinking_level,
-                        evidence_agent.runtime_config->>'reasoning_effort') = 'low'
+                        evidence_agent.runtime_config->>'reasoning_effort') = $${effortParam}::text
       ) evidence ON true`
   };
 }
@@ -715,7 +715,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
     // genuinely completed tasks; a failed task must never move work forward.
     // No completed_at window: eligibility is the task's terminal state, so a
     // daemon outage delays an advance instead of stranding it forever.
-    const evidenceSql = completedTaskEvidenceSql({ taskAlias: 'atq', issueAlias: 'i' });
+    const evidenceSql = completedTaskEvidenceSql({ taskAlias: 'atq', issueAlias: 'i', modelParam: 2, effortParam: 3 });
     const query = `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id,
              ${evidenceSql.columns}, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
@@ -729,7 +729,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       ORDER BY rrl.created_at ASC
       LIMIT 100`;
 
-    const result = await client.query(query, ['pending']);
+    const result = await client.query(query, ['pending', qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
 
     // A failed or cancelled task must not advance, but its pending log must not
     // linger either -- otherwise the row is retried forever. Close it as failed
@@ -1790,7 +1790,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
   if (!typedOutcomes) return [];
   const client = await dbPool.connect();
   try {
-    const evidenceSql = completedTaskEvidenceSql({ taskAlias: 't', issueAlias: 'i' });
+    const evidenceSql = completedTaskEvidenceSql({ taskAlias: 't', issueAlias: 'i', modelParam: 1, effortParam: 2 });
     const result = await client.query(
       `SELECT o.issue_id, o.stage AS to_stage, o.outcome, o.task_id,
               ${evidenceSql.columns}, rsc.next_stage
@@ -1801,7 +1801,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
            ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
          ${evidenceSql.joins}
         WHERE o.outcome IN ('ADVANCED', 'NO_OP') AND o.blocked_on IS DISTINCT FROM 'human'
-        ORDER BY o.outcome_at ASC LIMIT 100`);
+        ORDER BY o.outcome_at ASC LIMIT 100`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
     const advanced = [];
     for (const row of result.rows) {
       const route = row.outcome === 'NO_OP' && row.to_stage === 'In Progress'
