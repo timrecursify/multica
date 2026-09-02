@@ -5,9 +5,11 @@ set -euo pipefail
 
 PM2="${PM2:-pm2}"
 release_dir=""
+baseline=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release) release_dir="$2"; shift 2;;
+    --baseline-unstable-restarts) baseline="$2"; shift 2;;
     -h|--help) echo "usage: belt-status.sh --release DIR"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
@@ -27,17 +29,21 @@ echo "release commit = $commit_sha"
 fail=0
 IFS=',' read -r -a app_arr <<< "$apps"
 for app in "${app_arr[@]}"; do
-  read -r path status < <(python3 - "$snapshot" "$app" <<'PY'
+  read -r path status unstable restart_time err_path exit_code exit_signal < <(python3 - "$snapshot" "$app" <<'PY'
 import json, sys
 for item in json.load(open(sys.argv[1])):
     if item.get('name') == sys.argv[2]:
         env = item.get('pm2_env', {})
-        print(env.get('pm_exec_path', ''), env.get('status', ''))
+        print(env.get('pm_exec_path', ''), env.get('status', ''), env.get('unstable_restarts', ''), env.get('restart_time', ''), env.get('pm_err_log_path', ''), env.get('exit_code', ''), env.get('exit_signal', ''))
         break
 PY
 )
-  echo "$app -> $path (status=$status)"
-  [[ "$path" == "$release_dir/ops/gsp-belt/"* && "$status" == "online" ]] || fail=1
+  echo "$app -> $path (status=$status unstable_restarts=${unstable:-unknown} restart_time=${restart_time:-unknown})"
+  if [[ "$app" == gsp-multica-bridge && -n "$baseline" && "$unstable" =~ ^[0-9]+$ && "$unstable" -gt "$baseline" ]]; then
+    echo "status: bridge unstable_restarts increased from $baseline to $unstable (exit_code=${exit_code:-unknown} exit_signal=${exit_signal:-unknown} log=${err_path:-unknown})" >&2
+    fail=1
+  fi
+  [[ "$path" == "$release_dir/ops/belt/"* && "$status" == "online" ]] || fail=1
 done
 [[ $fail -eq 0 ]] || { echo "status: one or more apps are not online in the selected immutable release" >&2; exit 1; }
 echo "status: all five apps resolve to release commit $commit_sha"
