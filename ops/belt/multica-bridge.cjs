@@ -377,10 +377,10 @@ async function replaceStageTask(client, task) {
     `INSERT INTO agent_task_queue (
        agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
        trigger_summary, force_fresh_session, originator_source,
-       trigger_evidence_kind
+       trigger_evidence_kind, relay_pool_id, relay_pool_stage
      )
      SELECT $1, $2, $3, 'queued', $4, $5, $6::jsonb, $7, TRUE,
-            'unattributed', 'relay_stage_transition'
+            'unattributed', 'relay_stage_transition', $10, $11
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue active
          WHERE active.issue_id = $2
@@ -390,7 +390,7 @@ async function replaceStageTask(client, task) {
        ON CONFLICT DO NOTHING
        RETURNING id`,
     [task.agentId, task.issueId, task.workspaceId, task.priority, task.runtimeId, task.context,
-      task.triggerSummary, LIVE_TASK_STATUSES, task.toStage]
+      task.triggerSummary, LIVE_TASK_STATUSES, task.toStage, task.relayPoolId || null, task.relayPoolStage || null]
   );
 
   const taskId = inserted.rows[0]?.id || await existingStageTask(
@@ -643,13 +643,14 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
   // lock makes equal-load choices stable under concurrent advances.
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, ownerStage]);
   const result = await client.query(
-    `SELECT p.agent_id, a.name AS agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
+    `SELECT p.agent_id, p.pool_id, a.name AS agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
             a.status AS agent_status, a.instructions, a.model, a.thinking_level,
             a.max_concurrent_tasks, a.runtime_config, p.last_selected_at,
             COALESCE(own_runtime.provider, online_runtime.provider) AS selected_runtime_provider,
             COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id,
             COALESCE(active.task_count, 0)::int AS active_task_count
        FROM relay_stage_agent_pool p
+       JOIN relay_stage_pool pool ON pool.id = p.pool_id AND pool.enabled = true
        LEFT JOIN agent a ON a.id = p.agent_id AND a.workspace_id = p.workspace_id
        LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
         AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
@@ -1347,6 +1348,8 @@ async function relayAdvance(req, res, body) {
         agentId: stage.agent_id,
         priority: taskPriority,
         runtimeId: stage.selected_runtime_id,
+        relayPoolId: stage.pool_id || null,
+        relayPoolStage: stage.pool_id ? to_stage : null,
         context,
         triggerSummary: `Relay stage transition: ${issue.status} -> ${to_stage}`
       });
