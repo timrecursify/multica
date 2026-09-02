@@ -5,7 +5,8 @@ const { randomUUID } = require('node:crypto');
 const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
-  isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle } = require('./multica-relay-advance-daemon.cjs');
+  isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
+  readvanceRecordedOutcomes } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
 
@@ -36,8 +37,35 @@ test('reconciliation ramp defaults to 25 and passes the full candidate set to re
     if (sql.startsWith('SELECT id, workspace_id, status, priority, metadata, qc_fail_count, parent_issue_id')) return { rows: [] };
     return { rows: [] };
   }};
-  const result = await runReconcileCycle({ dbPool: { connect: async () => client }, maxCreate: 2, logger: { log() {} } });
+  const result = await runReconcileCycle({ dbPool: { connect: async () => client, query: async () => ({ rows: [] }) }, maxCreate: 2, logger: { log() {} } });
   assert.equal(result.length, candidates.length);
+});
+
+test('typed re-advance moves recorded work through relay without an agent dispatch', async () => {
+  const calls = [];
+  const client = { release() {}, query: async (sql) => {
+    calls.push(sql);
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1', to_stage: 'Queue',
+      outcome: 'ADVANCED', task_id: 'task-1', task_result: { output: 'done' },
+      issue_title: 'work', next_stage: 'In Progress' }] };
+    return { rows: [] };
+  }};
+  const advanced = await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async (payload) => {
+      assert.equal(payload.to_stage, 'In Progress');
+      assert.equal(payload.relay_source_task_id, 'task-1');
+      return { ok: true };
+    }, logger: { log() {} }, typedOutcomes: true });
+  assert.deepEqual(advanced, ['issue-1']);
+  assert.equal(calls.some((sql) => sql.includes('INSERT INTO agent_task_queue')), false);
+});
+
+test('no linked PR completion routes directly to Done and never In Review', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const route = source.slice(source.indexOf('async function buildCompletionRoute'), source.indexOf('function uniqueFullSha'));
+  assert.match(route, /FROM issue_pull_request/);
+  assert.match(route, /kind: 'no_pr', toStage: 'Done'/);
+  assert.doesNotMatch(route, /toStage: 'In Review'/);
 });
 
 test('assignment adoption inserts only the assigned configured QC task once and is workspace-safe', async () => {
