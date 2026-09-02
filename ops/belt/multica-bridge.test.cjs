@@ -1194,14 +1194,14 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       CREATE TABLE "${schema}".agent_task_queue (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), agent_id uuid NOT NULL,
       issue_id uuid NOT NULL, workspace_id uuid NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0,
       runtime_id uuid, context jsonb NOT NULL DEFAULT '{}'::jsonb, trigger_summary text, force_fresh_session boolean,
-      originator_source text, trigger_evidence_kind text, result jsonb, error text, completed_at timestamptz,
+      originator_source text, trigger_evidence_kind text, result jsonb, error text, started_at timestamptz, completed_at timestamptz,
       prepare_lease_expires_at timestamptz, failure_reason text, trigger_comment_id uuid,
       created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
       author_type text, author_id uuid, content text, type text, created_at timestamptz DEFAULT now());
-      CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, verdict text,
+      CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, checker_id uuid, verdict text,
       work_product_md5 text, created_at timestamptz DEFAULT now());`);
     await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
     await admin.query(`INSERT INTO "${schema}".agent (id, workspace_id, name, runtime_id, status, instructions, model, thinking_level, max_concurrent_tasks)
@@ -1232,6 +1232,26 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(issue.rows[0].metadata.human_review_release_reason, 'approved by operator');
       assert.ok(issue.rows[0].metadata.human_review_release_at);
       assert.equal(log.rows.length, 1);
+    });
+    await t.test('verdict-less completed In Review tasks do not consume either cap, while verdict-bearing tasks do', async () => {
+      const issueId = '55555555-5555-5555-5555-555555555555';
+      await insertIssue(issueId);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context, started_at, completed_at)
+        VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}', now() - interval '1 minute', now()),
+               ($1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}', now() - interval '1 minute', now())`,
+      [agentId, issueId, workspaceId]);
+      assert.equal(await capEscalationVerified(client, { id: issueId, metadata: {} },
+        'stage_cycle_limit', 'In Review'), false);
+      assert.equal(await capEscalationVerified(client, { id: issueId, metadata: {} },
+        'lifetime_task_limit', 'In Review'), false);
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, created_at)
+        VALUES ($1, $2, 'PASS', now() - interval '30 seconds'),
+               ($1, $2, 'FAIL', now() - interval '30 seconds')`, [issueId, agentId]);
+      assert.equal(await capEscalationVerified(client, { id: issueId, metadata: {} },
+        'stage_cycle_limit', 'In Review'), true);
+      assert.equal(await capEscalationVerified(client, { id: issueId, metadata: {} },
+        'lifetime_task_limit', 'In Review'), true);
     });
     await t.test('persists caller CI/CD parking evidence in the relay audit row', async () => {
       const issueId = '45454545-4545-4545-4545-454545454545';

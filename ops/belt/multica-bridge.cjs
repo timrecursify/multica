@@ -7,6 +7,7 @@ const {
   isBundledChild,
   instructionCompatibility,
   spendPreflight,
+  budgetCountPredicate,
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,
@@ -426,6 +427,7 @@ async function capEscalationVerified(client, issue, trigger, stage) {
         WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
           AND trigger_comment_id IS NULL
           AND COALESCE(context->>'kind', '') <> 'retry_escalation'
+          ${budgetCountPredicate()}
           AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz)`,
       [issue.id, stage, since]);
     return Number(history.rows[0]?.n || 0) >= STAGE_CYCLE_LIMIT;
@@ -435,6 +437,7 @@ async function capEscalationVerified(client, issue, trigger, stage) {
     `SELECT count(*)::int AS n FROM agent_task_queue
       WHERE issue_id = $1::uuid
         AND trigger_comment_id IS NULL
+        ${budgetCountPredicate()}
         AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)`,
     [issue.id, since]);
   return Number(history.rows[0]?.n || 0) >= LIFETIME_TASK_LIMIT;
@@ -1664,6 +1667,7 @@ async function relayAdvance(req, res, body) {
           WHERE issue_id = $1 AND context->>'to_stage' = $2
             AND trigger_comment_id IS NULL
             AND COALESCE(context->>'kind', '') <> 'retry_escalation'
+            ${budgetCountPredicate()}
             AND ($3::timestamptz IS NULL OR created_at >= $3)`,
         [issue.id, to_stage, releaseAt]
       );
@@ -1713,6 +1717,7 @@ async function relayAdvance(req, res, body) {
         `SELECT count(*)::int AS n FROM agent_task_queue
           WHERE issue_id = $1
             AND trigger_comment_id IS NULL
+            ${budgetCountPredicate()}
             AND ($2::timestamptz IS NULL OR created_at >= $2)`,
         [issue.id, releaseAt]
       );

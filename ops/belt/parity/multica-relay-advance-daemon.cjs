@@ -4,6 +4,7 @@ const {
   instructionCompatibility,
   retryAdmission,
   spendPreflight,
+  budgetCountPredicate,
   stageCycleAdmission,
   lifetimeTaskAdmission,
   quotaCircuitAdmission,
@@ -1162,6 +1163,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1 AND context->>'to_stage' = $2
               AND trigger_comment_id IS NULL
+              AND COALESCE(context->>'kind', '') <> 'retry_escalation'
+              ${budgetCountPredicate()}
               AND ($3::timestamptz IS NULL OR created_at >= $3)`,
           [row.issue_id, row.stage, releaseAt]
         );
@@ -1176,6 +1179,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1
               AND trigger_comment_id IS NULL
+              ${budgetCountPredicate()}
               AND ($2::timestamptz IS NULL OR created_at >= $2)`,
           [row.issue_id, releaseAt]
         );
