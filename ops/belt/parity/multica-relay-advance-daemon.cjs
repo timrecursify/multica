@@ -447,10 +447,70 @@ async function enqueuePassWithoutRelayRows({ dbPool = pool, logger = console } =
   }
 }
 
+// `sk multica assign` can dispatch a QC task without the ledger row normally
+// created by the relay bridge.  The completion query below intentionally uses
+// an inner join on that exact task id, so adopt only the orphaned task itself
+// (never an issue number) and let the ordinary verdict path decide its result.
+async function adoptUnloggedInReviewTasks({ dbPool = pool, workspaceId = WORKSPACE_ID,
+  logger = console } = {}) {
+  if (!workspaceId) {
+    logger.error(`${LOG_PREFIX} [assignment-adoption] workspace id is required`);
+    return [];
+  }
+  const client = await dbPool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `WITH candidates AS (
+         SELECT i.id AS issue_id, atq.agent_id, atq.id AS task_id
+           FROM issue i
+           JOIN relay_stage_config rsc
+             ON rsc.workspace_id = i.workspace_id
+            AND rsc.stage_name = i.status
+           JOIN agent_task_queue atq
+             ON atq.issue_id = i.id
+            AND atq.workspace_id = i.workspace_id
+          WHERE i.workspace_id = $1::uuid
+            AND i.status = 'In Review'
+            AND rsc.next_stage = 'CI/CD & Deploy'
+            AND atq.status = 'completed'
+            AND NOT EXISTS (
+              SELECT 1 FROM relay_run_log existing
+               WHERE existing.task_id = atq.id
+            )
+          ORDER BY atq.completed_at ASC NULLS LAST, atq.id ASC
+          LIMIT $2::int
+          FOR UPDATE OF i, atq SKIP LOCKED
+       )
+       INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
+       SELECT c.issue_id, 'In Progress', 'In Review', c.agent_id, c.task_id, 'pending'
+         FROM candidates c
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log existing
+           WHERE existing.task_id = c.task_id
+        )
+       RETURNING id, issue_id, task_id`,
+      [workspaceId, 20]
+    );
+    await client.query('COMMIT');
+    if (result.rowCount > 0) {
+      logger.log(`${LOG_PREFIX} [assignment-adoption] Adopted ${result.rowCount} unlogged In Review task(s)`);
+    }
+    return result.rows;
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    logger.error(`${LOG_PREFIX} [assignment-adoption] DB error: ${err.message}`);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
 async function advanceTick() {
   if (advanceTickInFlight) return;
   advanceTickInFlight = true;
   try {
+    await adoptUnloggedInReviewTasks();
     await enqueuePassWithoutRelayRows();
     await findAndAdvanceTasks();
   } finally {
@@ -1564,5 +1624,5 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { advanceTick, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
+module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon };

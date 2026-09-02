@@ -4,10 +4,59 @@ const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const { Client } = require('pg');
 const { qcCompletionAdvance, processParkedDiagnoses,
-  requeueStrandedTasks, requeueTriggerSummary } = require('./multica-relay-advance-daemon.cjs');
+  adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+
+test('completed assignment task in In Review is adopted once by exact task and workspace', async () => {
+  const workspaceId = '123e4567-e89b-42d3-a456-426614174000';
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const issueId = '323e4567-e89b-42d3-a456-426614174000';
+  const queries = [];
+  let adopted = false;
+  const client = { async query(sql, values = []) {
+    queries.push({ sql, values });
+    if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
+    if (sql.includes('INSERT INTO relay_run_log')) {
+      if (adopted) return { rowCount: 0, rows: [] };
+      adopted = true;
+      return { rowCount: 1, rows: [{ id: 'relay-log-1', issue_id: issueId, task_id: taskId }] };
+    }
+    throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
+  }, release() {} };
+  const options = { dbPool: { connect: async () => client }, workspaceId,
+    logger: { log() {}, error() {} } };
+  const first = await adoptUnloggedInReviewTasks(options);
+  const second = await adoptUnloggedInReviewTasks(options);
+  assert.deepEqual(first, [{ id: 'relay-log-1', issue_id: issueId, task_id: taskId }]);
+  assert.deepEqual(second, []);
+  const adoption = queries.find(({ sql }) => sql.includes('INSERT INTO relay_run_log'));
+  assert.deepEqual(adoption.values, [workspaceId, 20]);
+  assert.match(adoption.sql, /i\.workspace_id = \$1::uuid/);
+  assert.match(adoption.sql, /atq\.id AS task_id/);
+  assert.match(adoption.sql, /existing\.task_id = atq\.id/);
+  assert.match(adoption.sql, /FOR UPDATE OF i, atq SKIP LOCKED/);
+  assert.match(adoption.sql, /existing\.task_id = c\.task_id/);
+  assert.match(adoption.sql, /'In Progress', 'In Review', c\.agent_id, c\.task_id, 'pending'/);
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /INNER JOIN relay_run_log rrl ON rrl\.task_id = atq\.id AND rrl\.status = \$1/);
+});
+
+test('assignment adoption cannot select an equal issue number from another workspace', () => {
+  // GSP-1465 and PPP-1465 are distinct issues: this pass must have no number
+  // predicate to accidentally bridge them.
+  const gspFixture = { workspace_id: '123e4567-e89b-42d3-a456-426614174000', number: 1465 };
+  const pppFixture = { workspace_id: '423e4567-e89b-42d3-a456-426614174000', number: 1465 };
+  assert.equal(gspFixture.number, pppFixture.number);
+  assert.notEqual(gspFixture.workspace_id, pppFixture.workspace_id);
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const adoption = source.slice(source.indexOf('async function adoptUnloggedInReviewTasks'),
+    source.indexOf('async function advanceTick'));
+  assert.match(adoption, /i\.workspace_id = \$1::uuid/);
+  assert.match(adoption, /atq\.issue_id = i\.id/);
+  assert.doesNotMatch(adoption, /i\.number|atq\.number/);
+});
 
 test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async (t) => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
