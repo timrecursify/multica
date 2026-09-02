@@ -28,7 +28,7 @@ func TestReplaceRelayStagePoolGrantsWorkspaceInvocation(t *testing.T) {
 
 	replace := func() {
 		w := httptest.NewRecorder()
-		req := withURLParam(newRequest(http.MethodPut, "/api/relay-stage-pools/In Review", map[string]any{
+		req := withURLParam(newRequest(http.MethodPut, "/api/relay-stage-pools/In%20Review", map[string]any{
 			"enabled": true, "members": []string{agentID},
 		}), "stage", "In Review")
 		testHandler.ReplaceRelayStagePool(w, req)
