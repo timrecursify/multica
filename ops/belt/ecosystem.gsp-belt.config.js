@@ -12,4 +12,5 @@ export default {
     ...(process.env.MULTICA_INCLUDE_WORKER === '1' ? [app('gsp-multica-worker', 'ops/belt/multica-daemon-wrapper.sh', { kill_timeout: 30000,
       env: { MULTICA_DAEMON_MAX_CONCURRENT_TASKS: process.env.MULTICA_DAEMON_MAX_CONCURRENT_TASKS ?? '20', MULTICA_DAEMON_WORKSPACES_ROOT: process.env.MULTICA_DAEMON_WORKSPACES_ROOT ?? '/home/newadmin/multica-workspaces-gsp' } },
     )] : []),
+  ],
 };
