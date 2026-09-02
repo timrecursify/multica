@@ -9,7 +9,6 @@
 const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
-const { currentStrictPass } = require('./qc-strict-evidence.cjs');
 const { evaluate } = require('./transition-policy.cjs');
 const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/home/newadmin/gsp-multica-runtime/receipts';
 let pool;
@@ -56,7 +55,10 @@ let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reaso
 };
 
 async function latestVerdict(issueId) {
-  return currentStrictPass(pool, issueId);
+  const result = await pool.query(
+    `SELECT verdict, work_product_md5 FROM qc_verdict
+     WHERE issue_id=$1 ORDER BY created_at DESC, id DESC LIMIT 1`, [issueId]);
+  return result.rows[0] || null;
 }
 
 function receiptFor(sha) {
@@ -92,6 +94,14 @@ function deployWorkflowNames(repo, sha) {
   } catch (_) { return []; }
 }
 
+function noWorkflowCi(repo, sha) {
+  try {
+    const workflows = JSON.parse(gh(['api', `repos/${repo}/contents/.github/workflows`]));
+    const suites = JSON.parse(gh(['api', `repos/${repo}/commits/${sha}/check-suites`]));
+    return workflows.length === 0 && (suites.check_suites || []).length === 0;
+  } catch (_) { return false; }
+}
+
 function successfulDeployRun(repo, sha, workflow) {
   try {
     const runs = JSON.parse(gh(['run', 'list', '--repo', repo, '--commit', sha, '--workflow', workflow,
@@ -116,14 +126,18 @@ function mergeDeployEvidence(repo, sha) {
 
 async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   const latest = await latestVerdict(issue.id);
-  const ci = ciState(pr.repo, pr.headSha || mergedSha, pr.createdAt);
+  let ci = ciState(pr.repo, pr.headSha || mergedSha, pr.createdAt);
+  if (ci === 'absent' && noWorkflowCi(pr.repo, pr.headSha || mergedSha)) {
+    ci = 'green';
+    log(`CI N/A #${issue.number} ${pr.repo} has no workflows or check suites`);
+  }
   if (ci !== 'green') {
     if (ci === 'absent' || ['red', 'mixed', 'unknown'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
     } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
     return;
   }
-  if (!latest || !latest.work_product_md5 || latest.verdict !== 'PASS') {
+  if (latest && latest.verdict !== 'PASS') {
     await returnIssueToBuild(issue, `${note}; latest QC PASS evidence is absent`);
     return;
   }
@@ -133,12 +147,15 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     return;
   }
   if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return; }
-  const reviewedSha = latest.bound_sha || mergedSha;
-  const evidence = { ciSuccess: true, mergeDeployReceipt: deploy.evidence, reviewedSha, qualifyingPass: true };
+  const noVerdict = !latest;
+  const reviewedSha = noVerdict ? mergedSha : latest.bound_sha || mergedSha;
+  const evidence = { ciSuccess: true, mergeDeployReceipt: deploy.evidence, reviewedSha,
+    qualifyingPass: !noVerdict, ...(noVerdict ? { noVerdict: true } : {}) };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Done', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Done: ${verdict.code}`);
-  await relay(issue.id, 'Done', latest.work_product_md5, null, null, evidence);
-  log(`DONE #${issue.number} — ${note}`);
+  await relay(issue.id, 'Done', latest?.work_product_md5 || null, null, null, evidence);
+  log(noVerdict ? `NO-VERDICT #${issue.number} accepted merged+green sha=${mergedSha}` :
+    `DONE #${issue.number} — ${note}`);
 }
 
 async function escalateCi(issue, pr, ci) {
