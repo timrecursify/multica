@@ -45,6 +45,7 @@ const {
   retryEscalationLoop,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
+  relayDiagnosisRerun,
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
@@ -113,6 +114,51 @@ test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', asyn
   const result = await rerunParkedDiagnosis(client, { issue_id: '123e4567-e89b-42d3-a456-426614174000', idempotency_key: 'rerun-0001' });
   assert.deepEqual(result, { ok: true, replay: true, task_id: 'existing-task' });
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
+});
+
+test('Parked diagnosis rerun logs classified and unexpected database exceptions', async (t) => {
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+  const payload = { agent_token: 'test-relay-secret', issue_id: issueId, idempotency_key: 'rerun-0001' };
+  const originalError = console.error;
+  for (const scenario of [
+    { name: 'allowlisted runtime refusal', error: Object.assign(new Error('selected runtime was removed'), {
+      code: '23514', constraint: 'agent_task_queue_active_requires_runtime' }), status: 409,
+      body: { error: 'diagnosis_runtime_unavailable' } },
+    { name: 'unclassified database error', error: Object.assign(new Error('database unavailable'), {
+      code: '08006', constraint: 'unrelated_constraint' }), status: 500,
+      body: { error: 'internal_error' } }
+  ]) {
+    await t.test(scenario.name, async () => {
+      scenario.error.stack = `stack for ${scenario.name}`;
+      const calls = [];
+      const client = {
+        async connect() { calls.push('connect'); },
+        async query(sql) {
+          calls.push(sql);
+          if (sql === "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 805))") throw scenario.error;
+          return { rowCount: 0, rows: [] };
+        },
+        async end() { calls.push('end'); }
+      };
+      const response = { status: null, body: null,
+        writeHead(status) { this.status = status; }, end(body) { this.body = JSON.parse(body); } };
+      const logs = [];
+      setTestClientFactory(() => client);
+      console.error = (line) => logs.push(JSON.parse(line));
+      try {
+        await relayDiagnosisRerun({}, response, payload);
+      } finally {
+        console.error = originalError;
+        setTestClientFactory(null);
+      }
+      assert.equal(response.status, scenario.status);
+      assert.deepEqual(response.body, scenario.body);
+      assert.deepEqual(calls.slice(-2), ['ROLLBACK', 'end']);
+      assert.deepEqual(logs, [{ event: 'relay_parked_diagnosis_rerun_failed', issue_id: issueId,
+        message: scenario.error.message, stack: scenario.error.stack, code: scenario.error.code,
+        constraint: scenario.error.constraint }]);
+    });
+  }
 });
 
 test('relay status authority is transaction-local', async () => {
