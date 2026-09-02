@@ -16,11 +16,24 @@ function liveTasksSql() {
 }
 
 function ownerSql() {
-  return `SELECT pool.agent_id FROM relay_stage_agent_pool pool
+  return `SELECT pool.agent_id,
+                   COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id
+            FROM relay_stage_agent_pool pool
             JOIN relay_stage_pool policy ON policy.workspace_id = pool.workspace_id
              AND policy.stage_name = pool.stage_name AND policy.enabled = true
+            JOIN agent a ON a.id = pool.agent_id AND a.workspace_id = pool.workspace_id
+            LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
+             AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
+            LEFT JOIN LATERAL (
+              SELECT ar.id FROM agent_runtime ar
+               WHERE ar.workspace_id = pool.workspace_id
+                 AND ar.provider = 'codex' AND ar.status = 'online'
+               ORDER BY ar.updated_at DESC LIMIT 1
+            ) online_runtime ON true
            WHERE pool.workspace_id = $1::uuid AND pool.stage_name = $2
              AND pool.enabled = true
+             AND a.archived_at IS NULL AND a.status IN ('idle', 'working')
+             AND COALESCE(own_runtime.id, online_runtime.id) IS NOT NULL
            ORDER BY pool.last_selected_at NULLS FIRST, pool.agent_id LIMIT 1`;
 }
 
@@ -138,16 +151,16 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     const context = taskContext(issue.status);
     const created = await client.query(
-      `INSERT INTO agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context,
+      `INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, workspace_id, status, priority, context,
           trigger_summary, originator_source, attempt, max_attempts)
-       SELECT $1::uuid, $2::uuid, $3::uuid, 'queued', $4, $5::jsonb, $6, 'reconcile', $7, $8
+       SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'queued', $5, $6::jsonb, $7, 'reconcile', $8, $9
         WHERE NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
-           WHERE active.issue_id = $2::uuid AND active.status = ANY($9::text[])
-             AND active.context->>'to_stage' = $10
+           WHERE active.issue_id = $3::uuid AND active.status = ANY($10::text[])
+             AND active.context->>'to_stage' = $11
         )
        ON CONFLICT DO NOTHING RETURNING id`,
-      [owner.agent_id, issue.id, issue.workspace_id, issue.priority === "urgent" ? 1 : 0,
+      [owner.agent_id, owner.selected_runtime_id, issue.id, issue.workspace_id, issue.priority === "urgent" ? 1 : 0,
         JSON.stringify(context), `reconcile ${issue.status}`, attempt + 1, maxAttempts, LIVE, issue.status]
     );
     if (created.rows.length === 0) {
@@ -155,6 +168,11 @@ async function reconcileIssue(client, issueId, options = {}) {
       return { action: "already_live" };
     }
     const taskId = created.rows[0].id;
+    await client.query(
+      `UPDATE relay_stage_agent_pool SET last_selected_at = NOW()
+        WHERE workspace_id = $1::uuid AND stage_name = $2 AND agent_id = $3::uuid`,
+      [issue.workspace_id, issue.status, owner.agent_id]
+    );
     await client.query(
       `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
        VALUES ($1::uuid, $2, $2, $3::uuid, $4::uuid, 'pending')`,
