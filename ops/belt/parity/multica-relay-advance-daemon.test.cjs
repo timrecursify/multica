@@ -6,7 +6,7 @@ const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
-  readvanceRecordedOutcomes } = require('./multica-relay-advance-daemon.cjs');
+  readvanceRecordedOutcomes, buildCompletionRoute } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
 
@@ -64,8 +64,33 @@ test('no linked PR completion routes directly to Done and never In Review', () =
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const route = source.slice(source.indexOf('async function buildCompletionRoute'), source.indexOf('function uniqueFullSha'));
   assert.match(route, /FROM issue_pull_request/);
+  assert.match(route, /FROM comment/);
   assert.match(route, /kind: 'no_pr', toStage: 'Done'/);
   assert.doesNotMatch(route, /toStage: 'In Review'/);
+});
+
+test('completion route falls back to a PR URL in recent comments', async () => {
+  const queries = [];
+  const client = { query: async (sql) => {
+    queries.push(sql);
+    if (sql.includes('FROM issue_pull_request')) return { rows: [] };
+    if (sql.includes('FROM comment')) {
+      return { rows: [{ content: 'Build PR: https://github.com/acme/widget/pull/42' }] };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  }};
+  const githubCalls = [];
+  const route = await buildCompletionRoute(client, {
+    issue_id: 'issue-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: (args) => {
+    githubCalls.push(args);
+    return JSON.stringify({ state: 'OPEN', files: [{ path: 'server/main.go' }],
+      headRefOid: 'a'.repeat(40), mergeStateStatus: 'CLEAN', statusCheckRollup: [] });
+  }});
+  assert.equal(route.repo, 'acme/widget');
+  assert.equal(route.pr_url, 'https://github.com/acme/widget/pull/42');
+  assert.equal(githubCalls[0][2], 'https://github.com/acme/widget/pull/42');
+  assert.equal(queries.length, 2);
 });
 
 test('assignment adoption inserts only the assigned configured QC task once and is workspace-safe', async () => {

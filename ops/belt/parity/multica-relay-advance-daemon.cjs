@@ -125,26 +125,34 @@ function greenChecks(checks) {
     ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(String(check.conclusion || check.state || '').toUpperCase()));
 }
 
-async function buildCompletionRoute(client, row) {
+async function buildCompletionRoute(client, row, { githubCommand = github } = {}) {
   if (row.to_stage !== 'In Progress' || row.next_stage !== 'In Review') return null;
   const linked = await client.query(
     `SELECT p.html_url, p.repo_owner, p.repo_name
        FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
       WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1`, [row.issue_id]);
+  const commentPr = linked.rows[0] ? null : await client.query(
+    `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`, [row.issue_id]);
+  const commentMatch = commentPr?.rows
+    .map(({ content }) => String(content || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i))
+    .find(Boolean);
   // Coordination and parent issues without a linked PR close from their work product.
-  if (!linked.rows[0]) return { kind: 'no_pr', toStage: 'Done' };
+  if (!linked.rows[0] && !commentMatch) return { kind: 'no_pr', toStage: 'Done' };
   const issuePr = linked.rows[0];
-  const repo = `${issuePr.repo_owner}/${issuePr.repo_name}`;
-  const pr = JSON.parse(github(['pr', 'view', issuePr.html_url, '--json',
+  const repo = issuePr
+    ? `${issuePr.repo_owner}/${issuePr.repo_name}`
+    : `${commentMatch[1]}/${commentMatch[2]}`;
+  const prUrl = issuePr?.html_url || commentMatch[0];
+  const pr = JSON.parse(githubCommand(['pr', 'view', prUrl, '--json',
     'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
   const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
       greenChecks(pr.statusCheckRollup)) {
-    github(['pr', 'merge', issuePr.html_url, '--squash', '--admin']);
+    githubCommand(['pr', 'merge', prUrl, '--squash', '--admin']);
     return { ...route, toStage: 'Done', kind: 'merge_only_admin_merged', repo,
-      pr_url: issuePr.html_url, pr_state: 'MERGED', boundSha: pr.headRefOid };
+      pr_url: prUrl, pr_state: 'MERGED', boundSha: pr.headRefOid };
   }
-  return { ...route, repo, pr_url: issuePr.html_url, pr_state: pr.state, boundSha: pr.headRefOid };
+  return { ...route, repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
 }
 
 function uniqueFullSha(value) {
@@ -1847,7 +1855,7 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
+module.exports = { advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes };
