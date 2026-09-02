@@ -97,6 +97,25 @@ func TestBuildSearchQuery_MultiTermDoesNotRepeatPhrasePredicate(t *testing.T) {
 	}
 }
 
+func TestBuildSearchQuery_MultiTermUsesMaterializedCandidateIntersection(t *testing.T) {
+	query, _ := buildSearchQuery(linearTestContract, "no active lease", []string{"no", "active", "lease"}, 0, false, false)
+
+	if !strings.Contains(query, "WITH matching_issue_ids AS MATERIALIZED") {
+		t.Fatalf("multi-word search must narrow candidate IDs before ranking: %s", query)
+	}
+	if got := strings.Count(query, "INTERSECT"); got != 2 {
+		t.Errorf("candidate selection has %d intersections, want 2 for three terms: %s", got, query)
+	}
+	if !strings.Contains(query, "i.id IN (SELECT id FROM matching_issue_ids)") {
+		t.Errorf("main query does not consume the narrowed candidate IDs: %s", query)
+	}
+	// The candidate comment lookup is workspace-scoped and set-based; it must
+	// not be the old c.issue_id = i.id correlated predicate.
+	if !strings.Contains(query, "SELECT c.issue_id FROM comment c") || !strings.Contains(query, "c.workspace_id = $4") {
+		t.Errorf("candidate comment lookup lost workspace-scoped indexable path: %s", query)
+	}
+}
+
 func TestBuildSearchQuery_WithNumber(t *testing.T) {
 	query, args := buildSearchQuery(linearTestContract, "MUL-42", []string{"MUL-42"}, 42, true, false)
 
