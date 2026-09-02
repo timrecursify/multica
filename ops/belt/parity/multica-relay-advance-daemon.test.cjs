@@ -241,7 +241,9 @@ function strandedFixture(overrides = {}) {
   };
 }
 
-function strandedHarness(fixtures) {
+function strandedHarness(fixtures, state = {
+  tasks: [], marker: null, pendingTask: null, pendingMarker: undefined
+}) {
   const queries = [];
   const relayPosts = [];
   const dispatchedIssueIds = new Set();
@@ -249,6 +251,7 @@ function strandedHarness(fixtures) {
     queries.push({ sql, values });
     if (sql.includes('WITH stranded AS') && sql.includes('WHERE rn <= $1')) {
       const eligible = fixtures.filter((row) => row.eligible !== false &&
+        (row.forceContender || !state.tasks.some((task) => task.issue_id === row.issue_id && task.status === 'queued')) &&
         (row.allow_repeat || !dispatchedIssueIds.has(row.issue_id)));
       const exhausted = eligible.filter((row) => (row.stage_history_count ?? row.history_count ?? 1) >= values[3] ||
         (row.lifetime_history_count ?? row.history_count ?? 1) >= values[4])
@@ -275,21 +278,36 @@ function strandedHarness(fixtures) {
     if (sql.includes("INSERT INTO activity_log") && sql.includes("'relay_lane_paused'")) {
       return { rows: [] };
     }
-    if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
+    if (sql === 'BEGIN') return { rows: [] };
+    if (sql === 'COMMIT') {
+      if (state.pendingTask) state.tasks.push(state.pendingTask);
+      if (state.pendingMarker !== undefined) state.marker = state.pendingMarker;
+      state.pendingTask = null;
+      state.pendingMarker = undefined;
+      return { rows: [] };
+    }
+    if (sql === 'ROLLBACK') {
+      state.pendingTask = null;
+      state.pendingMarker = undefined;
+      return { rows: [] };
+    }
     if (sql.includes('pg_advisory_xact_lock') || sql.includes('FROM issue WHERE id')) return { rows: [] };
     if (sql.includes('FROM agent_task_queue') && sql.includes('FOR UPDATE')) return { rows: [] };
     if (sql.includes('count(*)::int AS n')) return { rows: [{ n: fixtures[0].history_count ?? 1 }] };
     if (sql.includes('INSERT INTO agent_task_queue')) {
       dispatchedIssueIds.add(values[1]);
+      state.pendingTask = { id: '623e4567-e89b-42d3-a456-426614174000', issue_id: values[1], status: 'queued' };
       return { rows: [{ id: '623e4567-e89b-42d3-a456-426614174000' }] };
     }
     if (sql.includes('UPDATE relay_run_log') && sql.includes("requeue_task_id")) {
+      if (state.marker !== null && state.marker !== values[2]) return { rows: [] };
+      state.pendingMarker = values[1];
       return { rows: [{ id: 'closed-relay-log' }] };
     }
     if (sql.includes('INSERT INTO relay_run_log')) return { rows: [] };
     throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
   }, release() {} };
-  return { queries, relayPosts, client, run: () => requeueStrandedTasks({
+  return { queries, relayPosts, client, state, run: () => requeueStrandedTasks({
     dbPool: { connect: async () => client },
     postRelay: async (payload) => { relayPosts.push(payload); return { status: 200 }; }
   }) };
@@ -471,18 +489,32 @@ test('completed task with a completed relay row is not admitted', () => {
   assert.doesNotMatch(requeue, /t\.status = 'completed'[\s\S]{0,80}closed_log\.status = 'completed'/);
 });
 
-test('a terminal no-progress retry rotates its consumed marker and is requeued once per sweep', async () => {
-  const harness = strandedHarness([strandedFixture({
+test('terminal retry contenders commit one live replacement, one marker rotation, and one pending log', async () => {
+  const state = { tasks: [], marker: '123e4567-e89b-42d3-a456-426614174000',
+    pendingTask: null, pendingMarker: undefined };
+  const fixture = strandedFixture({
     dead_task_status: 'completed',
     closed_relay_log_id: 'closed-relay-log',
-    requeue_marker_log_id: 'closed-relay-log',
-    allow_repeat: true
-  })]);
-  await harness.run();
-  await harness.run();
-  assert.equal(harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue')).length, 2);
-  assert.equal(harness.queries.filter(({ sql }) => sql.includes('UPDATE relay_run_log') &&
-    sql.includes("requeue_task_id")).length, 2);
+    requeue_marker_log_id: 'closed-relay-log'
+  });
+  const first = strandedHarness([fixture], state);
+  // This contender selected the stale candidate just before the first
+  // transaction committed; its compare-and-rotate must roll its insert back.
+  const contender = strandedHarness([{ ...fixture, forceContender: true }], state);
+  await first.run();
+  await contender.run();
+  const inserts = first.queries.concat(contender.queries)
+    .filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  const markerUpdates = first.queries.concat(contender.queries)
+    .filter(({ sql }) => sql.includes('UPDATE relay_run_log') && sql.includes("requeue_task_id"));
+  const logs = first.queries.concat(contender.queries)
+    .filter(({ sql }) => sql.includes('INSERT INTO relay_run_log'));
+  assert.equal(inserts.length, 2, 'the losing contender reaches the transactional insert');
+  assert.equal(markerUpdates.length, 2);
+  assert.equal(logs.length, 1);
+  assert.deepEqual(state.tasks, [{ id: '623e4567-e89b-42d3-a456-426614174000',
+    issue_id: fixture.issue_id, status: 'queued' }]);
+  assert.equal(state.marker, '623e4567-e89b-42d3-a456-426614174000');
 });
 
 test('live task on another stage fixture is excluded for every stage', () => {
