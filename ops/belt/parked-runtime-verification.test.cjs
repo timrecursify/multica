@@ -6,11 +6,13 @@ const { PARK_RUNTIME_VERIFICATION_KIND, firstDurableEvidence } = require('./park
 test('verification lane has a separate, bounded, non-diagnosis kind', () => {
   const source = fs.readFileSync(require.resolve('./parked-runtime-verification.cjs'), 'utf8');
   assert.equal(PARK_RUNTIME_VERIFICATION_KIND, 'parked_runtime_verification');
-  assert.match(source, /LIMIT \$3/);
+  assert.match(source, /LIMIT \$5/);
   assert.match(source, /FOR UPDATE SKIP LOCKED/);
   assert.match(source, /verification_processed/);
   assert.match(source, /runtime_evidence_unverified/);
-  assert.match(source, /context->>'kind' IS DISTINCT FROM \$2/);
+  assert.match(source, /verification_requested/);
+  assert.match(source, /workspace_id = \$1::uuid/);
+  assert.match(source, /INSERT INTO agent_task_queue/);
   assert.match(source, /runtime_evidence_verified/);
   assert.doesNotMatch(source, /recordParkAndQueueDiagnosis/);
 });
@@ -25,4 +27,5 @@ test('only durable issue-scoped evidence is selected and diagnosis tasks are exc
   assert.match(sql, /v\.issue_id = \$1::uuid/);
   assert.match(sql, /a\.issue_id = \$1::uuid/);
   assert.match(sql, /context->>'kind' IS DISTINCT FROM \$2/);
+  assert.match(sql, /context->>'kind' IS DISTINCT FROM \$3/);
 });
