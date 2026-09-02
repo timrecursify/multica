@@ -10,8 +10,13 @@ if [[ "$requested_codex_bin" == "/home/newadmin/tools/codex-openrouter" && "$MUL
 fi
 export CODEX_BIN="$requested_codex_bin"
 
+# The belt executes repository build commands through this process. Keep the
+# system Go toolchain ahead of inherited user paths for every task.
+export PATH="/usr/local/go/bin:${PATH}"
+
 cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-32}"
 root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
+help_timeout="${MULTICA_DAEMON_HELP_TIMEOUT_SECONDS:-5}"
 if [[ ! "$cap_raw" =~ ^[1-9][0-9]*$ ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer" >&2
   exit 64
@@ -20,8 +25,15 @@ if [[ -z "$root" || "$root" != /* ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path" >&2
   exit 64
 fi
+if [[ ! "$help_timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "multica-daemon-wrapper: MULTICA_DAEMON_HELP_TIMEOUT_SECONDS must be a positive integer" >&2
+  exit 64
+fi
 export MULTICA_DAEMON_MAX_CONCURRENT_TASKS="$cap_raw"
 export MULTICA_DAEMON_WORKSPACES_ROOT="$root"
+# Current daemon binaries consume this environment variable. Keep the fleet
+# wrapper variable above for the belt guard and rollback scripts.
+export MULTICA_WORKSPACES_ROOT="$root"
 
 lock_file="${MULTICA_DAEMON_LOCK_FILE:-/home/newadmin/.local/state/gsp-multica-worker.lock}"
 mkdir -p -- "$(dirname -- "$lock_file")"
@@ -39,6 +51,25 @@ if [[ -z "$daemon_cwd" || "$daemon_cwd" != /* || ! -d "$daemon_cwd" ]]; then
 fi
 export MULTICA_DAEMON_PORT="${MULTICA_DAEMON_PORT:-20464}"
 cd -- "$daemon_cwd"
-exec "$daemon_bin" daemon start --foreground --daemon-id=gsp-multica-worker \
-  --heartbeat-interval=30s --poll-interval=2s --workspaces-root="$root" \
-  --max-concurrent-tasks="$cap_raw"
+set +e
+daemon_help="$(timeout --kill-after=1s "${help_timeout}s" "$daemon_bin" daemon start --help 2>&1)"
+help_status=$?
+set -e
+if [[ $help_status -eq 124 ]]; then
+  echo "multica-daemon-wrapper: daemon start capability probe timed out" >&2
+  exit 64
+fi
+if [[ $help_status -ne 0 ]]; then
+  echo "multica-daemon-wrapper: daemon start capability probe failed (exit $help_status)" >&2
+  exit 64
+fi
+daemon_args=(daemon start --foreground --daemon-id=gsp-multica-worker
+  --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks="$cap_raw")
+# `--workspaces-root` was removed from a short-lived daemon release. The
+# environment setting is its documented replacement; old rollback artifacts
+# still need the flag, so detect the installed binary rather than guessing a
+# version string.
+if grep -Fq -- '--workspaces-root' <<<"$daemon_help"; then
+  daemon_args+=(--workspaces-root="$root")
+fi
+exec "$daemon_bin" "${daemon_args[@]}"

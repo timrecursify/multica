@@ -13,6 +13,12 @@ test('batch size is bounded at 25 and mode is explicit', () => {
   assert.throws(() => parseArgs(['--dry-run', '--apply']), /exactly one/);
   assert.throws(() => parseArgs(['--dry-run', '--retry-runtime-evidence']), /requires --apply/);
   assert.equal(parseArgs(['--apply', '--retry-runtime-evidence']).retryRuntimeEvidence, true);
+  assert.deepEqual(parseArgs(['--apply', '--recover-runtime-evidence-issue',
+    '123e4567-e89b-12d3-a456-426614174000']).recoverRuntimeEvidenceIssues,
+  ['123e4567-e89b-12d3-a456-426614174000']);
+  assert.throws(() => parseArgs(['--apply', '--recover-runtime-evidence-issue', 'bad']), /requires a UUID/);
+  assert.throws(() => parseArgs(['--dry-run', '--recover-runtime-evidence-issue',
+    '123e4567-e89b-12d3-a456-426614174000']), /requires --apply/);
   assert.equal(MAX_BATCH, 25);
 });
 
@@ -41,14 +47,32 @@ test('runtime-evidence correction retry admits exactly the completed held class'
 
 test('correction mode has an explicit held-completed candidate predicate and one-shot guard', async () => {
   const seen = [];
-  await run({ connect: async () => ({ query: async (sql) => {
+  const query = async (sql) => {
     seen.push(sql); return { rows: [], rowCount: 0 };
-  }, release() {} }) },
+  };
+  await run({ query, connect: async () => ({ query, release() {} }) },
     parseArgs(['--apply', '--retry-runtime-evidence']));
   const sql = seen.find((statement) => statement.includes('WITH ranked AS'));
   assert.match(sql, /i\.metadata->>'parked_blocker' = 'runtime_evidence_unverified'/);
   assert.match(sql, /LOWER\(completed\.status\) = 'completed'/);
   assert.match(sql, /retried\.context->>'evidence_correction_retry' = 'true'/);
+});
+
+test('recovery v2 selects only operator-supplied v1-consumed evidence rows', async () => {
+  const seen = [];
+  const query = async (sql) => {
+    seen.push(sql); return { rows: [], rowCount: 0 };
+  };
+  await run({ query, connect: async () => ({ query, release() {} }) }, parseArgs(['--apply', '--recover-runtime-evidence-issue',
+    '123e4567-e89b-12d3-a456-426614174000']));
+  const sql = seen.find((statement) => statement.includes('WITH ranked AS'));
+  assert.match(sql, /i\.id = ANY\(\$2::uuid\[\]\)/);
+  assert.match(sql, /runtime_evidence_recovery_consumed' = 'true'/);
+  assert.match(sql, /runtime_evidence_recovery_v2_requested' = 'true'/);
+  assert.match(sql, /runtime_evidence_unverified/);
+  const source = fs.readFileSync(require.resolve('./backfill-parked-diagnosis.cjs'), 'utf8');
+  assert.match(source, /SET context = COALESCE\(context, '\{\}'::jsonb\) \|\|/);
+  assert.match(source, /runtime_evidence_recovery_v2_requested/);
 });
 
 test('selection allows temporary blockers and retryable diagnoses before the batch limit', async () => {
@@ -82,6 +106,7 @@ test('folded #63 under open MEGA #1029 is skipped and the next candidate commits
       // because its parent #1029 is an open MEGA, so #64 fills this batch slot.
       return { rows: [next], rowCount: 1 };
     }
+    if (sql.includes('FROM issue')) return { rows: [next], rowCount: 1 };
     if (sql.includes('SELECT id, status FROM agent_task_queue') || sql.includes('SELECT 1 FROM comment') ||
         sql.includes('SELECT failure_reason, error') || sql.includes('SELECT verdict FROM qc_verdict')) return { rows: [], rowCount: 0 };
     if (sql.includes('FROM agent a')) return { rows: [{ id: 'sol', name: 'gsp-parked-diagnosis-sol-low-1',
@@ -90,7 +115,7 @@ test('folded #63 under open MEGA #1029 is skipped and the next candidate commits
     if (sql.includes('INSERT INTO agent_task_queue')) { state.queued.push(values[1]); return { rows: [{ id: 'task-64' }], rowCount: 1 }; }
     return { rows: [], rowCount: 0 };
   }, release() {} };
-  const result = await run({ connect: async () => client }, parseArgs(['--apply', '--batch-size', '1']));
+  const result = await run({ query: client.query, connect: async () => client }, parseArgs(['--apply', '--batch-size', '1']));
   assert.equal(megaChild.metadata.bundled_into, '1029');
   assert.deepEqual(result.ids.queued, ['64:task-64']);
   assert.deepEqual(state.queued, ['64']);
@@ -154,9 +179,9 @@ test('bounded selection interleaves 25+ rows from one workspace with another', a
   assert.ok(result.counts.scanned <= MAX_SCAN_WINDOW);
 });
 
-test('apply locks one eligible batch and commits it as one transaction', () => {
+test('apply locks and commits each candidate independently', () => {
   const source = fs.readFileSync(require.resolve('./backfill-parked-diagnosis.cjs'), 'utf8');
-  assert.match(source, /FOR UPDATE OF i SKIP LOCKED/);
+  assert.match(source, /WHERE id = \$1 AND status = 'Parked' FOR UPDATE SKIP LOCKED/);
   assert.match(source, /await client\.query\('BEGIN'\);[\s\S]*await client\.query\('COMMIT'\);/);
   assert.match(source, /await client\.query\('ROLLBACK'\)\.catch/);
 });
@@ -165,16 +190,15 @@ function applyPool(issueCount, failOnTask = null) {
   const state = {
     issues: Array.from({ length: issueCount }, (_, index) => ({
       id: `issue-${index + 1}`, workspace_id: 'workspace-1', status: 'Parked', priority: 'low', metadata: {}
-    })), tasks: [], pending: [], events: []
+    })), tasks: [], pending: [], events: [], hasFailed: false
   };
   const client = { query: async (sql, values) => {
     if (sql === 'BEGIN') { state.events.push('BEGIN'); state.pending = []; return { rows: [], rowCount: 0 }; }
     if (sql === 'COMMIT') { state.events.push('COMMIT'); state.tasks.push(...state.pending); state.pending = []; return { rows: [], rowCount: 0 }; }
     if (sql === 'ROLLBACK') { state.events.push('ROLLBACK'); state.pending = []; return { rows: [], rowCount: 0 }; }
-    if (sql.includes('WITH ranked AS')) {
-      const selected = state.issues.filter((issue) => !state.tasks.some((task) => task.issue_id === issue.id &&
-        !['failed', 'cancelled'].includes(task.status))).slice(0, values.at(-1));
-      return { rows: selected, rowCount: selected.length };
+    if (sql.includes('FROM issue')) {
+      const issue = state.issues.find((row) => row.id === values[0]);
+      return { rows: issue ? [issue] : [], rowCount: issue ? 1 : 0 };
     }
     if (sql.includes('SELECT id, status FROM agent_task_queue')) return { rows: [], rowCount: 0 };
     if (sql.includes('SELECT 1 FROM comment') || sql.includes('SELECT failure_reason, error') ||
@@ -186,14 +210,26 @@ function applyPool(issueCount, failOnTask = null) {
     }], rowCount: 1 };
     if (sql.includes('INSERT INTO agent_task_queue')) {
       const next = state.pending.length + state.tasks.length + 1;
-      if (failOnTask === next) throw new Error('injected task insert failure');
+      if (failOnTask === next && !state.hasFailed) {
+        state.hasFailed = true;
+        throw Object.assign(new Error('bundled child cannot be dispatched'), {
+          code: 'bundled_child_no_dispatch'
+        });
+      }
       const task = { id: `task-${next}`, issue_id: values[1], status: 'queued' };
       state.pending.push(task);
       return { rows: [task], rowCount: 1 };
     }
     return { rows: [], rowCount: 0 };
   }, release() {} };
-  return { state, connect: async () => client };
+  return { state,
+    query: async (sql, values) => {
+      assert.match(sql, /WITH ranked AS/);
+      const selected = state.issues.filter((issue) => !state.tasks.some((task) => task.issue_id === issue.id &&
+        !['failed', 'cancelled'].includes(task.status))).slice(0, values.at(-1));
+      return { rows: selected, rowCount: selected.length };
+    },
+    connect: async () => client };
 }
 
 test('successive apply batches progress beyond 100 tickets without duplicates', async () => {
@@ -204,15 +240,17 @@ test('successive apply batches progress beyond 100 tickets without duplicates', 
   }
   assert.equal(pool.state.tasks.length, 125);
   assert.equal(new Set(pool.state.tasks.map((task) => task.issue_id)).size, 125);
-  assert.equal(pool.state.events.filter((event) => event === 'COMMIT').length, 5);
+  assert.equal(pool.state.events.filter((event) => event === 'COMMIT').length, 125);
 });
 
-test('injected mid-batch failure rolls back every diagnosis task', async () => {
+test('bundled-child rejection rolls back only that ticket and returns a partial receipt', async () => {
   const pool = applyPool(3, 2);
-  await assert.rejects(run(pool, parseArgs(['--apply', '--batch-size', '3'])), /injected task insert failure/);
-  assert.deepEqual(pool.state.tasks, []);
+  const result = await run(pool, parseArgs(['--apply', '--batch-size', '3']));
+  assert.equal(result.counts.failed, 1);
+  assert.deepEqual(result.ids.failed, [{ issue_id: 'issue-2', reason: 'bundled_child_no_dispatch' }]);
+  assert.deepEqual(pool.state.tasks.map((task) => task.issue_id), ['issue-1', 'issue-3']);
   assert.deepEqual(pool.state.pending, []);
-  assert.deepEqual(pool.state.events, ['BEGIN', 'ROLLBACK']);
+  assert.deepEqual(pool.state.events, ['BEGIN', 'COMMIT', 'BEGIN', 'ROLLBACK', 'BEGIN', 'COMMIT']);
 });
 
 test('default selection covers both workspaces and emits stable dry-run IDs', async () => {

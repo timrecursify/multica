@@ -4,9 +4,11 @@ const {
   instructionCompatibility,
   retryAdmission,
   spendPreflight,
+  budgetCountPredicate,
   stageCycleAdmission,
   lifetimeTaskAdmission,
   quotaCircuitAdmission,
+  QUOTA_PAUSE_MAX_AGE_MS,
   crossStageExecutionAdmission,
   quotaPauseClearance,
   quotaPauseFlipLogLine
@@ -16,12 +18,101 @@ const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
   diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
+const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
+const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
+const MD5_RE = /^[0-9a-f]{32}$/i;
+const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
+const QC_EVIDENCE_MISMATCH_LIMIT = 3;
+let advanceTickInFlight = false;
+
+function uniqueFullSha(value) {
+  const matches = [...String(value || '').matchAll(FULL_SHA_RE)]
+    .map((match) => match[2].toLowerCase());
+  const unique = [...new Set(matches)];
+  return unique.length === 1 ? unique[0] : null;
+}
+
+function strictQcAttempt(row, verdictMd5) {
+  if (!row.qc_attempt_bound_sha && !row.qc_attempt_observed_sha) return null;
+  const bound = String(row.qc_attempt_bound_sha || '').toLowerCase();
+  const observed = String(row.qc_attempt_observed_sha || '').toLowerCase();
+  const md5 = String(row.qc_attempt_work_product_md5 || '').toLowerCase();
+  const evidenceAgentId = row.qc_attempt_evidence_agent_id || row.task_agent_id;
+  const ok = row.qc_attempt_verdict === 'PASS' && row.qc_attempt_qualifying === true &&
+    row.qc_attempt_evidence_agent_model === 'gpt-5.6-sol' &&
+    row.qc_attempt_evidence_agent_effort === 'low' &&
+    row.qc_verdict_checker_id === evidenceAgentId &&
+    /^[0-9a-f]{40}$/.test(bound) && bound === observed && md5 === verdictMd5;
+  return ok ? { ok: true, boundSha: bound,
+    evidenceTaskId: row.qc_attempt_evidence_task_id || row.task_id }
+    : { ok: false, reason: 'qc_attempt_mismatch' };
+}
+
+function legacyQcVerdict(row, verdictMd5, requireVerdictWindow = true) {
+  const taskSha = uniqueFullSha(JSON.stringify(row.task_result || ''));
+  const verdictSha = uniqueFullSha(row.qc_verdict_notes);
+  const started = Date.parse(row.task_started_at || '');
+  const completed = Date.parse(row.task_completed_at || '');
+  const recorded = Date.parse(row.qc_verdict_created_at || '');
+  const inWindow = Number.isFinite(started) && Number.isFinite(completed) &&
+    Number.isFinite(recorded) && recorded >= started && recorded <= completed + 30000;
+  const ok = row.qc_verdict_checker_id === row.task_agent_id &&
+    row.task_agent_model === 'gpt-5.6-sol' && row.task_agent_effort === 'low' &&
+    (!requireVerdictWindow || inWindow) &&
+    taskSha && taskSha === verdictSha && MD5_RE.test(verdictMd5);
+  return ok ? { ok: true, boundSha: taskSha, evidenceTaskId: row.task_id }
+    : { ok: false, reason: 'legacy_qc_evidence_mismatch' };
+}
+
+function qcCompletionAdvance(row) {
+  if (row.to_stage !== 'In Review' || row.next_stage !== 'CI/CD & Deploy') {
+    return { ok: false, reason: 'manual_gated_stage' };
+  }
+  if (row.task_status !== 'completed' || row.qc_verdict !== 'PASS') {
+    return { ok: false, reason: 'completed_sol_low_pass_required' };
+  }
+  const md5 = String(row.qc_verdict_work_product_md5 || '').toLowerCase();
+  if (!MD5_RE.test(md5)) return { ok: false, reason: 'qc_work_product_md5_required' };
+  const strict = strictQcAttempt(row, md5);
+  if (strict) {
+    return strict.ok ? { ok: true, workProductMd5: md5, boundSha: strict.boundSha,
+      evidenceTaskId: strict.evidenceTaskId } : strict;
+  }
+  const candidates = Array.isArray(row.qc_evidence_tasks) && row.qc_evidence_tasks.length > 0
+    ? row.qc_evidence_tasks.map((task) => ({ ...row, ...task })) : [row];
+  for (const candidate of candidates) {
+    const evidence = legacyQcVerdict(candidate, md5, candidates.length === 1 && candidate === row);
+    if (evidence.ok) {
+      return { ok: true, workProductMd5: md5, boundSha: evidence.boundSha,
+        evidenceTaskId: evidence.evidenceTaskId };
+    }
+  }
+  return { ok: false, reason: 'legacy_qc_evidence_mismatch' };
+}
+
+function requeueTriggerSummary(row, coldStart) {
+  const prefix = coldStart
+    ? `Relay cold start: never dispatched in ${row.stage}`
+    : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`;
+  if (row.stage !== 'In Review') return prefix;
+  const result = row.build_task_result || {};
+  const prUrl = result.pr_url || row.metadata?.pr_url;
+  const headSha = result.head_sha || result.bound_sha || row.metadata?.head_sha ||
+    row.metadata?.bound_sha || row.metadata?.commit_sha;
+  if (!prUrl || !/^[0-9a-f]{40}$/i.test(headSha || '')) {
+    return `${prefix}\nQC input: PR/SHA unknown: issue FAIL verdict per runbook`;
+  }
+  const board = row.metadata?.board ||
+    (row.workspace_id === WORKSPACE_ID ? 'gsp' : 'prod');
+  return `${prefix}\nQC input: ticket ${row.number}; board ${board}; ` +
+    `PR ${prUrl}; head SHA ${headSha}`;
+}
 
 // Deliberately small: the DeepSeek build lane is paid, so a backlog drains at a
 // steady trickle rather than firing every stranded ticket at the vendor at once.
@@ -36,8 +127,14 @@ const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10
 // agent is declared by relay_stage_config row 1 (Registered -> Spec,
 // multica-qc-worker-2, the spec writer) -- the belt knew who owned them and
 // still dispatched nobody. Widen further only with the same kind of evidence.
-const REQUEUE_STAGES = (process.env.RELAY_REQUEUE_STAGES || 'Queue,Spec,In Review')
+const NON_REQUEUE_STAGES = new Set(['Human Review', 'Done', 'Cancelled', 'Archived']);
+const configuredRequeueStages = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec,In Review')
   .split(',').map(s => s.trim()).filter(Boolean);
+const excludedRequeueStages = configuredRequeueStages.filter((stage) => NON_REQUEUE_STAGES.has(stage));
+const REQUEUE_STAGES = configuredRequeueStages.filter((stage) => !NON_REQUEUE_STAGES.has(stage));
+if (excludedRequeueStages.length > 0) {
+  console.warn(`${LOG_PREFIX} [requeue] ignoring non-dispatch stages: ${excludedRequeueStages.join(', ')}`);
+}
 
 // Mirrors --max-concurrent-tasks in fleet/multica-daemon-wrapper.sh. Not a
 // threshold of our own: it is the number of tasks the Tower can actually hold.
@@ -129,7 +226,7 @@ async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () =
             SET runtime_config = (COALESCE(runtime_config, '{}'::jsonb) - 'quota_paused' - 'quota_paused_at')
                   || jsonb_build_object(
                     'quota_pause_cleared_at', to_jsonb(NOW()),
-                    'quota_pause_clear_reason', $2
+                    'quota_pause_clear_reason', $2::text
                   ),
                 updated_at = NOW()
           WHERE id = $1
@@ -158,51 +255,6 @@ async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () =
   } finally {
     if (client) client.release();
   }
-}
-
-async function applyDisposition(client, row, disposition, reason, evidence = {}) {
-  const changed = await client.query(
-    `UPDATE issue SET status = $1, updated_at = NOW()
-      WHERE id = $2 AND status <> $1 RETURNING id`,
-    [disposition, row.issue_id]
-  );
-  if (changed.rowCount > 0 && disposition === 'Parked') {
-    await recordParkedEntry(client, {
-      issueId: row.issue_id,
-      fromStage: row.stage,
-      trigger: reason,
-      intendedStage: evidence.target_stage || null,
-      attempts: evidence.historical_tasks || 0,
-      taskCount: evidence.task_count || evidence.historical_tasks || 0
-    });
-    const diagnosisTaskId = await recordParkAndQueueDiagnosis(client,
-      { id: row.issue_id, workspace_id: row.workspace_id, status: row.stage,
-        priority: row.priority }, { ...evidence, reason,
-        failure_reason: row.failure_reason });
-    if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
-  }
-  await client.query(
-    `UPDATE agent_task_queue
-        SET status = 'cancelled', completed_at = NOW(),
-            prepare_lease_expires_at = NULL, failure_reason = $2
-      WHERE issue_id = $1
-        -- Never interrupt a paid task already executing. Cross-stage
-        -- admission defers successors until running predecessors are
-        -- terminal; only unstarted work may be retired by a disposition.
-        AND status IN ('queued','dispatched','waiting_local_directory','deferred')
-        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'`,
-    [row.issue_id, reason]
-  );
-  if (changed.rowCount > 0) {
-    await client.query(
-      `INSERT INTO activity_log
-         (workspace_id, issue_id, actor_type, action, details)
-       SELECT workspace_id, id, 'system', 'relay_disposition_applied', $2::jsonb
-         FROM issue WHERE id = $1`,
-      [row.issue_id, JSON.stringify({ from: row.stage, to: disposition, reason, ...evidence })]
-    );
-  }
-  return changed.rowCount > 0;
 }
 
 const configuredPoolMax = Number.parseInt(process.env.RELAY_PG_POOL_MAX || '2', 10);
@@ -270,6 +322,36 @@ async function markRelayLogFailedById(client, logId) {
   }
 }
 
+async function failMissingQcVerdict(client, logId) {
+  return client.query(
+    `UPDATE relay_run_log
+        SET status = 'failed',
+            parked_audit = jsonb_set(
+              COALESCE(parked_audit, '{}'::jsonb),
+              '{reason}', to_jsonb('qc_verdict_missing_after_task_created'::text))
+      WHERE id = $1 AND status = 'pending'`,
+    [logId]
+  );
+}
+
+async function holdQcEvidenceMismatch(client, logId) {
+  return client.query(
+    `UPDATE relay_run_log
+        SET parked_audit = jsonb_set(
+              COALESCE(parked_audit, '{}'::jsonb),
+              '{qc_evidence_mismatch_count}',
+              to_jsonb(COALESCE((parked_audit->>'qc_evidence_mismatch_count')::int, 0) + 1)),
+            status = CASE
+              WHEN COALESCE((parked_audit->>'qc_evidence_mismatch_count')::int, 0) + 1 >= $2
+                THEN 'rejected'
+              ELSE status
+            END
+      WHERE id = $1 AND status = 'pending'
+      RETURNING status, parked_audit->>'qc_evidence_mismatch_count' AS mismatch_count`,
+    [logId, QC_EVIDENCE_MISMATCH_LIMIT]
+  );
+}
+
 async function cleanupStalePendingRows() {
   const client = await pool.connect();
   try {
@@ -300,25 +382,253 @@ async function cleanupStalePendingRows() {
   }
 }
 
-async function findAndAdvanceTasks() {
-  const client = await pool.connect();
+// A QC verdict can be recorded after the relay row that originally delivered
+// the issue to In Review was completed (for example, while this daemon was
+// down or by a QC rerun). findAndAdvanceTasks deliberately consumes only
+// pending, task-correlated rows, so create that missing row here and let its
+// normal QC admission path decide whether the evidence is sufficient.
+async function enqueuePassWithoutRelayRows({ dbPool = pool, logger = console } = {}) {
+  const client = await dbPool.connect();
+  try {
+    const result = await client.query(
+      `WITH candidates AS (
+         SELECT i.id AS issue_id, qc."checker_id", evidence_task.id AS task_id
+           FROM issue i
+           JOIN relay_stage_config rsc
+             ON rsc.workspace_id = i.workspace_id
+            AND rsc.stage_name = i.status
+           JOIN LATERAL (
+             SELECT "checker_id", "verdict", "created_at", "id"
+               FROM qc_verdict
+              WHERE "issue_id" = i.id
+              ORDER BY "created_at" DESC, "id" DESC
+              LIMIT 1
+           ) qc ON true
+           JOIN LATERAL (
+             SELECT id
+               FROM agent_task_queue
+              WHERE issue_id = i.id
+                AND agent_id = qc."checker_id"
+                AND status = 'completed'
+              ORDER BY completed_at DESC, id DESC
+              LIMIT 1
+          ) evidence_task ON true
+          WHERE i.status = 'In Review'
+            AND rsc.next_stage = 'CI/CD & Deploy'
+            AND qc."verdict" = 'PASS'
+            AND qc."created_at" > COALESCE((
+              SELECT MAX(created_at) FROM relay_run_log WHERE issue_id = i.id
+            ), '-infinity'::timestamptz)
+            AND NOT EXISTS (
+              SELECT 1 FROM relay_run_log pending
+               WHERE pending.issue_id = i.id AND pending.status = 'pending'
+            )
+          ORDER BY qc."created_at" ASC
+          LIMIT 20
+       )
+       INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
+       SELECT c.issue_id, 'In Review', 'In Review', c.checker_id, c.task_id, 'pending'
+         FROM candidates c
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log pending
+           WHERE pending.issue_id = c.issue_id AND pending.status = 'pending'
+        )
+       RETURNING id, issue_id`
+    );
+    if (result.rowCount > 0) {
+      logger.log(`${LOG_PREFIX} Enqueued ${result.rowCount} PASS verdict(s) missing relay rows`);
+    }
+    return result.rows;
+  } catch (err) {
+    logger.error(`${LOG_PREFIX} [pass-sweep] DB error: ${err.message}`);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
+// `sk multica assign` can dispatch a QC task without the ledger row normally
+// created by the relay bridge.  The completion query below intentionally uses
+// an inner join on that exact task id, so adopt only the orphaned task itself
+// (never an issue number) and let the ordinary verdict path decide its result.
+async function adoptUnloggedInReviewTasks({ dbPool = pool, workspaceId = WORKSPACE_ID,
+  logger = console } = {}) {
+  if (!workspaceId) {
+    logger.error(`${LOG_PREFIX} [assignment-adoption] workspace id is required`);
+    return [];
+  }
+  const client = await dbPool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(
+      `WITH candidates AS (
+         SELECT i.id AS issue_id, atq.agent_id, atq.id AS task_id
+           FROM issue i
+         JOIN relay_stage_config rsc
+             ON rsc.workspace_id = i.workspace_id
+            AND rsc.stage_name = i.status
+         JOIN agent_task_queue atq
+             ON atq.issue_id = i.id
+            AND atq.workspace_id = i.workspace_id
+         -- The task was made by assigning the QC owner of the preceding
+         -- In Progress -> In Review handoff.  Current-stage config names the
+         -- deploy owner, so it cannot identify this QC task.
+         JOIN relay_stage_config qc_stage
+             ON qc_stage.workspace_id = i.workspace_id
+            AND qc_stage.stage_name = 'In Progress'
+            AND qc_stage.next_stage = 'In Review'
+            AND qc_stage.agent_id = atq.agent_id
+          WHERE i.workspace_id = $1::uuid
+            AND i.status = 'In Review'
+            AND rsc.next_stage = 'CI/CD & Deploy'
+            AND i.assignee_type = 'agent'
+            AND i.assignee_id = atq.agent_id
+            AND atq.status = 'completed'
+            AND NOT EXISTS (
+              SELECT 1 FROM relay_run_log existing
+               WHERE existing.task_id = atq.id
+            )
+          ORDER BY atq.completed_at ASC NULLS LAST, atq.id ASC
+          LIMIT $2::int
+          FOR UPDATE OF i, atq SKIP LOCKED
+       )
+       INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
+       SELECT c.issue_id, 'In Progress', 'In Review', c.agent_id, c.task_id, 'pending'
+         FROM candidates c
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log existing
+           WHERE existing.task_id = c.task_id
+        )
+       RETURNING id, issue_id, task_id`,
+      [workspaceId, 20]
+    );
+    await client.query('COMMIT');
+    if (result.rowCount > 0) {
+      logger.log(`${LOG_PREFIX} [assignment-adoption] Adopted ${result.rowCount} unlogged In Review task(s)`);
+    }
+    return result.rows;
+  } catch (err) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    logger.error(`${LOG_PREFIX} [assignment-adoption] DB error: ${err.message}`);
+    return [];
+  } finally {
+    client.release();
+  }
+}
+
+async function advanceTick() {
+  if (advanceTickInFlight) return;
+  advanceTickInFlight = true;
+  try {
+    await adoptUnloggedInReviewTasks();
+    await enqueuePassWithoutRelayRows();
+    await findAndAdvanceTasks();
+  } finally {
+    advanceTickInFlight = false;
+  }
+}
+
+async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
+  logger = console } = {}) {
+  const client = await dbPool.connect();
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
+    await closeDeadRelayRows(client, { terminalStages: [...TERMINAL_STAGES],
+      requestRetryEscalation, postRelay, postVerdict: postQcVerdict,
+      postNoArtifactRescope: (payload) => postRelay({ ...payload, agent_token: RELAY_AGENT_SECRET }),
+      logger, logPrefix: LOG_PREFIX });
 
     // Correlate strictly on the task that owns the relay log. Advance only
     // genuinely completed tasks; a failed task must never move work forward.
     // No completed_at window: eligibility is the task's terminal state, so a
     // daemon outage delays an advance instead of stranding it forever.
-    const query = `SELECT rrl.id AS log_id, atq.issue_id, atq.status AS task_status,
+    const query = `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id,
+             atq.status AS task_status,
              atq.result AS task_result, atq.error AS task_error,
+             atq.agent_id AS task_agent_id, atq.started_at AS task_started_at,
+             atq.completed_at AS task_completed_at,
+             task_agent.model AS task_agent_model,
+             task_agent.thinking_level AS task_agent_effort,
+             verdict.checker_id AS qc_verdict_checker_id,
+             verdict.verdict AS qc_verdict,
+             verdict.work_product_md5 AS qc_verdict_work_product_md5,
+             verdict.notes AS qc_verdict_notes,
+             verdict.created_at AS qc_verdict_created_at,
+             attempt.verdict AS qc_attempt_verdict,
+             attempt.work_product_md5 AS qc_attempt_work_product_md5,
+             attempt.bound_sha AS qc_attempt_bound_sha,
+             attempt.observed_head AS qc_attempt_observed_sha,
+             attempt.qualifying AS qc_attempt_qualifying,
+             attempt.evidence_task_id AS qc_attempt_evidence_task_id,
+             attempt.evidence_agent_id AS qc_attempt_evidence_agent_id,
+             attempt.evidence_agent_model AS qc_attempt_evidence_agent_model,
+             attempt.evidence_agent_effort AS qc_attempt_evidence_agent_effort,
+             evidence.tasks AS qc_evidence_tasks,
              i.workspace_id, i.priority, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
       INNER JOIN issue i ON atq.issue_id = i.id
+      LEFT JOIN agent task_agent ON task_agent.id = atq.agent_id
       INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name AND rsc.workspace_id = i.workspace_id
+      LEFT JOIN LATERAL (
+        SELECT checker_id, verdict, work_product_md5, notes, created_at
+          FROM qc_verdict WHERE issue_id = atq.issue_id
+         ORDER BY created_at DESC LIMIT 1
+      ) verdict ON true
+      LEFT JOIN LATERAL (
+        SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
+               qa.qualifying,
+               evidence_task.id AS evidence_task_id,
+               evidence_task.agent_id AS evidence_agent_id,
+               evidence_agent.model AS evidence_agent_model,
+               evidence_agent.thinking_level AS evidence_agent_effort
+          FROM qc_attempt qa
+          INNER JOIN agent_task_queue evidence_task
+                  ON evidence_task.issue_id = qa.issue_id
+                 AND evidence_task.id::text = substring(
+                       qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+          INNER JOIN agent evidence_agent
+                  ON evidence_agent.id = evidence_task.agent_id
+                 AND evidence_agent.workspace_id = i.workspace_id
+         WHERE qa.issue_id = atq.issue_id
+           AND evidence_task.agent_id = verdict.checker_id
+           AND qa.work_product_md5 = verdict.work_product_md5
+         ORDER BY qa.created_at DESC LIMIT 1
+      ) attempt ON true
+      LEFT JOIN LATERAL (
+        SELECT jsonb_agg(jsonb_build_object(
+                 'task_id', evidence_task.id,
+                 'task_status', evidence_task.status,
+                 'task_result', evidence_task.result,
+                 'task_agent_id', evidence_task.agent_id,
+                 'task_agent_model', evidence_agent.model,
+                 'task_agent_effort', evidence_agent.thinking_level,
+                 'task_started_at', evidence_task.started_at,
+                 'task_completed_at', evidence_task.completed_at
+               ) ORDER BY evidence_task.completed_at DESC) AS tasks
+          FROM agent_task_queue evidence_task
+          INNER JOIN agent evidence_agent
+                  ON evidence_agent.id = evidence_task.agent_id
+                 AND evidence_agent.workspace_id = i.workspace_id
+         WHERE evidence_task.issue_id = atq.issue_id
+           AND evidence_task.agent_id = verdict.checker_id
+           AND evidence_task.status = 'completed'
+           AND COALESCE(evidence_agent.model,
+                        evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
+           AND COALESCE(evidence_agent.thinking_level,
+                        evidence_agent.runtime_config->>'reasoning_effort') = 'low'
+      ) evidence ON true
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
+        AND NOT (
+          rrl.to_stage = 'In Review'
+          AND NOT EXISTS (
+            SELECT 1 FROM qc_verdict missing_verdict
+             WHERE missing_verdict.issue_id = atq.issue_id
+               AND missing_verdict.created_at >= atq.created_at
+          )
+        )
       ORDER BY rrl.created_at ASC
       LIMIT 20`;
 
@@ -338,59 +648,96 @@ async function findAndAdvanceTasks() {
        RETURNING rrl.id, rrl.issue_id`
     );
     if (failed.rowCount > 0) {
-      console.log(`${LOG_PREFIX} Closed ${failed.rowCount} relay log(s) whose task failed/cancelled; NOT advanced`);
+      logger.log(`${LOG_PREFIX} Closed ${failed.rowCount} relay log(s) whose task failed/cancelled; NOT advanced`);
     }
 
     if (result.rows.length === 0) return;
 
-    console.log(`${LOG_PREFIX} Found ${result.rows.length} tasks ready to advance`);
+    logger.log(`${LOG_PREFIX} Found ${result.rows.length} tasks ready to advance`);
 
     for (const row of result.rows) {
       try {
+        // A completed terminal arrival is a final ledger entry, not an exit
+        // trigger. This also neutralizes old rows created before the bridge
+        // stopped terminal-stage dispatch.
+        if (TERMINAL_STAGES.has(row.to_stage)) {
+          await markRelayLogCompletedById(client, row.log_id);
+          logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
+          continue;
+        }
         const completion = completionAdmission(row.task_result ??
           (row.task_error ? { error: row.task_error } : null));
         if (!completion.ok) {
           // Process exit 0 is not a work-product guarantee. A completed task
           // carrying an explicit blocker/FAIL (or no result at all) must not
-          // advance into a successor lane and buy another paid task.
-          const parked = await applyDisposition(client,
-            { ...row, stage: row.to_stage }, completion.disposition, completion.reason,
-            { target_stage: row.to_stage, completion_reason: completion.reason });
-          console.log(`${LOG_PREFIX} [completion-admission] PARK: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, disposition_applied=${parked}`);
+          // buy another same-lane attempt. The bridge changes hands to re-spec.
+          const escalation = await requestRetryEscalation(row, completion.reason);
+          logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
           await markRelayLogFailedById(client, row.log_id);
           continue;
         }
-        // Check if next stage is gated; skip auto-advance if it is
-        if (gatedStages.includes(row.next_stage)) {
-          console.log(`${LOG_PREFIX} SKIPPED: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=stage requires manual QC approval`);
-          await markRelayLogCompletedById(client, row.log_id);
+        // A QC worker records its verdict before its own execution row becomes
+        // terminal. The bridge correctly defers its in-task advance, so replay
+        // that exact handoff here only after completion and only when the same
+        // Sol-low task carries a SHA-bound PASS plus the current artifact MD5.
+        const qcAdvance = qcCompletionAdvance(row);
+        if (gatedStages.includes(row.next_stage) && !qcAdvance.ok) {
+          if (qcAdvance.reason === 'qc_work_product_md5_required') {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
+            continue;
+          }
+          if (qcAdvance.reason === 'qc_attempt_mismatch' ||
+              qcAdvance.reason === 'legacy_qc_evidence_mismatch') {
+            const held = await holdQcEvidenceMismatch(client, row.log_id);
+            const state = held.rows[0];
+            logger.log(`${LOG_PREFIX} QC evidence mismatch: issue=${row.issue_id}, ` +
+              `relay=${row.log_id}, attempt=${state?.mismatch_count || 'unknown'}, ` +
+              `status=${state?.status || 'unknown'}`);
+          }
+          logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
           continue;
         }
 
-        const payload = { issue_id: row.issue_id, to_stage: row.next_stage, agent_token: RELAY_AGENT_SECRET };
-        const response = await postToRelay(payload);
+        if (qcAdvance.ok) {
+          const currentWorkProductMd5 = await currentPassWorkProductMD5(client, row.issue_id);
+          if (!currentWorkProductMd5) {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
+            continue;
+          }
+          if (currentWorkProductMd5.toLowerCase() !== qcAdvance.workProductMd5) {
+            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=stale_pass_md5_mismatch`);
+            continue;
+          }
+        }
+
+        const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
+          agent_token: RELAY_AGENT_SECRET,
+          relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
+          ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
+        const response = await postRelay(payload);
 
         if (response.ok) {
-          console.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})`);
+          const proof = qcAdvance.ok ? ` sha=${qcAdvance.boundSha} md5=${qcAdvance.workProductMd5}` : '';
+          logger.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})${proof}`);
           await markRelayLogCompletedById(client, row.log_id);
         } else if (response.deferred) {
           // Preserve the task-correlated pending log. The same advance becomes
           // eligible once the predecessor is terminal; recording failure here
           // would strand it permanently.
-          console.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
+          logger.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
         } else {
           // The relay's own error text was parsed and then discarded, so 76 of every
           // 400 log lines were a bare `status 409` with no cause. Print the reason.
-          console.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
+          logger.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
           await markRelayLogFailedById(client, row.log_id);
         }
       } catch (err) {
-        console.error(`${LOG_PREFIX} Error: ${err.message}`);
+        logger.error(`${LOG_PREFIX} Error: ${err.message}`);
         await markRelayLogFailedById(client, row.log_id);
       }
     }
   } catch (err) {
-    console.error(`${LOG_PREFIX} DB error: ${err.message}`);
+    logger.error(`${LOG_PREFIX} DB error: ${err.message}`);
   } finally {
     client.release();
   }
@@ -404,7 +751,8 @@ async function recoveryAdvanceTasks() {
   try {
 
     // Get the latest relay_run_log per issue using LATERAL subquery
-    const query = `SELECT DISTINCT atq.issue_id, atq.status as task_status,
+    const query = `SELECT DISTINCT atq.id AS task_id, atq.issue_id,
+             atq.status as task_status,
              atq.result AS task_result, atq.error AS task_error,
              i.workspace_id, i.priority, i.status as to_stage, rsc.next_stage
       FROM agent_task_queue atq
@@ -435,10 +783,8 @@ async function recoveryAdvanceTasks() {
         const completion = completionAdmission(row.task_result ??
           (row.task_error ? { error: row.task_error } : null));
         if (!completion.ok) {
-          const parked = await applyDisposition(client,
-            { ...row, stage: row.to_stage }, completion.disposition, completion.reason,
-            { target_stage: row.to_stage, completion_reason: completion.reason });
-          console.log(`${LOG_PREFIX} [recovery] PARK: issue=${row.issue_id}, reason=${completion.reason}, disposition_applied=${parked}`);
+          const escalation = await requestRetryEscalation(row, completion.reason);
+          console.log(`${LOG_PREFIX} [recovery] RESPEC: issue=${row.issue_id}, reason=${completion.reason}, relay=${escalation.status}`);
           await markRelayLogFailed(client, row.issue_id);
           continue;
         }
@@ -449,7 +795,8 @@ async function recoveryAdvanceTasks() {
           continue;
         }
 
-        const payload = { issue_id: row.issue_id, to_stage: row.next_stage, agent_token: RELAY_AGENT_SECRET };
+        const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
+          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id };
         const response = await postToRelay(payload);
 
         if (response.ok) {
@@ -487,14 +834,51 @@ function postToRelay(payload) {
         try {
           const parsed = JSON.parse(data);
           resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
-            status: res.statusCode, error: parsed.error });
-        } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202, status: res.statusCode }); }
+            status: res.statusCode, error: parsed.error, body: data });
+        } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
+          status: res.statusCode, body: data }); }
       });
     });
 
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     req.end(body);
+  });
+}
+
+function postQcVerdict(payload) {
+  return postToPath('/relay/verdict', { ...payload, agent_token: RELAY_AGENT_SECRET });
+}
+
+function postToPath(path, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const opts = { hostname: '127.0.0.1', port: 5005, path, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }, timeout: 5000 };
+    const req = http.request(opts, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { const parsed = JSON.parse(data); resolve({ ok: res.statusCode === 200 || res.statusCode === 201,
+          deferred: res.statusCode === 202, status: res.statusCode, error: parsed.error, body: data });
+        } catch { resolve({ ok: res.statusCode === 200 || res.statusCode === 201,
+          deferred: res.statusCode === 202, status: res.statusCode, body: data }); }
+      });
+    });
+    req.on('error', reject); req.on('timeout', () => req.destroy(new Error('relay timeout'))); req.write(body); req.end();
+  });
+}
+
+function requestRetryEscalation(row, reason, relay = postToRelay) {
+  const taskId = row.task_id || row.dead_task_id;
+  const triggerStage = row.to_stage || row.stage;
+  return relay({
+    issue_id: row.issue_id,
+    to_stage: 'Spec',
+    agent_token: RELAY_AGENT_SECRET,
+    reason: `retry_escalation:${reason}`,
+    retry_escalation_task_id: taskId,
+    retry_escalation_stage: triggerStage
   });
 }
 
@@ -581,25 +965,22 @@ const INFRA_FAILURE_REASONS = [
 // agent forever (the agent_task_queue trigger rejects an archived assignee). The
 // stage contract is the authority on who owns a stage, so a re-owned stage heals
 // its own strays.
-async function requeueStrandedTasks() {
-  const client = await pool.connect();
+async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } = {}) {
+  const client = await dbPool.connect();
   try {
     const candidates = await client.query(
-      // The outer wrapper ranks candidates per owning agent. A single global
-      // oldest-created ordering without per-agent partitioning let the oldest backlog monopolise
-      // every tick: ~300 Spec tickets are all older than any In Review one,
-      // so the In Review lane would never appear in a 3-row window and its
-      // tickets could not be recovered at all. Ranking per agent gives each
-      // owning lane its own oldest-created-first slice; the per-agent capacity check
-      // below is still what decides how many actually dispatch.
-      `SELECT * FROM (
-       SELECT c.*, ROW_NUMBER() OVER (
-                PARTITION BY c.agent_id ORDER BY c.created_at ASC, c.issue_id ASC
-              ) AS rn FROM (
-       SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage, i.created_at, i.metadata,
+      // The per-owner ranking prevents an old backlog in one lane from
+      // monopolising recovery. Each owner gets its own oldest-created-first
+      // slice; the per-agent capacity check below still decides dispatch.
+      `WITH stranded AS (
+        SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage,
+              i.created_at AS issue_created_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
-              t.attempt, t.max_attempts, t.failure_reason,
+              t.attempt, t.max_attempts, t.failure_reason, t.created_at AS dead_task_created_at,
+              t.updated_at AS dead_task_updated_at,
               t.result AS dead_task_result, t.error AS dead_task_error,
+              closed_log.id AS closed_relay_log_id,
+              build.result AS build_task_result,
               r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
               r.model, r.thinking_level, r.max_concurrent_tasks, r.runtime_config, r.archived_at, r.agent_name,
               COALESCE(
@@ -620,6 +1001,15 @@ async function requeueStrandedTasks() {
            SELECT * FROM agent_task_queue
             WHERE issue_id = i.id ORDER BY created_at DESC LIMIT 1
          ) t ON true
+         LEFT JOIN LATERAL (
+           SELECT id, status, parked_audit FROM relay_run_log
+            WHERE task_id = t.id ORDER BY created_at DESC, id DESC LIMIT 1
+         ) closed_log ON true
+         LEFT JOIN LATERAL (
+           SELECT result FROM agent_task_queue
+            WHERE issue_id = i.id AND status = 'completed'
+            ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1
+         ) build ON true
          JOIN LATERAL (
            SELECT rsc.stage_name AS from_stage, rsc.agent_id,
                   COALESCE(a.runtime_mode, 'local') AS runtime_mode,
@@ -630,49 +1020,50 @@ async function requeueStrandedTasks() {
               AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
             ORDER BY rsc.id LIMIT 1
          ) r ON true
-        WHERE i.status = ANY($3)
+        WHERE i.status = ANY($2::text[])
           -- t.id IS NULL is the cold start: a ticket that reached this stage
           -- and never had a first task. The lateral above used to be an inner
           -- join, so such a ticket produced no row and was invisible to the
           -- requeue forever -- no agent, no error, no alert. It is not a retry,
           -- so the attempt/max_attempts test cannot apply to it.
-          AND (t.id IS NULL
-               OR (t.status IN ('failed', 'cancelled')
-                   AND (t.attempt < t.max_attempts
-                        OR COALESCE(t.failure_reason, 'cancelled') = ANY($1)))
-               -- Third stranding case: the QC task ran to 'completed' but wrote
-               -- no verdict (QC-BLOCKED). It is not failed and not cancelled, so
-               -- neither of the branches above can see it, and a ticket with no
-               -- verdict can never advance -- 44 sat in In Review this way on
-               -- 2026-08-31 (GSP #761). Bounded by the task's own attempt
-               -- ceiling, so each ticket gets exactly one retry, never a loop.
-               OR (i.status = 'In Review'
-                   AND t.status = 'completed'
-                   AND t.attempt < t.max_attempts
-                   AND NOT EXISTS (
-                     SELECT 1 FROM qc_verdict v WHERE v.issue_id = i.id
-                   ))
-               -- Fourth stranding case, same shape one stage earlier. A spec
-               -- worker that posts a specification advances the flight to
-               -- 'Queue' in the same run, so a task that ran to 'completed'
-               -- and left the flight in 'Spec' produced no specification: the
-               -- SPEC-BLOCKED result. 36 sat this way on 2026-08-31 (GSP #775),
-               -- invisible to every branch above because the task did not fail.
-               -- The stage is the evidence, so no content test is needed.
-               OR (i.status = 'Spec'
-                   AND t.status = 'completed'
-                   AND t.attempt < t.max_attempts)
-               OR (t.id IS NOT NULL
-                   AND t.status IN ('queued', 'dispatched', 'running')
-                   AND ((t.context ? 'to_stage'
-                         AND t.context->>'to_stage' IS DISTINCT FROM i.status)
-                        OR (NOT (t.context ? 'to_stage')
-                            AND t.created_at < i.updated_at))))
+          AND (
+            t.id IS NULL
+            OR t.status IN ('failed', 'cancelled')
+            OR (
+              t.status = 'completed'
+              AND (
+                -- Preserve the one-shot retry of a relay row that explicitly
+                -- failed before the worker completed.
+                (closed_log.status = 'failed'
+                 AND closed_log.parked_audit->>'requeue_task_id' IS NULL)
+                -- A completed worker can also fail to advance the stage: QC
+                -- may not record a verdict, and build stages may not write a
+                -- completed relay row. Wait the existing queue TTL so a
+                -- normal asynchronous completion still has time to land.
+                OR (
+                  t.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
+                  AND (
+                    (i.status = 'In Review' AND NOT EXISTS (
+                      SELECT 1 FROM qc_verdict qv
+                       WHERE qv.issue_id = i.id
+                         AND qv.created_at >= t.created_at
+                    ))
+                    OR
+                    (i.status <> 'In Review' AND NOT EXISTS (
+                      SELECT 1 FROM relay_run_log completed_log
+                       WHERE completed_log.issue_id = i.id
+                         AND completed_log.status = 'completed'
+                         AND completed_log.created_at >= t.created_at
+                    ))
+                  )
+                )
+              )
+            )
+          )
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue q
              WHERE q.issue_id = i.id AND q.status IN
                ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
-               AND COALESCE(q.context->>'to_stage', '') = i.status
           )
           AND COALESCE(t.context->>'no_builder', 'false') <> 'true'
           -- A bundled child is never its own unit of work: its MEGA parent
@@ -686,14 +1077,60 @@ async function requeueStrandedTasks() {
           -- of work, even after the parent has shipped and the child is still
           -- open for disposition.
           AND i.parent_issue_id IS NULL
-       ) c
-       ) ranked
-        WHERE ranked.rn <= $2
-        ORDER BY ranked.created_at ASC, ranked.issue_id ASC`,
-      [INFRA_FAILURE_REASONS, REQUEUE_BATCH, REQUEUE_STAGES]
+      ), budgeted AS (
+        SELECT stranded.*,
+          (SELECT count(*)::int FROM agent_task_queue stage_history
+            WHERE stage_history.issue_id = stranded.issue_id
+              AND stage_history.context->>'to_stage' = stranded.stage
+              AND stage_history.trigger_comment_id IS NULL
+              AND COALESCE(stage_history.context->>'kind', '') <> 'retry_escalation'
+              ${budgetCountPredicate('stage_history')}
+              AND (COALESCE(NULLIF(stranded.metadata->>'parked_release_at', ''),
+                            NULLIF(stranded.metadata->>'retry_escalation_at', '')) IS NULL
+                OR stage_history.created_at >= COALESCE(
+                  NULLIF(stranded.metadata->>'parked_release_at', ''),
+                  NULLIF(stranded.metadata->>'retry_escalation_at', ''))::timestamptz)
+          ) AS stage_task_count,
+          (SELECT count(*)::int FROM agent_task_queue lifetime_history
+            WHERE lifetime_history.issue_id = stranded.issue_id
+              AND lifetime_history.trigger_comment_id IS NULL
+              ${budgetCountPredicate('lifetime_history')}
+              AND (COALESCE(NULLIF(stranded.metadata->>'parked_release_at', ''),
+                            NULLIF(stranded.metadata->>'retry_escalation_at', '')) IS NULL
+                OR lifetime_history.created_at >= COALESCE(
+                  NULLIF(stranded.metadata->>'parked_release_at', ''),
+                  NULLIF(stranded.metadata->>'retry_escalation_at', ''))::timestamptz)
+          ) AS lifetime_task_count
+        FROM stranded
+      ), ranked AS (
+        SELECT budgeted.*, ROW_NUMBER() OVER (
+          PARTITION BY agent_id ORDER BY issue_created_at ASC, issue_id ASC
+        ) AS rn
+        FROM budgeted
+        WHERE stage_task_count < $4::int AND lifetime_task_count < $5::int
+      )
+      SELECT * FROM (
+        SELECT ranked.*, NULL::text AS exhaustion_reason
+          FROM ranked
+         WHERE rn <= $1::int
+        UNION ALL
+        SELECT budgeted.*, CASE WHEN stage_task_count >= $4::int
+              THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
+          FROM budgeted
+         WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int
+      ) candidates
+      ORDER BY issue_created_at ASC, issue_id ASC`,
+      [REQUEUE_BATCH, REQUEUE_STAGES, QUEUED_TASK_TTL_MINUTES,
+        STAGE_CYCLE_LIMIT, LIFETIME_TASK_LIMIT]
     );
 
-    if (candidates.rows.length === 0) return;
+    const exhausted = candidates.rows.filter((row) => row.exhaustion_reason);
+    for (const row of exhausted) {
+      const escalation = await requestRetryEscalation(row, row.exhaustion_reason, postRelay);
+      console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${row.exhaustion_reason}; relay=${escalation.status}`);
+    }
+    const admissible = candidates.rows.filter((row) => !row.exhaustion_reason);
+    if (admissible.length === 0) return;
 
     // Backpressure, scoped per owning agent. Each agent carries its own
     // authoritative concurrency ceiling in `agent.max_concurrent_tasks` (build
@@ -733,14 +1170,14 @@ async function requeueStrandedTasks() {
          LEFT JOIN agent_task_queue q ON q.agent_id = a.id
         WHERE a.id = ANY($2::uuid[])
         GROUP BY a.id, a.max_concurrent_tasks`,
-      [MAX_CONCURRENT, [...new Set(candidates.rows.map((c) => c.agent_id))]]
+      [MAX_CONCURRENT, [...new Set(admissible.map((c) => c.agent_id))]]
     );
     const slotsByAgent = new Map(loadRows.map((r) => [r.agent_id, r.cap - r.in_flight]));
     const loadByAgent = new Map(loadRows.map((r) => [r.agent_id, r]));
 
     const admitted = [];
     const heldByAgent = new Map();
-    for (const row of candidates.rows) {
+    for (const row of admissible) {
       const free = slotsByAgent.get(row.agent_id) ?? 0;
       if (free > 0) {
         admitted.push(row);
@@ -772,21 +1209,6 @@ async function requeueStrandedTasks() {
       // A cold start has no prior task, so it is attempt 1 of the queue's own
       // default ceiling -- never row.attempt + 1 on a NULL.
       const coldStart = !row.dead_task_id;
-      if (row.dead_task_status === 'completed') {
-        const completion = completionAdmission(row.dead_task_result ??
-          (row.dead_task_error ? { error: row.dead_task_error } : null));
-        if (!completion.ok) {
-          // The predecessor reached process status=completed but did not
-          // produce admissible work. Re-dispatching it would buy a duplicate
-          // paid task (the GSP #1229 shape), so hold it for diagnosis/operator
-          // action instead of treating it as an ordinary missing artifact.
-          const parked = await applyDisposition(client,
-            { ...row, stage: row.stage }, completion.disposition, completion.reason,
-            { target_stage: row.stage, completion_reason: completion.reason });
-          console.log(`${LOG_PREFIX} [requeue] PARK #${row.number}: completed predecessor failed completion admission (${completion.reason}), disposition_applied=${parked}`);
-          continue;
-        }
-      }
       const compatibility = instructionCompatibility(row.instructions, row.stage);
       if (!compatibility.ok) {
         console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: agent instructions do not authorize '${compatibility.stage}'`);
@@ -801,11 +1223,8 @@ async function requeueStrandedTasks() {
           expected_effort: preflight.expected_effort }));
         continue;
       }
-      // A 'completed' predecessor means QC finished without writing a verdict.
-      // That is a real retry, not an infra replay, so it costs an attempt.
-      const noArtifact = row.dead_task_status === 'completed';
       const infra = INFRA_FAILURE_REASONS.includes(row.failure_reason || 'cancelled');
-      if (infra) {
+      if (infra && !coldStart) {
         const headroom = await client.query(
           `SELECT COALESCE(max(EXTRACT(epoch FROM (now() - created_at)) / 60), 0) AS age
              FROM agent_task_queue WHERE status = 'queued'`
@@ -823,14 +1242,8 @@ async function requeueStrandedTasks() {
           continue;
         }
       }
-      // noArtifact must be checked BEFORE infra: a completed task has a NULL
-      // failure_reason, which coalesces to 'cancelled' -- an INFRA reason --
-      // and infra replays reuse the same attempt number. Left in that order
-      // the retry would never consume an attempt and these tickets would
-      // requeue forever, which is the QC bounce loop that burned 134 paid
-      // calls on a single ticket. A missing verdict is a real failed try.
       const attempt = coldStart ? 1
-        : (noArtifact || !infra) ? row.attempt + 1
+        : !infra ? row.attempt + 1
         : row.attempt;
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
@@ -864,71 +1277,73 @@ async function requeueStrandedTasks() {
           console.log(`${LOG_PREFIX} [requeue] DEFERRED #${row.number}: ${crossStage.reason} tasks=${crossStage.active_task_ids.join(',')} stages=${crossStage.active_stages.join(',')}`);
           continue;
         }
-        if (quotaCircuitAdmission([row.failure_reason], 1).pause) {
+        if (quotaCircuitAdmission([{
+          failure_reason: row.failure_reason,
+          updated_at: row.dead_task_updated_at
+        }], 1).pause) {
           const recentFailures = await client.query(
-            `SELECT failure_reason FROM agent_task_queue
-              WHERE agent_id = $1 AND status = 'failed'
-              ORDER BY created_at DESC LIMIT $2`,
-            [row.agent_id, QUOTA_FAILURE_LIMIT]
+            `SELECT failure_reason, updated_at FROM agent_task_queue
+              WHERE agent_id = $1::uuid AND status = 'failed'
+                AND updated_at > NOW() - ($3::bigint * INTERVAL '1 millisecond')
+              ORDER BY created_at DESC LIMIT $2::integer`,
+            [row.agent_id, QUOTA_FAILURE_LIMIT, QUOTA_PAUSE_MAX_AGE_MS]
           );
           const circuit = quotaCircuitAdmission(
-            recentFailures.rows.map((failure) => failure.failure_reason), QUOTA_FAILURE_LIMIT
+            recentFailures.rows, QUOTA_FAILURE_LIMIT
           );
           const quotaPause = circuit.pause
             ? await pauseQuotaLane(client, row, circuit.consecutive)
             : null;
-          const moved = await applyDisposition(client, row, 'Human Review', 'payment_required_402', {
-            dead_task_id: row.dead_task_id, consecutive_failures: circuit.consecutive,
-            lane_paused: Boolean(quotaPause)
-          });
           await client.query('COMMIT');
+          const moved = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
+            agent_token: RELAY_AGENT_SECRET, reason: 'payment_required_402' });
           if (quotaPause) {
             logQuotaPauseFlip({ agent_name: quotaPause.agent_name,
               timestamp: quotaPause.paused_at, paused: true });
           }
-          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; applied=${moved}; lane_paused=${Boolean(quotaPause)}`);
+          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; relay=${moved.status}; lane_paused=${Boolean(quotaPause)}`);
           continue;
         }
-        const releaseAt = row.metadata?.parked_release_at || null;
+        const releaseAt = row.metadata?.parked_release_at ||
+          row.metadata?.retry_escalation_at || null;
         const history = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1 AND context->>'to_stage' = $2
+              AND trigger_comment_id IS NULL
+              AND COALESCE(context->>'kind', '') <> 'retry_escalation'
+              ${budgetCountPredicate()}
               AND ($3::timestamptz IS NULL OR created_at >= $3)`,
           [row.issue_id, row.stage, releaseAt]
         );
         const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
         if (!cycle.ok) {
-          const moved = await applyDisposition(client, row, cycle.disposition, cycle.reason, {
-            target_stage: row.stage, historical_tasks: history.rows[0]?.n || 0,
-            ceiling: cycle.ceiling
-          });
-          await client.query('COMMIT');
-          console.log(`${LOG_PREFIX} [requeue] PARKED #${row.number}: ${cycle.reason}; applied=${moved}`);
+          await client.query('ROLLBACK');
+          const escalation = await requestRetryEscalation(row, cycle.reason, postRelay);
+          console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${cycle.reason}; relay=${escalation.status}`);
           continue;
         }
         const lifetimeHistory = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1
+              AND trigger_comment_id IS NULL
+              ${budgetCountPredicate()}
               AND ($2::timestamptz IS NULL OR created_at >= $2)`,
           [row.issue_id, releaseAt]
         );
         const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
         if (!lifetime.ok) {
-          const moved = await applyDisposition(client, row, lifetime.disposition, lifetime.reason, {
-            historical_tasks: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling
-          });
-          await client.query('COMMIT');
-          console.log(`${LOG_PREFIX} [requeue] PARKED #${row.number}: ${lifetime.reason}; applied=${moved}`);
+          await client.query('ROLLBACK');
+          const escalation = await requestRetryEscalation(row, lifetime.reason, postRelay);
+          console.log(`${LOG_PREFIX} [requeue] RESPEC #${row.number}: ${lifetime.reason}; relay=${escalation.status}`);
           continue;
         }
         const context = JSON.stringify({
           source: coldStart ? 'relay-cold-start'
-            : noArtifact
-              ? (row.stage === 'Spec' ? 'relay-spec-no-artifact' : 'relay-qc-no-verdict')
-              : 'relay-requeue',
+            : 'relay-requeue',
           from_stage: row.from_stage,
           to_stage: row.stage,
           requeue_of_task: row.dead_task_id,
+          requeue_of_relay_log: row.closed_relay_log_id,
           dead_task_reason: row.failure_reason
         });
         const task = await client.query(
@@ -949,11 +1364,7 @@ async function requeueStrandedTasks() {
            ON CONFLICT DO NOTHING
            RETURNING id`,
           [row.agent_id, row.issue_id, row.runtime_id, context,
-           coldStart
-             ? `Relay cold start: never dispatched in ${row.stage}`
-             : noArtifact
-               ? `Relay requeue: task completed in ${row.stage} without producing its artifact`
-               : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`,
+           requeueTriggerSummary(row, coldStart),
            attempt, maxAttempts, row.dead_task_id, row.stage]
         );
         if (task.rows.length === 0) {
@@ -965,6 +1376,24 @@ async function requeueStrandedTasks() {
           console.log(`${LOG_PREFIX} [requeue] SKIPPED #${row.number}: insert produced no row (conflict or trigger); still stranded in '${row.stage}'`);
           continue;
         }
+        if (row.closed_relay_log_id) {
+          const recorded = await client.query(
+            `UPDATE relay_run_log
+                SET parked_audit = jsonb_set(
+                  COALESCE(parked_audit, '{}'::jsonb),
+                  '{requeue_task_id}', to_jsonb($2::text))
+              WHERE id = $1
+                AND status = 'failed'
+                AND parked_audit->>'requeue_task_id' IS NULL
+              RETURNING id`,
+            [row.closed_relay_log_id, task.rows[0].id]
+          );
+          if (recorded.rows.length === 0) {
+            await client.query('ROLLBACK');
+            console.log(`${LOG_PREFIX} [requeue] SKIPPED #${row.number}: closed relay row already requeued`);
+            continue;
+          }
+        }
         await client.query(
           `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
            VALUES ($1, $2, $3, $4, $5, 'pending')`,
@@ -972,7 +1401,7 @@ async function requeueStrandedTasks() {
         );
         await client.query('COMMIT');
         requeued++;
-        console.log(`${LOG_PREFIX} [requeue] #${row.number} stranded in '${row.stage}' (${row.failure_reason || 'cancelled'}) -> new task ${task.rows[0].id} attempt ${attempt}/${row.max_attempts}`);
+        console.log(`${LOG_PREFIX} [requeue] #${row.number} stranded in '${row.stage}' (${row.failure_reason || 'cancelled'}) -> new task ${task.rows[0].id} attempt ${attempt}/${maxAttempts}`);
       } catch (err) {
         try { await client.query('ROLLBACK'); } catch (_) {}
         console.error(`${LOG_PREFIX} [requeue] Error on #${row.number}: ${err.message}`);
@@ -995,8 +1424,30 @@ function diagnosisText(result) {
     .filter(Boolean).join('\n');
 }
 
-async function processParkedDiagnoses() {
-  const client = await pool.connect();
+async function recordDiagnosisReleaseFailure(client, taskId, context, failure) {
+  const attempts = Number.parseInt(context?.diagnosis_release_attempts || '0', 10) || 0;
+  const nextAttempts = attempts + 1;
+  const error = String(failure).slice(0, 2000);
+  if (nextAttempts >= 5) {
+    await client.query(
+      `UPDATE agent_task_queue
+          SET context = COALESCE(context, '{}'::jsonb) ||
+                jsonb_build_object('diagnosis_processed', true,
+                  'diagnosis_release_attempts', $2::int,
+                  'diagnosis_release_error', $3::text)
+        WHERE id = $1::uuid`, [taskId, nextAttempts, error]);
+    return;
+  }
+  await client.query(
+    `UPDATE agent_task_queue
+        SET context = (COALESCE(context, '{}'::jsonb) - 'diagnosis_processed'
+              - 'runtime_evidence_recovery_v2_consumed') ||
+            jsonb_build_object('diagnosis_release_attempts', $2::int)
+      WHERE id = $1::uuid`, [taskId, nextAttempts]);
+}
+
+async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postToRelay } = {}) {
+  const client = await diagnosisPool.connect();
   try {
     const { rows: candidates } = await client.query(
       `SELECT t.id, i.workspace_id
@@ -1009,6 +1460,12 @@ async function processParkedDiagnoses() {
             OR (t.context->>'evidence_correction_retry' = 'true'
                 AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
                 AND COALESCE(t.context->>'runtime_evidence_recovery_consumed', 'false') <> 'true'
+                AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
+            OR (t.context->>'evidence_correction_retry' = 'true'
+                AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
+                AND t.context->>'runtime_evidence_recovery_consumed' = 'true'
+                AND t.context->>'runtime_evidence_recovery_v2_requested' = 'true'
+                AND COALESCE(t.context->>'runtime_evidence_recovery_v2_consumed', 'false') <> 'true'
                 AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
           )
           AND i.workspace_id IS NOT NULL
@@ -1032,6 +1489,12 @@ async function processParkedDiagnoses() {
               OR (t.context->>'evidence_correction_retry' = 'true'
                   AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
                   AND COALESCE(t.context->>'runtime_evidence_recovery_consumed', 'false') <> 'true'
+                  AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
+              OR (t.context->>'evidence_correction_retry' = 'true'
+                  AND COALESCE(t.context->>'diagnosis_processed', 'false') = 'true'
+                  AND t.context->>'runtime_evidence_recovery_consumed' = 'true'
+                  AND t.context->>'runtime_evidence_recovery_v2_requested' = 'true'
+                  AND COALESCE(t.context->>'runtime_evidence_recovery_v2_consumed', 'false') <> 'true'
                   AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified')
             )
           FOR UPDATE OF t SKIP LOCKED`, [candidate.id, PARK_DIAGNOSIS_KIND, candidate.workspace_id]);
@@ -1092,6 +1555,13 @@ async function processParkedDiagnoses() {
                     '{parked_release_at}', to_jsonb(NOW()), true),
                   updated_at = NOW()
              WHERE id = $1::uuid AND status = 'Parked'`, [task.issue_id]);
+        if (task.context?.reason_code === 'escalation_loop') {
+          await client.query(
+            `UPDATE issue
+                SET metadata = COALESCE(metadata, '{}'::jsonb) - 'retry_escalation',
+                    updated_at = NOW()
+              WHERE id = $1::uuid AND status = 'Parked'`, [task.issue_id]);
+        }
       } else if (action.action === 'close' && action.status === 'Cancelled') {
         await client.query(
           `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2::uuid),
@@ -1113,6 +1583,11 @@ async function processParkedDiagnoses() {
             SET context = COALESCE(context, '{}'::jsonb) ||
                   CASE WHEN context->>'evidence_correction_retry' = 'true'
                        AND context->>'diagnosis_processed' = 'true'
+                       AND context->>'runtime_evidence_recovery_consumed' = 'true'
+                       AND context->>'runtime_evidence_recovery_v2_requested' = 'true'
+                    THEN '{"runtime_evidence_recovery_v2_consumed":true}'::jsonb
+                  WHEN context->>'evidence_correction_retry' = 'true'
+                       AND context->>'diagnosis_processed' = 'true'
                     THEN '{"runtime_evidence_recovery_consumed":true}'::jsonb
                     ELSE '{"diagnosis_processed":true}'::jsonb END
           WHERE id = $1::uuid`, [task.id]);
@@ -1120,19 +1595,21 @@ async function processParkedDiagnoses() {
       const nextStage = action.action === 'release' ? action.nextStage
         : action.action === 'close' ? action.status : null;
       if (nextStage) {
-        const response = await postToRelay({ issue_id: task.issue_id, to_stage: nextStage,
-          agent_token: RELAY_AGENT_SECRET,
-          ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
-          ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
-        if (!response.ok) {
-          // Keep the diagnosis retryable when the bridge is unavailable. The
-          // bridge owns terminal transitions and must record the gate result.
-          await client.query(
-            `UPDATE agent_task_queue
-                SET context = context - 'diagnosis_processed'
-              WHERE id = $1::uuid`, [task.id]);
+        try {
+          const response = await relayPost({ issue_id: task.issue_id, to_stage: nextStage,
+            agent_token: RELAY_AGENT_SECRET,
+            ...(completionMD5 ? { current_work_product_md5: completionMD5 } : {}),
+            ...(needsQC ? { reason: `runtime_evidence_verified:${evidence}` } : {}) });
+          if (!response.ok) {
+            await recordDiagnosisReleaseFailure(client, task.id, task.context,
+              `status=${response.status}; body=${response.body || response.error || ''}`);
+          }
+          console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
+        } catch (err) {
+          await recordDiagnosisReleaseFailure(client, task.id, task.context,
+            `fetch_error=${err.message}`);
+          console.error(`${LOG_PREFIX} [diagnosis] #${task.number}: relay error: ${err.message}`);
         }
-        console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome} -> ${nextStage}; relay=${response.status}`);
       } else {
         console.log(`${LOG_PREFIX} [diagnosis] #${task.number}: ${outcome}`);
       }
@@ -1151,14 +1628,14 @@ function startDaemon() {
     process.exit(1);
   }
   console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
-  setInterval(findAndAdvanceTasks, 15000);
+  setInterval(advanceTick, 15000);
   setInterval(findAndAdvanceRegistered, 20000);
   setInterval(recoveryAdvanceTasks, 120000);
   setInterval(cleanupStalePendingRows, 300000);
   setInterval(requeueStrandedTasks, 60000);
   setInterval(processParkedDiagnoses, 30000);
   setInterval(reconcileQuotaPauses, 60000);
-  findAndAdvanceTasks().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
+  advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
   cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
@@ -1167,4 +1644,5 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { pauseQuotaLane, reconcileQuotaPauses, startDaemon };
+module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
+  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon };

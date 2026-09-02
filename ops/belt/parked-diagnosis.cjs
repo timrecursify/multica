@@ -49,16 +49,19 @@ function diagnosisEvidence(text) {
 }
 
 function parseRuntimeEvidenceReference(value) {
-  const match = String(value || '').trim().match(/^(task|qc|activity):([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i);
+  const text = String(value || '').trim();
+  const qc = text.match(/^qc:(\d+)$/i);
+  if (qc) {
+    const id = Number(qc[1]);
+    return Number.isSafeInteger(id) && id >= 0 && id <= 2147483647
+      ? { kind: 'qc', id } : null;
+  }
+  const match = text.match(/^(task|activity):([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i);
   return match ? { kind: match[1].toLowerCase(), id: match[2].toLowerCase() } : null;
 }
 
 function isConcreteRuntimeEvidence(value) {
-  const evidence = String(value || '').trim();
-  return evidence.length >= 8 && (
-    /(?:^|\s)[\w./-]+:\d+(?:\s|$)/.test(evidence) ||
-    /\b(?:sha|commit|status|http|output|command)\s*[=:]/i.test(evidence)
-  );
+  return parseRuntimeEvidenceReference(value) !== null;
 }
 
 function namedBlocker(text) {
@@ -99,7 +102,8 @@ function isBuilderDispatchAllowed(context) {
 // to the Sol-low diagnosis lane. Attribution must never widen authority: an
 // ordinary scoper cannot receive a diagnosis task.
 function selectDiagnosisOwner(rows) {
-  const eligible = (rows || []).filter(isSolLowDiagnosisAgent);
+  const eligible = (rows || []).filter((row) => isSolLowDiagnosisAgent(row) &&
+    Number(row.active_task_count || 0) < Math.max(1, Number(row.max_concurrent_tasks || 1)));
   return eligible.find((row) => row.is_original_scoper === true) || eligible[0] || null;
 }
 
@@ -120,8 +124,8 @@ function diagnosisOutcomeAction({ outcome, evidenceVerified = false, duplicateIs
     return { action: 'close', status: 'Cancelled', duplicateIssueId };
   }
   const holdReason = missingOutcome ? 'Sol-low diagnosis response omitted an explicit outcome'
-    : invalidAlreadyFixed ? 'runtime_evidence_unverified'
-      : invalidDuplicate ? 'duplicate response did not resolve a same-workspace duplicate_of target'
+    : invalidAlreadyFixed ? `Sol-low diagnosis: ${blocker || outcome}; rejected: runtime_evidence_unverified`
+      : invalidDuplicate ? `Sol-low diagnosis: ${blocker || outcome}; rejected: duplicate response did not resolve a same-workspace duplicate_of target`
         : outcome === 'genuinely_blocked' && !blocker
           ? 'genuinely_blocked response omitted a named blocker'
           : `Sol-low diagnosis: ${blocker || outcome}`;
@@ -137,7 +141,7 @@ async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = 
              WHERE t.id = $1::uuid AND t.issue_id = $2::uuid AND t.id IS DISTINCT FROM $3::uuid
                AND t.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'
                AND t.status = 'completed'`,
-    qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1::uuid AND v.issue_id = $2::uuid`,
+    qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1::integer AND v.issue_id = $2::uuid`,
     activity: `SELECT 1 FROM activity_log WHERE id = $1::uuid AND issue_id = $2::uuid`
   };
   const values = kind === 'task' ? [id, issueId, excludeTaskId] : [id, issueId];
@@ -192,6 +196,10 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
 
   const owner = await client.query(
     `SELECT a.id, a.name, a.model, a.runtime_config, a.runtime_id, a.instructions,
+             a.max_concurrent_tasks,
+             (SELECT count(*)::int FROM agent_task_queue active
+               WHERE active.agent_id = a.id
+                 AND active.status IN ('queued','dispatched','running','waiting_local_directory','deferred')) AS active_task_count,
              EXISTS (
                SELECT 1 FROM agent_task_queue prior
                 WHERE prior.issue_id = $2::uuid AND prior.agent_id = a.id
@@ -250,6 +258,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
     context.evidence_correction_retry = true;
     context.retry_of_task_id = evidence.retry_of_task_id;
   }
+  if (evidence.operator_rerun_idem_key) context.operator_rerun_idem_key = evidence.operator_rerun_idem_key;
   const task = await client.query(
     `INSERT INTO agent_task_queue (
        agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
@@ -266,7 +275,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
             (COALESCE($9::boolean, FALSE) = FALSE
               AND COALESCE(LOWER(status), '') NOT IN ('failed', 'cancelled'))
             OR (COALESCE($9::boolean, FALSE) = TRUE
-              AND context->>'evidence_correction_retry' = 'true')
+              AND COALESCE(LOWER(status), '') IN ('queued','dispatched','running','waiting_local_directory','deferred'))
           )
       )
       ON CONFLICT DO NOTHING
@@ -278,7 +287,7 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
       evidence.evidence_correction_retry === true
         ? 'Sol-low parked-ticket evidence correction diagnosis; use runtime_evidence: task:<uuid>, qc:<uuid>, or activity:<uuid>.'
         : 'Sol-low parked-ticket diagnosis (no builder dispatch)',
-      evidence.evidence_correction_retry === true]
+      evidence.evidence_correction_retry === true || Boolean(evidence.operator_rerun_idem_key)]
   );
   return task.rows[0]?.id || null;
 }

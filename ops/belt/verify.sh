@@ -2,33 +2,42 @@
 set -Eeuo pipefail
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/home/newadmin}"
 
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
   "$root_dir/guardrails.cjs"
+  "$root_dir/parked-entry-audit.cjs"
   "$root_dir/parity/multica-relay-advance-daemon.cjs"
+  "$root_dir/parity/relay-dead-rows.cjs"
   "$root_dir/multica-cicd-worker.cjs"
+  "$root_dir/cicd-deploy-evidence.cjs"
   "$root_dir/belt-config-guard.sh"
   "$root_dir/multica-daemon-wrapper.sh"
   "$root_dir/ecosystem.gsp-belt.config.js"
   "$root_dir/multica-bundle.py"
   "$root_dir/RUNBOOK_SPEC_WORKER.md"
   "$root_dir/RUNBOOK_BUILD_WORKER.md"
+  "$root_dir/RUNBOOK_QC_WORKER.md"
   "$root_dir/WORKER_COMMON.md"
 )
 
 declare -a targets=(
-  "/home/newadmin/gsp-multica/multica-bridge.cjs"
-  "/home/newadmin/gsp-multica/guardrails.cjs"
-  "/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs"
-  "/home/newadmin/multica-cicd-worker.cjs"
-  "/home/newadmin/tools/belt-config-guard.sh"
-  "/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh"
-  "/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js"
-  "/home/newadmin/tools/multica-bundle.py"
-  "/home/newadmin/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
-  "/home/newadmin/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
-  "/home/newadmin/multica-doctrine/WORKER_COMMON.md"
+  "$runtime_root/gsp-multica/multica-bridge.cjs"
+  "$runtime_root/gsp-multica/guardrails.cjs"
+  "$runtime_root/gsp-multica/parked-entry-audit.cjs"
+  "$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
+  "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs"
+  "$runtime_root/multica-cicd-worker.cjs"
+  "$runtime_root/cicd-deploy-evidence.cjs"
+  "$runtime_root/tools/belt-config-guard.sh"
+  "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
+  "$runtime_root/gsp-multica/fleet/ecosystem.gsp-belt.config.js"
+  "$runtime_root/tools/multica-bundle.py"
+  "$runtime_root/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
+  "$runtime_root/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
+  "$runtime_root/multica-doctrine/RUNBOOK_QC_WORKER.md"
+  "$runtime_root/multica-doctrine/WORKER_COMMON.md"
 )
 
 status=0

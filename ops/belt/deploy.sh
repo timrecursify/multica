@@ -37,7 +37,9 @@ declare -a sources=(
   "$root_dir/parked-diagnosis.cjs"
   "$root_dir/parked-entry-audit.cjs"
   "$root_dir/parity/multica-relay-advance-daemon.cjs"
+  "$root_dir/parity/relay-dead-rows.cjs"
   "$root_dir/multica-cicd-worker.cjs"
+  "$root_dir/cicd-deploy-evidence.cjs"
   "$root_dir/multica-archiver.cjs"
   "$root_dir/belt-config-guard.sh"
   "$root_dir/multica-daemon-wrapper.sh"
@@ -45,6 +47,7 @@ declare -a sources=(
   "$root_dir/multica-bundle.py"
   "$root_dir/RUNBOOK_SPEC_WORKER.md"
   "$root_dir/RUNBOOK_BUILD_WORKER.md"
+  "$root_dir/RUNBOOK_QC_WORKER.md"
   "$root_dir/WORKER_COMMON.md"
   "$root_dir/relay-completion-admission.cjs"
 )
@@ -55,7 +58,9 @@ declare -a targets=(
   "$runtime_root/gsp-multica/parked-diagnosis.cjs"
   "$runtime_root/gsp-multica/parked-entry-audit.cjs"
   "$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
+  "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs"
   "$runtime_root/multica-cicd-worker.cjs"
+  "$runtime_root/cicd-deploy-evidence.cjs"
   "$runtime_root/multica-archiver.cjs"
   "$runtime_root/tools/belt-config-guard.sh"
   "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
@@ -63,12 +68,13 @@ declare -a targets=(
   "$runtime_root/tools/multica-bundle.py"
   "$runtime_root/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
   "$runtime_root/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
+  "$runtime_root/multica-doctrine/RUNBOOK_QC_WORKER.md"
   "$runtime_root/multica-doctrine/WORKER_COMMON.md"
   "$runtime_root/gsp-multica/relay-completion-admission.cjs"
 )
 
 selected() {
-  [[ -z "$only_target" || ( "$only_target" == multica-cicd-worker && "$1" -eq 5 ) ]]
+  [[ -z "$only_target" || "${sources[$1]##*/}" == "$only_target.cjs" ]]
 }
 
 invalid=0
@@ -116,9 +122,11 @@ for index in "${!sources[@]}"; do
   selected "$index" || continue
   new_targets[$index]=0
   [[ "${targets[$index]}" == "$runtime_root/gsp-multica/guardrails.cjs" ||
-     "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ||
-     "${targets[$index]}" == "$runtime_root/gsp-multica/parked-entry-audit.cjs" ||
-     "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
+      "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/parked-entry-audit.cjs" ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs" ||
+      "${targets[$index]}" == "$runtime_root/cicd-deploy-evidence.cjs" ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
     invalid=1
@@ -214,6 +222,14 @@ for index in "${!sources[@]}"; do
 done
 
 trap - ERR
+if [[ "$mode" == apply ]]; then
+  receipt_dir="$runtime_root/gsp-multica/deploy-receipts"
+  mkdir -p -- "$receipt_dir"
+  source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
+  receipt="$receipt_dir/belt-${timestamp}.json"
+  printf '{"repo":"timrecursify/multica","source_sha":"%s"}\n' "$source_sha" > "$receipt"
+  printf 'Receipt: %s\n' "$receipt"
+fi
 printf 'No processes were restarted.\n'
 if [[ "$mode" == apply ]]; then
   printf 'Rollback receipt: %s --rollback %s' "$0" "$timestamp"

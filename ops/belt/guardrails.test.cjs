@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
   crossStageExecutionAdmission,
-  retryAdmission, spendPreflight, beltRoutingAdmission, stageCycleAdmission, lifetimeTaskAdmission,
+  retryAdmission, spendPreflight, beltRoutingAdmission, budgetCountPredicate, stageCycleAdmission, lifetimeTaskAdmission,
   isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
   quotaCircuitAdmission, QUOTA_PAUSE_MAX_AGE_MS, quotaPauseClearance, quotaPauseFlipLogLine
 } = require('./guardrails.cjs');
@@ -127,32 +127,40 @@ test('quota pauses self-clear after fifteen minutes without an exhausted workspa
     'quota_paused flip agent="DeepSeek Builder" timestamp=2026-09-01T12:00:00.000Z value=true');
 });
 
-test('stage cycle breaker parks repeated task creation without human review', () => {
+test('stage cycle breaker escalates repeated task creation to Sol-low re-spec', () => {
   assert.deepEqual(stageCycleAdmission(0), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(2), {
-    ok: false, reason: 'stage_cycle_limit', ceiling: 2, disposition: 'Parked'
+    ok: false, reason: 'stage_cycle_limit', ceiling: 2,
+    disposition: 'Spec', escalation: 'sol_low_respec'
   });
 });
 
-test('recovery ceilings count queued tasks that never started', () => {
+test('budget predicate counts a completed In Review task with a post-completion verdict', () => {
+  const predicate = budgetCountPredicate();
+  assert.match(predicate, /context->>'to_stage' IS DISTINCT FROM 'In Review'/);
+  assert.match(predicate, /status IS DISTINCT FROM 'completed'/);
+  assert.match(predicate, /verdict\.checker_id = agent_id/);
+  assert.match(predicate, /verdict\.created_at >= started_at/);
+  assert.doesNotMatch(predicate, /verdict\.created_at <= completed_at/);
+});
+
+test('bridge and daemon use the same budget predicate', () => {
+  const predicate = budgetCountPredicate().replace(/\s+/g, ' ').trim();
+  const bridge = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const source = fs.readFileSync(
     require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8'
   );
-  const stageHistory = source.match(
-    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1 AND context->>'to_stage' = \$2\s+AND \(\$3::timestamptz IS NULL OR created_at >= \$3\)/
-  );
-  const lifetimeHistory = source.match(
-    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1\s+AND \(\$2::timestamptz IS NULL OR created_at >= \$2\)/
-  );
-  assert.ok(stageHistory, 'stage ceiling must count every created task');
-  assert.ok(lifetimeHistory, 'lifetime ceiling must count every created task');
+  assert.equal((bridge.match(/\$\{budgetCountPredicate\(\)\}/g) || []).length, 4);
+  assert.equal((source.match(/\$\{budgetCountPredicate\(\)\}/g) || []).length, 2);
+  assert.ok(predicate.includes("verdict.checker_id = agent_id"));
 });
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
   assert.deepEqual(lifetimeTaskAdmission(5), { ok: true, ceiling: 6 });
   assert.deepEqual(lifetimeTaskAdmission(6), {
-    ok: false, reason: 'lifetime_task_limit', ceiling: 6, disposition: 'Parked'
+    ok: false, reason: 'lifetime_task_limit', ceiling: 6,
+    disposition: 'Spec', escalation: 'sol_low_respec'
   });
 });
 
@@ -202,4 +210,11 @@ test('quota circuit pauses only after consecutive money failures', () => {
     { pause: true, consecutive: 3, ceiling: 3 });
   assert.deepEqual(quotaCircuitAdmission(['402', 'timeout', '402']),
     { pause: false, consecutive: 1, ceiling: 3 });
+});
+
+test('quota circuit ignores a quota failure outside the pause window', () => {
+  const now = Date.parse('2026-09-02T02:00:00.000Z');
+  assert.deepEqual(quotaCircuitAdmission([{ failure_reason: 'provider_quota_limit',
+    updated_at: new Date(now - QUOTA_PAUSE_MAX_AGE_MS - 1).toISOString() }], 1, { now }),
+  { pause: false, consecutive: 0, ceiling: 1 });
 });

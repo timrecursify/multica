@@ -312,7 +312,10 @@ func requireDaemonAuth(profile string) error {
 }
 
 func runDaemonStart(cmd *cobra.Command, _ []string) error {
-	if err := requireHumanLocalCommand("daemon start"); err != nil {
+	// MULTICA_DAEMON_PORT is also set by the supervisor wrapper. A port alone
+	// is not task context; only explicit task identity or the authenticated task
+	// marker may prohibit a child from starting a sibling daemon.
+	if err := requireHumanLocalDaemonStart(); err != nil {
 		return err
 	}
 	foreground, _ := cmd.Flags().GetBool("foreground")

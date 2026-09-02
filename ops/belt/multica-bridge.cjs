@@ -7,13 +7,14 @@ const {
   isBundledChild,
   instructionCompatibility,
   spendPreflight,
+  budgetCountPredicate,
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,
   assertRoutableStageOwners,
   crossStageExecutionAdmission
 } = require("./guardrails.cjs");
-const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed } = require("./parked-diagnosis.cjs");
+const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvidenceReference } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 
@@ -21,6 +22,11 @@ const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const JWT_SECRET = process.env.JWT_SECRET;
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
+// Optional at process start, but mandatory for an explicit operator terminal
+// exit. Leaving it unset therefore fails that exceptional path closed.
+const RELAY_OPERATOR_SECRET = process.env.RELAY_OPERATOR_SECRET;
+const OPERATOR_SECRET_DISABLED = typeof RELAY_OPERATOR_SECRET === "string" &&
+  RELAY_OPERATOR_SECRET.length > 0 && RELAY_OPERATOR_SECRET === RELAY_AGENT_SECRET;
 const SSO_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID;
 
 // One canonical login (Cloudflare Access) serving several isolated client
@@ -48,6 +54,9 @@ for (const [name, value] of Object.entries({
 })) {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
 }
+if (OPERATOR_SECRET_DISABLED) {
+  console.error("[relay] RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET; operator terminal exits disabled");
+}
 
 const PORT = Number(process.env.PORT || 5005);
 
@@ -69,12 +78,92 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
+const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived"]);
+const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review", "Parked"]);
+
+function isTerminalStage(stage) {
+  return TERMINAL_STAGES.has(stage);
+}
+
+function isNoDispatchArrivalStage(stage) {
+  return isTerminalStage(stage) || NO_DISPATCH_ARRIVAL_STAGES.has(stage);
+}
+
+async function verifiedParkedEvidenceRelease(client, issue, toStage, reason) {
+  if (issue.status !== 'Parked' || toStage !== 'In Review' || issue.metadata?.parked_release_once !== true) return false;
+  const match = String(reason || '').match(/^runtime_evidence_verified:(.+)$/);
+  const reference = match && parseRuntimeEvidenceReference(match[1]);
+  if (!reference) return false;
+  const sql = {
+    task: `SELECT 1 FROM agent_task_queue WHERE id = $1::uuid AND issue_id = $2::uuid AND status = 'completed' AND context->>'kind' IS DISTINCT FROM 'parked_diagnosis'`,
+    qc: `SELECT 1 FROM qc_verdict WHERE id = $1::integer AND issue_id = $2::uuid`,
+    activity: `SELECT 1 FROM activity_log WHERE id = $1::uuid AND issue_id = $2::uuid`
+  };
+  return (await client.query(sql[reference.kind], [reference.id, issue.id])).rowCount === 1;
+}
+// The operator recovery tool records this marker only after its exact failed
+// relay-requeue lineage and same-issue runtime evidence checks succeed. Consume
+// it before the retry ceiling is evaluated: it admits one stranded QC task,
+// not a general Parked escape hatch.
+async function consumeParkedQcRecovery(client, issue, toStage, reason, evidenceRelease) {
+  if (!evidenceRelease || issue.status !== 'Parked' || toStage !== 'In Review') return false;
+  const match = String(reason || '').match(/^runtime_evidence_verified:(.+)$/);
+  const evidence = match && parseRuntimeEvidenceReference(match[1]);
+  if (!evidence) return false;
+  const consumed = await client.query(
+    `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) - 'parked_qc_recovery', updated_at = NOW()
+      WHERE id = $1::uuid AND status = 'Parked' AND metadata->>'parked_release_once' = 'true'
+        AND metadata->'parked_qc_recovery'->>'canonical_evidence' = $2::text
+        AND metadata->'parked_qc_recovery'->>'failed_task_id' ~* '^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$'
+      RETURNING id`, [issue.id, `${evidence.kind}:${evidence.id}`]);
+  return consumed.rowCount === 1;
+}
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
+const RERUN_IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
+
+async function authorizeRelayStatusWrites(client) {
+  await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
+}
+
+async function rerunParkedDiagnosis(client, payload) {
+  if (!UUID_RE.test(String(payload.issue_id || '')) || !RERUN_IDEM_KEY_RE.test(String(payload.idempotency_key || ''))) {
+    return { ok: false, error: 'invalid_request' };
+  }
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 805))", [payload.issue_id]);
+  const issue = await client.query(
+    `SELECT id, workspace_id, status, priority FROM issue WHERE id = $1::uuid AND status = 'Parked' FOR UPDATE`,
+    [payload.issue_id]);
+  if (issue.rowCount === 0) return { ok: false, error: 'parked_issue_required' };
+  const prior = await client.query(
+    `SELECT id FROM agent_task_queue
+      WHERE issue_id = $1::uuid AND context->>'kind' = 'parked_diagnosis'
+        AND context->>'operator_rerun_idem_key' = $2::text
+      ORDER BY created_at DESC LIMIT 1`, [payload.issue_id, payload.idempotency_key]);
+  if (prior.rowCount > 0) return { ok: true, replay: true, task_id: prior.rows[0].id };
+  const active = await client.query(
+    `SELECT id FROM agent_task_queue WHERE issue_id = $1::uuid
+      AND context->>'kind' = 'parked_diagnosis'
+      AND status IN ('queued','dispatched','running','waiting_local_directory','deferred') LIMIT 1`, [payload.issue_id]);
+  if (active.rowCount > 0) return { ok: true, replay: true, task_id: active.rows[0].id };
+  const taskId = await recordParkAndQueueDiagnosis(client, issue.rows[0], {
+    reason: 'operator_parked_diagnosis_rerun', operator_rerun_idem_key: payload.idempotency_key,
+    skip_reason_comment: false
+  });
+  return taskId ? { ok: true, replay: false, task_id: taskId } : { ok: false, error: 'diagnosis_owner_or_capacity_unavailable' };
+}
 const IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "access"]);
+const RETRY_ESCALATION_REASONS = new Set([
+  "completion_blocked", "completion_qc_blocked", "completion_spec_blocked",
+  "completion_build_blocked", "completion_failed", "completion_no_work_product",
+  "missing_result", "qc_bounce_ceiling", "stage_cycle_limit", "lifetime_task_limit"
+]);
+const RETRY_ESCALATION_DEADLINE_MINUTES = Number.parseInt(
+  process.env.RELAY_RETRY_ESCALATION_DEADLINE_MINUTES || "20", 10
+);
 let testClientFactory = null;
 // A stage transition may retire work that has not started. Running paid work
 // is never cancelled here: crossStageExecutionAdmission defers the successor
@@ -113,6 +202,10 @@ function ownerStageForTransition(fromStage, toStage) {
   // absent from stageOrder. A diagnosis-authorized no-spec release returns to
   // Spec and must use the Registered scoper pool, never Parked's prior builder.
   if (fromStage === "Parked" && toStage === "Spec") return "Registered";
+  // A verified already-fixed diagnosis returns directly to QC. Parked has no
+  // execution owner, so selecting the source row would reuse the pre-park
+  // builder; use the canonical In Progress -> In Review Sol-low owner instead.
+  if (fromStage === "Parked" && toStage === "In Review") return "In Progress";
   const stageOrder = ["Registered", "Spec", "Queue", "In Progress", "In Review", "Human Review", "CI/CD & Deploy"];
   const fromIndex = stageOrder.indexOf(fromStage);
   const toIndex = stageOrder.indexOf(toStage);
@@ -132,6 +225,7 @@ function validateRelayVerdict(payload) {
   const required = ["issue_id", "checker", "verdict", "work_product_md5", "bound_sha", "observed_sha", "failure_class", "qualifying", "model", "effort", "idem_key"];
   if (required.some((key) => !(key in payload))) return "missing_fields";
   if (!UUID_RE.test(payload.issue_id)) return "invalid_issue_id";
+  if (payload.qc_task_id != null && !UUID_RE.test(payload.qc_task_id)) return "invalid_qc_task_id";
   if (typeof payload.checker !== "string" || !IDENTITY_RE.test(payload.checker)) return "invalid_checker";
   if (payload.verdict !== "PASS" && payload.verdict !== "FAIL") return "invalid_verdict";
   if (typeof payload.work_product_md5 !== "string" || !MD5_RE.test(payload.work_product_md5)) return "invalid_work_product_md5";
@@ -145,9 +239,29 @@ function validateRelayVerdict(payload) {
   return null;
 }
 
-async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
+function qcBounceDecision(latestVerdict, expectedStage) {
+  if (latestVerdict?.verdict !== "PASS") return { action: "escalate" };
+  if (!MD5_RE.test(String(latestVerdict.work_product_md5 || "")) ||
+      expectedStage !== "CI/CD & Deploy") {
+    return { action: "hold", reason: "pass_deploy_evidence_invalid" };
+  }
+  return { action: "deploy", toStage: expectedStage };
+}
+
+async function latestQcVerdict(client, issueId) {
   const result = await client.query(
-    `SELECT t.id, t.agent_id, t.context, t.result, a.name AS agent_name
+    `SELECT verdict, work_product_md5
+       FROM qc_verdict
+      WHERE issue_id = $1
+      ORDER BY created_at DESC
+      LIMIT 1`, [issueId]
+  );
+  return result.rows[0] || null;
+}
+
+async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explicitTaskId = null) {
+  const result = await client.query(
+    `SELECT t.id, t.agent_id, t.status, t.context, t.result, a.name AS agent_name
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
@@ -155,21 +269,135 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
         AND t.context->>'to_stage' = 'In Review'
         AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
         AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+        AND ($3::uuid IS NULL OR t.id = $3::uuid)
       ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
       LIMIT 1 FOR UPDATE`,
-    [issueId, workspaceId]
+    [issueId, workspaceId, explicitTaskId]
   );
   return result.rows[0] || null;
 }
 
-function qcTaskEvidenceMismatch(task, payload) {
+function taskResultText(result) {
+  if (result == null) return "";
+  if (typeof result === "string") {
+    try { result = JSON.parse(result); } catch { return result; }
+  }
+  if (!result || typeof result !== "object") return "";
+  return [result.output, result.comment, result.error]
+    .filter((value) => typeof value === "string").join("\n");
+}
+
+function isNoArtifactQcBlock(text) {
+  if (typeof text !== "string" || !/^\s*QC[- ]BLOCKED\b/im.test(text)) return false;
+  if (/^\s*QC\s+VERDICT\s*:\s*(?:PASS|FAIL)\b/im.test(text) || /QC_EVIDENCE_JSON=/m.test(text)) return false;
+  if (PR_URL_RE.test(text) || /\b[0-9a-f]{40}\b/i.test(text)) return false;
+  return /\bNO-SHA\b/i.test(text) ||
+    /\bno\s+(?:(?:implementation|bound|reviewable)\s+)?SHA\b/i.test(text) ||
+    /\bno\s+(?:linked\s+)?PR\b/i.test(text) ||
+    /\bno\s+immutable\s+tracked-tree\s+artifact\b/i.test(text);
+}
+
+function operatorRescopeIssueId(explicitIssueId, reason) {
+  if (explicitIssueId != null) return String(explicitIssueId);
+  const match = String(reason || "").match(
+    /^RETURN:Spec — QC-BLOCKED NO-SHA operator re-scope ([0-9a-f-]+)$/i
+  );
+  return match?.[1] || null;
+}
+
+async function issueImplementationArtifact(client, issueId) {
+  const result = await client.query(
+    `SELECT
+       EXISTS (SELECT 1 FROM qc_verdict WHERE issue_id = $1) AS has_qc_verdict,
+       EXISTS (
+         SELECT 1 FROM agent_task_queue
+          WHERE issue_id = $1 AND status = 'completed'
+            AND context->>'to_stage' = 'Queue'
+            AND (
+              NULLIF(BTRIM(COALESCE(result->>'work_product', '')), '') IS NOT NULL
+              OR result::text ~* 'https?://github\\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/pull/[0-9]+'
+              OR result::text ~* '"(implementation_sha|bound_sha|observed_sha)"[^0-9a-f]{0,32}[0-9a-f]{40}'
+            )
+       ) AS has_builder_artifact,
+       EXISTS (
+         SELECT 1 FROM comment
+          WHERE issue_id = $1 AND (
+            content ~* 'https?://github\\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/pull/[0-9]+'
+            OR content ~* '(^|[\r\n])[[:space:]*-]*(implementation[_ ]sha|bound[_ ]sha|observed[_ ]sha)[[:space:]]*[:=][[:space:]]*[0-9a-f]{40}'
+          )
+       ) AS has_comment_artifact`, [issueId]);
+  const row = result.rows[0] || {};
+  return Boolean(row.has_qc_verdict || row.has_builder_artifact || row.has_comment_artifact);
+}
+
+async function noArtifactRescopeAdmission(client, issue, toStage, operatorIssueId) {
+  if (!["In Review", "Human Review"].includes(issue.status)) return false;
+  const qcReturn = issue.status === "In Review" && toStage === "In Progress" &&
+    operatorIssueId == null;
+  const operatorReturn = toStage === "Spec" && UUID_RE.test(String(operatorIssueId || "")) &&
+    String(operatorIssueId).toLowerCase() === String(issue.id).toLowerCase();
+  if (!qcReturn && !operatorReturn) return false;
+  if (issue.metadata?.no_artifact_rescope_consumed_at) return false;
+  const task = await latestCompletedSolLowQcTask(client, issue.id, issue.workspace_id);
+  if (!task || task.status !== "completed" || !isNoArtifactQcBlock(taskResultText(task.result))) return false;
+  return !await issueImplementationArtifact(client, issue.id);
+}
+
+async function consumeNoArtifactRescope(client, issue) {
+  const consumed = await client.query(
+    `UPDATE issue
+        SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),
+                                 '{no_artifact_rescope_consumed_at}', to_jsonb(NOW()), true),
+            updated_at = NOW()
+      WHERE id = $1::uuid AND status IN ('In Review', 'Human Review')
+        AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'no_artifact_rescope_consumed_at')
+      RETURNING id`, [issue.id]);
+  return consumed.rowCount === 1;
+}
+
+async function latestQcNoArtifactSignal(client, issue) {
+  const latest = await client.query(
+    `SELECT t.result, c.content
+       FROM agent_task_queue t
+       JOIN agent a ON a.id = t.agent_id AND a.workspace_id = t.workspace_id
+       LEFT JOIN LATERAL (
+         SELECT content FROM comment
+          WHERE issue_id = t.issue_id AND author_type = 'agent' AND author_id = t.agent_id
+            AND created_at >= t.created_at
+          ORDER BY created_at DESC, id DESC LIMIT 1
+       ) c ON true
+      WHERE t.issue_id = $1 AND t.workspace_id = $2
+        AND t.context->>'to_stage' = 'In Review'
+        AND t.status IN ('queued','dispatched','running','waiting_local_directory','deferred','completed')
+        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id]);
+  const row = latest.rows[0];
+  return Boolean(row && (isNoArtifactQcBlock(taskResultText(row.result)) ||
+    isNoArtifactQcBlock(row.content)));
+}
+
+function qcTaskEvidence(task) {
   const output = task.result && typeof task.result === "object" ? task.result.output : null;
-  if (typeof output !== "string") return "qc_task_evidence_required";
+  if (typeof output !== "string") return null;
   const matches = [...output.matchAll(/^QC_EVIDENCE_JSON=(\{[^\r\n]*\})$/gm)];
-  if (matches.length !== 1) return "qc_task_evidence_required";
+  if (matches.length !== 1) return null;
   let evidence;
-  try { evidence = JSON.parse(matches[0][1]); } catch { return "qc_task_evidence_required"; }
-  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return "qc_task_evidence_required";
+  try { evidence = JSON.parse(matches[0][1]); } catch { return null; }
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return null;
+  if ((evidence.verdict !== "PASS" && evidence.verdict !== "FAIL") ||
+      !MD5_RE.test(String(evidence.work_product_md5 || "")) ||
+      !SHA_RE.test(String(evidence.bound_sha || "")) ||
+      !SHA_RE.test(String(evidence.observed_sha || "")) ||
+      String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase() ||
+      !FAILURE_CLASSES.has(evidence.failure_class) || typeof evidence.qualifying !== "boolean" ||
+      evidence.model !== "gpt-5.6-sol" || evidence.effort !== "low") return null;
+  return evidence;
+}
+
+function qcTaskEvidenceMismatch(task, payload) {
+  const evidence = qcTaskEvidence(task);
+  if (!evidence) return "qc_task_evidence_required";
   if (evidence.verdict !== payload.verdict) return "qc_task_verdict_mismatch";
   if (String(evidence.work_product_md5 || "").toLowerCase() !== payload.work_product_md5.toLowerCase()) return "qc_task_work_product_mismatch";
   if (String(evidence.bound_sha || "").toLowerCase() !== payload.bound_sha.toLowerCase() ||
@@ -177,6 +405,135 @@ function qcTaskEvidenceMismatch(task, payload) {
   if (evidence.failure_class !== payload.failure_class || evidence.qualifying !== payload.qualifying ||
       evidence.model !== payload.model || evidence.effort !== payload.effort) return "qc_task_evidence_mismatch";
   return null;
+}
+
+function retryEscalationReason(reason) {
+  const match = String(reason || "").match(/^retry_escalation:([a-z_]+)$/);
+  return match && RETRY_ESCALATION_REASONS.has(match[1]) ? match[1] : null;
+}
+
+async function retryEscalationSourceTask(client, issue, requestedTaskId = null) {
+  if (requestedTaskId != null && !UUID_RE.test(String(requestedTaskId))) return null;
+  const source = await client.query(
+    `SELECT t.id FROM agent_task_queue t
+      JOIN issue i ON i.id = t.issue_id AND i.workspace_id = $2::uuid
+      WHERE t.issue_id = $1::uuid
+        AND ($4::uuid IS NULL OR t.id = $4::uuid)
+        AND (
+          (t.status IN ('queued','dispatched','running','waiting_local_directory','deferred')
+            AND t.context->>'to_stage' = $3::text)
+          OR (t.status IN ('completed','failed','cancelled') AND EXISTS (
+            SELECT 1 FROM relay_run_log r
+             WHERE r.task_id = t.id AND r.issue_id = t.issue_id
+               AND r.to_stage = $3::text AND r.status = 'pending'
+          ))
+        )
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 2 FOR UPDATE OF t`,
+    [issue.id, issue.workspace_id, issue.status, requestedTaskId]);
+  return source.rows.length === 1 ? source.rows[0].id : null;
+}
+
+async function capEscalationVerified(client, issue, trigger, stage) {
+  const since = issue.metadata?.human_review_release_at ||
+    issue.metadata?.parked_release_at || issue.metadata?.retry_escalation_at || null;
+  if (trigger === "stage_cycle_limit") {
+    const history = await client.query(
+      `SELECT count(*)::int AS n FROM agent_task_queue
+        WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
+          AND trigger_comment_id IS NULL
+          AND COALESCE(context->>'kind', '') <> 'retry_escalation'
+          ${budgetCountPredicate()}
+          AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz)`,
+      [issue.id, stage, since]);
+    return Number(history.rows[0]?.n || 0) >= STAGE_CYCLE_LIMIT;
+  }
+  if (trigger !== "lifetime_task_limit") return true;
+  const history = await client.query(
+    `SELECT count(*)::int AS n FROM agent_task_queue
+      WHERE issue_id = $1::uuid
+        AND trigger_comment_id IS NULL
+        ${budgetCountPredicate()}
+        AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)`,
+    [issue.id, since]);
+  return Number(history.rows[0]?.n || 0) >= LIFETIME_TASK_LIMIT;
+}
+
+// One Sol-low re-spec is a bounded handoff. A second escalation for the same
+// stage is evidence that the handoff did not break the cycle, so park it.
+function retryEscalationLoop(issue, stage) {
+  return issue.metadata?.retry_escalation?.trigger_stage === stage;
+}
+
+async function verifiedRetryEscalation(client, issue, body) {
+  const trigger = retryEscalationReason(body.reason);
+  const taskId = body.retry_escalation_task_id;
+  const stage = body.retry_escalation_stage;
+  if (!trigger && !taskId && !stage) return null;
+  if (!trigger || body.to_stage !== "Spec" || !UUID_RE.test(String(taskId || "")) ||
+      typeof stage !== "string" || stage !== issue.status ||
+      issue.metadata?.retry_escalation?.source_task_id === taskId) return false;
+  const task = await client.query(
+    `SELECT t.status, t.result, t.error FROM agent_task_queue t
+      JOIN issue i ON i.id = t.issue_id AND i.workspace_id = $3::uuid
+      WHERE t.id = $1::uuid AND t.issue_id = $2::uuid
+        AND (t.context->>'to_stage' = $4::text OR EXISTS (
+          SELECT 1 FROM relay_run_log r
+           WHERE r.task_id = t.id AND r.issue_id = t.issue_id AND r.to_stage = $4::text
+        ))
+        AND t.status IN ('completed', 'failed', 'cancelled') FOR UPDATE OF t`,
+    [taskId, issue.id, issue.workspace_id, stage]
+  );
+  const row = task.rows[0];
+  if (!row) return false;
+  if (trigger.startsWith("completion_") || trigger === "missing_result") {
+    const admission = completionAdmission(row.result ?? (row.error ? { error: row.error } : null));
+    if (row.status !== "completed" || admission.ok || admission.reason !== trigger) return false;
+  }
+  if (!await capEscalationVerified(client, issue, trigger, stage)) return false;
+  return { reason: trigger, trigger_stage: stage, source_task_id: taskId };
+}
+
+function escalationDeadline() {
+  const minutes = Number.isInteger(RETRY_ESCALATION_DEADLINE_MINUTES) &&
+    RETRY_ESCALATION_DEADLINE_MINUTES > 0 ? RETRY_ESCALATION_DEADLINE_MINUTES : 20;
+  return new Date(Date.now() + minutes * 60 * 1000).toISOString();
+}
+
+async function recordRetryEscalation(client, issue, escalation) {
+  const details = { ...escalation, target_stage: "Spec", model: "gpt-5.6-sol", effort: "low" };
+  await client.query(
+    `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+          jsonb_build_object('retry_escalation', $2::jsonb, 'retry_escalation_at', to_jsonb(NOW())),
+        updated_at = NOW() WHERE id = $1::uuid`, [issue.id, JSON.stringify(details)]);
+  const content = `<!-- multica-retry-escalation -->\nreason_code: ${details.reason}\n` +
+    `failed_stage: ${details.trigger_stage}\nowner: ${details.owner}\ndeadline: ${details.deadline}\n` +
+    `source_task_id: ${details.source_task_id || "bridge_cap"}\nnext_action: Sol-low re-spec`;
+  await client.query(
+    `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+     SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
+      WHERE NOT EXISTS (SELECT 1 FROM comment WHERE issue_id = $1::uuid AND content = $4::text)`,
+    [issue.id, issue.workspace_id, "00000000-0000-0000-0000-000000000000", content]);
+  await client.query(
+    `INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+     VALUES ($1::uuid, $2::uuid, 'system', 'relay_retry_escalated', $3::jsonb)`,
+    [issue.workspace_id, issue.id, JSON.stringify(details)]);
+}
+
+async function selectRetryEscalationOwner(client, issue) {
+  const owner = await selectStageOwner(client, issue.workspace_id, "Registered", "Spec");
+  if (!owner?.agent_id || !owner.owner_id || owner.archived_at || !owner.selected_runtime_id) {
+    throw new Error(`No active Sol-low re-spec owner for workspace ${issue.workspace_id}`);
+  }
+  if (owner.model !== "gpt-5.6-sol" || owner.thinking_level !== "low") {
+    throw new Error(`Sol-low re-spec owner has invalid lane: ${owner.agent_name}`);
+  }
+  const compatibility = instructionCompatibility(owner.instructions, "Spec");
+  const preflight = spendPreflight(owner, { provider: owner.selected_runtime_provider });
+  if (!compatibility.ok || !preflight.ok) {
+    const reason = compatibility.ok ? preflight.reason : "instruction_incompatible";
+    throw new Error(`Sol-low re-spec owner refused: ${reason}`);
+  }
+  return owner;
 }
 
 async function applyDisposition(client, issue, disposition, reason, evidence = {}) {
@@ -334,6 +691,15 @@ async function authorizeCicdReturnCapBypass(client, issueId, capBypass) {
 }
 
 async function replaceStageTask(client, task) {
+  // The issue row lock normally serializes relayAdvance callers. Keep the
+  // enqueue primitive safe for recovery/replay callers too: the predicate and
+  // insert must share a stage-specific transaction lock or simultaneous
+  // retries can both observe no active successor.
+  if (task.serialize) {
+    await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
+      task.issueId, task.toStage
+    ]);
+  }
   const context = typeof task.context === 'string' ? JSON.parse(task.context) : task.context;
   if (!isBuilderDispatchAllowed(context)) {
     throw new Error('builder dispatcher rejected a no_builder diagnosis task');
@@ -383,18 +749,30 @@ async function replaceStageTask(client, task) {
     throw new Error(`relay successor task was not created for issue ${task.issueId} stage ${task.toStage}`);
   }
 
-  const log = await client.query(
-    `INSERT INTO relay_run_log (
-       issue_id, from_stage, to_stage, agent_id, task_id, status
-     )
-     SELECT $1, $2, $3, $4, $5, 'pending'
-      WHERE NOT EXISTS (
-        SELECT 1 FROM relay_run_log
-         WHERE issue_id = $1 AND task_id = $5
-      )
-     RETURNING id`,
-    [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
-  );
+  const log = task.relayAudit
+    ? await client.query(
+      `INSERT INTO relay_run_log (
+         issue_id, from_stage, to_stage, agent_id, task_id, status, parked_audit
+       )
+       SELECT $1, $2, $3, $4, $5, 'pending', $6::jsonb
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log
+           WHERE issue_id = $1 AND task_id = $5
+        )
+       RETURNING id`,
+      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId, task.relayAudit]
+    ) : await client.query(
+      `INSERT INTO relay_run_log (
+         issue_id, from_stage, to_stage, agent_id, task_id, status
+       )
+       SELECT $1, $2, $3, $4, $5, 'pending'
+        WHERE NOT EXISTS (
+          SELECT 1 FROM relay_run_log
+           WHERE issue_id = $1 AND task_id = $5
+        )
+       RETURNING id`,
+      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
+    );
   return { taskId, relayLogId: log.rows[0]?.id || null };
 }
 
@@ -621,17 +999,20 @@ async function canonicalStageOwner(client, workspaceId, ownerStage) {
   return result.rows[0] || null;
 }
 
-async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
-  if (toStage !== "Spec") return null;
-  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, ownerStage]);
+async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
+  // Selection and the rotation update share the relay transaction. The advisory
+  // lock makes equal-load choices stable under concurrent advances into this pool.
+  await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, toStage]);
   const result = await client.query(
     `SELECT p.agent_id, a.name AS agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
             a.status AS agent_status, a.instructions, a.model, a.thinking_level,
-            a.max_concurrent_tasks, a.runtime_config,
+            a.max_concurrent_tasks, a.runtime_config, p.last_selected_at,
             COALESCE(own_runtime.provider, online_runtime.provider) AS selected_runtime_provider,
             COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id,
             COALESCE(active.task_count, 0)::int AS active_task_count
        FROM relay_stage_agent_pool p
+       JOIN relay_stage_pool policy ON policy.workspace_id = p.workspace_id
+        AND policy.stage_name = p.stage_name AND policy.enabled = true
        LEFT JOIN agent a ON a.id = p.agent_id AND a.workspace_id = p.workspace_id
        LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
         AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
@@ -646,19 +1027,32 @@ async function selectScoperPoolOwner(client, workspaceId, ownerStage, toStage) {
             AND atq.status IN ('queued','dispatched','running','waiting_local_directory','deferred')
        ) active ON true
       WHERE p.workspace_id = $1 AND p.stage_name = $2 AND p.enabled = true
-      ORDER BY active_task_count, p.agent_id`, [workspaceId, toStage]);
+      ORDER BY active_task_count, p.last_selected_at NULLS FIRST, p.agent_id`, [workspaceId, toStage]);
   if (result.rows.length === 0) return null;
-  const eligible = result.rows.filter((row) => row.archived_at === null &&
-    ["idle", "working"].includes(row.agent_status) && row.model === "gpt-5.6-sol" &&
-    row.thinking_level === "low" && row.selected_runtime_id &&
-    Number(row.active_task_count) < Number(row.max_concurrent_tasks) &&
+  const identityEligible = result.rows.filter((row) => row.archived_at === null &&
+    ["idle", "working"].includes(row.agent_status) && row.selected_runtime_id &&
     instructionCompatibility(row.instructions, toStage).ok);
-  if (eligible.length === 0) throw new Error(`No eligible Sol-low scoper in pool: ${workspaceId}/${ownerStage}`);
-  return eligible[0];
+  if (identityEligible.length === 0) throw new Error(`No eligible stage owner in pool: ${workspaceId}/${toStage}`);
+  const ts = (value) => (value === null || value === undefined) ? -Infinity : new Date(value).getTime();
+  identityEligible.sort((left, right) => Number(left.active_task_count) - Number(right.active_task_count) ||
+    ts(left.last_selected_at) - ts(right.last_selected_at) ||
+    String(left.agent_id).localeCompare(String(right.agent_id)));
+  const eligible = identityEligible.filter((row) =>
+    Number(row.active_task_count) < Number(row.max_concurrent_tasks));
+  // A pool is still a valid owner when every member is busy. Queue the task on
+  // its least-loaded compatible member instead of rejecting the relay advance.
+  // The SQL order preserves the normal round-robin choice for below-cap rows.
+  const selected = eligible[0] || identityEligible[0];
+  await client.query(
+    `UPDATE relay_stage_agent_pool SET last_selected_at = NOW()
+      WHERE workspace_id = $1 AND stage_name = $2 AND agent_id = $3`,
+    [workspaceId, toStage, selected.agent_id]
+  );
+  return selected;
 }
 
 async function selectStageOwner(client, workspaceId, ownerStage, toStage) {
-  const pooled = await selectScoperPoolOwner(client, workspaceId, ownerStage, toStage);
+  const pooled = await selectPoolOwner(client, workspaceId, ownerStage, toStage);
   return pooled || canonicalStageOwner(client, workspaceId, ownerStage);
 }
 
@@ -705,7 +1099,8 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 404, "issue_not_found");
     }
-    const qcTask = await latestCompletedSolLowQcTask(client, payload.issue_id, issue.rows[0].workspace_id);
+    const qcTask = await latestCompletedSolLowQcTask(client, payload.issue_id,
+      issue.rows[0].workspace_id, payload.qc_task_id || null);
     if (!qcTask) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "completed_sol_low_qc_required");
@@ -766,7 +1161,8 @@ async function relayVerdict(req, res, payload) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit } = body;
+    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
+      operator_rescope_issue_id, operator_terminal_exit, operator_release } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -783,9 +1179,10 @@ async function relayAdvance(req, res, body) {
       return;
     }
     
-    client = new Client({ connectionString: MULTICA_DB });
+    client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
     await client.connect();
     await client.query("BEGIN");
+    await authorizeRelayStatusWrites(client);
     // Every relay execution admission for an issue takes this transaction lock,
     // including the recovery daemon. A partial unique index would either miss
     // waiting/deferred tasks or incorrectly constrain manual tasks; this lock
@@ -794,7 +1191,7 @@ async function relayAdvance(req, res, body) {
 
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
-    const terminalStages = new Set(["Done", "Cancelled", "Archived"]);
+    let escalationLoop = false;
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -811,6 +1208,46 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    const noArtifactRescope = await noArtifactRescopeAdmission(
+      client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
+    );
+    if (noArtifactRescope && to_stage === "In Progress") {
+      to_stage = "Spec";
+    }
+    if (issue.status === "In Review" && to_stage === "Human Review" &&
+        await latestQcNoArtifactSignal(client, issue)) {
+      await client.query("ROLLBACK");
+      console.warn(JSON.stringify({
+        event: "relay_advance_rejected",
+        reason: "technical_human_review_forbidden",
+        issue_id: issue.id,
+        from_stage: issue.status,
+        to_stage
+      }));
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "technical_human_review_forbidden",
+        message: "QC-BLOCKED NO-SHA work must be re-scoped by Sol-low; Human Review is money-only"
+      }));
+      return;
+    }
+    let retryEscalation = noArtifactRescope ? null :
+      await verifiedRetryEscalation(client, issue, body);
+    if (retryEscalation === false) {
+      await client.query("ROLLBACK");
+      console.warn(JSON.stringify({ event: "relay_advance_rejected",
+        reason: "retry_escalation_evidence_required", issue_id: issue.id }));
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "retry_escalation_evidence_required" }));
+      return;
+    }
+    if (retryEscalation && retryEscalationLoop(issue, retryEscalation.trigger_stage)) {
+      escalationLoop = true;
+      parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
+        attempts: 2, taskCount: 2 };
+      to_stage = "Parked";
+      retryEscalation = null;
+    }
     const targetStageResult = await client.query(
       "SELECT stage_name FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
       [issue.workspace_id, to_stage]
@@ -820,8 +1257,59 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayStage(res, to_stage);
       return;
     }
+    const sourceStageResult = await client.query(
+      "SELECT next_stage FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
+      [issue.workspace_id, issue.status]
+    );
+    // Done -> Archived remains an automation path: it is the configured,
+    // terminal-to-terminal successor and terminal arrivals return before any
+    // task dispatch. Other terminal exits require operator-only credentials.
+    const configuredTerminalExit = isTerminalStage(issue.status) &&
+      sourceStageResult.rows[0]?.next_stage === to_stage;
+    const explicitTerminalExitRequested = isTerminalStage(issue.status) &&
+      operator_terminal_exit === true && typeof reason === "string" && reason.trim() !== "";
+    const explicitTerminalExit = explicitTerminalExitRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const explicitHumanReviewReleaseRequested = issue.status === "Human Review" &&
+      operator_release === true && typeof reason === "string" && reason.trim() !== "";
+    const explicitHumanReviewRelease = explicitHumanReviewReleaseRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease;
+    if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
+        OPERATOR_SECRET_DISABLED) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_operator_secret_conflict",
+        message: "operator terminal exits are disabled because relay secrets are identical"
+      }));
+      return;
+    }
+    if (explicitHumanReviewReleaseRequested && !explicitHumanReviewRelease) {
+      await client.query("ROLLBACK");
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_operator_secret_conflict",
+        message: "operator human review releases require a valid operator secret"
+      }));
+      return;
+    }
+    if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "terminal_stage_operator_marker_required",
+        message: "terminal exits require the configured successor or an authenticated operator marker and reason"
+      }));
+      return;
+    }
     const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
       issue.metadata?.parked_release_once === true;
+    const parkedEvidenceQcRelease = await verifiedParkedEvidenceRelease(client, issue, to_stage, reason);
     // Parked -> Done is reserved for the relay's already-fixed diagnosis
     // outcome. It still reaches the current PASS + work-product-hash gate
     // below; the relay secret is the authority boundary for this exception.
@@ -834,10 +1322,17 @@ async function relayAdvance(req, res, body) {
     const cicdReturn = isCicdReturn(issue.status, to_stage, reason) &&
       !issue.metadata?.cicd_return_consumed_at;
     let cicdReturnCapBypass = false;
-    const releaseAt = issue.metadata?.parked_release_at || null;
-    if (issue.status === to_stage) {
+    if (explicitHumanReviewRelease) {
+      issue.metadata = { ...(issue.metadata || {}),
+        human_review_release_at: new Date().toISOString(),
+        human_review_release_reason: reason.trim() };
+    }
+    const releaseAt = issue.metadata?.human_review_release_at ||
+      issue.metadata?.parked_release_at ||
+      issue.metadata?.retry_escalation_at || null;
+    if (issue.status === to_stage && !retryEscalation) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
-      const relayLogId = terminalStages.has(to_stage)
+      const relayLogId = isTerminalStage(to_stage)
         ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -888,10 +1383,30 @@ async function relayAdvance(req, res, body) {
     const expectedStage = transitionResult.rows[0]?.next_stage;
     const altStages = transitionResult.rows[0]?.alt_next_stages || [];
     const allowedStages = [expectedStage].concat(altStages).filter(Boolean);
+    if (issue.status === "In Review" && to_stage === "Spec" && !noArtifactRescope) {
+      const decision = qcBounceDecision(await latestQcVerdict(client, issue_id), expectedStage);
+      if (decision.action === "hold") {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: decision.reason }));
+        return;
+      }
+      if (decision.action === "deploy") {
+        to_stage = decision.toStage;
+        retryEscalation = null;
+        console.warn(JSON.stringify({
+          event: "qc_pass_rescope_suppressed",
+          issue_id,
+          redirected_to: to_stage
+        }));
+      }
+    }
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    if (!parkedRelease && !parkedDiagnosisDone && !allowedStages.includes(to_stage) && !dispositionStages.has(to_stage)) {
+    if (!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&
+        !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) &&
+        !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
@@ -914,35 +1429,62 @@ async function relayAdvance(req, res, body) {
     // and the review lane on every lap. GSP #151 ran 67 laps.
     // The ceiling is agent_task_queue.max_attempts (default 2) -- the belt's own
     // declared retry limit, applied to stage re-entry instead of to one task.
-    // Past it the ticket is a human's problem, not another paid rebuild.
+    // Past it the ticket changes hands to a Sol-low re-spec, not another paid rebuild.
     if (issue.status === "In Review" && to_stage === "In Progress" &&
         altStages.includes("Human Review")) {
-      const bounced = await client.query(
-        `SELECT count(*)::int AS n,
-                COALESCE(max(q.max_attempts), 2) AS ceiling
-           FROM relay_run_log l
-           LEFT JOIN agent_task_queue q ON q.id = l.task_id
-          WHERE l.issue_id = $1
-            AND l.from_stage = 'In Review'
-            AND l.to_stage = 'In Progress'`,
-        [issue_id]
-      );
-      const { n, ceiling } = bounced.rows[0];
-      if (n >= ceiling) {
+      const decision = qcBounceDecision(await latestQcVerdict(client, issue_id), expectedStage);
+      if (decision.action === "hold") {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: decision.reason }));
+        return;
+      }
+      if (decision.action === "deploy") {
+        to_stage = decision.toStage;
+        retryEscalation = null;
         console.warn(JSON.stringify({
-          event: "qc_bounce_ceiling",
+          event: "qc_pass_bounce_suppressed",
           issue_id,
-          bounces: n,
-          ceiling,
-          redirected_to: "Parked"
+          redirected_to: to_stage
         }));
-        to_stage = "Parked";
-        parkedAudit = {
-          trigger: "qc_bounce_ceiling",
-          intendedStage: "In Progress",
-          attempts: n,
-          taskCount: n
-        };
+      } else {
+        const bounced = await client.query(
+          `SELECT count(*)::int AS n,
+                  COALESCE(max(q.max_attempts), 2) AS ceiling
+             FROM relay_run_log l
+             LEFT JOIN agent_task_queue q ON q.id = l.task_id
+            WHERE l.issue_id = $1
+              AND l.from_stage = 'In Review'
+              AND l.to_stage = 'In Progress'`,
+          [issue_id]
+        );
+        const { n, ceiling } = bounced.rows[0];
+        if (n >= ceiling) {
+          const sourceTaskId = await retryEscalationSourceTask(
+            client, issue, body.relay_source_task_id
+          );
+          if (!sourceTaskId) {
+            await client.query("ROLLBACK");
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+              reason: "qc_bounce_ceiling" }));
+            return;
+          }
+          retryEscalation = {
+            reason: "qc_bounce_ceiling", trigger_stage: issue.status,
+            attempts: n, ceiling, source_task_id: sourceTaskId,
+            deadline: escalationDeadline()
+          };
+          to_stage = "Spec";
+          console.warn(JSON.stringify({
+            event: "qc_bounce_ceiling",
+            issue_id,
+            bounces: n,
+            ceiling,
+            redirected_to: "Spec",
+            source_task_id: sourceTaskId
+          }));
+        }
       }
     }
 
@@ -1027,8 +1569,15 @@ async function relayAdvance(req, res, body) {
       );
     }
 
-    const ownerStage = ownerStageForTransition(issue.status, to_stage);
-    const stage = await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage);
+    const ownerStage = retryEscalation ? "Registered" :
+      ownerStageForTransition(issue.status, to_stage);
+    let stage = isNoDispatchArrivalStage(to_stage) ? {} : (retryEscalation
+      ? await selectRetryEscalationOwner(client, issue)
+      : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage));
+    if (retryEscalation) {
+      retryEscalation = { ...retryEscalation, owner: stage.agent_name,
+        deadline: escalationDeadline() };
+    }
 
     if (!stage) {
       throw new Error(`Missing relay configuration for stage: ${to_stage}`);
@@ -1128,70 +1677,104 @@ async function relayAdvance(req, res, body) {
       // A stage re-entry creates a fresh task, so per-task max_attempts does not
       // stop a QC FAIL loop. Count every historical task for this issue and
       // target stage before admitting another paid call; once the ceiling is
-      // reached the flight receives an explicit human disposition.
+      // reached the flight changes hands to a bounded Sol-low re-spec task.
       const history = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
           WHERE issue_id = $1 AND context->>'to_stage' = $2
+            AND trigger_comment_id IS NULL
+            AND COALESCE(context->>'kind', '') <> 'retry_escalation'
+            ${budgetCountPredicate()}
             AND ($3::timestamptz IS NULL OR created_at >= $3)`,
         [issue.id, to_stage, releaseAt]
       );
       const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
-      if (!cycle.ok && !cicdReturn) {
-        const moved = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
-          target_stage: to_stage, historical_tasks: history.rows[0]?.n || 0,
-          ceiling: cycle.ceiling
-        });
-        await client.query("COMMIT");
+      const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
+        client, issue, to_stage, reason, parkedEvidenceQcRelease
+      );
+      if (!cycle.ok && !operatorCapBypass && retryEscalationLoop(issue, issue.status)) {
+        escalationLoop = true;
+        parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
+          attempts: 2, taskCount: 2 };
+        to_stage = "Parked";
+      }
+      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !escalationLoop &&
+          !noArtifactRescope && !retryEscalation) {
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: cycle.reason }));
+          return;
+        }
+        retryEscalation = {
+          reason: cycle.reason, trigger_stage: issue.status,
+          attempts: history.rows[0]?.n || 0, ceiling: cycle.ceiling,
+          source_task_id: sourceTaskId, deadline: escalationDeadline()
+        };
+        to_stage = cycle.disposition;
+        stage = await selectRetryEscalationOwner(client, issue);
+        retryEscalation.owner = stage.agent_name;
         console.warn(JSON.stringify({
-          event: "relay_advance_rejected",
+          event: "relay_retry_escalated",
           reason: cycle.reason,
           issue_id: issue.id,
           target_stage: to_stage,
           historical_tasks: history.rows[0]?.n || 0,
           ceiling: cycle.ceiling,
           disposition: cycle.disposition,
-          disposition_applied: moved
+          escalation_owner: stage.agent_name,
+          deadline: retryEscalation.deadline
         }));
-        res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: cycle.reason,
-          message: "stage retry ceiling reached; issue parked and retry eligibility removed",
-          disposition: cycle.disposition,
-          target_stage: to_stage,
-          historical_tasks: history.rows[0]?.n || 0,
-          ceiling: cycle.ceiling
-        }));
-        return;
       }
       const lifetimeHistory = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
           WHERE issue_id = $1
+            AND trigger_comment_id IS NULL
+            ${budgetCountPredicate()}
             AND ($2::timestamptz IS NULL OR created_at >= $2)`,
         [issue.id, releaseAt]
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !cicdReturn) {
-        const moved = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
-          target_stage: to_stage, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
-          ceiling: lifetime.ceiling
-        });
-        await client.query("COMMIT");
+      if (!lifetime.ok && !operatorCapBypass && retryEscalationLoop(issue, issue.status)) {
+        escalationLoop = true;
+        parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
+          attempts: 2, taskCount: 2 };
+        to_stage = "Parked";
+      }
+      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !escalationLoop && !retryEscalation) {
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: lifetime.reason }));
+          return;
+        }
+        retryEscalation = {
+          reason: lifetime.reason, trigger_stage: issue.status,
+          attempts: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling,
+          source_task_id: sourceTaskId, deadline: escalationDeadline()
+        };
+        to_stage = lifetime.disposition;
+        stage = await selectRetryEscalationOwner(client, issue);
+        retryEscalation.owner = stage.agent_name;
         console.warn(JSON.stringify({
-          event: "relay_advance_rejected",
+          event: "relay_retry_escalated",
           reason: lifetime.reason,
           issue_id: issue.id,
           target_stage: to_stage,
           historical_tasks: lifetimeHistory.rows[0]?.n || 0,
           ceiling: lifetime.ceiling,
           disposition: lifetime.disposition,
-          disposition_applied: moved
+          escalation_owner: stage.agent_name,
+          deadline: retryEscalation.deadline
         }));
-        res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: lifetime.reason, disposition: lifetime.disposition,
-          disposition_applied: moved, historical_tasks: lifetimeHistory.rows[0]?.n || 0,
-          ceiling: lifetime.ceiling }));
-        return;
       }
     }
 
@@ -1241,24 +1824,33 @@ async function relayAdvance(req, res, body) {
       )) {
         throw new Error(`CI/CD return authorization already consumed: ${issue.id}`);
       }
+      if (noArtifactRescope && !await consumeNoArtifactRescope(client, issue)) {
+        throw new Error(`no-artifact re-scope authorization already consumed: ${issue.id}`);
+      }
     }
 
     const result = await client.query(
       `UPDATE "issue"
        SET status = $1,
-           metadata = CASE WHEN $3 THEN
-             jsonb_set(COALESCE(metadata, '{}'::jsonb) - 'parked_release_once',
-                       '{parked_release_at}', to_jsonb(NOW()), true)
+           metadata = CASE
+             WHEN $3 THEN jsonb_set(COALESCE(metadata, '{}'::jsonb) - 'parked_release_once',
+                                    '{parked_release_at}', to_jsonb(NOW()), true)
+             WHEN $4 THEN COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+               'human_review_release_at', $5::timestamptz,
+               'human_review_release_reason', $6::text)
              ELSE metadata END,
            updated_at = NOW()
        WHERE id = $2
        RETURNING id, status`,
-      [to_stage, issue_id, parkedRelease]
+      [to_stage, issue_id, parkedRelease || parkedEvidenceQcRelease,
+        explicitHumanReviewRelease, issue.metadata?.human_review_release_at || null,
+        explicitHumanReviewRelease ? reason.trim() : null]
     );
-    if (parkedRelease) {
+    if (parkedRelease || parkedEvidenceQcRelease) {
       console.warn(JSON.stringify({ event: "parked_release_consumed",
         issue_id: issue.id, from_stage: issue.status, to_stage }));
     }
+    if (retryEscalation) await recordRetryEscalation(client, issue, retryEscalation);
 
     let taskId = null;
     let relayLogId = null;
@@ -1270,14 +1862,36 @@ async function relayAdvance(req, res, body) {
         trigger: parkedAudit?.trigger || "relay_advance",
         intendedStage: parkedAudit?.intendedStage || null,
         attempts: parkedAudit?.attempts || 0,
-        taskCount: parkedAudit?.taskCount || 0
+        taskCount: parkedAudit?.taskCount || 0,
+        callerAudit: parkedAudit,
+        terminalExit: explicitTerminalExit
+          ? { operator_marker: true, reason: reason.trim() }
+          : null
       });
+      if (escalationLoop === true && result.rowCount > 0) {
+        await recordParkAndQueueDiagnosis(client, issue, {
+          ...parkedAudit, reason: 'escalation_loop'
+        });
+      }
     }
 
-    if (terminalStages.has(to_stage)) {
-      relayLogId = await ensureCompletedRelayLog(
+    if (isNoDispatchArrivalStage(to_stage)) {
+      // Parked has already written its completed, dedicated audit row above.
+      // Other no-dispatch arrivals need a regular completed relay log.
+      relayLogId = relayLogId || await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
+      // Terminal, human-gate, and parked-disposition arrivals have no stage owner, task, or
+      // successor relay. Keep this return before every dispatch path.
+      await client.query("COMMIT");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        issue: result.rows[0],
+        task_id: null,
+        relay_log_id: relayLogId
+      }));
+      return;
     }
 
     // A bundled child must never be dispatched on its own. Its MEGA parent IS
@@ -1310,7 +1924,22 @@ async function relayAdvance(req, res, body) {
         from_stage: issue.status,
         to_stage,
         agent_name: stage.agent_name,
+        pool_stage: stage.pool_stage || (stage.agent_id ? to_stage : null),
+        ...(retryEscalation ? {
+          kind: "retry_escalation",
+          escalation_reason: retryEscalation.reason,
+          escalation_owner: retryEscalation.owner,
+          escalation_deadline: retryEscalation.deadline,
+          escalation_source_task_id: retryEscalation.source_task_id
+        } : {}),
         ...(cicdReturn ? { return_reason: reason } : {}),
+        ...(noArtifactRescope ? {
+          rescope_reason: "qc_blocked_no_artifact",
+          operator_rescope_issue_id: issue.id
+        } : {}),
+        ...(explicitTerminalExit ? {
+          terminal_exit: { operator_marker: true, reason: reason.trim() }
+        } : {}),
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
@@ -1324,7 +1953,16 @@ async function relayAdvance(req, res, body) {
         priority: taskPriority,
         runtimeId: stage.selected_runtime_id,
         context,
-        triggerSummary: `Relay stage transition: ${issue.status} -> ${to_stage}`
+        relayAudit: operatorCapBypass ? JSON.stringify({
+          ...(explicitTerminalExit ? {
+            terminal_exit: { operator_marker: true, reason: reason.trim() }
+          } : {}),
+          operator_cap_bypass: true,
+          reason: reason.trim()
+        }) : null,
+        triggerSummary: retryEscalation
+          ? `Sol-low re-spec escalation: ${retryEscalation.reason}`
+          : `Relay stage transition: ${issue.status} -> ${to_stage}`
       });
       taskId = successor.taskId;
       relayLogId = successor.relayLogId;
@@ -1357,6 +1995,26 @@ async function relayAdvance(req, res, body) {
   }
 }
 
+async function relayDiagnosisRerun(req, res, payload) {
+  if (!RELAY_AGENT_SECRET || payload.agent_token !== RELAY_AGENT_SECRET) return relayVerdictError(res, 403, 'invalid_token');
+  const client = new Client({ connectionString: MULTICA_DB });
+  try {
+    await client.connect();
+    await client.query('BEGIN');
+    const result = await rerunParkedDiagnosis(client, payload);
+    if (!result.ok) {
+      await client.query('ROLLBACK');
+      return relayVerdictError(res, 409, result.error);
+    }
+    await client.query('COMMIT');
+    res.writeHead(result.replay ? 200 : 202, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result));
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {});
+    relayVerdictError(res, 500, 'internal_error');
+  } finally { await client.end().catch(() => {}); }
+}
+
 const server = http.createServer(async (req, res) => {
   if (req.url === "/relay/verdict") {
     if (req.method !== "POST") return relayVerdictError(res, 405, "method_not_allowed");
@@ -1380,6 +2038,12 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(400);
         res.end("Invalid JSON");
       }
+    });
+  } else if (req.method === "POST" && req.url === "/relay/parked-diagnosis-rerun") {
+    let body = "";
+    req.on("data", chunk => body += chunk);
+    req.on("end", () => {
+      try { relayDiagnosisRerun(req, res, JSON.parse(body)); } catch { relayVerdictError(res, 400, 'invalid_json'); }
     });
   } else if (req.method === "GET" && req.url === "/sso/bridge") {
     ssoBridge(req, res);
@@ -1437,13 +2101,34 @@ module.exports = {
   isBookkeepingTransition,
   recordBookkeepingHandoff,
   validateRelayVerdict,
+  qcBounceDecision,
   latestCompletedSolLowQcTask,
+  qcTaskEvidence,
   qcTaskEvidenceMismatch,
   relayVerdict,
+  relayAdvance,
   setTestClientFactory(factory) { testClientFactory = factory; },
   isCicdReturn,
   consumeCicdReturnAuthorization,
   authorizeCicdReturnCapBypass,
+  selectPoolOwner,
   selectStageOwner,
-  applyDisposition
+  applyDisposition,
+  consumeParkedQcRecovery,
+  taskResultText,
+  isNoArtifactQcBlock,
+  operatorRescopeIssueId,
+  issueImplementationArtifact,
+  noArtifactRescopeAdmission,
+  consumeNoArtifactRescope,
+  latestQcNoArtifactSignal,
+  isTerminalStage,
+  isNoDispatchArrivalStage,
+  retryEscalationReason,
+  verifiedRetryEscalation,
+  retryEscalationSourceTask,
+  capEscalationVerified,
+  retryEscalationLoop,
+  authorizeRelayStatusWrites,
+  rerunParkedDiagnosis
 };

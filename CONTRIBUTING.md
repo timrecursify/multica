@@ -330,6 +330,10 @@ commands:
 3. `sk repo test --path <checkout> --profile docs-lint --json` — applies the
    committed offline ruleset in `.sk/scripts/docs-rules.toml` to the
    maintained Markdown/MDX documentation and names the offending `file:line`.
+4. `sk repo test --path <checkout> --profile parked-diagnosis-node-tests --json`
+   — runs the committed parked-diagnosis CJS suites
+   `ops/belt/backfill-parked-diagnosis.test.cjs` and
+   `ops/belt/parked-diagnosis.test.cjs` with Node's built-in test runner.
 
 Discovery is bound to the committed listings under `.sk/` (`.sk/tracked-sh.txt`,
 `.sk/tracked-docs.txt`), so checks never depend on `git`, caller credentials,

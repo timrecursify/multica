@@ -171,7 +171,21 @@ function stageCycleAdmission(taskCount, limit = 2) {
   if (!Number.isInteger(ceiling) || ceiling < 1) return { ok: false, reason: 'invalid_stage_cycle_limit' };
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Parked' };
+    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Spec', escalation: 'sol_low_respec' };
+}
+
+function budgetCountPredicate(taskAlias = '') {
+  const task = taskAlias ? `${taskAlias}.` : '';
+  return `AND (
+    ${task}context->>'to_stage' IS DISTINCT FROM 'In Review'
+    OR ${task}status IS DISTINCT FROM 'completed'
+    OR EXISTS (
+      SELECT 1 FROM qc_verdict verdict
+       WHERE verdict.issue_id = ${task}issue_id
+         AND verdict.checker_id = ${task}agent_id
+         AND verdict.created_at >= ${task}started_at
+    )
+  )`;
 }
 
 function lifetimeTaskAdmission(taskCount, limit = 6) {
@@ -182,7 +196,7 @@ function lifetimeTaskAdmission(taskCount, limit = 6) {
   }
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Parked' };
+    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Spec', escalation: 'sol_low_respec' };
 }
 
 function isExecutionStage(stage) {
@@ -212,13 +226,20 @@ function assertRoutableStageOwners(rows) {
   }
 }
 
-function quotaCircuitAdmission(failureReasons, limit = 3) {
+function quotaCircuitAdmission(failures, limit = 3, { now = Date.now(),
+  maxAgeMs = QUOTA_PAUSE_MAX_AGE_MS } = {}) {
   const ceiling = Number(limit);
   if (!Number.isInteger(ceiling) || ceiling < 1) {
     return { pause: true, reason: 'invalid_quota_failure_limit' };
   }
   let consecutive = 0;
-  for (const reason of failureReasons || []) {
+  for (const failure of failures || []) {
+    const reason = typeof failure === 'object' && failure !== null
+      ? failure.failure_reason : failure;
+    const updatedAt = typeof failure === 'object' && failure !== null
+      ? failure.updated_at : null;
+    if (updatedAt && (!Number.isFinite(Date.parse(updatedAt)) ||
+      now - Date.parse(updatedAt) > maxAgeMs)) break;
     if (!/\b402\b|provider_quota_limit|payment[ _-]?required/i.test(String(reason || ''))) break;
     consecutive += 1;
   }
@@ -240,6 +261,7 @@ module.exports = {
   QUOTA_PAUSE_MAX_AGE_MS,
   quotaPauseClearance,
   quotaPauseFlipLogLine,
+  budgetCountPredicate,
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,

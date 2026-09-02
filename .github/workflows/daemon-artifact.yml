@@ -22,6 +22,8 @@ jobs:
           cache-dependency-path: server/go.sum
       - name: Build immutable daemon artifact
         run: ops/belt/build-daemon-artifact.sh dist/daemon-linux-amd64-${{ github.sha }}
+      - name: Verify workflow-relative artifact output
+        run: bash ops/belt/build-daemon-artifact.test.sh
       - name: Verify operator deploy safety checks
         run: bash ops/belt/daemon-artifact.test.sh
       - uses: actions/upload-artifact@v4

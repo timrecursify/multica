@@ -4,6 +4,10 @@ This directory mirrors the current GSP belt runtime. The runtime paths below
 are authoritative today. Editing a repository copy does not change running
 behavior until it is deployed with `./deploy.sh --apply`.
 
+Explicit terminal exits require `RELAY_OPERATOR_SECRET` in the bridge
+environment and the matching `X-Relay-Operator-Secret` request header. If the
+environment variable is unset, those exceptional exits are refused.
+
 ## Runtime map
 
 | Repository file | Runtime path | Current runner |
@@ -77,7 +81,9 @@ is recorded in task context and is never automatically repeated.
 Add `--workspace <UUID>` to constrain a run. The script locks each still-Parked
 issue, skips named blockers and all prior diagnosis tasks (reporting completed,
 failed, and cancelled statuses), and emits stable JSON counts and IDs,
-including stale rows that changed before the lock. It is an operator one-shot
-and is not part of the runtime deploy manifest; rollback is a no-op because
-dry-run performs no writes and apply writes only the ticket comment, blocker
-metadata, and diagnosis task.
+including stale rows that changed before the lock. Each apply candidate has its
+own transaction: a policy rejection is rolled back, included in `counts.failed`
+and `ids.failed`, and does not prevent later candidates or the final receipt.
+It is an operator one-shot and is not part of the runtime deploy manifest;
+rollback is a no-op because dry-run performs no writes and apply writes only the
+ticket comment, blocker metadata, and diagnosis task.

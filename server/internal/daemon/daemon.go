@@ -477,6 +477,11 @@ type Daemon struct {
 	// It deliberately includes preparation and local-directory waiters because
 	// restart/update barriers must not kill any claimed task.
 	activeTasks atomic.Int64
+	// taskTempDirs records temp directories owned by live task handlers. It is
+	// consulted by the orphan sweep so a periodic sweep cannot remove a task's
+	// working directory.
+	taskTempDirsMu sync.Mutex
+	taskTempDirs   map[string]struct{}
 	// runningTasks counts live provider execution sessions, beginning only after
 	// backend.Execute returns. It can briefly lag the server-side running state,
 	// which starts during preparation before provider launch. resourceWaitTasks
@@ -574,6 +579,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		resolvedPaths:             make(map[string]healedAgent),
 		wsHBLastAck:               make(map[string]time.Time),
 		activeEnvRoots:            make(map[string]int),
+		taskTempDirs:              make(map[string]struct{}),
 		deletingEnvRoots:          make(map[string]bool),
 		activeStores:              make(map[string]int),
 		deletingStores:            make(map[string]bool),
@@ -1659,6 +1665,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancelFunc = cancel
 	d.rootCtx = ctx
+	if dir, err := cli.ProfileDir(d.cfg.Profile); err != nil {
+		return fmt.Errorf("resolve codex lease directory: %w", err)
+	} else {
+		agent.RecoverCodexProcessLeases(filepath.Join(dir, "codex-process-leases"), d.logger)
+	}
 
 	// Bind health port early to detect another running daemon.
 	healthLn, err := d.listenHealth()
@@ -1675,6 +1686,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		logFields = append(logFields, "profile", d.cfg.Profile)
 	}
 	d.logger.Info("starting daemon", logFields...)
+	d.sweepTaskTempDirs()
 	d.logger.Debug("daemon config resolved",
 		"daemon_id", d.cfg.DaemonID,
 		"device_name", d.cfg.DeviceName,
@@ -1743,6 +1755,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.gcLoop(ctx)
 	go d.autoUpdateLoop(ctx)
 	go d.tokenRenewalLoop(ctx)
+	go d.codexLeaseSweepLoop(ctx)
 
 	// Preflight succeeded and the background loops are up: the daemon has
 	// registered its runtimes and can now claim and run tasks. Flip /health
@@ -1754,6 +1767,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 	err = d.pollLoop(ctx, taskWakeups)
 	d.logger.Debug("daemon main loop returning", "error", err)
 	return err
+}
+
+func (d *Daemon) codexLeaseSweepLoop(ctx context.Context) {
+	dir, err := cli.ProfileDir(d.cfg.Profile)
+	if err != nil {
+		return
+	}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			agent.RecoverCodexProcessLeases(filepath.Join(dir, "codex-process-leases"), d.logger)
+		}
+	}
+}
+
+func codexLeaseDir(profile string) string {
+	dir, err := cli.ProfileDir(profile)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "codex-process-leases")
 }
 
 // RestartBinary returns the path to the new binary if the daemon needs to restart
@@ -5954,7 +5992,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("prepare task temp dir: %w", err)
 	}
+	d.trackTaskTempDir(taskTempDir)
 	defer func() {
+		d.untrackTaskTempDir(taskTempDir)
 		if cerr := os.RemoveAll(taskTempDir); cerr != nil {
 			taskLog.Warn("task temp dir cleanup failed", "path", taskTempDir, "error", cerr)
 		}
@@ -6143,6 +6183,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		RuntimeID:      task.RuntimeID,
 		DaemonVersion:  d.cfg.CLIVersion,
 		CodexVersion:   codexVersion,
+		CodexLeaseDir:  codexLeaseDir(d.cfg.Profile),
+		DaemonID:       d.cfg.DaemonID,
 		BuiltinRuntime: !usesCustomProfileCommand,
 	})
 	if err != nil {
@@ -7550,6 +7592,63 @@ func socketSafeTempBaseDir() string {
 		}
 	}
 	return os.TempDir()
+}
+
+func (d *Daemon) trackTaskTempDir(path string) {
+	d.taskTempDirsMu.Lock()
+	if d.taskTempDirs == nil {
+		d.taskTempDirs = make(map[string]struct{})
+	}
+	d.taskTempDirs[path] = struct{}{}
+	d.taskTempDirsMu.Unlock()
+}
+
+func (d *Daemon) untrackTaskTempDir(path string) {
+	d.taskTempDirsMu.Lock()
+	delete(d.taskTempDirs, path)
+	d.taskTempDirsMu.Unlock()
+}
+
+func (d *Daemon) sweepTaskTempDirs() {
+	d.taskTempDirsMu.Lock()
+	tracked := make(map[string]struct{}, len(d.taskTempDirs))
+	for path := range d.taskTempDirs {
+		tracked[path] = struct{}{}
+	}
+	d.taskTempDirsMu.Unlock()
+
+	removed, bytesFreed := sweepOrphanTaskTempDirs(socketSafeTempBaseDir(), d.cfg.TaskTempOrphanTTL, tracked, time.Now())
+	d.logger.Info("task temp orphan sweep complete", "removed", removed, "bytes_freed", bytesFreed, "ttl", d.cfg.TaskTempOrphanTTL)
+}
+
+func sweepOrphanTaskTempDirs(root string, ttl time.Duration, tracked map[string]struct{}, now time.Time) (int, int64) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, 0
+	}
+
+	removed := 0
+	var bytesFreed int64
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "multica-task-") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if _, ok := tracked[path]; ok {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < ttl {
+			continue
+		}
+		size := dirSize(path)
+		if err := os.RemoveAll(path); err != nil {
+			continue
+		}
+		removed++
+		bytesFreed += size
+	}
+	return removed, bytesFreed
 }
 
 // isBlockedEnvKey returns true if the key must not be overridden by user-

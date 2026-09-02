@@ -36,6 +36,39 @@ test('Parked entry writer creates one completed relay log row with audit JSON', 
   });
 });
 
+test('Done to Parked operator exit records its reason in the Parked audit', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ id: 'parked-log' }] };
+  } };
+
+  await recordParkedEntry(client, {
+    issueId: 'issue-1', fromStage: 'Done', trigger: 'relay_advance',
+    terminalExit: { operator_marker: true, reason: 'operator correction' }
+  });
+
+  assert.deepEqual(JSON.parse(calls[0].values[2]), {
+    trigger: 'relay_advance', intended_stage: null, attempts: 0, task_count: 0,
+    terminal_exit: { operator_marker: true, reason: 'operator correction' }
+  });
+});
+
+test('escalation-loop Parked audit preserves its reason', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ id: 'parked-log' }] };
+  } };
+
+  await recordParkedEntry(client, {
+    issueId: 'issue-1', fromStage: 'In Review', trigger: 'escalation_loop',
+    callerAudit: { reason: 'escalation_loop' }
+  });
+
+  assert.equal(JSON.parse(calls[0].values[2]).reason, 'escalation_loop');
+});
+
 test('hourly Parked flow query counts entries and exits separately', () => {
   assert.match(PARKED_FLOW_PER_HOUR_SQL, /date_trunc\('hour', created_at\)/);
   assert.match(PARKED_FLOW_PER_HOUR_SQL, /to_stage = 'Parked'.*entries_per_hour/s);
