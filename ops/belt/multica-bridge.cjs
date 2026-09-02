@@ -1852,6 +1852,11 @@ async function relayAdvance(req, res, body) {
           ? { operator_marker: true, reason: reason.trim() }
           : null
       });
+      if (escalationLoop === true && result.rowCount > 0) {
+        await recordParkAndQueueDiagnosis(client, issue, {
+          ...parkedAudit, reason: 'escalation_loop'
+        });
+      }
     }
 
     if (isNoDispatchArrivalStage(to_stage)) {

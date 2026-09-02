@@ -631,6 +631,15 @@ test('runtime-evidence recovery is one-shot, typed, and stays on relay authority
   assert.doesNotMatch(diagnosis, /UPDATE issue SET status/);
 });
 
+test('a released escalation-loop diagnosis consumes only retry_escalation', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const diagnosis = source.slice(source.indexOf('async function processParkedDiagnoses'),
+    source.indexOf('function startDaemon'));
+  assert.match(diagnosis, /task\.context\?\.reason_code === 'escalation_loop'/);
+  assert.match(diagnosis, /metadata = COALESCE\(metadata, '\{\}'::jsonb\) - 'retry_escalation'/);
+  assert.doesNotMatch(diagnosis, /- 'parked_release_once'/);
+});
+
 test('diagnosis release retries every non-2xx response and records the attempt', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /if \(!response\.ok\)/);

@@ -1450,6 +1450,13 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
                     '{parked_release_at}', to_jsonb(NOW()), true),
                   updated_at = NOW()
              WHERE id = $1::uuid AND status = 'Parked'`, [task.issue_id]);
+        if (task.context?.reason_code === 'escalation_loop') {
+          await client.query(
+            `UPDATE issue
+                SET metadata = COALESCE(metadata, '{}'::jsonb) - 'retry_escalation',
+                    updated_at = NOW()
+              WHERE id = $1::uuid AND status = 'Parked'`, [task.issue_id]);
+        }
       } else if (action.action === 'close' && action.status === 'Cancelled') {
         await client.query(
           `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('duplicate_of', $2::uuid),
