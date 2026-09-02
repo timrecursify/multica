@@ -23,6 +23,9 @@ const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
 const { reconcileCycle } = require('../reconciler.cjs');
+const { recordStageOutcomes } = require('../stage-outcome.cjs');
+const TYPED_OUTCOMES = process.env.RECONCILE_TYPED_OUTCOMES === '1';
+const QUOTA_BREAKER_MINUTES = Number.parseInt(process.env.RECONCILE_QUOTA_BREAKER_MINUTES || '30', 10);
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -42,10 +45,30 @@ function reconcileCreateLimit(value = RECONCILE_MAX_CREATE_PER_CYCLE) {
   return Number.isInteger(value) && value > 0 ? value : 25;
 }
 
+async function recordOutcomesPass({ dbPool = pool, logger = console } = {}) {
+  if (!TYPED_OUTCOMES) return null;
+  const client = await dbPool.connect();
+  try {
+    const result = await recordStageOutcomes(client, { logger });
+    if (result.recorded) logger.log(`${LOG_PREFIX} [stage-outcome] recorded=${result.recorded}`);
+    return result;
+  } finally { client.release(); }
+}
+
 async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } = {}) {
   if (process.env.RECONCILE_DISPATCH_HOLD === '1') {
     logger.log('Reconcile cycle: held (RECONCILE_DISPATCH_HOLD=1)');
     return null;
+  }
+  // GSP-1826 item 5: one provider quota failure holds all dispatch for the breaker window.
+  if (QUOTA_BREAKER_MINUTES > 0) {
+    const probe = await dbPool.query(
+      `SELECT completed_at FROM agent_task_queue WHERE failure_reason = 'agent_error.provider_quota_limit'
+         AND completed_at > NOW() - ($1::int * interval '1 minute') ORDER BY completed_at DESC LIMIT 1`, [QUOTA_BREAKER_MINUTES]);
+    if (probe.rows[0]) {
+      logger.log(`Reconcile cycle: held (provider quota failure at ${new Date(probe.rows[0].completed_at).toISOString()}, breaker ${QUOTA_BREAKER_MINUTES}m)`);
+      return null;
+    }
   }
   const client = await dbPool.connect();
   try {
@@ -1758,6 +1781,7 @@ function startDaemon() {
   setInterval(() => runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`)), RECONCILE_INTERVAL_MS);
   setInterval(processParkedDiagnoses, 30000);
   setInterval(reconcileQuotaPauses, 60000);
+  setInterval(() => recordOutcomesPass().catch(err => console.error(`${LOG_PREFIX} stage-outcome error: ${err.message}`)), 30000);
   advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
   runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
@@ -1771,4 +1795,4 @@ if (require.main === module) startDaemon();
 module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
-  runReconcileCycle };
+  runReconcileCycle, recordOutcomesPass };
