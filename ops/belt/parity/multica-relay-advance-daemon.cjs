@@ -57,6 +57,47 @@ function github(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
 }
 
+function resultPointer(row) {
+  const text = JSON.stringify(row.task_result || {});
+  return text.match(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|commit)\/[^\s"']+/i)?.[0] ||
+    `task:${row.task_id}:result`;
+}
+
+function riskClass(row) {
+  const text = String(row.issue_title || '');
+  return /auth|billing|money|migration|secret|prod flag/i.test(text) ? 'risk' : 'standard';
+}
+
+function completionEvidence(row, targetStage, route, qcAdvance) {
+  const pointer = resultPointer(row);
+  if (row.to_stage === 'Spec' && targetStage === 'Queue') {
+    return { bindingScope: pointer, acceptanceTests: pointer || 'per task result', riskClass: riskClass(row) };
+  }
+  if (row.to_stage === 'Queue' && targetStage === 'In Progress') {
+    return { completedCurrentTask: row.task_id, workProductPointer: pointer };
+  }
+  if (row.to_stage === 'In Progress' && targetStage === 'In Review') {
+    return { reviewRequiredRoute: route?.kind || 'review', pr: route?.pr_url || pointer,
+      boundSha: route?.boundSha || pointer };
+  }
+  if (row.to_stage === 'In Progress' && targetStage === 'CI/CD & Deploy') {
+    return { noReviewRoute: route?.kind || 'deploy', pr: route?.pr_url || pointer,
+      boundSha: route?.boundSha || pointer };
+  }
+  if (row.to_stage === 'In Progress' && targetStage === 'Done') {
+    return { noDeployRoute: route?.kind || 'no_pr', workProductEvidence: pointer };
+  }
+  if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
+    return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };
+  }
+  return {};
+}
+
+function greenChecks(checks) {
+  return Array.isArray(checks) && checks.length > 0 && checks.every((check) =>
+    ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(String(check.conclusion || check.state || '').toUpperCase()));
+}
+
 async function buildCompletionRoute(client, row) {
   if (row.to_stage !== 'In Progress' || row.next_stage !== 'In Review') return null;
   const comments = await client.query(
@@ -66,9 +107,16 @@ async function buildCompletionRoute(client, row) {
     /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i)).find(Boolean);
   if (!match) return { kind: 'no_pr', toStage: 'Done' };
   const repo = `${match[1]}/${match[2]}`;
-  const pr = JSON.parse(github(['pr', 'view', match[0], '--json', 'state,files']));
-  return { ...classifyStageRoute({ repo, state: pr.state,
-    files: pr.files.map(({ path }) => path) }), repo, pr_url: match[0], pr_state: pr.state };
+  const pr = JSON.parse(github(['pr', 'view', match[0], '--json',
+    'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
+  const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
+  if (route.reason === 'non_runtime_pr_not_merged' && pr.mergeStateStatus === 'MERGEABLE' &&
+      greenChecks(pr.statusCheckRollup)) {
+    github(['pr', 'merge', match[0], '--squash', '--admin']);
+    return { ...route, toStage: 'Done', kind: 'merge_only_admin_merged', repo,
+      pr_url: match[0], pr_state: 'MERGED', boundSha: pr.headRefOid };
+  }
+  return { ...route, repo, pr_url: match[0], pr_state: pr.state, boundSha: pr.headRefOid };
 }
 
 function uniqueFullSha(value) {
@@ -576,7 +624,8 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
              attempt.evidence_agent_model AS qc_attempt_evidence_agent_model,
              attempt.evidence_agent_effort AS qc_attempt_evidence_agent_effort,
              evidence.tasks AS qc_evidence_tasks,
-             i.workspace_id, i.priority, rrl.to_stage, rsc.next_stage
+             i.workspace_id, i.priority, i.title AS issue_title,
+             rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
       INNER JOIN issue i ON atq.issue_id = i.id
@@ -724,6 +773,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         const payload = { issue_id: row.issue_id, to_stage: targetStage,
           agent_token: RELAY_AGENT_SECRET,
           relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
+          evidence: completionEvidence(row, targetStage, route, qcAdvance),
           ...(route ? { routing_classification: route } : {}),
           ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
         const response = await postRelay(payload);
@@ -1702,7 +1752,7 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
+module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle };

@@ -3,10 +3,26 @@ const test = require('node:test');
 const fs = require('node:fs');
 const { randomUUID } = require('node:crypto');
 const { Client } = require('pg');
-const { qcCompletionAdvance, processParkedDiagnoses,
+const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
+const { evaluate } = require('../transition-policy.cjs');
+
+test('completion evidence satisfies every automatic transition policy row', () => {
+  const row = { task_id: 'task-1', task_result: { output: 'completed' }, issue_title: 'normal change' };
+  const cases = [
+    ['Spec', 'Queue', 'worker'], ['Queue', 'In Progress', 'system'],
+    ['In Progress', 'In Review', 'system'], ['In Progress', 'CI/CD & Deploy', 'system'],
+    ['In Progress', 'Done', 'system'], ['In Review', 'CI/CD & Deploy', 'system']
+  ];
+  for (const [from, to, actor] of cases) {
+    const qc = from === 'In Review' ? { ok: true, evidenceTaskId: 'qc-task' } : { ok: false };
+    const route = { kind: to === 'In Review' ? 'risk' : 'runtime', pr_url: 'https://github.com/o/r/pull/1', boundSha: 'a'.repeat(40) };
+    assert.equal(evaluate({ from, to, actor, evidence: completionEvidence({ ...row, to_stage: from }, to, route, qc) }).ok, true,
+      `${from} -> ${to}`);
+  }
+});
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
 
