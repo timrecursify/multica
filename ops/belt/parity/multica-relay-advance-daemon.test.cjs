@@ -3,7 +3,7 @@ const test = require('node:test');
 const fs = require('node:fs');
 const { Client } = require('pg');
 const { qcCompletionAdvance, processParkedDiagnoses,
-  requeueStrandedTasks } = require('./multica-relay-advance-daemon.cjs');
+  requeueStrandedTasks, requeueTriggerSummary } = require('./multica-relay-advance-daemon.cjs');
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
 
@@ -132,6 +132,31 @@ test('stranded-task fixture redispatches a cancelled-only task', async () => {
   assert.ok(insert);
   assert.match(insert.values[3], /"source":"relay-requeue"/);
   assert.match(insert.values[3], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
+});
+
+test('zero-task Queue fixture creates attempt one without retry admission', async () => {
+  const harness = strandedHarness([strandedFixture({ dead_task_id: null, attempt: null,
+    max_attempts: null, failure_reason: null })]);
+  await harness.run();
+  const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.ok(insert);
+  assert.equal(insert.values[5], 1);
+  assert.equal(harness.queries.some(({ sql }) => sql.includes('max(EXTRACT(epoch')), false);
+});
+
+test('In Review requeue summary supplies the QC PR URL and full SHA', () => {
+  const summary = requeueTriggerSummary(strandedFixture({ stage: 'In Review', number: 159,
+    build_task_result: { pr_url: 'https://github.com/timrecursify/multica/pull/1',
+      head_sha: 'c909401ef7a4a438348eb5ceda33839211721524' } }), false);
+  assert.match(summary, /ticket 159/);
+  assert.match(summary, /board prod/);
+  assert.match(summary, /https:\/\/github.com\/timrecursify\/multica\/pull\/1/);
+  assert.match(summary, /c909401ef7a4a438348eb5ceda33839211721524/);
+});
+
+test('In Review requeue summary directs a FAIL verdict when PR or SHA is absent', () => {
+  assert.match(requeueTriggerSummary(strandedFixture({ stage: 'In Review' }), true),
+    /PR\/SHA unknown: issue FAIL verdict per runbook/);
 });
 
 test('stranded-task fixtures leave running tasks and bundled children untouched', async () => {
