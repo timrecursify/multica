@@ -1393,7 +1393,15 @@ async function relayAdvance(req, res, body) {
         message: "operator cap releases require the current PASS work-product hash" }));
       return;
     }
-    if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit) {
+    // sk multica advance authenticates this narrowly-scoped recovery with the
+    // relay agent token.  It does not send operator-only fields or headers, so
+    // admit only the one Rejected -> In Review recovery whose latest PASS is
+    // bound to the caller's exact work-product MD5.
+    const rejectedPassCliReopen = issue.status === "Rejected" &&
+      to_stage === "In Review" &&
+      await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
+    if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit &&
+        !rejectedPassCliReopen) {
       await client.query("ROLLBACK");
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1496,9 +1504,9 @@ async function relayAdvance(req, res, body) {
         }));
       }
     }
-    const rejectedPassTerminalExit = issue.status === "Rejected" &&
+    const rejectedPassTerminalExit = rejectedPassCliReopen || (issue.status === "Rejected" &&
       to_stage === "In Review" && explicitTerminalExit &&
-      await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
+      await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5));
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
