@@ -1854,7 +1854,9 @@ SELECT
   relay_stage_config.stage_name,
   COUNT(issue.id)::int AS ticket_count
 FROM relay_stage_config
-LEFT JOIN issue ON issue.status = relay_stage_config.stage_name
+LEFT JOIN issue ON issue.workspace_id = relay_stage_config.workspace_id
+  AND issue.status = relay_stage_config.stage_name
+WHERE relay_stage_config.workspace_id = $1
 GROUP BY relay_stage_config.id, relay_stage_config.stage_name
 ORDER BY relay_stage_config.id;
 
