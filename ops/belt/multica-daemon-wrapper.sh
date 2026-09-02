@@ -14,7 +14,7 @@ export CODEX_BIN="$requested_codex_bin"
 # system Go toolchain ahead of inherited user paths for every task.
 export PATH="/usr/local/go/bin:${PATH}"
 
-cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-32}"
+cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-20}"
 root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
 help_timeout="${MULTICA_DAEMON_HELP_TIMEOUT_SECONDS:-5}"
 if [[ ! "$cap_raw" =~ ^[1-9][0-9]*$ ]]; then
