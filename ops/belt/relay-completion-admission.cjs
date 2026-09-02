@@ -91,4 +91,11 @@ function completionAdmission(result) {
   return { ok: true };
 }
 
-module.exports = { completionAdmission };
+function deploymentCompletionAdmission(taskStatus, result) {
+  if (taskStatus !== 'completed') {
+    return { ok: false, reason: `task_${taskStatus || 'missing'}_not_completed`, disposition: 'Spec', escalation: 'sol_low_respec' };
+  }
+  return completionAdmission(result);
+}
+
+module.exports = { completionAdmission, deploymentCompletionAdmission };

@@ -19,7 +19,7 @@ async function routeWith({ receipt, verdict = pass }) {
 (async () => {
   const matching = { source_sha: sha, release: `/releases/${sha}`, health: 'ok' };
   let calls = await routeWith({ receipt: matching });
-  assert.deepStrictEqual(calls, [['issue-1', 'Done', pass.work_product_md5]);
+  assert.deepStrictEqual(calls, [['issue-1', 'Done', pass.work_product_md5]]);
   calls = await routeWith({ receipt: null });
   assert.deepStrictEqual(calls, [['issue-1', 'Human Review', null,
     'merged; exact-SHA release receipt at reviewed SHA is required']]);
