@@ -4,13 +4,17 @@ function conversionEnabled(env = process.env) {
   return String(env.RELAY_QC_EVIDENCE_CONVERSION || 'on').toLowerCase() !== 'off';
 }
 
-function qcTaskEvidence(task) {
+function qcTaskEvidenceResult(task) {
   const output = task.result && typeof task.result === 'object' ? task.result.output : null;
-  if (typeof output !== 'string') return null;
-  const matches = [...output.matchAll(/^QC_EVIDENCE_JSON=(\{[^\r\n]*\})$/gm)];
-  if (matches.length !== 1) return null;
+  if (typeof output !== 'string') return { reason: 'missing-output' };
+  // A marker may be plain, inline-code wrapped, or placed inside a Markdown
+  // fence.  The line matcher intentionally counts all three forms so the
+  // exactly-one-marker rule is retained across presentation styles.
+  const matches = [...output.matchAll(/^(?:QC_EVIDENCE_JSON=([^\r\n]*)|`QC_EVIDENCE_JSON=([^\r\n]*)`)$/gm)];
+  if (matches.length === 0) return { reason: 'missing-marker' };
+  if (matches.length !== 1) return { reason: 'duplicate-marker' };
   try {
-    const evidence = JSON.parse(matches[0][1]);
+    const evidence = JSON.parse(matches[0][1] ?? matches[0][2]);
     if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence) ||
       !['PASS', 'FAIL'].includes(evidence.verdict) ||
       !/^[0-9a-f]{32}$/i.test(String(evidence.work_product_md5 || '')) ||
@@ -19,9 +23,13 @@ function qcTaskEvidence(task) {
       String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase() ||
       !['none', 'implementation', 'evidence', 'tool', 'access'].includes(evidence.failure_class) ||
       typeof evidence.qualifying !== 'boolean' || evidence.model !== 'gpt-5.6-sol' ||
-      evidence.effort !== 'low') return null;
-    return evidence;
-  } catch { return null; }
+      evidence.effort !== 'low') return { reason: 'invalid-evidence' };
+    return { evidence };
+  } catch { return { reason: 'invalid-json' }; }
+}
+
+function qcTaskEvidence(task) {
+  return qcTaskEvidenceResult(task).evidence || null;
 }
 
 function noArtifactRescopeBatch(env = process.env) {
@@ -52,8 +60,12 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
   const seenIssues = new Set();
   for (const task of candidates.rows) {
     if (seenIssues.has(task.issue_id)) continue;
-    const evidence = qcTaskEvidence(task);
-    if (!evidence) continue;
+    const parsed = qcTaskEvidenceResult(task);
+    if (!parsed.evidence) {
+      logger.log(`${logPrefix} [qc-evidence-skipped] task=${task.id} reason=${parsed.reason}`);
+      continue;
+    }
+    const { evidence } = parsed;
     seenIssues.add(task.issue_id);
     const payload = { issue_id: task.issue_id, checker: task.agent_name,
       verdict: evidence.verdict, work_product_md5: evidence.work_product_md5,

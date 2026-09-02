@@ -35,18 +35,41 @@ test('completed valid QC marker converts once and preserves its relay task ident
   assert.equal(payloads[0].idem_key, `qc-42-${SHA}-PASS`);
 });
 
-test('missing, duplicate, and SHA-mismatched markers never convert', async () => {
-  const invalid = [
-    { id: '1', issue_id: 'a', result: { output: '' }, agent_name: 'qc', number: 1 },
-    { id: '2', issue_id: 'b', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}\nQC_EVIDENCE_JSON=${JSON.stringify(marker())}` }, agent_name: 'qc', number: 2 },
-    { id: '3', issue_id: 'c', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker({ observed_sha: '0123456789012345678901234567890123456789' }))}` }, agent_name: 'qc', number: 3 }
+test('single-backtick and fenced QC markers convert', async () => {
+  const evidence = JSON.stringify(marker());
+  const tasks = [
+    { id: 'backtick-task', issue_id: 'backtick-issue', number: 43, agent_name: 'qc',
+      result: { output: `\`QC_EVIDENCE_JSON=${evidence}\`` } },
+    { id: 'fenced-task', issue_id: 'fenced-issue', number: 44, agent_name: 'qc',
+      result: { output: `\`\`\`\nQC_EVIDENCE_JSON=${evidence}\n\`\`\`` } }
   ];
   const payloads = [];
+  const converted = await convertCompletedQcEvidence({ query: async () => ({ rows: tasks }) }, {
+    postRelay: async (payload) => { payloads.push(payload); return { status: 201 }; }, logger: { log() {} }
+  });
+  assert.deepEqual([...converted], ['backtick-task', 'fenced-task']);
+  assert.equal(payloads.length, 2);
+});
+
+test('malformed, schema-invalid, and duplicate markers skip with one diagnostic each', async () => {
+  const invalid = [
+    { id: 'missing-task', issue_id: 'missing', result: { output: '' }, agent_name: 'qc', number: 0 },
+    { id: 'malformed-task', issue_id: 'a', result: { output: 'QC_EVIDENCE_JSON={bad json}' }, agent_name: 'qc', number: 1 },
+    { id: 'schema-task', issue_id: 'b', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker({ observed_sha: '0123456789012345678901234567890123456789' }))}` }, agent_name: 'qc', number: 2 },
+    { id: 'duplicate-task', issue_id: 'c', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}\nQC_EVIDENCE_JSON=${JSON.stringify(marker())}` }, agent_name: 'qc', number: 3 }
+  ];
+  const payloads = [];
+  const logs = [];
   const client = { query: async () => ({ rows: invalid }) };
   assert.deepEqual([...await convertCompletedQcEvidence(client, {
-    postRelay: async (payload) => { payloads.push(payload); return { status: 201 }; }, logger: { log() {} }
+    postRelay: async (payload) => { payloads.push(payload); return { status: 201 }; },
+    logger: { log: (line) => logs.push(line) }
   })], []);
   assert.equal(payloads.length, 0);
+  for (const [taskId, reason] of [['missing-task', 'missing-marker'], ['malformed-task', 'invalid-json'],
+    ['schema-task', 'invalid-evidence'], ['duplicate-task', 'duplicate-marker']]) {
+    assert.equal(logs.filter((line) => line.includes(`[qc-evidence-skipped] task=${taskId} reason=${reason}`)).length, 1);
+  }
 });
 
 test('QC evidence conversion flag off is a clean no-op', async () => {
