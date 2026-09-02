@@ -44,6 +44,36 @@ html[lang|="ja"] {
     "Noto Sans CJK KR", sans-serif;
 }
 
+/* PPP's canonical login uses a quiet, centered card with a prominent brand
+   mark. Synthetic keeps its independent Multica credentials while using that
+   same visual hierarchy and its own identity. */
+.synthetic-login-brand {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.625rem;
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  letter-spacing: -0.025em;
+}
+
+.synthetic-login-brand span {
+  display: grid;
+  width: 2.5rem;
+  height: 2.5rem;
+  place-items: center;
+  border-radius: 0.75rem;
+  background: var(--primary);
+  color: var(--primary-foreground);
+  font-size: var(--text-title-lg);
+  font-weight: 700;
+}
+
+.synthetic-login-brand strong {
+  font-size: var(--text-display-sm);
+  font-weight: 500;
+}
+
 /* The landing tree overrides `--font-serif` with its own Instrument Serif +
    per-locale CJK chain, built on the same structure; see "Landing editorial
    serif" in ./custom.css and keep the two CJK orderings in sync. */

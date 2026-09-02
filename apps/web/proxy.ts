@@ -7,6 +7,19 @@ import {
 import { runtimeRewriteDestination } from "./config/runtime-urls";
 import { isOfficialMarketingHost } from "./lib/public-host";
 
+export const PPP_TICKETS_HOST = "tickets.preciouspicspro.com";
+
+export function isPppTicketsHost(hostname: string): boolean {
+  return hostname.trim().toLowerCase().replace(/\.$/, "") === PPP_TICKETS_HOST;
+}
+
+function redirectToPppLogin(req: NextRequest): NextResponse {
+  const loginUrl = new URL("https://auth.preciouspicspro.com/login");
+  const returnTo = new URL("/login", req.nextUrl.origin);
+  loginUrl.searchParams.set("returnTo", returnTo.toString());
+  return NextResponse.redirect(loginUrl);
+}
+
 // Old workspace-scoped route segments that existed before the URL refactor
 // (pre-#1131). Any URL with these as the FIRST segment is a legacy URL that
 // needs to be rewritten to /{slug}/{route}/... so old bookmarks, deep links,
@@ -48,6 +61,14 @@ function nextWithLocale(req: NextRequest): NextResponse {
 // edge.
 export function proxy(req: NextRequest) {
   const { pathname } = req.nextUrl;
+
+  // PPP tickets use PPP's session issuer and canonical screen. This mirrors
+  // the production ingress rule so a direct frontend deployment cannot expose
+  // Multica's standalone code login on the PPP host.
+  if (pathname === "/login" && isPppTicketsHost(req.nextUrl.hostname)) {
+    return redirectToPppLogin(req);
+  }
+
   const runtimeDestination = runtimeRewriteDestination(pathname, process.env);
   if (runtimeDestination) {
     const url = new URL(runtimeDestination);
