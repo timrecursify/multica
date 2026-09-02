@@ -184,7 +184,6 @@ function budgetCountPredicate(taskAlias = '') {
        WHERE verdict.issue_id = ${task}issue_id
          AND verdict.checker_id = ${task}agent_id
          AND verdict.created_at >= ${task}started_at
-         AND verdict.created_at <= ${task}completed_at
     )
   )`;
 }

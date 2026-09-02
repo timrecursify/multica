@@ -417,7 +417,7 @@ test('verdict checker identity is selected from the completed same-workspace Sol
   } };
   const task = await latestCompletedSolLowQcTask(client, 'issue-1', 'workspace-1');
   assert.equal(task.agent_id, 'agent-1');
-  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1']);
+  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1', null]);
   assert.match(calls[0].sql, /i\.workspace_id = t\.workspace_id/);
   assert.match(calls[0].sql, /a\.workspace_id = i\.workspace_id/);
   assert.match(calls[0].sql, /t\.context->>'to_stage' = 'In Review'/);
@@ -433,7 +433,7 @@ test('completed In Review rerun task is admitted for the QC verdict', async () =
     agent_name: 'qc-sol-low'
   };
   const client = { query: async (sql, values) => {
-    assert.deepEqual(values, ['issue-in-review', 'workspace-for-issue']);
+    assert.deepEqual(values, ['issue-in-review', 'workspace-for-issue', null]);
     assert.match(sql, /i\.workspace_id = t\.workspace_id/);
     assert.match(sql, /t\.context->>'to_stage' = 'In Review'/);
     return { rows: [rerunTask] };
@@ -442,6 +442,17 @@ test('completed In Review rerun task is admitted for the QC verdict', async () =
     await latestCompletedSolLowQcTask(client, 'issue-in-review', 'workspace-for-issue'),
     rerunTask
   );
+});
+
+test('explicit QC task binding selects that completed task instead of the newest one', async () => {
+  const client = { query: async (sql, values) => {
+    assert.deepEqual(values, ['issue-1', 'workspace-1', '11111111-1111-4111-8111-111111111111']);
+    assert.match(sql, /\$3::uuid IS NULL OR t\.id = \$3::uuid/);
+    return { rows: [{ id: values[2] }] };
+  } };
+  const task = await latestCompletedSolLowQcTask(client, 'issue-1', 'workspace-1',
+    '11111111-1111-4111-8111-111111111111');
+  assert.equal(task.id, '11111111-1111-4111-8111-111111111111');
 });
 
 test('verdict route never trusts a caller supplied checker identity', () => {
@@ -457,6 +468,7 @@ test('verdict route never trusts a caller supplied checker identity', () => {
 test('verdict handler binds all evidence to the completed QC task and resists forgery', async () => {
   const attempts = new Map();
   const writes = [];
+  let taskQueryValues;
   let task = {
     id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1',
     context: {}, result: qcResult()
@@ -466,7 +478,7 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
     async query(sql, values = []) {
       if (/FROM qc_attempt/.test(sql)) return { rows: attempts.has(values[0]) ? [attempts.get(values[0])] : [] };
       if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
-      if (/FROM agent_task_queue t/.test(sql)) return { rows: task ? [task] : [] };
+      if (/FROM agent_task_queue t/.test(sql)) { taskQueryValues = values; return { rows: task ? [task] : [] }; }
       if (/FROM qc_verdict/.test(sql)) return { rows: [] };
       if (/INSERT INTO qc_attempt/.test(sql)) {
         const [issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head, failure_class, qualifying, model, effort, idem_key] = values;
@@ -499,6 +511,12 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
     assert.equal(result.status, 200, 'same immutable evidence must replay despite a forged checker string');
     result = await call({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false });
     assert.equal(result.json.error, 'idempotency_conflict');
+    const explicitTaskId = '11111111-1111-4111-8111-111111111111';
+    task = { ...task, id: explicitTaskId, result: qcResult() };
+    result = await call({ ...validVerdict, idem_key: 'qc-explicit-task-binding', qc_task_id: explicitTaskId });
+    assert.equal(result.status, 201);
+    assert.deepEqual(taskQueryValues, [validVerdict.issue_id, 'workspace-1', explicitTaskId]);
+    assert.match(writes.at(-1)[5], new RegExp(`relay_task_id=${explicitTaskId}`));
   } finally {
     setTestClientFactory(null);
   }

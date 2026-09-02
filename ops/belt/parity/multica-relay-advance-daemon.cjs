@@ -464,7 +464,9 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
     await closeDeadRelayRows(client, { terminalStages: [...TERMINAL_STAGES],
-      requestRetryEscalation, postRelay, logger, logPrefix: LOG_PREFIX });
+      requestRetryEscalation, postRelay, postVerdict: postQcVerdict,
+      postNoArtifactRescope: (payload) => postRelay({ ...payload, agent_token: RELAY_AGENT_SECRET }),
+      logger, logPrefix: LOG_PREFIX });
 
     // Correlate strictly on the task that owns the relay log. Advance only
     // genuinely completed tasks; a failed task must never move work forward.
@@ -771,6 +773,29 @@ function postToRelay(payload) {
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
     req.end(body);
+  });
+}
+
+function postQcVerdict(payload) {
+  return postToPath('/relay/verdict', { ...payload, agent_token: RELAY_AGENT_SECRET });
+}
+
+function postToPath(path, payload) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify(payload);
+    const opts = { hostname: '127.0.0.1', port: 5005, path, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }, timeout: 5000 };
+    const req = http.request(opts, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { const parsed = JSON.parse(data); resolve({ ok: res.statusCode === 200 || res.statusCode === 201,
+          deferred: res.statusCode === 202, status: res.statusCode, error: parsed.error, body: data });
+        } catch { resolve({ ok: res.statusCode === 200 || res.statusCode === 201,
+          deferred: res.statusCode === 202, status: res.statusCode, body: data }); }
+      });
+    });
+    req.on('error', reject); req.on('timeout', () => req.destroy(new Error('relay timeout'))); req.write(body); req.end();
   });
 }
 

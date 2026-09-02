@@ -11,10 +11,103 @@ process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-wor
 const { qcBounceDecision } = require('../multica-bridge.cjs');
 const { enqueuePassWithoutRelayRows, findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
 const { parseArgs, recover } = require('../recover-stranded-qc-pass.cjs');
-const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
+const { closeDeadRelayRows, convertCompletedQcEvidence,
+  rescopeCompletedNoArtifactQc } = require('./relay-dead-rows.cjs');
 
 const SHA = 'c909401ef7a4a438348eb5ceda33839211721524';
 const MD5 = '76becea4ab970644b7a21220665a1619';
+
+function marker(overrides = {}) {
+  return { verdict: 'PASS', work_product_md5: MD5, bound_sha: SHA, observed_sha: SHA,
+    failure_class: 'none', qualifying: true, model: 'gpt-5.6-sol', effort: 'low', ...overrides };
+}
+
+test('completed valid QC marker converts once and preserves its relay task identity', async () => {
+  const task = { id: '11111111-1111-4111-8111-111111111111', issue_id: 'issue-1', number: 42,
+    agent_name: 'qc-sol-low', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}` } };
+  const payloads = [];
+  const client = { query: async () => ({ rows: [task] }) };
+  const converted = await convertCompletedQcEvidence(client, {
+    postRelay: async (payload) => { payloads.push(payload); return { status: 201 }; }, logger: { log() {} }
+  });
+  assert.deepEqual([...converted], [task.id]);
+  assert.equal(payloads[0].qc_task_id, task.id);
+  assert.equal(payloads[0].idem_key, `qc-42-${SHA}-PASS`);
+});
+
+test('missing, duplicate, and SHA-mismatched markers never convert', async () => {
+  const invalid = [
+    { id: '1', issue_id: 'a', result: { output: '' }, agent_name: 'qc', number: 1 },
+    { id: '2', issue_id: 'b', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}\nQC_EVIDENCE_JSON=${JSON.stringify(marker())}` }, agent_name: 'qc', number: 2 },
+    { id: '3', issue_id: 'c', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker({ observed_sha: '0123456789012345678901234567890123456789' }))}` }, agent_name: 'qc', number: 3 }
+  ];
+  const payloads = [];
+  const client = { query: async () => ({ rows: invalid }) };
+  assert.deepEqual([...await convertCompletedQcEvidence(client, {
+    postRelay: async (payload) => { payloads.push(payload); return { status: 201 }; }, logger: { log() {} }
+  })], []);
+  assert.equal(payloads.length, 0);
+});
+
+test('QC evidence conversion flag off is a clean no-op', async () => {
+  let queried = false;
+  const converted = await convertCompletedQcEvidence({ query: async () => { queried = true; return { rows: [] }; } }, {
+    postRelay: async () => ({ status: 201 }), env: { RELAY_QC_EVIDENCE_CONVERSION: 'off' }
+  });
+  assert.deepEqual([...converted], []);
+  assert.equal(queried, false);
+});
+
+function noArtifactTask(id = 'no-artifact-task') {
+  return { id, issue_id: `issue-${id}`, result: { output:
+    'QC-BLOCKED: no implementation SHA or PR exists. NO-SHA.' } };
+}
+
+test('QC-BLOCKED no-artifact task posts one In Progress relay return', async () => {
+  const posts = [];
+  const converted = await rescopeCompletedNoArtifactQc({ query: async () => ({ rows: [noArtifactTask()] }) }, {
+    postRelay: async (payload) => { posts.push(payload); return { status: 201 }; }, logger: { log() {} }
+  });
+  assert.deepEqual([...converted], ['no-artifact-task']);
+  assert.deepEqual(posts, [{ issue_id: 'issue-no-artifact-task', to_stage: 'In Progress',
+    reason: 'QC-BLOCKED NO-SHA relay return' }]);
+});
+
+test('valid QC_EVIDENCE_JSON marker does not take no-artifact rescope path', async () => {
+  const task = noArtifactTask();
+  task.result.output = `QC_EVIDENCE_JSON=${JSON.stringify(marker())}`;
+  const posts = [];
+  await rescopeCompletedNoArtifactQc({ query: async () => ({ rows: [task] }) }, {
+    postRelay: async (payload) => { posts.push(payload); return { status: 201 }; }, logger: { log() {} }
+  });
+  assert.deepEqual(posts, []);
+});
+
+test('no-artifact rescope treats 409 as a non-retrying skip', async () => {
+  let attempts = 0;
+  const logs = [];
+  await rescopeCompletedNoArtifactQc({ query: async () => ({ rows: [noArtifactTask()] }) }, {
+    postRelay: async () => { attempts += 1; return { status: 409 }; },
+    logger: { log: (line) => logs.push(line) }
+  });
+  assert.equal(attempts, 1);
+  assert.ok(logs.some((line) => line.includes('status=409')));
+});
+
+test('no-artifact rescope respects RELAY_NOARTIFACT_RESCOPE_BATCH', async () => {
+  let queryValues;
+  const tasks = [noArtifactTask('first'), noArtifactTask('second')];
+  const posts = [];
+  await rescopeCompletedNoArtifactQc({ query: async (_sql, values) => {
+    queryValues = values;
+    return { rows: tasks.slice(0, values[0]) };
+  } }, {
+    postRelay: async (payload) => { posts.push(payload); return { status: 200 }; },
+    env: { RELAY_REQUEUE_BATCH: '8', RELAY_NOARTIFACT_RESCOPE_BATCH: '1' }, logger: { log() {} }
+  });
+  assert.deepEqual(queryValues, [1]);
+  assert.equal(posts.length, 1);
+});
 
 async function deadRowsDb() {
   const schema = `relay_dead_rows_${Date.now()}_${Math.random().toString(16).slice(2)}`;
@@ -24,9 +117,19 @@ async function deadRowsDb() {
     id text PRIMARY KEY, issue_id text NOT NULL, task_id text NOT NULL, to_stage text NOT NULL,
     status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now())`);
   await admin.query(`CREATE TABLE ${schema}.agent_task_queue (
-    id text PRIMARY KEY, issue_id text NOT NULL, status text NOT NULL, created_at timestamptz NOT NULL)`);
+    id text PRIMARY KEY, issue_id text NOT NULL, agent_id text, workspace_id text NOT NULL DEFAULT 'workspace-1',
+    status text NOT NULL, context jsonb, result jsonb, completed_at timestamptz, created_at timestamptz NOT NULL)`);
+  await admin.query(`CREATE TABLE ${schema}.issue (
+    id text PRIMARY KEY, workspace_id text NOT NULL, number integer NOT NULL, status text NOT NULL DEFAULT 'In Review')`);
+  await admin.query(`CREATE TABLE ${schema}.agent (
+    id text PRIMARY KEY, workspace_id text NOT NULL, name text NOT NULL, model text,
+    thinking_level text, runtime_config jsonb)`);
   await admin.query(`CREATE TABLE ${schema}.qc_verdict (
     issue_id text NOT NULL, created_at timestamptz NOT NULL)`);
+  await admin.query(`INSERT INTO ${schema}.issue (id, workspace_id, number)
+    VALUES ('fixture-issue', 'workspace-1', 1)`);
+  await admin.query(`INSERT INTO ${schema}.agent (id, workspace_id, name, model, thinking_level, runtime_config)
+    VALUES ('fixture-agent', 'workspace-1', 'fixture-agent', 'gpt-5.6-sol', 'low', '{}'::jsonb)`);
   const dbPool = {
     async connect() {
       const client = await admin.connect();
