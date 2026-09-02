@@ -17,6 +17,7 @@ const {
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvidenceReference } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
+const { currentStrictPass } = require("./qc-strict-evidence.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -1174,6 +1175,9 @@ async function relayVerdict(req, res, payload) {
       checker_id: qcTask.agent_id, work_product_md5: payload.work_product_md5 }));
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
+    if (err.message === "qc_attempt_binding_required") {
+      return relayVerdictError(res, 409, "qc_attempt_binding_required");
+    }
     console.error("[relay/verdict] ERROR:", err.message);
     relayVerdictError(res, 500, "internal_error");
   } finally {
@@ -1539,12 +1543,8 @@ async function relayAdvance(req, res, body) {
     }
 
     if (to_stage === "Done") {
-      const verdict = await client.query(
-        `SELECT verdict, work_product_md5 FROM qc_verdict
-          WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]
-      );
-      const latest = verdict.rows[0];
-      if (!latest || latest.verdict !== "PASS") {
+      const latest = await currentStrictPass(client, issue.id);
+      if (!latest) {
         await client.query("ROLLBACK");
         res.writeHead(409, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: "no_pass_verdict", message: "Done requires a current PASS verdict" }));

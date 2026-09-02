@@ -569,16 +569,14 @@ const QC_ROW = {
   qc_verdict_created_at: '2026-09-01T19:07:38Z'
 };
 
-test('completed legacy Sol-low PASS replays its exact SHA and artifact MD5', () => {
+test('legacy note-only PASS cannot replay into deploy admission', () => {
   assert.deepEqual(qcCompletionAdvance(QC_ROW), {
-    ok: true,
-    workProductMd5: '76becea4ab970644b7a21220665a1619',
-    boundSha: 'c909401ef7a4a438348eb5ceda33839211721524',
-    evidenceTaskId: '11111111-1111-4111-8111-111111111111'
+    ok: false,
+    reason: 'qc_attempt_binding_required'
   });
 });
 
-test('legacy PASS binds to the completed Sol-low task that recorded the verdict', () => {
+test('legacy PASS ignores a completed task unless it has a recorded attempt', () => {
   const row = { ...QC_ROW,
     task_id: '22222222-2222-4222-8222-222222222222',
     task_started_at: '2026-09-01T19:20:00Z',
@@ -595,7 +593,7 @@ test('legacy PASS binds to the completed Sol-low task that recorded the verdict'
       task_result: QC_ROW.task_result
     }]
   };
-  assert.equal(qcCompletionAdvance(row).evidenceTaskId, QC_ROW.task_id);
+  assert.equal(qcCompletionAdvance(row).reason, 'qc_attempt_binding_required');
 });
 
 test('strict relay attempt must bind PASS to one observed SHA and artifact MD5', () => {

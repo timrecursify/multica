@@ -10,6 +10,7 @@ const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
 const { deployed } = require('./cicd-deploy-evidence.cjs');
+const { currentStrictPass } = require('./qc-strict-evidence.cjs');
 let deployEvidence = deployed;
 let pool;
 let relayToken;
@@ -63,16 +64,13 @@ async function closePendingTask(issueId) {
 }
 
 async function latestVerdict(issueId) {
-  const verdict = await pool.query(
-    `SELECT verdict, work_product_md5 FROM qc_verdict
-      WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1`, [issueId]);
-  return verdict.rows[0];
+  return currentStrictPass(pool, issueId);
 }
 
 async function routeFinishedPR(issue, note) {
   const latest = await latestVerdict(issue.id);
-  if (!latest || latest.verdict !== 'PASS' || !latest.work_product_md5) {
-    await returnIssueToBuild(issue, `${note}; latest QC is ${latest?.verdict || 'missing'}`);
+  if (!latest || !latest.work_product_md5) {
+    await returnIssueToBuild(issue, `${note}; current QC lacks strict SHA-bound evidence`);
     return;
   }
   await relay(issue.id, 'Done', latest.work_product_md5);
