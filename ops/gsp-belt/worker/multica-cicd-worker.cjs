@@ -9,6 +9,7 @@
 const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
+const { ciState, qcAdmission } = require('./merge-admission.cjs');
 // pg module path externalized via GSP_BELT_PG_MODULE; default matches the
 // current install so the primitive behavior is preserved.
 const { Pool } = require(process.env.GSP_BELT_PG_MODULE || '/home/newadmin/node_modules/pg');
@@ -91,15 +92,21 @@ function findAllPRs(work) {
 // Green means every completed run on THIS head SHA succeeded. A run list
 // filtered by status alone can return a success from an older SHA of the same
 // branch, which is how a red PR reads as green.
-function ciState(repo, sha) {
+function currentHeadCiState(repo, sha) {
   try {
     const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=30`]));
-    const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
-    if (!done.length) return 'pending';
-    if (done.every(r => r.conclusion === 'success')) return 'green';
-    if (done.some(r => r.conclusion === 'failure')) return 'red';
-    return 'mixed';
+    return ciState(runs.workflow_runs || []);
   } catch (e) { return 'unknown'; }
+}
+
+async function currentQcVerdict(issueId) {
+  // qc_attempt is the immutable authoritative record: qc_verdict is a current
+  // display projection and lacks the SHA/model/effort admission evidence.
+  const { rows } = await pool.query(
+    `SELECT verdict, bound_sha, qualifying, model, effort
+       FROM qc_attempt WHERE issue_id=$1
+       ORDER BY created_at DESC LIMIT 1`, [issueId]);
+  return rows[0] || null;
 }
 
 async function sweep() {
@@ -148,10 +155,14 @@ async function sweep() {
       const pr = openStates[0].pr;
       const info = openStates[0].info;
 
-      const ci = ciState(pr.repo, info.headRefOid);
+      const ci = currentHeadCiState(pr.repo, info.headRefOid);
       if (ci !== 'green') { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}`); continue; }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
-      if (info.mergeable === 'CONFLICTING') { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} conflicting`); continue; }
+      if (info.state !== 'OPEN' || info.mergeable !== 'MERGEABLE') {
+        log(`HOLD #${issue.number} ${pr.repo}#${pr.num} state=${info.state} mergeable=${info.mergeable}`); continue;
+      }
+      const qc = qcAdmission(await currentQcVerdict(issue.id), info.headRefOid);
+      if (!qc.ok) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ${qc.reason}`); continue; }
 
       try {
         gh(['pr', 'merge', pr.num, '-R', pr.repo, '--squash', '--delete-branch']);
