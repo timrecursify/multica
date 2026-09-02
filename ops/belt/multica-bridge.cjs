@@ -134,9 +134,10 @@ async function rerunParkedDiagnosis(client, payload) {
   }
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 805))", [payload.issue_id]);
   const issue = await client.query(
-    `SELECT id, workspace_id, status, priority FROM issue WHERE id = $1::uuid AND status = 'Parked' FOR UPDATE`,
+    `SELECT id, workspace_id, status, priority FROM issue WHERE id = $1::uuid FOR UPDATE`,
     [payload.issue_id]);
-  if (issue.rowCount === 0) return { ok: false, error: 'parked_issue_required' };
+  if (issue.rowCount === 0) return { ok: false, error: 'issue_not_found' };
+  if (issue.rows[0].status !== 'Parked') return { ok: false, error: 'parked_issue_required' };
   const prior = await client.query(
     `SELECT id FROM agent_task_queue
       WHERE issue_id = $1::uuid AND context->>'kind' = 'parked_diagnosis'
@@ -148,14 +149,31 @@ async function rerunParkedDiagnosis(client, payload) {
       AND context->>'kind' = 'parked_diagnosis'
       AND status IN ('queued','dispatched','running','waiting_local_directory','deferred') LIMIT 1`, [payload.issue_id]);
   if (active.rowCount > 0) return { ok: true, replay: true, task_id: active.rows[0].id };
-  const selection = await recordParkAndQueueDiagnosis(client, issue.rows[0], {
-    reason: 'operator_parked_diagnosis_rerun', operator_rerun_idem_key: payload.idempotency_key,
-    skip_reason_comment: false
-  });
+  let selection;
+  try {
+    selection = await recordParkAndQueueDiagnosis(client, issue.rows[0], {
+      reason: 'operator_parked_diagnosis_rerun', operator_rerun_idem_key: payload.idempotency_key,
+      skip_reason_comment: false
+    });
+  } catch (err) {
+    // The helper owns the legacy ticket-dependent queries. Attach only stable
+    // identifiers for the outer logger; neither request credentials nor body
+    // contents become diagnostic output.
+    if (err && typeof err === 'object') err.relayDiagnosisContext = {
+      issue_id: issue.rows[0].id, workspace_id: issue.rows[0].workspace_id
+    };
+    throw err;
+  }
   return selection.task_id ? { ok: true, replay: false, task_id: selection.task_id,
     candidate_count: selection.candidate_count, aggregate_free_slots: selection.aggregate_free_slots } :
     { ok: false, error: selection.reason, candidate_count: selection.candidate_count,
       aggregate_free_slots: selection.aggregate_free_slots };
+}
+
+function diagnosisRerunErrorStatus(error) {
+  if (error === 'invalid_request') return 400;
+  if (error === 'issue_not_found') return 404;
+  return 409;
 }
 
 // This is deliberately an exact database-error allowlist. A missing runtime
@@ -2032,6 +2050,9 @@ async function relayAdvance(req, res, body) {
 }
 
 async function relayDiagnosisRerun(req, res, payload) {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    return relayVerdictError(res, 400, 'invalid_request');
+  }
   if (!RELAY_AGENT_SECRET || payload.agent_token !== RELAY_AGENT_SECRET) return relayVerdictError(res, 403, 'invalid_token');
   const client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
   try {
@@ -2040,20 +2061,23 @@ async function relayDiagnosisRerun(req, res, payload) {
     const result = await rerunParkedDiagnosis(client, payload);
     if (!result.ok) {
       await client.query('ROLLBACK');
-      return relayVerdictError(res, 409, result.error);
+      return relayVerdictError(res, diagnosisRerunErrorStatus(result.error), result.error);
     }
     await client.query('COMMIT');
     res.writeHead(result.replay ? 200 : 202, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result));
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
+    const context = err?.relayDiagnosisContext || {};
     console.error(JSON.stringify({
-      event: 'relay_parked_diagnosis_rerun_failed',
-      issue_id: payload.issue_id,
-      message: err?.message,
+      event: 'parked_diagnosis_rerun_error',
+      issue_id: context.issue_id || (UUID_RE.test(String(payload.issue_id || '')) ? payload.issue_id : null),
+      workspace_id: context.workspace_id || null,
+      error_name: err?.name || 'Error',
+      error_message: String(err?.message || err),
       stack: err?.stack,
-      ...(err?.code ? { code: err.code } : {}),
-      ...(err?.constraint ? { constraint: err.constraint } : {})
+      ...(err?.code ? { error_code: err.code } : {}),
+      ...(err?.constraint ? { error_constraint: err.constraint } : {})
     }));
     const refusal = parkedDiagnosisRerunRefusal(err);
     relayVerdictError(res, refusal ? 409 : 500, refusal || 'internal_error');
@@ -2177,5 +2201,6 @@ module.exports = {
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
   relayDiagnosisRerun,
-  parkedDiagnosisRerunRefusal
+  parkedDiagnosisRerunRefusal,
+  diagnosisRerunErrorStatus
 };
