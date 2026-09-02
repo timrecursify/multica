@@ -25,13 +25,14 @@ test('dispatch requires the target stage to be named by agent instructions', () 
   assert.equal(instructionCompatibility('', 'Queue').ok, false);
 });
 
-test('belt routing allows DeepSeek/Terra builders and Sol-low QC/spec only', () => {
+test('belt routing allows DeepSeek/Terra builders and QC-lane QC/spec only', () => {
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-deepseek', model: 'deepseek/v4', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-terra', model: 'gpt-5.6-terra', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'low' }).reason, 'builder_requires_deepseek_or_terra');
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'low' }).ok, true);
+  assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-luna', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
-  assert.equal(beltRoutingAdmission({ name: 'ppp-spec', model: 'gpt-5.6-terra', thinking_level: 'low' }).reason, 'qc_spec_requires_sol_low');
+  assert.equal(beltRoutingAdmission({ name: 'ppp-spec', model: 'gpt-5.6-terra', thinking_level: 'low' }).reason, 'qc_spec_requires_qc_lane');
   const configOnly = beltRoutingAdmission({ id: 'agent-1', name: 'gsp-build', model: 'gpt-5.6-luna', thinking_level: '', runtime_config: { model: 'gpt-5.6-terra', reasoning_effort: 'low' } });
   assert.equal(configOnly.reason, 'belt_low_reasoning_effort_required');
   assert.deepEqual({ agent_name: configOnly.agent_name, agent_id: configOnly.agent_id, model: configOnly.model, effort: configOnly.effort }, { agent_name: 'gsp-build', agent_id: 'agent-1', model: 'gpt-5.6-luna', effort: '' });

@@ -1,5 +1,7 @@
 'use strict';
 
+const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
+
 function conversionEnabled(env = process.env) {
   return String(env.RELAY_QC_EVIDENCE_CONVERSION || 'on').toLowerCase() !== 'off';
 }
@@ -22,8 +24,9 @@ function qcTaskEvidenceResult(task) {
       !/^[0-9a-f]{40}$/i.test(String(evidence.observed_sha || '')) ||
       String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase() ||
       !['none', 'implementation', 'evidence', 'tool', 'access'].includes(evidence.failure_class) ||
-      typeof evidence.qualifying !== 'boolean' || evidence.model !== 'gpt-5.6-sol' ||
-      evidence.effort !== 'low') return { reason: 'invalid-evidence' };
+      typeof evidence.qualifying !== 'boolean' || !isQcLane(evidence.model, evidence.effort)) {
+      return { reason: 'invalid-evidence' };
+    }
     return { evidence };
   } catch { return { reason: 'invalid-json' }; }
 }
@@ -42,19 +45,21 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
   logPrefix = '[relay-advance-daemon]', env = process.env } = {}) {
   if (!conversionEnabled(env)) return new Set();
   const candidates = await client.query(
-    `SELECT t.id, t.issue_id, t.created_at, t.result, a.name AS agent_name, i.number
+    `SELECT t.id, t.issue_id, t.created_at, t.result, a.name AS agent_name, i.number,
+            COALESCE(a.model, a.runtime_config->>'model') AS agent_model,
+            COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') AS agent_effort
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
       WHERE t.status = 'completed' AND t.context->>'to_stage' = 'In Review'
         AND t.result->>'output' LIKE '%QC_EVIDENCE_JSON=%'
-        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($1::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $2::text
         AND NOT EXISTS (
           SELECT 1 FROM qc_verdict verdict WHERE verdict.issue_id = t.issue_id
             AND verdict.created_at >= t.created_at)
       ORDER BY t.issue_id, t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
-      LIMIT 100`
+      LIMIT 100`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]
   );
   const converted = new Set();
   const seenIssues = new Set();
@@ -67,11 +72,15 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
     }
     const { evidence } = parsed;
     seenIssues.add(task.issue_id);
+    if (evidence.model !== task.agent_model || evidence.effort !== task.agent_effort) {
+      logger.log(`${logPrefix} [qc-evidence-model-mismatch] task=${task.id} ` +
+        `evidence=${evidence.model}/${evidence.effort} agent=${task.agent_model}/${task.agent_effort}`);
+    }
     const payload = { issue_id: task.issue_id, checker: task.agent_name,
       verdict: evidence.verdict, work_product_md5: evidence.work_product_md5,
       bound_sha: evidence.bound_sha, observed_sha: evidence.observed_sha,
       failure_class: evidence.failure_class, qualifying: evidence.qualifying,
-      model: evidence.model, effort: evidence.effort,
+      model: task.agent_model, effort: task.agent_effort,
       idem_key: `qc-${task.number}-${evidence.bound_sha}-${evidence.verdict}`,
       qc_task_id: task.id };
     const result = await postRelay(payload);
@@ -95,13 +104,13 @@ async function rescopeCompletedNoArtifactQc(client, { postRelay, logger = consol
         AND NOT (i.metadata ? 'no_artifact_rescope_consumed_at')
         AND t.status = 'completed'
         AND t.context->>'to_stage' = 'In Review'
-        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($1::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $2::text
         AND NOT EXISTS (
           SELECT 1 FROM qc_verdict verdict WHERE verdict.issue_id = t.issue_id
             AND verdict.created_at >= t.created_at)
       ORDER BY t.issue_id, t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
-      LIMIT $1`, [noArtifactRescopeBatch(env)]
+      LIMIT $3`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT, noArtifactRescopeBatch(env)]
   );
   const converted = new Set();
   const seenIssues = new Set();
@@ -170,12 +179,13 @@ async function closeDeadRelayRows(client, { terminalStages, requestRetryEscalati
              AND verdict.checker_id = evidence_task.agent_id
              AND evidence_agent.workspace_id = evidence_task.workspace_id
              AND COALESCE(evidence_agent.model,
-                          evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
+                          evidence_agent.runtime_config->>'model') = ANY($1::text[])
              AND COALESCE(evidence_agent.thinking_level,
-                          evidence_agent.runtime_config->>'reasoning_effort') = 'low'
+                          evidence_agent.runtime_config->>'reasoning_effort') = $2::text
              AND lower(attempt.bound_sha) = lower(attempt.observed_head)
              AND attempt.bound_sha ~* '^[0-9a-f]{40}$'
-             AND attempt.work_product_md5 ~* '^[0-9a-f]{32}$')`
+             AND attempt.work_product_md5 ~* '^[0-9a-f]{32}$')`,
+    [qcLaneModelsSqlArray(), QC_LANE_EFFORT]
   );
   for (const row of candidates.rows) {
     const claimed = await client.query(

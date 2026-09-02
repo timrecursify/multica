@@ -1,7 +1,7 @@
 # Runbook — native QC agent
 
 Read `WORKER_COMMON.md` first. Use this runbook for an issue in `In Review`.
-The required lane is `gpt-5.6-sol` with `low` effort.
+Emit the model and effort your agent actually runs (see your task context); the accepted lane set is `QC_LANE_MODELS` at low effort.
 
 ## Review
 
@@ -40,6 +40,8 @@ FAILURE_CLASS=none; QUALIFYING=true
 # For an unavailable prerequisite: FAILURE_CLASS=evidence|tool|access;
 # QUALIFYING=false; BLOCKED_REASON='actionable reason'
 IDEM_KEY="qc-${NUMBER}-${BOUND_SHA}-${VERDICT}"
+QC_MODEL="${QC_MODEL:?set to the model from your task context}"
+QC_EFFORT="${QC_EFFORT:?set to the effort from your task context}"
 VERDICT_NOTES=''
 if [ "$VERDICT" = FAIL ]; then
   VERDICT_NOTES="${REWORK_SUMMARY:?set a concise rework summary}"
@@ -47,7 +49,7 @@ if [ "$VERDICT" = FAIL ]; then
 fi
 QC_EVIDENCE_JSON="$(jq -cn --arg verdict "$VERDICT" --arg work_product_md5 "$WORK_PRODUCT_MD5" \
   --arg bound_sha "$BOUND_SHA" --arg observed_sha "$OBSERVED_SHA" \
-  --arg failure_class "$FAILURE_CLASS" --arg model gpt-5.6-sol --arg effort low \
+  --arg failure_class "$FAILURE_CLASS" --arg model "$QC_MODEL" --arg effort "$QC_EFFORT" \
   --argjson qualifying "$QUALIFYING" \
   '{verdict:$verdict,work_product_md5:$work_product_md5,bound_sha:$bound_sha,observed_sha:$observed_sha,failure_class:$failure_class,qualifying:$qualifying,model:$model,effort:$effort}')"
 printf 'QC_EVIDENCE_JSON=%s\n' "$QC_EVIDENCE_JSON"
@@ -55,7 +57,7 @@ test -z "${BLOCKED_REASON:-}" || printf 'BLOCKED: %s\n' "$BLOCKED_REASON"
 sk multica verdict "$NUMBER" --board "$BOARD" --verdict "$VERDICT" \
   --bound-sha "$BOUND_SHA" --observed-sha "$OBSERVED_SHA" \
   --work-product-md5 "$WORK_PRODUCT_MD5" --failure-class "$FAILURE_CLASS" \
-  --qualifying "$QUALIFYING" --model gpt-5.6-sol --effort low --idem-key "$IDEM_KEY" \
+  --qualifying "$QUALIFYING" --model "$QC_MODEL" --effort "$QC_EFFORT" --idem-key "$IDEM_KEY" \
   --notes "$VERDICT_NOTES"
 ```
 
