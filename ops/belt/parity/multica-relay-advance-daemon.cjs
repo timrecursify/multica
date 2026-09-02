@@ -22,16 +22,48 @@ const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
+const { issueCandidatesSql, reconcileCycle } = require('../reconciler.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
+const RECONCILE_INTERVAL_MS = 30000;
+const RECONCILE_MAX_CREATE_PER_CYCLE = Number.parseInt(
+  process.env.RECONCILE_MAX_CREATE_PER_CYCLE || '25', 10
+);
 const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
 let advanceTickInFlight = false;
+
+function reconcileCreateLimit(value = RECONCILE_MAX_CREATE_PER_CYCLE) {
+  return Number.isInteger(value) && value > 0 ? value : 25;
+}
+
+function limitReconcileCandidates(client, maxCreate) {
+  return {
+    ...client,
+    async query(sql, values) {
+      const result = await client.query(sql, values);
+      return sql === issueCandidatesSql()
+        ? { ...result, rows: result.rows.slice(0, reconcileCreateLimit(maxCreate)) }
+        : result;
+    }
+  };
+}
+
+async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } = {}) {
+  const client = await dbPool.connect();
+  try {
+    const results = await reconcileCycle(limitReconcileCandidates(client, maxCreate));
+    logger.log(`${LOG_PREFIX} reconciled ${results.length} ticket(s)`);
+    return results;
+  } finally {
+    client.release();
+  }
+}
 
 function github(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
@@ -986,6 +1018,10 @@ function selectReplayAttempt(row) {
 // stage contract is the authority on who owns a stage, so a re-owned stage heals
 // its own strays.
 async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } = {}) {
+  // v3 reconciliation is the only live recovery path. Keep this compatibility
+  // export temporarily because older unit consumers import it directly.
+  return runReconcileCycle({ dbPool });
+  /* v2 recovery retained below only for source-history bisectability. */
   const client = await dbPool.connect();
   try {
     const candidates = await client.query(
@@ -1660,15 +1696,16 @@ function startDaemon() {
     console.error('[relay-advance-daemon] FATAL: env vars missing');
     process.exit(1);
   }
-  console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
+  console.log(`${LOG_PREFIX} Starting (reconcile every 30s, cleanup every 5m)`);
   setInterval(advanceTick, 15000);
   setInterval(findAndAdvanceRegistered, 20000);
   setInterval(recoveryAdvanceTasks, 120000);
   setInterval(cleanupStalePendingRows, 300000);
-  setInterval(requeueStrandedTasks, 60000);
+  setInterval(() => runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`)), RECONCILE_INTERVAL_MS);
   setInterval(processParkedDiagnoses, 30000);
   setInterval(reconcileQuotaPauses, 60000);
   advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
+  runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
   cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
@@ -1679,4 +1716,5 @@ if (require.main === module) startDaemon();
 
 module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
-  INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt };
+  INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
+  limitReconcileCandidates, runReconcileCycle };

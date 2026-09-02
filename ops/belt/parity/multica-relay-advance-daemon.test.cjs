@@ -5,10 +5,20 @@ const { randomUUID } = require('node:crypto');
 const { Client } = require('pg');
 const { qcCompletionAdvance, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
-  isInfrastructureFailure, selectReplayAttempt } = require('./multica-relay-advance-daemon.cjs');
+  isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, limitReconcileCandidates } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+
+test('reconciliation ramp defaults to 25 and bounds candidates before reconciliation', async () => {
+  assert.equal(reconcileCreateLimit(), 25);
+  assert.equal(reconcileCreateLimit(3), 3);
+  assert.equal(reconcileCreateLimit(0), 25);
+  const client = { query: async () => ({ rows: [{ id: 1 }, { id: 2 }, { id: 3 }] }) };
+  const limited = limitReconcileCandidates(client, 2);
+  const result = await limited.query(require('../reconciler.cjs').issueCandidatesSql(), [[]]);
+  assert.deepEqual(result.rows, [{ id: 1 }, { id: 2 }]);
+});
 
 test('assignment adoption inserts only the assigned configured QC task once and is workspace-safe', async () => {
   const schema = `assignment_adoption_${Date.now()}_${Math.random().toString(16).slice(2)}`;
