@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
 const { qcCompletionAdvance } = require('./parity/multica-relay-advance-daemon.cjs');
+const { classifyStageRoute } = require('./stage-routing.cjs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
@@ -10,6 +11,18 @@ process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
 process.env.RELAY_AGENT_SECRET = 'test-relay-secret';
 process.env.RELAY_OPERATOR_SECRET = 'test-operator-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
+
+test('stage routing applies only the required QC and deploy lanes', () => {
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
+    files: ['server/migrations/999_risk.up.sql'] }), { kind: 'risk', toStage: 'In Review' });
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
+    files: ['ops/belt/multica-bridge.cjs'] }), { kind: 'runtime', toStage: 'CI/CD & Deploy' });
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'MERGED',
+    files: ['ops/belt/README.md'] }), { kind: 'merge_only', toStage: 'Done' });
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
+    files: ['ops/belt/README.md'] }),
+    { kind: 'merge_only', toStage: null, reason: 'non_runtime_pr_not_merged' });
+});
 
 const {
   existingStageTask,
