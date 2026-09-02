@@ -86,6 +86,8 @@ var workspaceDeletionManifest = map[string]workspaceDeleteAction{
 	"project":                         workspaceDelete,
 	"project_resource":                workspaceDelete,
 	"quick_action":                    workspaceDelete,
+	"relay_stage_agent_pool":          workspaceDelete,
+	"relay_stage_pool":                workspaceDelete,
 	"relay_run_log":                   workspaceDelete,
 	"relay_stage_config":              workspaceDelete,
 	"runtime_profile":                 workspaceDelete,

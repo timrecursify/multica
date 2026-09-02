@@ -33,11 +33,11 @@ type RelayAdvanceStageRequest struct {
 
 // relayAdvanceStageResult is the success/coalesced response from the relay.
 type relayAdvanceStageResult struct {
-	Success    bool                 `json:"success"`
-	Issue      *IssueSummary        `json:"issue"`
-	Transition string               `json:"transition,omitempty"`
-	TaskID     *string              `json:"task_id,omitempty"`
-	RelayLogID *int64               `json:"relay_log_id,omitempty"`
+	Success    bool          `json:"success"`
+	Issue      *IssueSummary `json:"issue"`
+	Transition string        `json:"transition,omitempty"`
+	TaskID     *string       `json:"task_id,omitempty"`
+	RelayLogID *int64        `json:"relay_log_id,omitempty"`
 }
 
 // IssueSummary is the minimal issue projection the relay returns on success.
@@ -147,6 +147,10 @@ func (h *Handler) RelayAdvanceStage(w http.ResponseWriter, r *http.Request) {
 		StageName:   req.ToStage,
 		WorkspaceID: issue.WorkspaceID,
 	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeErrorJSON(w, http.StatusBadRequest, relayError{Error: "invalid_to_stage", Message: "to_stage is not a configured relay stage", FromStage: issue.Status, ToStage: req.ToStage})
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to resolve relay stage owner")
 		return
@@ -234,13 +238,17 @@ func (h *Handler) RelayAdvanceStage(w http.ResponseWriter, r *http.Request) {
 			id := int64(logRow.ID)
 			relayLogID = &id
 		}
-	default:
-		// A duplicate delivery whose task already exists: the unique index
-		// rejects the insert, which is the expected dedup outcome. The status
-		// transition is committed; no second successor is created. We do not
-		// treat 23505 as an error (see isDuplicatePendingTaskErr).
+	case errors.Is(taskErr, pgx.ErrNoRows):
+		// ON CONFLICT DO NOTHING RETURNING produces ErrNoRows only when the
+		// pending-task uniqueness constraint rejected this repeat delivery.
 		slog.Info("relay advance-stage: successor task already pending (dedup)",
 			"issue_id", uuidToString(issue.ID), "agent_id", uuidToString(owner.AgentID))
+	default:
+		// Every other enqueue failure is a real database/query error. Returning
+		// before commit lets the deferred rollback undo the issue status update.
+		slog.Error("relay advance-stage: successor enqueue failed", "issue_id", uuidToString(issue.ID), "error", taskErr)
+		writeError(w, http.StatusInternalServerError, "failed to enqueue relay successor")
+		return
 	}
 
 	if err := tx.Commit(r.Context()); err != nil {
@@ -256,6 +264,11 @@ func (h *Handler) RelayAdvanceStage(w http.ResponseWriter, r *http.Request) {
 		"prev_status":    issue.Status,
 		"relay":          true,
 	})
+	if taskID != nil && h.TaskService != nil {
+		// Notification is post-commit and idempotent; callers can safely retry
+		// notification without repeating the stage mutation or task insert.
+		h.TaskService.NotifyTaskEnqueued(r.Context(), task)
+	}
 
 	writeJSON(w, http.StatusOK, relayAdvanceStageResult{
 		Success:    true,
@@ -285,7 +298,6 @@ func relayContainsString(haystack []string, needle string) bool {
 	}
 	return false
 }
-
 
 // relayPriorityToInt mirrors the service-side priority mapping so the relay can
 // enqueue a successor task with the same priority ordering as other task paths.
