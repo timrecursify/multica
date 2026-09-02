@@ -65,6 +65,41 @@ test('quota-pause reconciliation clears an expired pause and records its resume'
   }
 });
 
+test('quota-pause reconciliation retains an expired pause when the workspace budget is exhausted', async () => {
+  const schema = `quota_pause_budget_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const admin = new Pool({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`CREATE TABLE ${schema}.agent (
+      id text PRIMARY KEY, workspace_id text NOT NULL, name text, runtime_config jsonb, updated_at timestamptz NOT NULL)`);
+    await admin.query(`CREATE TABLE ${schema}.build_budget (
+      workspace_id text NOT NULL, scope text NOT NULL, state text NOT NULL,
+      spent_ticks bigint NOT NULL, reserved_ticks bigint NOT NULL, limit_ticks bigint NOT NULL)`);
+    await admin.query(`CREATE TABLE ${schema}.activity_log (
+      workspace_id text NOT NULL, issue_id text, actor_type text NOT NULL, action text NOT NULL, details jsonb NOT NULL)`);
+    await admin.query(`INSERT INTO ${schema}.agent (id, workspace_id, runtime_config, updated_at)
+      VALUES ('agent-1', 'workspace-1',
+        '{"quota_paused": true, "quota_paused_at": "2026-09-01T12:00:00.000Z"}',
+        '2026-09-01T12:00:00.000Z');
+      INSERT INTO ${schema}.build_budget
+        VALUES ('workspace-1', 'workspace', 'closed', 10, 0, 10)`);
+    const dbPool = { connect: async () => {
+      const client = await admin.connect();
+      await client.query(`SET search_path TO ${schema}, public`);
+      return client;
+    } };
+    await reconcileQuotaPauses({ connect: dbPool.connect, now: NOW, onError: (err) => { throw err; } });
+    const agent = await admin.query(`SELECT runtime_config FROM ${schema}.agent WHERE id = 'agent-1'`);
+    const activity = await admin.query(`SELECT count(*)::int AS n FROM ${schema}.activity_log`);
+    assert.equal(agent.rows[0].runtime_config.quota_paused, true);
+    assert.equal(agent.rows[0].runtime_config.quota_paused_at, '2026-09-01T12:00:00.000Z');
+    assert.equal(activity.rows[0].n, 0);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
 test('quota-pause clear emits its flip only after commit', async () => {
   const events = [];
   const flips = [];
