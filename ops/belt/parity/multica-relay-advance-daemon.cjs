@@ -94,6 +94,24 @@ function qcCompletionAdvance(row) {
   return { ok: false, reason: 'legacy_qc_evidence_mismatch' };
 }
 
+function requeueTriggerSummary(row, coldStart) {
+  const prefix = coldStart
+    ? `Relay cold start: never dispatched in ${row.stage}`
+    : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`;
+  if (row.stage !== 'In Review') return prefix;
+  const result = row.build_task_result || {};
+  const prUrl = result.pr_url || row.metadata?.pr_url;
+  const headSha = result.head_sha || result.bound_sha || row.metadata?.head_sha ||
+    row.metadata?.bound_sha || row.metadata?.commit_sha;
+  if (!prUrl || !/^[0-9a-f]{40}$/i.test(headSha || '')) {
+    return `${prefix}\nQC input: PR/SHA unknown: issue FAIL verdict per runbook`;
+  }
+  const board = row.metadata?.board ||
+    (row.workspace_id === WORKSPACE_ID ? 'gsp' : 'prod');
+  return `${prefix}\nQC input: ticket ${row.number}; board ${board}; ` +
+    `PR ${prUrl}; head SHA ${headSha}`;
+}
+
 // Deliberately small: the DeepSeek build lane is paid, so a backlog drains at a
 // steady trickle rather than firing every stranded ticket at the vendor at once.
 const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10);
@@ -860,6 +878,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
               t.attempt, t.max_attempts, t.failure_reason,
               t.result AS dead_task_result, t.error AS dead_task_error,
               closed_log.id AS closed_relay_log_id,
+              build.result AS build_task_result,
               r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
               r.model, r.thinking_level, r.max_concurrent_tasks, r.runtime_config, r.archived_at, r.agent_name,
               COALESCE(
@@ -884,6 +903,11 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
            SELECT id, status, parked_audit FROM relay_run_log
             WHERE task_id = t.id ORDER BY created_at DESC, id DESC LIMIT 1
          ) closed_log ON true
+         LEFT JOIN LATERAL (
+           SELECT result FROM agent_task_queue
+            WHERE issue_id = i.id AND status = 'completed'
+            ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1
+         ) build ON true
          JOIN LATERAL (
            SELECT rsc.stage_name AS from_stage, rsc.agent_id,
                   COALESCE(a.runtime_mode, 'local') AS runtime_mode,
@@ -1025,7 +1049,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
         continue;
       }
       const infra = INFRA_FAILURE_REASONS.includes(row.failure_reason || 'cancelled');
-      if (infra) {
+      if (infra && !coldStart) {
         const headroom = await client.query(
           `SELECT COALESCE(max(EXTRACT(epoch FROM (now() - created_at)) / 60), 0) AS age
              FROM agent_task_queue WHERE status = 'queued'`
@@ -1158,9 +1182,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
            ON CONFLICT DO NOTHING
            RETURNING id`,
           [row.agent_id, row.issue_id, row.runtime_id, context,
-           coldStart
-             ? `Relay cold start: never dispatched in ${row.stage}`
-             : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`,
+           requeueTriggerSummary(row, coldStart),
            attempt, maxAttempts, row.dead_task_id, row.stage]
         );
         if (task.rows.length === 0) {
@@ -1197,7 +1219,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
         );
         await client.query('COMMIT');
         requeued++;
-        console.log(`${LOG_PREFIX} [requeue] #${row.number} stranded in '${row.stage}' (${row.failure_reason || 'cancelled'}) -> new task ${task.rows[0].id} attempt ${attempt}/${row.max_attempts}`);
+        console.log(`${LOG_PREFIX} [requeue] #${row.number} stranded in '${row.stage}' (${row.failure_reason || 'cancelled'}) -> new task ${task.rows[0].id} attempt ${attempt}/${maxAttempts}`);
       } catch (err) {
         try { await client.query('ROLLBACK'); } catch (_) {}
         console.error(`${LOG_PREFIX} [requeue] Error on #${row.number}: ${err.message}`);
@@ -1434,4 +1456,4 @@ function startDaemon() {
 if (require.main === module) startDaemon();
 
 module.exports = { advanceTick, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
-  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, startDaemon };
+  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon };
