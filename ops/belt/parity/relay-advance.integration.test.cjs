@@ -11,7 +11,8 @@ process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-wor
 const { qcBounceDecision } = require('../multica-bridge.cjs');
 const { enqueuePassWithoutRelayRows, findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
 const { parseArgs, recover } = require('../recover-stranded-qc-pass.cjs');
-const { closeDeadRelayRows, convertCompletedQcEvidence } = require('./relay-dead-rows.cjs');
+const { closeDeadRelayRows, convertCompletedQcEvidence,
+  rescopeCompletedNoArtifactQc } = require('./relay-dead-rows.cjs');
 
 const SHA = 'c909401ef7a4a438348eb5ceda33839211721524';
 const MD5 = '76becea4ab970644b7a21220665a1619';
@@ -57,6 +58,57 @@ test('QC evidence conversion flag off is a clean no-op', async () => {
   assert.equal(queried, false);
 });
 
+function noArtifactTask(id = 'no-artifact-task') {
+  return { id, issue_id: `issue-${id}`, result: { output:
+    'QC-BLOCKED: no implementation SHA or PR exists. NO-SHA.' } };
+}
+
+test('QC-BLOCKED no-artifact task posts one In Progress relay return', async () => {
+  const posts = [];
+  const converted = await rescopeCompletedNoArtifactQc({ query: async () => ({ rows: [noArtifactTask()] }) }, {
+    postRelay: async (payload) => { posts.push(payload); return { status: 201 }; }, logger: { log() {} }
+  });
+  assert.deepEqual([...converted], ['no-artifact-task']);
+  assert.deepEqual(posts, [{ issue_id: 'issue-no-artifact-task', to_stage: 'In Progress',
+    reason: 'QC-BLOCKED NO-SHA relay return' }]);
+});
+
+test('valid QC_EVIDENCE_JSON marker does not take no-artifact rescope path', async () => {
+  const task = noArtifactTask();
+  task.result.output = `QC_EVIDENCE_JSON=${JSON.stringify(marker())}`;
+  const posts = [];
+  await rescopeCompletedNoArtifactQc({ query: async () => ({ rows: [task] }) }, {
+    postRelay: async (payload) => { posts.push(payload); return { status: 201 }; }, logger: { log() {} }
+  });
+  assert.deepEqual(posts, []);
+});
+
+test('no-artifact rescope treats 409 as a non-retrying skip', async () => {
+  let attempts = 0;
+  const logs = [];
+  await rescopeCompletedNoArtifactQc({ query: async () => ({ rows: [noArtifactTask()] }) }, {
+    postRelay: async () => { attempts += 1; return { status: 409 }; },
+    logger: { log: (line) => logs.push(line) }
+  });
+  assert.equal(attempts, 1);
+  assert.ok(logs.some((line) => line.includes('status=409')));
+});
+
+test('no-artifact rescope respects RELAY_NOARTIFACT_RESCOPE_BATCH', async () => {
+  let queryValues;
+  const tasks = [noArtifactTask('first'), noArtifactTask('second')];
+  const posts = [];
+  await rescopeCompletedNoArtifactQc({ query: async (_sql, values) => {
+    queryValues = values;
+    return { rows: tasks.slice(0, values[0]) };
+  } }, {
+    postRelay: async (payload) => { posts.push(payload); return { status: 200 }; },
+    env: { RELAY_REQUEUE_BATCH: '8', RELAY_NOARTIFACT_RESCOPE_BATCH: '1' }, logger: { log() {} }
+  });
+  assert.deepEqual(queryValues, [1]);
+  assert.equal(posts.length, 1);
+});
+
 async function deadRowsDb() {
   const schema = `relay_dead_rows_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const admin = new Pool({ connectionString: process.env.DATABASE_URL });
@@ -68,7 +120,7 @@ async function deadRowsDb() {
     id text PRIMARY KEY, issue_id text NOT NULL, agent_id text, workspace_id text NOT NULL DEFAULT 'workspace-1',
     status text NOT NULL, context jsonb, result jsonb, completed_at timestamptz, created_at timestamptz NOT NULL)`);
   await admin.query(`CREATE TABLE ${schema}.issue (
-    id text PRIMARY KEY, workspace_id text NOT NULL, number integer NOT NULL)`);
+    id text PRIMARY KEY, workspace_id text NOT NULL, number integer NOT NULL, status text NOT NULL DEFAULT 'In Review')`);
   await admin.query(`CREATE TABLE ${schema}.agent (
     id text PRIMARY KEY, workspace_id text NOT NULL, name text NOT NULL, model text,
     thinking_level text, runtime_config jsonb)`);

@@ -464,7 +464,9 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
     await closeDeadRelayRows(client, { terminalStages: [...TERMINAL_STAGES],
-      requestRetryEscalation, postRelay, postVerdict: postQcVerdict, logger, logPrefix: LOG_PREFIX });
+      requestRetryEscalation, postRelay, postVerdict: postQcVerdict,
+      postNoArtifactRescope: (payload) => postRelay({ ...payload, agent_token: RELAY_AGENT_SECRET }),
+      logger, logPrefix: LOG_PREFIX });
 
     // Correlate strictly on the task that owns the relay log. Advance only
     // genuinely completed tasks; a failed task must never move work forward.
