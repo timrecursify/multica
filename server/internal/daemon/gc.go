@@ -329,30 +329,61 @@ func (d *Daemon) safeIssueRemoval(taskDir string) string {
 		return "process-held"
 	}
 	workdir := filepath.Join(taskDir, "workdir")
-	if _, err := os.Stat(filepath.Join(workdir, ".git")); err != nil {
-		return "" // no checkout to inspect
+	repos, err := gcCheckoutRoots(workdir)
+	if err != nil {
+		return "check-failed"
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	run := func(args ...string) (string, error) {
-		cmd := exec.CommandContext(ctx, "ionice", append([]string{"-c3", "nice", "-n19", "git", "-C", workdir}, args...)...)
+		cmd := exec.CommandContext(ctx, "ionice", append([]string{"-c3", "nice", "-n19", "git", "-C"}, args...)...)
 		out, err := cmd.Output()
 		return strings.TrimSpace(string(out)), err
 	}
-	if out, err := run("status", "--porcelain", "--ignore-submodules=none"); err != nil || out != "" {
-		return "dirty"
-	}
-	branch, err := run("symbolic-ref", "--quiet", "--short", "HEAD")
-	if err != nil || branch == "" {
-		return "check-failed"
-	}
-	if _, err = run("rev-parse", "--verify", "origin/"+branch); err != nil {
-		return "check-failed"
-	}
-	if out, err := run("rev-list", "origin/"+branch+"..HEAD"); err != nil || out != "" {
-		return "unpushed"
+	for _, repo := range repos {
+		if out, err := run(append([]string{repo, "status", "--porcelain", "--ignore-submodules=none"})...); err != nil || out != "" {
+			return "dirty"
+		}
+		branch, err := run(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
+		if err != nil || branch == "" {
+			return "check-failed"
+		}
+		if _, err = run(repo, "rev-parse", "--verify", "origin/"+branch); err != nil {
+			return "check-failed"
+		}
+		if out, err := run(repo, "rev-list", "origin/"+branch+"..HEAD"); err != nil || out != "" {
+			return "unpushed"
+		}
 	}
 	return ""
+}
+
+// gcCheckoutRoots finds repositories below one task workdir. It does not cross
+// symlinks, and a walk failure is returned to the caller as a fail-closed gate.
+func gcCheckoutRoots(workdir string) ([]string, error) {
+	var roots []string
+	err := filepath.WalkDir(workdir, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Name() == ".git" {
+			roots = append(roots, filepath.Dir(path))
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+		}
+		return nil
+	})
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	return roots, err
 }
 
 // processReferencesPath obtains a bounded snapshot of cwd and fd links. Any
