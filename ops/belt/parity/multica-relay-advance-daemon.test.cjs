@@ -423,7 +423,7 @@ test('stranded-task fixtures leave running tasks and bundled children untouched'
 
 test('RELAY_REQUEUE_STAGES drops Human Review before binding the candidate SQL', async () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  assert.match(source, /RELAY_REQUEUE_STAGES \|\| 'Queue,In Progress,Spec,In Review'/);
+  assert.match(source, /RELAY_REQUEUE_STAGES \|\| 'Queue,In Progress,Spec,In Review,CI\/CD & Deploy'/);
   const previous = process.env.RELAY_REQUEUE_STAGES;
   const warnings = [];
   const warn = console.warn;
@@ -442,6 +442,13 @@ test('RELAY_REQUEUE_STAGES drops Human Review before binding the candidate SQL',
     loadRequeueDaemon();
   }
   assert.deepEqual(warnings, ['[relay-advance-daemon] [requeue] ignoring non-dispatch stages: Human Review']);
+});
+
+test('default recovery stages include CI/CD & Deploy', async () => {
+  const harness = strandedHarness([strandedFixture({ stage: 'CI/CD & Deploy' })]);
+  await harness.run();
+  const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
+  assert.ok(candidateQuery.values[1].includes('CI/CD & Deploy'));
 });
 
 test('completed task with failed closed relay row is requeued with stage instructions', async () => {
