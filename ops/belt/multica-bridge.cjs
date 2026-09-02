@@ -1084,63 +1084,8 @@ async function relayVerdict(req, res, payload) {
         String(existing.observed_head).toLowerCase() === payload.observed_sha.toLowerCase() &&
         existing.failure_class === payload.failure_class && existing.qualifying === payload.qualifying &&
         existing.model === payload.model && existing.effort === payload.effort;
-      if (!same) {
-        await client.query("COMMIT");
-        return relayVerdictError(res, 409, "idempotency_conflict");
-      }
-      const issue = await client.query(
-        `SELECT id, workspace_id FROM issue WHERE id = $1 FOR UPDATE`, [payload.issue_id]
-      );
-      if (issue.rows.length === 0) {
-        await client.query("ROLLBACK");
-        return relayVerdictError(res, 404, "issue_not_found");
-      }
-      const qcTask = await latestCompletedSolLowQcTask(client, payload.issue_id,
-        issue.rows[0].workspace_id, payload.qc_task_id || null);
-      if (!qcTask) {
-        await client.query("ROLLBACK");
-        return relayVerdictError(res, 409, "completed_sol_low_qc_required");
-      }
-      const evidenceMismatch = qcTaskEvidenceMismatch(qcTask, payload);
-      if (evidenceMismatch) {
-        await client.query("ROLLBACK");
-        return relayVerdictError(res, 409, evidenceMismatch);
-      }
-      const fresh = await client.query(
-        `SELECT id FROM qc_verdict
-          WHERE issue_id = $1 AND checker_id = $2
-            AND created_at >= (SELECT created_at FROM agent_task_queue WHERE id = $3)
-          FOR UPDATE`, [payload.issue_id, qcTask.agent_id, qcTask.id]
-      );
-      if (fresh.rows.length === 0) {
-        const notes = [
-          `relay_task_id=${qcTask.id}`,
-          `relay_agent_id=${qcTask.agent_id}`,
-          `relay_agent_name=${qcTask.agent_name}`,
-          typeof payload.notes === "string" && payload.notes.length <= 2000 ? payload.notes : null,
-        ].filter(Boolean).join("\n");
-        const current = await client.query(
-          `SELECT issue_id FROM qc_verdict WHERE issue_id = $1 FOR UPDATE`, [payload.issue_id]
-        );
-        if (current.rows.length > 0) {
-          await client.query(
-            `UPDATE qc_verdict SET checker_id = $2, checker_name = $3, verdict = $4,
-                    work_product_md5 = $5, notes = $6, created_at = NOW()
-              WHERE issue_id = $1`,
-            [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
-              payload.work_product_md5, notes]
-          );
-        } else {
-          await client.query(
-            `INSERT INTO qc_verdict
-               (issue_id, checker_id, checker_name, verdict, work_product_md5, notes)
-             VALUES ($1, $2, $3, $4, $5, $6)`,
-            [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
-              payload.work_product_md5, notes]
-          );
-        }
-      }
       await client.query("COMMIT");
+      if (!same) return relayVerdictError(res, 409, "idempotency_conflict");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: true, replay: true, issue_id: payload.issue_id,
         work_product_md5: existing.work_product_md5 }));
