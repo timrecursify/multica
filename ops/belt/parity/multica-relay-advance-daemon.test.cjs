@@ -532,7 +532,7 @@ test('five eligible fixtures dispatch the oldest-created candidate from each own
   assert.match(candidateQuery.sql, /ORDER BY issue_created_at ASC, issue_id ASC/);
 });
 
-test('over-limit rows escalate outside the batch while three admissible rows dispatch', async () => {
+test('over-limit rows are terminally rejected outside the batch while three admissible rows dispatch', async () => {
   const overLimit = [1, 2, 3].map((number) => strandedFixture({
     number, issue_id: `223e4567-e89b-42d3-a456-42661417410${number}`,
     agent_id: `423e4567-e89b-42d3-a456-42661417410${number}`,
@@ -547,8 +547,11 @@ test('over-limit rows escalate outside the batch while three admissible rows dis
   await harness.run();
   const dispatched = harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
   assert.deepEqual(dispatched.map(({ values }) => values[1]), admissible.map(({ issue_id }) => issue_id));
-  assert.deepEqual(harness.relayPosts.map(({ issue_id, reason }) => ({ issue_id, reason })),
-    overLimit.map(({ issue_id }) => ({ issue_id, reason: 'retry_escalation:lifetime_task_limit' })));
+  assert.deepEqual(harness.relayPosts.map(({ issue_id, to_stage, cap_refusal }) => ({ issue_id, to_stage, cap_refusal })),
+    overLimit.map(({ issue_id }) => ({ issue_id, to_stage: 'Rejected', cap_refusal: {
+      reason: 'lifetime_task_limit', ceiling: 6, task_count: 6,
+      target_stage: 'Queue', trigger_stage: 'Queue'
+    } })));
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /\$\{budgetCountPredicate\('stage_history'\)\}/);
   assert.match(source, /\$\{budgetCountPredicate\('lifetime_history'\)\}/);
@@ -705,16 +708,15 @@ test('relay advancement admits task results before creating a successor', () => 
   assert.match(source, /relay_source_task_id: row\.task_id/);
 });
 
-test('retry ceilings leave the daemon through relay authority instead of direct status writes', () => {
+test('retry ceilings use the relay-owned terminal disposition receipt', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
     source.indexOf('function diagnosisText'));
-  assert.match(requeue, /requestRetryEscalation\(row, cycle\.reason, postRelay\)/);
-  assert.match(requeue, /requestRetryEscalation\(row, lifetime\.reason, postRelay\)/);
+  assert.match(requeue, /requestCapDisposition\(row, cycle, postRelay/);
+  assert.match(requeue, /requestCapDisposition\(row, lifetime, postRelay/);
   assert.match(requeue,
     /row\.metadata\?\.parked_release_at \|\|\s+row\.metadata\?\.retry_escalation_at \|\| null/);
-  assert.doesNotMatch(requeue, /applyDisposition\(client, row, cycle\.disposition/);
-  assert.doesNotMatch(requeue, /applyDisposition\(client, row, lifetime\.disposition/);
+  assert.doesNotMatch(requeue, /UPDATE issue SET status/);
 });
 
 test('stranded-task recovery admits only unconsumed failed completed predecessors', () => {
