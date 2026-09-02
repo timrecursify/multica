@@ -7,9 +7,9 @@ export default {
   apps: [
     app('gsp-multica-bridge', 'ops/belt/multica-bridge.cjs'),
     app('multica-relay-advance', 'ops/belt/parity/multica-relay-advance-wrapper.sh'),
-    app('multica-cicd-worker', 'ops/belt/multica-cicd-worker.cjs'),
+    ...(process.env.MULTICA_SKIP_CICD_WORKER === '1' ? [] : [app('multica-cicd-worker', 'ops/belt/multica-cicd-worker.cjs')]),
     app('multica-archiver', 'ops/belt/multica-archiver.cjs'),
-    app('gsp-multica-worker', 'ops/belt/multica-daemon-wrapper.sh', { kill_timeout: 30000,
+    ...(process.env.MULTICA_INCLUDE_WORKER === '1' ? [app('gsp-multica-worker', 'ops/belt/multica-daemon-wrapper.sh', { kill_timeout: 30000,
       env: { MULTICA_DAEMON_MAX_CONCURRENT_TASKS: process.env.MULTICA_DAEMON_MAX_CONCURRENT_TASKS ?? '20', MULTICA_DAEMON_WORKSPACES_ROOT: process.env.MULTICA_DAEMON_WORKSPACES_ROOT ?? '/home/newadmin/multica-workspaces-gsp' } },
-    ), ],
+    )] : []),
 };
