@@ -34,10 +34,15 @@ test('requires evidence and never accepts request booleans as authority', () => 
     evidence: { recordedDecision: true, isOperator: true } }).code, 'request_boolean_authority_denied');
 });
 
-test('permits the Human Review fallback only with a named blocker', () => {
+test('permits every reconciler blocker reason for the Human Review fallback', () => {
   assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system', evidence: {} }).ok, false);
+  for (const blocker of ['lifetime_task_limit', 'retry_exhausted', 'unresolved_owner',
+    'duplicate_live_task', 'stale_stage_running', 'quota', 'policy_fault']) {
+    assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system',
+      evidence: { blocker } }).ok, true, blocker);
+  }
   assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system',
-    evidence: { namedBlocker: 'unresolved owner' } }).ok, true);
+    evidence: { namedBlocker: 'legacy worker blocker' } }).ok, true);
 });
 
 test('requires destination evidence after Human Review and QC PASS when risk requires it', () => {

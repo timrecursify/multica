@@ -191,15 +191,24 @@ async function reconcileIssue(client, issueId, options = {}) {
 async function reconcileCycle(client, options = {}) {
   const settings = settingsFor({ ...options, budget: { created: 0, byAgent: new Map() } });
   const rows = (await client.query(issueCandidatesSql(), [[...DISPATCHABLE]])).rows;
-  const counts = { created: 0, skipped: 0, humanReview: 0, alreadyLive: 0 };
+  const counts = { created: 0, skipped: 0, humanReview: 0, alreadyLive: 0, error: 0 };
+  const results = [];
   for (const issue of rows) {
-    const result = await reconcileIssue(client, issue.id, settings);
+    let result;
+    try {
+      result = await reconcileIssue(client, issue.id, settings);
+    } catch (error) {
+      result = { action: "error", issueId: issue.id, message: error.message };
+    }
+    results.push(result);
     if (result.action === "created") counts.created += 1;
     else if (result.action === "human_review") counts.humanReview += 1;
     else if (result.action === "already_live") counts.alreadyLive += 1;
+    else if (result.action === "error") counts.error += 1;
     else counts.skipped += 1;
   }
-  return counts;
+  console.log(`Reconcile cycle: created=${counts.created} alreadyLive=${counts.alreadyLive} skipped=${counts.skipped} humanReview=${counts.humanReview} error=${counts.error}`);
+  return results;
 }
 
 module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, reconcileIssue, reconcileCycle };
