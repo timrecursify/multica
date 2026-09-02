@@ -15,26 +15,24 @@ function parseArgs(argv) {
     else if (argv[i] === '--batch-size') out.batch = Number(argv[++i]);
     else throw new Error(`unknown option: ${argv[i]}`);
   }
-  if (!out.mode) throw new Error('exactly one of --dry-run or --apply is required');
+  if (!out.mode || !out.workspace) throw new Error('--workspace and exactly one of --dry-run or --apply are required');
   if (!Number.isInteger(out.batch) || out.batch < 1 || out.batch > DEFAULT_BATCH) throw new Error(`--batch-size must be 1 to ${DEFAULT_BATCH}`);
   return out;
 }
 
 async function run(pool, options, relayPost) {
-  const where = options.workspace ? 'AND i.workspace_id = $1::uuid' : '';
-  const values = options.workspace ? [options.workspace, options.batch] : [options.batch];
-  const limit = options.workspace ? '$2' : '$1';
-  const selected = await pool.query(`SELECT i.id FROM issue i WHERE i.status = 'Parked'
-    AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified' ${where}
+  const selected = await pool.query(`SELECT i.id FROM issue i WHERE i.workspace_id = $1::uuid AND i.status = 'Parked'
+    AND i.metadata->>'parked_blocker' = 'runtime_evidence_unverified'
     AND EXISTS (SELECT 1 FROM agent_task_queue d WHERE d.issue_id = i.id AND d.status = 'completed'
       AND d.context->>'kind' = 'parked_diagnosis' AND lower(COALESCE(d.result::text, '')) ~ 'already_fixed')
     AND NOT EXISTS (SELECT 1 FROM agent_task_queue v WHERE v.issue_id = i.id
-      AND v.context->>'verification_kind' = '${PARK_RUNTIME_VERIFICATION_KIND}'
-      AND v.context->>'verification_processed' = 'true') ORDER BY i.id LIMIT ${limit}`, values);
-  const receipt = { mode: options.mode, counts: { selected: selected.rowCount, writes: 0 }, ids: selected.rows.map(r => r.id) };
+      AND v.context->>'kind' = '${PARK_RUNTIME_VERIFICATION_KIND}'
+      AND v.context->>'verification_processed' = 'true') ORDER BY i.id LIMIT $2`, [options.workspace, options.batch]);
+  const ids = selected.rows.map(r => r.id);
+  const receipt = { mode: options.mode, workspace: options.workspace, counts: { selected: selected.rowCount, writes: 0 }, ids };
   if (options.mode === 'apply' && selected.rowCount) {
-    await processParkedRuntimeVerifications({ verificationPool: pool, relayPost, batch: options.batch });
-    receipt.counts.writes = selected.rowCount;
+    receipt.counts.writes = (await processParkedRuntimeVerifications({ verificationPool: pool, relayPost,
+      workspaceId: options.workspace, issueIds: ids, batch: options.batch })).writes;
   }
   return receipt;
 }
