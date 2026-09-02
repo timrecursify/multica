@@ -330,7 +330,13 @@ commands:
 3. `sk repo test --path <checkout> --profile docs-lint --json` — applies the
    committed offline ruleset in `.sk/scripts/docs-rules.toml` to the
    maintained Markdown/MDX documentation and names the offending `file:line`.
-4. `sk repo test --path <checkout> --profile parked-diagnosis-node-tests --json`
+4. `sk repo test --path <checkout> --profile backend --json` — runs the Linux
+   CI backend sequence: Helm verification, `go build ./...`, migrations,
+   `scripts/test-go.test.sh`, then `scripts/test-go.sh --race`. It requires
+   reachable PostgreSQL and Redis services on loopback. The profile supplies
+   CI's fixed local service URLs and excludes caller environment; its runner
+   rejects a non-loopback service URL if invoked directly.
+5. `sk repo test --path <checkout> --profile parked-diagnosis-node-tests --json`
    — runs the committed parked-diagnosis CJS suites
    `ops/belt/backfill-parked-diagnosis.test.cjs` and
    `ops/belt/parked-diagnosis.test.cjs` with Node's built-in test runner.
