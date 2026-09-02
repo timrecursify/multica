@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -148,25 +149,30 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 
 	cleanedHere := 0
 	issueCandidates := make([]issueGCCandidate, 0, len(taskEntries))
-	for _, entry := range taskEntries {
-		if ctx.Err() != nil {
-			return
+	for start := 0; start < len(taskEntries); start += taskGCBatchSize {
+		end := min(start+taskGCBatchSize, len(taskEntries))
+		for _, entry := range taskEntries[start:end] {
+			if ctx.Err() != nil {
+				return
+			}
+			if !entry.IsDir() {
+				continue
+			}
+			taskDir := filepath.Join(wsDir, entry.Name())
+			if d.isActiveEnvRoot(taskDir) {
+				stats.skipped++
+				continue
+			}
+			meta, metaErr := execenv.ReadGCMeta(taskDir)
+			if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
+				issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
+				continue
+			}
+			action := d.shouldCleanTaskDir(ctx, taskDir)
+			cleanedHere += d.applyGCAction(taskDir, action, stats)
 		}
-		if !entry.IsDir() {
-			continue
-		}
-		taskDir := filepath.Join(wsDir, entry.Name())
-		if d.isActiveEnvRoot(taskDir) {
-			stats.skipped++
-			continue
-		}
-		meta, metaErr := execenv.ReadGCMeta(taskDir)
-		if metaErr == nil && meta.Kind == execenv.GCKindIssue && strings.TrimSpace(meta.IssueID) != "" {
-			issueCandidates = append(issueCandidates, issueGCCandidate{taskDir: taskDir, meta: meta})
-			continue
-		}
-		action := d.shouldCleanTaskDir(ctx, taskDir)
-		cleanedHere += d.applyGCAction(taskDir, action, stats)
+		// Keep a large historical workspace from monopolizing a daemon worker.
+		runtime.Gosched()
 	}
 	cleanedHere += d.gcWorkspaceIssues(ctx, filepath.Base(wsDir), issueCandidates, stats)
 
@@ -179,7 +185,12 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 	}
 }
 
-const issueGCBatchSize = 500
+const (
+	// taskGCBatchSize bounds filesystem and checkout inspection work before
+	// yielding to the daemon's dispatch and heartbeat goroutines.
+	taskGCBatchSize  = 100
+	issueGCBatchSize = 500
+)
 
 type issueGCCandidate struct {
 	taskDir string
@@ -269,6 +280,10 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionOrphan:
+		if !d.reapCheckoutIsSafe(taskDir) {
+			stats.skipped++
+			return 0
+		}
 		bytes := dirSize(taskDir)
 		d.cleanTaskDir(taskDir)
 		stats.orphaned++
@@ -1071,8 +1086,8 @@ func runGitCommand(barePath string, timeout time.Duration, args ...string) (stri
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	cmdArgs := append([]string{"-C", barePath}, args...)
-	cmd := exec.CommandContext(ctx, "git", cmdArgs...)
+	cmdArgs := append([]string{"-c3", "nice", "-n", "19", "git", "-C", barePath}, args...)
+	cmd := exec.CommandContext(ctx, "ionice", cmdArgs...)
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
