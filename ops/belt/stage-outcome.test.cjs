@@ -16,7 +16,18 @@ test("legacy heuristics map known outputs; unknown is FAILED", () => {
   assert.equal(so.parseOutcome('{"verdict":"FAIL","qualifying":true}').outcome, "ADVANCED");
   assert.equal(so.parseOutcome("release blocked by queued CI").blockedOn, "ci");
   assert.equal(so.parseOutcome("validated the already-merged implementation").outcome, "NO_OP");
+  assert.equal(so.parseOutcome("relay transition Queue -> In Progress denied (409 transition_denied)").outcome, "ADVANCED");
+  assert.equal(so.parseOutcome("relay rejected In Progress -> In Review evidence_missing").outcome, "ADVANCED");
+  assert.equal(so.parseOutcome("BUILD-READY posted").outcome, "ADVANCED");
+  assert.equal(so.parseOutcome("specification posted; now in Queue").outcome, "ADVANCED");
   assert.deepEqual(so.parseOutcome(""), { outcome: "FAILED", blockedOn: null, typed: false });
+});
+
+test("stage input hash includes current PR check-suite conclusions", () => {
+  const sql = so.stageInputHashSql();
+  assert.match(sql, /github_pull_request_check_suite/);
+  assert.match(sql, /s\.conclusion/);
+  assert.match(sql, /s\.head_sha = \(SELECT head_sha FROM pr\)/);
 });
 
 function fakeClient(responses) {

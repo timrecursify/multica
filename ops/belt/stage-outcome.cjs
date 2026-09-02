@@ -25,6 +25,7 @@ function parseOutcome(output) {
 
 function legacyOutcome(text) {
   if (/"qualifying"\s*:\s*true/.test(text) || /"verdict"\s*:\s*"(PASS|FAIL)"/.test(text)) return { outcome: "ADVANCED", blockedOn: null };
+  if (/relay transition .* denied \(409 transition_denied\)|relay rejected .* evidence_missing|BUILD-READY posted|specification posted.*now in Queue/i.test(text)) return { outcome: "ADVANCED", blockedOn: null };
   if (/QC-BLOCKED NO-SHA|no implementation (pull request|commit)/i.test(text)) return { outcome: "BLOCKED", blockedOn: "sha" };
   if (/blocked by (queued|pending|running) CI|waiting (on|for) CI/i.test(text)) return { outcome: "BLOCKED", blockedOn: "ci" };
   if (/usage limit|provider_quota_limit/i.test(text)) return { outcome: "BLOCKED", blockedOn: "quota" };
@@ -38,11 +39,14 @@ function legacyOutcome(text) {
 function stageInputHashSql() {
   return `
     WITH pr AS (
-      SELECT p.head_sha, p.checks_rollup_state
+      SELECT p.id, p.head_sha, p.checks_rollup_state
       FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
       WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1)
     SELECT md5(concat_ws('|',
       (SELECT head_sha FROM pr), (SELECT checks_rollup_state FROM pr),
+      (SELECT string_agg(s.suite_id::text || ':' || s.status || ':' || coalesce(s.conclusion, ''), ',' ORDER BY s.suite_id)
+         FROM github_pull_request_check_suite s
+        WHERE s.pr_id = (SELECT id FROM pr) AND s.head_sha = (SELECT head_sha FROM pr)),
       (SELECT c.id::text FROM comment c WHERE c.issue_id = i.id ORDER BY c.created_at DESC LIMIT 1),
       (SELECT string_agg(d.depends_on_issue_id::text || ':' || di.status, ',' ORDER BY d.depends_on_issue_id)
          FROM issue_dependency d JOIN issue di ON di.id = d.depends_on_issue_id WHERE d.issue_id = i.id),

@@ -125,26 +125,34 @@ function greenChecks(checks) {
     ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(String(check.conclusion || check.state || '').toUpperCase()));
 }
 
-async function buildCompletionRoute(client, row) {
+async function buildCompletionRoute(client, row, { githubCommand = github } = {}) {
   if (row.to_stage !== 'In Progress' || row.next_stage !== 'In Review') return null;
-  const comments = await client.query(
-    `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`,
-    [row.issue_id]);
-  const match = comments.rows.map(({ content }) => String(content || '').match(
-    /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i)).find(Boolean);
-  // No PR: Sol-low decides whether the work product closes the ticket (Tim 2026-09-02: closed means work behind it).
-  if (!match) return { kind: 'no_pr', toStage: 'In Review' };
-  const repo = `${match[1]}/${match[2]}`;
-  const pr = JSON.parse(github(['pr', 'view', match[0], '--json',
+  const linked = await client.query(
+    `SELECT p.html_url, p.repo_owner, p.repo_name
+       FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
+      WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1`, [row.issue_id]);
+  const commentPr = linked.rows[0] ? null : await client.query(
+    `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`, [row.issue_id]);
+  const commentMatch = commentPr?.rows
+    .map(({ content }) => String(content || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i))
+    .find(Boolean);
+  // Coordination and parent issues without a linked PR close from their work product.
+  if (!linked.rows[0] && !commentMatch) return { kind: 'no_pr', toStage: 'Done' };
+  const issuePr = linked.rows[0];
+  const repo = issuePr
+    ? `${issuePr.repo_owner}/${issuePr.repo_name}`
+    : `${commentMatch[1]}/${commentMatch[2]}`;
+  const prUrl = issuePr?.html_url || commentMatch[0];
+  const pr = JSON.parse(githubCommand(['pr', 'view', prUrl, '--json',
     'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
   const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
       greenChecks(pr.statusCheckRollup)) {
-    github(['pr', 'merge', match[0], '--squash', '--admin']);
+    githubCommand(['pr', 'merge', prUrl, '--squash', '--admin']);
     return { ...route, toStage: 'Done', kind: 'merge_only_admin_merged', repo,
-      pr_url: match[0], pr_state: 'MERGED', boundSha: pr.headRefOid };
+      pr_url: prUrl, pr_state: 'MERGED', boundSha: pr.headRefOid };
   }
-  return { ...route, repo, pr_url: match[0], pr_state: pr.state, boundSha: pr.headRefOid };
+  return { ...route, repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
 }
 
 function uniqueFullSha(value) {
@@ -1768,6 +1776,59 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
   }
 }
 
+// Retry recorded successful work without creating another agent task.  A relay
+// denial is retried at most three times, then the durable outcome becomes human-owned.
+async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRelay,
+  logger = console, typedOutcomes = TYPED_OUTCOMES } = {}) {
+  if (!typedOutcomes) return [];
+  const client = await dbPool.connect();
+  try {
+    const result = await client.query(
+      `SELECT o.issue_id, o.stage AS to_stage, o.outcome, o.task_id,
+              t.result AS task_result, i.title AS issue_title, rsc.next_stage
+         FROM issue_stage_outcome o
+         JOIN issue i ON i.id = o.issue_id AND i.status = o.stage
+         JOIN agent_task_queue t ON t.id = o.task_id AND t.status = 'completed'
+         LEFT JOIN relay_stage_config rsc
+           ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
+        WHERE o.outcome IN ('ADVANCED', 'NO_OP') AND o.blocked_on IS DISTINCT FROM 'human'
+        ORDER BY o.outcome_at ASC LIMIT 100`);
+    const advanced = [];
+    for (const row of result.rows) {
+      const route = row.outcome === 'NO_OP' && row.to_stage === 'In Progress'
+        ? { kind: 'no_pr', toStage: 'Done' }
+        : await buildCompletionRoute(client, row);
+      const targetStage = route?.toStage || row.next_stage;
+      if (!targetStage) continue;
+      const response = await postRelay({ issue_id: row.issue_id, to_stage: targetStage,
+        agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+        evidence: completionEvidence(row, targetStage, route, { ok: false }),
+        ...(route ? { routing_classification: route } : {}) });
+      if (response.ok) {
+        advanced.push(row.issue_id);
+        logger.log(`${LOG_PREFIX} [typed-readvance] advanced issue=${row.issue_id} ${row.to_stage}->${targetStage}`);
+        continue;
+      }
+      const error = `status=${response.status}; error=${response.error || response.body || 'unknown'}`;
+      const denied = await client.query(
+        `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
+             jsonb_build_object('typed_readvance_denials',
+               COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) + 1,
+               'typed_readvance_error', $2::text)
+          WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)
+        RETURNING COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) AS denials`, [row.task_id, error]);
+      if (Number(denied.rows[0]?.denials || 0) >= 3) {
+        await client.query(`UPDATE issue_stage_outcome SET blocked_on = 'human'
+          WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
+      }
+      logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);
+    }
+    return advanced;
+  } finally {
+    client.release();
+  }
+}
+
 function startDaemon() {
   if (!MULTICA_DB || !RELAY_AGENT_SECRET || !WORKSPACE_ID) {
     console.error('[relay-advance-daemon] FATAL: env vars missing');
@@ -1782,17 +1843,19 @@ function startDaemon() {
   setInterval(processParkedDiagnoses, 30000);
   setInterval(reconcileQuotaPauses, 60000);
   setInterval(() => recordOutcomesPass().catch(err => console.error(`${LOG_PREFIX} stage-outcome error: ${err.message}`)), 30000);
+  setInterval(() => readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`)), 300000);
   advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
   runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
   cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
   reconcileQuotaPauses().catch(err => console.error(`${LOG_PREFIX} Error in quota-pause reconciliation: ${err.message}`));
+  readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`));
 }
 
 if (require.main === module) startDaemon();
 
-module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
+module.exports = { advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
-  runReconcileCycle, recordOutcomesPass };
+  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes };
