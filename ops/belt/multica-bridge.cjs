@@ -233,6 +233,9 @@ function validateRelayVerdict(payload) {
   if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
   if (!FAILURE_CLASSES.has(payload.failure_class)) return "invalid_failure_class";
   if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
+  if (["evidence", "tool", "access"].includes(payload.failure_class) && payload.qualifying) {
+    return "nonqualifying_failure_class";
+  }
   if (payload.model !== "gpt-5.6-sol" || payload.effort !== "low") return "invalid_qc_lane";
   if (typeof payload.idem_key !== "string" || !IDEM_KEY_RE.test(payload.idem_key)) return "invalid_idem_key";
   return null;

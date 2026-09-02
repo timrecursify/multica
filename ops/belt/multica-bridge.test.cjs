@@ -392,6 +392,16 @@ test('verdict validation accepts the sanctioned CLI checker field and rejects fo
   assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
+  for (const failureClass of ['evidence', 'tool', 'access']) {
+    assert.equal(
+      validateRelayVerdict({ ...validVerdict, verdict: 'FAIL', failure_class: failureClass, qualifying: true }),
+      'nonqualifying_failure_class'
+    );
+    assert.equal(
+      validateRelayVerdict({ ...validVerdict, verdict: 'FAIL', failure_class: failureClass, qualifying: false }),
+      null
+    );
+  }
 });
 
 test('routing rejections expose only bounded agent routing fields', () => {
@@ -457,6 +467,7 @@ test('verdict route never trusts a caller supplied checker identity', () => {
 test('verdict handler binds all evidence to the completed QC task and resists forgery', async () => {
   const attempts = new Map();
   const writes = [];
+  let queryCalls = 0;
   let task = {
     id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1',
     context: {}, result: qcResult()
@@ -464,6 +475,7 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   const client = {
     async connect() {}, async end() {},
     async query(sql, values = []) {
+      queryCalls += 1;
       if (/FROM qc_attempt/.test(sql)) return { rows: attempts.has(values[0]) ? [attempts.get(values[0])] : [] };
       if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
       if (/FROM agent_task_queue t/.test(sql)) return { rows: task ? [task] : [] };
@@ -486,6 +498,14 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
     let result = await call({ ...validVerdict, checker: 'forged-human-name' });
     assert.equal(result.status, 201);
     assert.equal(writes[0][2], 'qc-sol-low-1', 'checker_name must come from QC agent, not CLI checker');
+    for (const failureClass of ['evidence', 'tool', 'access']) {
+      const beforeQueries = queryCalls;
+      result = await call({ ...validVerdict, verdict: 'FAIL', failure_class: failureClass,
+        qualifying: true, idem_key: `qc-verdict-${failureClass}-qualifying` });
+      assert.equal(result.status, 400);
+      assert.equal(result.json.error, 'nonqualifying_failure_class');
+      assert.equal(queryCalls, beforeQueries, 'invalid verdict must be rejected before database access');
+    }
     result = await call({ ...validVerdict, idem_key: 'qc-verdict-wrong-md5', work_product_md5: 'a41d8cd98f00b204e9800998ecf8427e' });
     assert.equal(result.json.error, 'qc_task_work_product_mismatch');
     task = { ...task, result: qcResult({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false }) };
