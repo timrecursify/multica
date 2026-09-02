@@ -105,11 +105,60 @@ function testHumanReviewIsNotDispatchable() {
   assert.doesNotMatch(sweep, /Human Review/);
 }
 
+async function testCompletionAdmission() {
+  const calls = [];
+  const retries = new Map();
+  let issue = { id: 'closed', number: 11, workspace_id: 'gsp' };
+  const setup = (content, state, deployed = false) => worker.setTestDependencies({
+    pool: { query: async (sql, params) => {
+      if (sql.includes("FROM issue WHERE status")) return { rows: [issue] };
+      if (sql.includes('FROM comment')) return { rows: [{ content }] };
+      if (sql.includes('FROM qc_verdict')) return { rows: [{ verdict: 'PASS', work_product_md5: 'md5' }] };
+      if (sql.includes('relay_stage_config')) return { rows: [] };
+      if (sql.includes('cicd_deploy_wait_polls')) {
+        const count = (retries.get(params[0]) || 0) + 1;
+        retries.set(params[0], count);
+        return { rows: [{ count: String(count) }] };
+      }
+      return { rows: [] };
+    } }, relay: async (...args) => calls.push(args),
+    gh: () => JSON.stringify({ state, mergeable: 'MERGEABLE', headRefOid: 'head', createdAt: '2026-09-01T00:00:00Z', mergedAt: '2026-09-01T01:00:00Z', mergeCommit: { oid: 'merge' } }),
+    deployed: () => deployed,
+  });
+  setup('', 'MERGED');
+  await worker.sweep();
+  assert.equal(calls[0][1], 'Parked'); // no PR -> Parked
+  assert.deepEqual(calls[0].slice(0, 4), ['closed', 'Parked', null, 'no PR referenced']);
+  assert.deepEqual({ ...calls[0][4].cicd_worker, checked_at: 'timestamp' }, {
+    reason: 'no PR referenced', pr_state: null, pr_url: null, checked_at: 'timestamp'
+  });
+  calls.length = 0;
+  setup('https://github.com/timrecursify/sk-cli/pull/1', 'CLOSED');
+  await worker.sweep();
+  assert.equal(calls[0][1], 'Parked'); // CLOSED -> Parked
+  assert.deepEqual({ ...calls[0][4].cicd_worker, checked_at: 'timestamp' }, {
+    reason: 'timrecursify/sk-cli#1 closed without merge', pr_state: 'CLOSED',
+    pr_url: 'https://github.com/timrecursify/sk-cli/pull/1', checked_at: 'timestamp'
+  });
+  calls.length = 0; issue = { id: 'wait', number: 12, workspace_id: 'gsp' };
+  setup('https://github.com/timrecursify/sk-cli/pull/2', 'MERGED', false);
+  await worker.sweep();
+  assert.equal(calls.length, 0); // merged without evidence waits
+  setup('https://github.com/timrecursify/sk-cli/pull/2', 'MERGED', true);
+  await worker.sweep();
+  assert.deepStrictEqual(calls[0].slice(0, 3), ['wait', 'Done', 'md5']);
+  calls.length = 0; issue = { id: 'ppp', number: 13, workspace_id: 'prod' };
+  setup('https://github.com/timrecursify/ppp/pull/3', 'MERGED', false);
+  await worker.sweep(); await worker.sweep(); await worker.sweep();
+  assert.equal(calls.at(-1)[1], 'Parked'); // retry ceiling -> Parked
+}
+
 (async () => {
   await testFinishedRoutes();
   testConsecutiveFailures();
   testAbsentCi();
   testHumanReviewIsNotDispatchable();
+  await testCompletionAdmission();
   console.log('multica-cicd-worker tests passed');
 })().catch(error => {
   console.error(error);
