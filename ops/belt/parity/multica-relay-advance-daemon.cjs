@@ -21,6 +21,7 @@ const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
 const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
+const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -29,7 +30,6 @@ const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 const LOG_PREFIX = '[relay-advance-daemon]';
 const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
-const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
 let advanceTickInFlight = false;
 
@@ -75,22 +75,6 @@ function strictQcAttempt(row, verdictMd5) {
     : { ok: false, reason: 'qc_attempt_mismatch' };
 }
 
-function legacyQcVerdict(row, verdictMd5, requireVerdictWindow = true) {
-  const taskSha = uniqueFullSha(JSON.stringify(row.task_result || ''));
-  const verdictSha = uniqueFullSha(row.qc_verdict_notes);
-  const started = Date.parse(row.task_started_at || '');
-  const completed = Date.parse(row.task_completed_at || '');
-  const recorded = Date.parse(row.qc_verdict_created_at || '');
-  const inWindow = Number.isFinite(started) && Number.isFinite(completed) &&
-    Number.isFinite(recorded) && recorded >= started && recorded <= completed + 30000;
-  const ok = row.qc_verdict_checker_id === row.task_agent_id &&
-    row.task_agent_model === 'gpt-5.6-sol' && row.task_agent_effort === 'low' &&
-    (!requireVerdictWindow || inWindow) &&
-    taskSha && taskSha === verdictSha && MD5_RE.test(verdictMd5);
-  return ok ? { ok: true, boundSha: taskSha, evidenceTaskId: row.task_id }
-    : { ok: false, reason: 'legacy_qc_evidence_mismatch' };
-}
-
 function qcCompletionAdvance(row) {
   if (row.to_stage !== 'In Review' || row.next_stage !== 'CI/CD & Deploy') {
     return { ok: false, reason: 'manual_gated_stage' };
@@ -100,21 +84,9 @@ function qcCompletionAdvance(row) {
   }
   const md5 = String(row.qc_verdict_work_product_md5 || '').toLowerCase();
   if (!MD5_RE.test(md5)) return { ok: false, reason: 'qc_work_product_md5_required' };
-  const strict = strictQcAttempt(row, md5);
-  if (strict) {
-    return strict.ok ? { ok: true, workProductMd5: md5, boundSha: strict.boundSha,
-      evidenceTaskId: strict.evidenceTaskId } : strict;
-  }
-  const candidates = Array.isArray(row.qc_evidence_tasks) && row.qc_evidence_tasks.length > 0
-    ? row.qc_evidence_tasks.map((task) => ({ ...row, ...task })) : [row];
-  for (const candidate of candidates) {
-    const evidence = legacyQcVerdict(candidate, md5, candidates.length === 1 && candidate === row);
-    if (evidence.ok) {
-      return { ok: true, workProductMd5: md5, boundSha: evidence.boundSha,
-        evidenceTaskId: evidence.evidenceTaskId };
-    }
-  }
-  return { ok: false, reason: 'legacy_qc_evidence_mismatch' };
+  const strict = strictEvidenceFromRow(row, md5);
+  return strict.ok ? { ok: true, workProductMd5: md5, boundSha: strict.boundSha,
+    evidenceTaskId: strict.evidenceTaskId } : strict;
 }
 
 function requeueTriggerSummary(row, coldStart) {

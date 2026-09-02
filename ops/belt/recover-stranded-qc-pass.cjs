@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const { currentStrictPass } = require('./qc-strict-evidence.cjs');
 
 function parseArgs(args) {
   let mode = 'dry-run';
@@ -35,6 +36,16 @@ const CANDIDATE_SQL = `SELECT DISTINCT ON (i.id)
    AND rsc.next_stage = 'CI/CD & Deploy'
    AND verdict.verdict = 'PASS'
    AND verdict.work_product_md5 ~* '^[0-9a-f]{32}$'
+   AND EXISTS (
+     SELECT 1 FROM qc_attempt qa
+      JOIN agent_task_queue t ON t.issue_id=qa.issue_id
+       AND t.id::text=substring(qa.notes FROM 'relay_task_id=([0-9a-f-]{36})') AND t.status='completed'
+      JOIN agent a ON a.id=t.agent_id
+     WHERE qa.issue_id=i.id AND qa.work_product_md5=verdict.work_product_md5
+       AND qa.verdict='PASS' AND qa.qualifying=true AND qa.bound_sha ~* '^[0-9a-f]{40}$'
+       AND lower(qa.bound_sha)=lower(qa.observed_head) AND t.agent_id=verdict.checker_id
+       AND a.model='gpt-5.6-sol' AND a.thinking_level='low'
+   )
    AND NOT EXISTS (
      SELECT 1 FROM relay_run_log pending
       WHERE pending.issue_id = i.id AND pending.status = 'pending'
@@ -59,12 +70,17 @@ async function recover(client, { mode }) {
   await client.query('BEGIN');
   try {
     const candidates = await client.query(CANDIDATE_SQL);
+    // Keep recovery on the same exact-one-attempt contract as deploy/Done.
+    const strictCandidates = [];
+    for (const candidate of candidates.rows) {
+      if (await currentStrictPass(client, candidate.issue_id)) strictCandidates.push(candidate);
+    }
     if (mode === 'dry-run') {
       await client.query('ROLLBACK');
-      return { mode, candidates: candidates.rows, reopened: [] };
+      return { mode, candidates: strictCandidates, reopened: [] };
     }
     const reopened = [];
-    for (const row of candidates.rows) {
+    for (const row of strictCandidates) {
       const result = await client.query(
         `UPDATE relay_run_log
             SET status = 'pending'
@@ -74,7 +90,7 @@ async function recover(client, { mode }) {
       reopened.push(...result.rows);
     }
     await client.query('COMMIT');
-    return { mode, candidates: candidates.rows, reopened };
+    return { mode, candidates: strictCandidates, reopened };
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
     throw err;
