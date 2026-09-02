@@ -37,7 +37,7 @@ hermetic = true
 
 [[profile]]
 name = "parked-diagnosis-node-tests"
-command_argv = ["/usr/bin/node", "--test", "ops/belt/backfill-parked-diagnosis.test.cjs", "ops/belt/parked-diagnosis.test.cjs"]
+command_argv = ["/usr/bin/node", "--test", "ops/belt/backfill-parked-diagnosis.test.cjs", "ops/belt/parked-diagnosis.test.cjs", "ops/belt/parked-runtime-verification.test.cjs"]
 working_directory = "."
 env_allowlist = []
 timeout = 60
