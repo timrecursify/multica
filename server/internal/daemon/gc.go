@@ -259,6 +259,10 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 	}
 	switch action {
 	case gcActionClean:
+		if !d.reapCheckoutIsSafe(taskDir) {
+			stats.skipped++
+			return 0
+		}
 		bytes := dirSize(taskDir)
 		d.cleanTaskDir(taskDir)
 		stats.cleaned++
@@ -282,6 +286,53 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		stats.skipped++
 	}
 	return 0
+}
+
+// reapCheckoutIsSafe retains a candidate for human review unless its checkout
+// is clean, fully pushed to its own upstream branch, and unused by any process.
+func (d *Daemon) reapCheckoutIsSafe(taskDir string) bool {
+	workDir := filepath.Join(taskDir, "workdir")
+	if processUsesPath(taskDir) || !gitWorktreeIsClean(workDir) {
+		d.logger.Warn("gc: quarantine", "dir", taskDir, "reason", "busy or unpushed checkout")
+		return false
+	}
+	return true
+}
+
+func processUsesPath(root string) bool {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return true
+	}
+	root = filepath.Clean(root) + string(os.PathSeparator)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		links := []string{filepath.Join("/proc", entry.Name(), "cwd")}
+		fds, _ := filepath.Glob(filepath.Join("/proc", entry.Name(), "fd", "*"))
+		links = append(links, fds...)
+		for _, link := range links {
+			target, linkErr := os.Readlink(link)
+			if linkErr == nil && strings.HasPrefix(filepath.Clean(target)+string(os.PathSeparator), root) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func gitWorktreeIsClean(workDir string) bool {
+	status, err := runGitGCCommand(workDir, "status", "--porcelain")
+	if err != nil || status != "" {
+		return false
+	}
+	branch, err := runGitGCCommand(workDir, "branch", "--show-current")
+	if err != nil || branch == "" {
+		return false
+	}
+	out, err := runGitGCCommand(workDir, "rev-list", "origin/"+branch+"..HEAD")
+	return err == nil && strings.TrimSpace(out) == ""
 }
 
 func recordArtifactCleanup(stats *gcStats, removed int, bytes int64, perPattern map[string]int) {

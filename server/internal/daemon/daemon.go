@@ -5151,7 +5151,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 // internal task with no IDs at all). The caller skips writing a meta file
 // in that case so the directory falls back to mtime-based orphan cleanup.
 func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
-	meta := execenv.GCMeta{WorkspaceID: task.WorkspaceID}
+	meta := execenv.GCMeta{WorkspaceID: task.WorkspaceID, TaskID: task.ID}
 	switch {
 	case task.ChatSessionID != "":
 		meta.Kind = execenv.GCKindChat
@@ -5168,7 +5168,6 @@ func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
 		// task ID instead and let the GC loop ask the server for terminal
 		// state via the task gc-check endpoint.
 		meta.Kind = execenv.GCKindQuickCreate
-		meta.TaskID = task.ID
 	default:
 		return execenv.GCMeta{}, false
 	}
