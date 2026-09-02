@@ -65,6 +65,20 @@ migration-provenance table lets you verify the import is the running bridge.
 bash ops/gsp-belt/scripts/belt-guard-check.sh --checkout <reviewed-checkout>
 ```
 
+## Duplicate PR cleanup
+
+Inventory the known duplicate clusters without mutation:
+
+```bash
+node ops/gsp-belt/scripts/retire-duplicate-prs.cjs
+```
+
+Apply is deliberately repository-owner-only: it requires `--confirm-owner` and
+one `--canonical=<PR>` for each cluster. It refuses a closed, conflicting, or
+non-admitted canonical, and closes the other PRs only with a supersession note.
+Run `ops/gsp-belt/sql/20260902-qc-verdict-admission.sql` before deployment so
+the worker and cleanup inventory can read SHA-bound Sol-low QC fields.
+
 This fails CI whenever a manifest source is untracked/missing, a deployed source
 differs from the selected ref (add `--release`), the ecosystem references an
 unmanaged home-directory script, a secret-shaped value is embedded in tracked

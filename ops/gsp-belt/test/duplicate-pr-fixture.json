@@ -1,0 +1,4 @@
+{
+  "44": {"number":44,"state":"OPEN","mergeable":"MERGEABLE","head_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ci":"green","qc":{"verdict":"PASS","qualifying":true,"model":"gpt-5.6-sol","effort":"low","bound_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},
+  "63": {"number":63,"state":"OPEN","mergeable":"MERGEABLE","head_sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","ci":"green","qc":null}
+}

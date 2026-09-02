@@ -11,14 +11,18 @@ const http = require('http');
 const { execFileSync } = require('child_process');
 // pg module path externalized via GSP_BELT_PG_MODULE; default matches the
 // current install so the primitive behavior is preserved.
-const { Pool } = require(process.env.GSP_BELT_PG_MODULE || '/home/newadmin/node_modules/pg');
+let pool;
+let relayToken;
 
-// Operator secret file externalized via env (see ops/gsp-belt README); the
-// default matches the current home-directory install so behavior is unchanged.
-const ENV = fs.readFileSync(process.env.GSP_BELT_SECRETS_ENV_FILE
-  || '/home/newadmin/.secrets/multica-remote/remote-bridge.env', 'utf8');
-const RELAY_TOKEN = ENV.split('\n').find(l => l.startsWith('RELAY_AGENT_SECRET=')).split('=')[1];
-const pool = new Pool({ connectionString: ENV.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });
+function initializeRuntime() {
+  const { Pool } = require(process.env.GSP_BELT_PG_MODULE || '/home/newadmin/node_modules/pg');
+  // Operator secret file externalized via env (see ops/gsp-belt README); the
+  // default matches the current home-directory install so behavior is unchanged.
+  const env = fs.readFileSync(process.env.GSP_BELT_SECRETS_ENV_FILE
+    || '/home/newadmin/.secrets/multica-remote/remote-bridge.env', 'utf8');
+  relayToken = env.split('\n').find(l => l.startsWith('RELAY_AGENT_SECRET=')).split('=')[1];
+  pool = new Pool({ connectionString: env.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });
+}
 const BOT = 'b8ecc1c4-d58c-4233-a669-7ede7060531c';
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 // Merging is the one irreversible action here, so it is opt-in and defaults on
@@ -33,7 +37,7 @@ function gh(args) {
 
 function relay(issueId, toStage) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: RELAY_TOKEN });
+    const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: relayToken });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);
@@ -102,6 +106,24 @@ function ciState(repo, sha) {
   } catch (e) { return 'unknown'; }
 }
 
+// Admission is intentionally sourced only from the structured QC record. A
+// comment may describe a verdict, but cannot safely bind model, effort and SHA.
+async function qualifyingPass(issueId, headSha) {
+  const result = await pool.query(
+    `SELECT verdict, bound_sha, qualifying, model, effort
+       FROM qc_verdict WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1`, [issueId]);
+  const verdict = result.rows[0];
+  if (!verdict) return { ok: false, reason: 'QC verdict missing' };
+  if (verdict.verdict !== 'PASS') return { ok: false, reason: `QC verdict=${verdict.verdict}` };
+  if (verdict.qualifying !== true || verdict.model !== 'gpt-5.6-sol' || verdict.effort !== 'low') {
+    return { ok: false, reason: 'QC PASS is not qualifying Sol-low' };
+  }
+  if (!verdict.bound_sha || String(verdict.bound_sha).toLowerCase() !== String(headSha).toLowerCase()) {
+    return { ok: false, reason: `QC PASS bound_sha does not match head ${headSha.slice(0, 12)}` };
+  }
+  return { ok: true };
+}
+
 async function sweep() {
   const { rows } = await pool.query(
     `SELECT id, number, title FROM issue WHERE status='CI/CD & Deploy' ORDER BY number`);
@@ -152,6 +174,8 @@ async function sweep() {
       if (ci !== 'green') { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}`); continue; }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
       if (info.mergeable === 'CONFLICTING') { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} conflicting`); continue; }
+      const qc = await qualifyingPass(issue.id, info.headRefOid);
+      if (!qc.ok) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ${qc.reason}`); continue; }
 
       try {
         gh(['pr', 'merge', pr.num, '-R', pr.repo, '--squash', '--delete-branch']);
@@ -167,10 +191,21 @@ async function sweep() {
   }
 }
 
-(async () => {
+async function main() {
+  initializeRuntime();
   log(`[cicd-worker] started; poll=${POLL_MS}ms merge=${MERGE_ENABLED}`);
   for (;;) {
     await sweep().catch(e => log('[sweep] error:', e.message));
     await new Promise(r => setTimeout(r, POLL_MS));
   }
-})();
+}
+
+if (require.main === module) main();
+
+function setTestDependencies(dependencies) {
+  if (dependencies.pool) pool = dependencies.pool;
+  if (dependencies.gh) gh = dependencies.gh;
+  if (dependencies.relay) relay = dependencies.relay;
+}
+
+module.exports = { ciState, findAllPRs, qualifyingPass, setTestDependencies, sweep };
