@@ -1271,6 +1271,27 @@ async function relayAdvance(req, res, body) {
         res.end(JSON.stringify({ error: "merged_pr_evidence_operator_required" }));
         return;
       }
+      // The first evidence transition changes the source stage, so replay
+      // recognition must happen before the source-stage guard.  Match the
+      // evidence captured in the completed no-dispatch audit; a different SHA
+      // is deliberately not treated as a replay.
+      const suppliedSha = typeof body.merged_pr_evidence === 'object'
+        ? body.merged_pr_evidence.sha : body.sha;
+      if (issue.status === 'CI/CD & Deploy' && to_stage === 'CI/CD & Deploy' &&
+          SHA_RE.test(String(suppliedSha || ''))) {
+        const applied = await client.query(
+          `SELECT id FROM relay_run_log
+            WHERE issue_id = $1 AND to_stage = 'CI/CD & Deploy' AND status = 'completed'
+              AND parked_audit->'merged_pr_evidence'->>'verified_sha' ILIKE $2
+            ORDER BY created_at DESC, id DESC LIMIT 1`, [issue.id, suppliedSha]);
+        if (applied.rows[0]?.id) {
+          await client.query("COMMIT");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: issue.status },
+            transition: 'already_applied', task_id: null, relay_log_id: applied.rows[0].id }));
+          return;
+        }
+      }
       if (!['Spec', 'Queue', 'In Progress'].includes(issue.status) || to_stage !== 'CI/CD & Deploy') {
         await client.query("ROLLBACK");
         res.writeHead(409, { "Content-Type": "application/json" });
