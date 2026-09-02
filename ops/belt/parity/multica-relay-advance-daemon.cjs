@@ -108,7 +108,7 @@ const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10
 // multica-qc-worker-2, the spec writer) -- the belt knew who owned them and
 // still dispatched nobody. Widen further only with the same kind of evidence.
 const NON_REQUEUE_STAGES = new Set(['Human Review', 'Done', 'Cancelled', 'Archived']);
-const configuredRequeueStages = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec')
+const configuredRequeueStages = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec,In Review')
   .split(',').map(s => s.trim()).filter(Boolean);
 const excludedRequeueStages = configuredRequeueStages.filter((stage) => NON_REQUEUE_STAGES.has(stage));
 const REQUEUE_STAGES = configuredRequeueStages.filter((stage) => !NON_REQUEUE_STAGES.has(stage));
@@ -859,6 +859,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
               t.id AS dead_task_id, t.status AS dead_task_status,
               t.attempt, t.max_attempts, t.failure_reason,
               t.result AS dead_task_result, t.error AS dead_task_error,
+              closed_log.id AS closed_relay_log_id,
               r.from_stage, r.agent_id, r.runtime_mode, r.instructions,
               r.model, r.thinking_level, r.max_concurrent_tasks, r.runtime_config, r.archived_at, r.agent_name,
               COALESCE(
@@ -879,6 +880,10 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
            SELECT * FROM agent_task_queue
             WHERE issue_id = i.id ORDER BY created_at DESC LIMIT 1
          ) t ON true
+         LEFT JOIN LATERAL (
+           SELECT id, status, parked_audit FROM relay_run_log
+            WHERE task_id = t.id ORDER BY created_at DESC, id DESC LIMIT 1
+         ) closed_log ON true
          JOIN LATERAL (
            SELECT rsc.stage_name AS from_stage, rsc.agent_id,
                   COALESCE(a.runtime_mode, 'local') AS runtime_mode,
@@ -895,7 +900,15 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
           -- join, so such a ticket produced no row and was invisible to the
           -- requeue forever -- no agent, no error, no alert. It is not a retry,
           -- so the attempt/max_attempts test cannot apply to it.
-          AND (t.id IS NULL OR t.status IN ('failed', 'cancelled'))
+          AND (
+            t.id IS NULL
+            OR t.status IN ('failed', 'cancelled')
+            OR (
+              t.status = 'completed'
+              AND closed_log.status = 'failed'
+              AND closed_log.parked_audit->>'requeue_task_id' IS NULL
+            )
+          )
           AND NOT EXISTS (
             SELECT 1 FROM agent_task_queue q
              WHERE q.issue_id = i.id AND q.status IN
@@ -1122,6 +1135,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
           from_stage: row.from_stage,
           to_stage: row.stage,
           requeue_of_task: row.dead_task_id,
+          requeue_of_relay_log: row.closed_relay_log_id,
           dead_task_reason: row.failure_reason
         });
         const task = await client.query(
@@ -1155,6 +1169,24 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
           await client.query('ROLLBACK');
           console.log(`${LOG_PREFIX} [requeue] SKIPPED #${row.number}: insert produced no row (conflict or trigger); still stranded in '${row.stage}'`);
           continue;
+        }
+        if (row.closed_relay_log_id) {
+          const recorded = await client.query(
+            `UPDATE relay_run_log
+                SET parked_audit = jsonb_set(
+                  COALESCE(parked_audit, '{}'::jsonb),
+                  '{requeue_task_id}', to_jsonb($2::text))
+              WHERE id = $1
+                AND status = 'failed'
+                AND parked_audit->>'requeue_task_id' IS NULL
+              RETURNING id`,
+            [row.closed_relay_log_id, task.rows[0].id]
+          );
+          if (recorded.rows.length === 0) {
+            await client.query('ROLLBACK');
+            console.log(`${LOG_PREFIX} [requeue] SKIPPED #${row.number}: closed relay row already requeued`);
+            continue;
+          }
         }
         await client.query(
           `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)

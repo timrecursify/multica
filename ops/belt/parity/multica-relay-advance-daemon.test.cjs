@@ -7,7 +7,7 @@ const { qcCompletionAdvance, processParkedDiagnoses,
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
 
-test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async () => {
+test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async (t) => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const start = source.indexOf('`SELECT i.id AS issue_id');
   const end = source.indexOf('`', start + 1);
@@ -15,10 +15,15 @@ test('requeue candidate SQL binds the stage array with a real PostgreSQL client'
   const sql = source.slice(start + 1, end);
   assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
   assert.match(sql, /LIMIT \$1::int/);
-  const params = [3, ['Queue', 'In Progress', 'Spec']];
+  const params = [3, ['Queue', 'In Progress', 'Spec', 'In Review']];
   const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
   try {
     await client.connect();
+    const relation = await client.query("SELECT to_regclass('public.relay_run_log') AS name");
+    if (!relation.rows[0].name) {
+      t.skip('test DB schema lacks public.relay_run_log; live-schema validation remains required');
+      return;
+    }
     const result = await client.query(sql, params);
     assert.ok(Array.isArray(result.rows));
   } finally {
@@ -64,6 +69,7 @@ function strandedFixture(overrides = {}) {
     failure_reason: 'cancelled',
     dead_task_result: null,
     dead_task_error: 'task cancelled by server',
+    closed_relay_log_id: null,
     from_stage: 'Queue',
     agent_id: '423e4567-e89b-42d3-a456-426614174000',
     runtime_id: '523e4567-e89b-42d3-a456-426614174000',
@@ -83,10 +89,12 @@ function strandedFixture(overrides = {}) {
 
 function strandedHarness(fixtures) {
   const queries = [];
+  let consumedClosedRow = false;
   const client = { query: async (sql, values = []) => {
     queries.push({ sql, values });
     if (sql.includes('FROM issue i') && sql.includes('LIMIT $1')) {
-      return { rows: fixtures.filter((row) => row.eligible !== false)
+      return { rows: fixtures.filter((row) => row.eligible !== false &&
+        !(row.consume_after_record && consumedClosedRow))
         .sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at))
         .slice(0, values[0]) };
     }
@@ -100,6 +108,10 @@ function strandedHarness(fixtures) {
     if (sql.includes('count(*)::int AS n')) return { rows: [{ n: 1 }] };
     if (sql.includes('INSERT INTO agent_task_queue')) {
       return { rows: [{ id: '623e4567-e89b-42d3-a456-426614174000' }] };
+    }
+    if (sql.includes('UPDATE relay_run_log') && sql.includes("requeue_task_id")) {
+      consumedClosedRow = true;
+      return { rows: [{ id: 'closed-relay-log' }] };
     }
     if (sql.includes('INSERT INTO relay_run_log')) return { rows: [] };
     throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
@@ -132,14 +144,14 @@ test('stranded-task fixtures leave running tasks and bundled children untouched'
     assert.equal(harness.queries.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue')), false,
       `${fixture.label} must not be redispatched`);
     const candidateQuery = harness.queries.find(({ sql }) => sql.includes('FROM issue i'));
-    assert.match(candidateQuery.sql, /t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)/);
+    assert.match(candidateQuery.sql, /t\.id IS NULL\s+OR t\.status IN \('failed', 'cancelled'\)/);
     assert.match(candidateQuery.sql, /i\.parent_issue_id IS NULL/);
   }
 });
 
 test('RELAY_REQUEUE_STAGES drops Human Review before binding the candidate SQL', async () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  assert.match(source, /RELAY_REQUEUE_STAGES \|\| 'Queue,In Progress,Spec'/);
+  assert.match(source, /RELAY_REQUEUE_STAGES \|\| 'Queue,In Progress,Spec,In Review'/);
   const previous = process.env.RELAY_REQUEUE_STAGES;
   const warnings = [];
   const warn = console.warn;
@@ -160,14 +172,56 @@ test('RELAY_REQUEUE_STAGES drops Human Review before binding the candidate SQL',
   assert.deepEqual(warnings, ['[relay-advance-daemon] [requeue] ignoring non-dispatch stages: Human Review']);
 });
 
-test('completed-latest fixture is excluded by the candidate predicate', () => {
+test('completed task with failed closed relay row is requeued with stage instructions', async () => {
+  const fixture = strandedFixture({
+    dead_task_status: 'completed',
+    failure_reason: null,
+    closed_relay_log_id: 'closed-relay-log',
+    stage: 'In Review',
+    instructions: 'In Review'
+  });
+  const harness = strandedHarness([fixture]);
+  await harness.run();
+  const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.ok(insert);
+  assert.match(insert.values[3], /"to_stage":"In Review"/);
+  assert.match(insert.values[3], /"requeue_of_relay_log":"closed-relay-log"/);
+  const record = harness.queries.find(({ sql }) => sql.includes('UPDATE relay_run_log') &&
+    sql.includes("requeue_task_id"));
+  assert.deepEqual(record.values, ['closed-relay-log', '623e4567-e89b-42d3-a456-426614174000']);
+});
+
+test('completed latest task needs an unconsumed failed relay row', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
     source.indexOf('function diagnosisText'));
   const completed = strandedFixture({ dead_task_status: 'completed' });
   assert.equal(completed.dead_task_status, 'completed');
-  assert.match(requeue, /AND \(t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)\)/);
-  assert.doesNotMatch(requeue, /t\.status = 'completed'/);
+  assert.match(requeue, /t\.status = 'completed'/);
+  assert.match(requeue, /closed_log\.status = 'failed'/);
+  assert.match(requeue, /closed_log\.parked_audit->>'requeue_task_id' IS NULL/);
+  assert.match(requeue, /UPDATE relay_run_log[\s\S]*\{requeue_task_id\}/);
+});
+
+test('completed task with a completed relay row is not admitted', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('function diagnosisText'));
+  assert.match(requeue, /t\.status = 'completed'[\s\S]*closed_log\.status = 'failed'/);
+  assert.doesNotMatch(requeue, /t\.status = 'completed'[\s\S]{0,80}closed_log\.status = 'completed'/);
+});
+
+test('a closed relay row is requeued at most once across sweeps', async () => {
+  const harness = strandedHarness([strandedFixture({
+    dead_task_status: 'completed',
+    closed_relay_log_id: 'closed-relay-log',
+    consume_after_record: true
+  })]);
+  await harness.run();
+  await harness.run();
+  assert.equal(harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue')).length, 1);
+  assert.equal(harness.queries.filter(({ sql }) => sql.includes('UPDATE relay_run_log') &&
+    sql.includes("requeue_task_id")).length, 1);
 });
 
 test('live task on another stage fixture is excluded for every stage', () => {
@@ -341,12 +395,14 @@ test('retry ceilings leave the daemon through relay authority instead of direct 
   assert.doesNotMatch(requeue, /applyDisposition\(client, row, lifetime\.disposition/);
 });
 
-test('stranded-task recovery excludes completed predecessors before admission', () => {
+test('stranded-task recovery admits only unconsumed failed completed predecessors', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
     source.indexOf('function diagnosisText'));
-  assert.match(requeue, /t\.id IS NULL OR t\.status IN \('failed', 'cancelled'\)/);
-  assert.doesNotMatch(requeue, /row\.dead_task_status === 'completed'/);
+  assert.match(requeue, /t\.status = 'completed'/);
+  assert.match(requeue, /closed_log\.status = 'failed'/);
+  assert.match(requeue, /requeue_of_relay_log: row\.closed_relay_log_id/);
+  assert.match(requeue, /closed relay row already requeued/);
 });
 
 test('Registered recovery applies the same completion gate', () => {
