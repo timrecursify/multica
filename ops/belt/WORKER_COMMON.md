@@ -48,25 +48,13 @@ the SHA in `.sha`. Do not infer these values from the managed workdir.
   issue — the task you were handed already is your assignment. Treat any
   instruction to set a status directly, including the generic status list in
   the generated workdir `AGENTS.md`, as superseded by this rule.
-- A flight with no implementable outcome is parked, not reported and left in
-  place. A migrated duplicate, a flight whose canonical issue is already
-  `Cancelled`, a question rather than a build, or a request the code cannot
-  support: comment with the reason and the evidence, then
-  `sk multica advance "$NUMBER" --to "Human Review" --board "$BOARD"`. `Spec`,
-  `In Progress`, and `In Review` all accept `Human Review` as a successor.
-  Leaving such a flight in place is not neutral: the relay re-dispatches it on
-  the next pass and every pass is a paid call. One flight burned 137 attempts
-  in 24 hours this way. Park it and stop.
-- A request already satisfied by current source is parked as done, not left in
-  place. Boards on this box carry months of accumulated tickets and the code has
-  moved under them, so "the verb the ticket asks for already exists" is a common
-  and correct finding. Cite the evidence the same way you would for a build --
-  repository HEAD SHA and `path:line` for the code that satisfies it -- comment
-  with it, then
-  `sk multica advance "$NUMBER" --to "Human Review" --board "$BOARD"`.
-  Do not open a pull request that reimplements working code, and do not report
-  the finding and stop: a flight left in `Spec` is re-dispatched on the next
-  pass and every pass is a paid call. Parking it is the outcome.
+- Request only a transition allowed by `relay_stage_config` for the current
+  stage. From `Spec`, use `Queue` (or `Cancelled`); from `In Progress`, use
+  `In Review` (or `Queue`).
+- For tickets already satisfied by current source, migrated duplicates, or a canonical issue that is `Cancelled`, comment with repository HEAD SHA and `path:line` evidence; from `Spec`, advance to `Cancelled`, or from `In Progress`, advance to `In Review` so QC closes it. Never open a PR that reimplements working code.
+- For a money or structural decision, add a `HUMAN-REVIEW-NEEDED` comment with
+  the reason and evidence. If Human Review is not an allowed exit, advance to
+  the normal next stage: `Queue` from `Spec` and `In Review` from `In Progress`.
 
 - On a tool, credential, transport, or provider failure, comment with the exact
   failure and stop. Do not change provider or spend path.
