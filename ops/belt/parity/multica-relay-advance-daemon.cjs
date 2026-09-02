@@ -18,7 +18,7 @@ const {
 const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
   namedBlocker, isConcreteRuntimeEvidence, verifyRuntimeEvidence, currentPassWorkProductMD5,
   diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
-const { completionAdmission } = require('../relay-completion-admission.cjs');
+const { deploymentCompletionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
@@ -762,7 +762,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
           logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
           continue;
         }
-        const completion = completionAdmission(row.task_result ??
+        const completion = deploymentCompletionAdmission(row.task_status, row.task_result ??
           (row.task_error ? { error: row.task_error } : null));
         if (!completion.ok) {
           // Process exit 0 is not a work-product guarantee. A completed task

@@ -2,7 +2,12 @@
 
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { completionAdmission } = require('./relay-completion-admission.cjs');
+const { completionAdmission, deploymentCompletionAdmission } = require('./relay-completion-admission.cjs');
+
+test('deployment admission rejects cancelled and null-result tasks', () => {
+  assert.equal(deploymentCompletionAdmission('cancelled', null).ok, false);
+  assert.equal(deploymentCompletionAdmission('completed', null).reason, 'missing_result');
+});
 
 test('admits a completed work-product result', () => {
   assert.deepEqual(completionAdmission({
