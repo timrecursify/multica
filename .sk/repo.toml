@@ -27,6 +27,15 @@ timeout = 60
 hermetic = true
 
 [[profile]]
+name = "backend"
+command_argv = ["/usr/bin/bash", ".sk/scripts/check-backend.sh"]
+working_directory = "."
+# The runner supplies fixed loopback service values; caller environment is excluded.
+env_allowlist = []
+timeout = 600
+hermetic = true
+
+[[profile]]
 name = "parked-diagnosis-node-tests"
 command_argv = ["/usr/bin/node", "--test", "ops/belt/backfill-parked-diagnosis.test.cjs", "ops/belt/parked-diagnosis.test.cjs"]
 working_directory = "."
