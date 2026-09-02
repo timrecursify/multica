@@ -193,6 +193,84 @@ function qcCompletionAdvance(row) {
     evidenceTaskId: strict.evidenceTaskId } : strict;
 }
 
+function completedTaskEvidenceSql({ taskAlias, issueAlias }) {
+  return {
+    columns: `${taskAlias}.status AS task_status,
+             ${taskAlias}.result AS task_result, ${taskAlias}.error AS task_error,
+             ${taskAlias}.agent_id AS task_agent_id, ${taskAlias}.started_at AS task_started_at,
+             ${taskAlias}.completed_at AS task_completed_at,
+             task_agent.model AS task_agent_model,
+             task_agent.thinking_level AS task_agent_effort,
+             verdict.checker_id AS qc_verdict_checker_id,
+             verdict.verdict AS qc_verdict,
+             verdict.work_product_md5 AS qc_verdict_work_product_md5,
+             verdict.notes AS qc_verdict_notes,
+             verdict.created_at AS qc_verdict_created_at,
+             attempt.verdict AS qc_attempt_verdict,
+             attempt.work_product_md5 AS qc_attempt_work_product_md5,
+             attempt.bound_sha AS qc_attempt_bound_sha,
+             attempt.observed_head AS qc_attempt_observed_sha,
+             attempt.qualifying AS qc_attempt_qualifying,
+             attempt.evidence_task_id AS qc_attempt_evidence_task_id,
+             attempt.evidence_task_status AS qc_attempt_evidence_task_status,
+             attempt.evidence_agent_id AS qc_attempt_evidence_agent_id,
+             attempt.evidence_agent_model AS qc_attempt_evidence_agent_model,
+             attempt.evidence_agent_effort AS qc_attempt_evidence_agent_effort,
+             evidence.tasks AS qc_evidence_tasks,
+             ${issueAlias}.workspace_id, ${issueAlias}.priority, ${issueAlias}.title AS issue_title`,
+    joins: `LEFT JOIN agent task_agent ON task_agent.id = ${taskAlias}.agent_id
+      LEFT JOIN LATERAL (
+        SELECT checker_id, verdict, work_product_md5, notes, created_at
+          FROM qc_verdict WHERE issue_id = ${taskAlias}.issue_id
+         ORDER BY created_at DESC LIMIT 1
+      ) verdict ON true
+      LEFT JOIN LATERAL (
+        SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
+               qa.qualifying,
+               evidence_task.id AS evidence_task_id,
+               evidence_task.status AS evidence_task_status,
+               evidence_task.agent_id AS evidence_agent_id,
+               evidence_agent.model AS evidence_agent_model,
+               evidence_agent.thinking_level AS evidence_agent_effort
+          FROM qc_attempt qa
+          INNER JOIN agent_task_queue evidence_task
+                  ON evidence_task.issue_id = qa.issue_id
+                 AND evidence_task.id::text = substring(
+                       qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+          INNER JOIN agent evidence_agent
+                  ON evidence_agent.id = evidence_task.agent_id
+                 AND evidence_agent.workspace_id = ${issueAlias}.workspace_id
+         WHERE qa.issue_id = ${taskAlias}.issue_id
+           AND evidence_task.agent_id = verdict.checker_id
+           AND qa.work_product_md5 = verdict.work_product_md5
+         ORDER BY qa.created_at DESC LIMIT 1
+      ) attempt ON true
+      LEFT JOIN LATERAL (
+        SELECT jsonb_agg(jsonb_build_object(
+                 'task_id', evidence_task.id,
+                 'task_status', evidence_task.status,
+                 'task_result', evidence_task.result,
+                 'task_agent_id', evidence_task.agent_id,
+                 'task_agent_model', evidence_agent.model,
+                 'task_agent_effort', evidence_agent.thinking_level,
+                 'task_started_at', evidence_task.started_at,
+                 'task_completed_at', evidence_task.completed_at
+               ) ORDER BY evidence_task.completed_at DESC) AS tasks
+          FROM agent_task_queue evidence_task
+          INNER JOIN agent evidence_agent
+                  ON evidence_agent.id = evidence_task.agent_id
+                 AND evidence_agent.workspace_id = ${issueAlias}.workspace_id
+         WHERE evidence_task.issue_id = ${taskAlias}.issue_id
+           AND evidence_task.agent_id = verdict.checker_id
+           AND evidence_task.status = 'completed'
+           AND COALESCE(evidence_agent.model,
+                        evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
+           AND COALESCE(evidence_agent.thinking_level,
+                        evidence_agent.runtime_config->>'reasoning_effort') = 'low'
+      ) evidence ON true`
+  };
+}
+
 function requeueTriggerSummary(row, coldStart) {
   const prefix = coldStart
     ? `Relay cold start: never dispatched in ${row.stage}`
@@ -637,85 +715,14 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
     // genuinely completed tasks; a failed task must never move work forward.
     // No completed_at window: eligibility is the task's terminal state, so a
     // daemon outage delays an advance instead of stranding it forever.
+    const evidenceSql = completedTaskEvidenceSql({ taskAlias: 'atq', issueAlias: 'i' });
     const query = `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id,
-             atq.status AS task_status,
-             atq.result AS task_result, atq.error AS task_error,
-             atq.agent_id AS task_agent_id, atq.started_at AS task_started_at,
-             atq.completed_at AS task_completed_at,
-             task_agent.model AS task_agent_model,
-             task_agent.thinking_level AS task_agent_effort,
-             verdict.checker_id AS qc_verdict_checker_id,
-             verdict.verdict AS qc_verdict,
-             verdict.work_product_md5 AS qc_verdict_work_product_md5,
-             verdict.notes AS qc_verdict_notes,
-             verdict.created_at AS qc_verdict_created_at,
-             attempt.verdict AS qc_attempt_verdict,
-             attempt.work_product_md5 AS qc_attempt_work_product_md5,
-             attempt.bound_sha AS qc_attempt_bound_sha,
-             attempt.observed_head AS qc_attempt_observed_sha,
-             attempt.qualifying AS qc_attempt_qualifying,
-             attempt.evidence_task_id AS qc_attempt_evidence_task_id,
-             attempt.evidence_task_status AS qc_attempt_evidence_task_status,
-             attempt.evidence_agent_id AS qc_attempt_evidence_agent_id,
-             attempt.evidence_agent_model AS qc_attempt_evidence_agent_model,
-             attempt.evidence_agent_effort AS qc_attempt_evidence_agent_effort,
-             evidence.tasks AS qc_evidence_tasks,
-             i.workspace_id, i.priority, i.title AS issue_title,
-             rrl.to_stage, rsc.next_stage
+             ${evidenceSql.columns}, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
       INNER JOIN issue i ON atq.issue_id = i.id
-      LEFT JOIN agent task_agent ON task_agent.id = atq.agent_id
       INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name AND rsc.workspace_id = i.workspace_id
-      LEFT JOIN LATERAL (
-        SELECT checker_id, verdict, work_product_md5, notes, created_at
-          FROM qc_verdict WHERE issue_id = atq.issue_id
-         ORDER BY created_at DESC LIMIT 1
-      ) verdict ON true
-      LEFT JOIN LATERAL (
-        SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
-               qa.qualifying,
-               evidence_task.id AS evidence_task_id,
-               evidence_task.status AS evidence_task_status,
-               evidence_task.agent_id AS evidence_agent_id,
-               evidence_agent.model AS evidence_agent_model,
-               evidence_agent.thinking_level AS evidence_agent_effort
-          FROM qc_attempt qa
-          INNER JOIN agent_task_queue evidence_task
-                  ON evidence_task.issue_id = qa.issue_id
-                 AND evidence_task.id::text = substring(
-                       qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
-          INNER JOIN agent evidence_agent
-                  ON evidence_agent.id = evidence_task.agent_id
-                 AND evidence_agent.workspace_id = i.workspace_id
-         WHERE qa.issue_id = atq.issue_id
-           AND evidence_task.agent_id = verdict.checker_id
-           AND qa.work_product_md5 = verdict.work_product_md5
-         ORDER BY qa.created_at DESC LIMIT 1
-      ) attempt ON true
-      LEFT JOIN LATERAL (
-        SELECT jsonb_agg(jsonb_build_object(
-                 'task_id', evidence_task.id,
-                 'task_status', evidence_task.status,
-                 'task_result', evidence_task.result,
-                 'task_agent_id', evidence_task.agent_id,
-                 'task_agent_model', evidence_agent.model,
-                 'task_agent_effort', evidence_agent.thinking_level,
-                 'task_started_at', evidence_task.started_at,
-                 'task_completed_at', evidence_task.completed_at
-               ) ORDER BY evidence_task.completed_at DESC) AS tasks
-          FROM agent_task_queue evidence_task
-          INNER JOIN agent evidence_agent
-                  ON evidence_agent.id = evidence_task.agent_id
-                 AND evidence_agent.workspace_id = i.workspace_id
-         WHERE evidence_task.issue_id = atq.issue_id
-           AND evidence_task.agent_id = verdict.checker_id
-           AND evidence_task.status = 'completed'
-           AND COALESCE(evidence_agent.model,
-                        evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
-           AND COALESCE(evidence_agent.thinking_level,
-                        evidence_agent.runtime_config->>'reasoning_effort') = 'low'
-      ) evidence ON true
+      ${evidenceSql.joins}
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
@@ -1783,14 +1790,16 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
   if (!typedOutcomes) return [];
   const client = await dbPool.connect();
   try {
+    const evidenceSql = completedTaskEvidenceSql({ taskAlias: 't', issueAlias: 'i' });
     const result = await client.query(
       `SELECT o.issue_id, o.stage AS to_stage, o.outcome, o.task_id,
-              t.result AS task_result, i.title AS issue_title, rsc.next_stage
+              ${evidenceSql.columns}, rsc.next_stage
          FROM issue_stage_outcome o
          JOIN issue i ON i.id = o.issue_id AND i.status = o.stage
          JOIN agent_task_queue t ON t.id = o.task_id AND t.status = 'completed'
          LEFT JOIN relay_stage_config rsc
            ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
+         ${evidenceSql.joins}
         WHERE o.outcome IN ('ADVANCED', 'NO_OP') AND o.blocked_on IS DISTINCT FROM 'human'
         ORDER BY o.outcome_at ASC LIMIT 100`);
     const advanced = [];
@@ -1800,9 +1809,18 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         : await buildCompletionRoute(client, row);
       const targetStage = route?.toStage || row.next_stage;
       if (!targetStage) continue;
+      const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
+      if (row.to_stage === 'In Review' && !qcAdvance.ok) {
+        const blockedOn = /sha|md5/i.test(qcAdvance.reason) ? 'sha' : 'human';
+        await client.query(`UPDATE issue_stage_outcome SET blocked_on = $3::text
+          WHERE issue_id = $1::uuid AND stage = $2::text`,
+        [row.issue_id, row.to_stage, blockedOn]);
+        logger.log(`${LOG_PREFIX} [typed-readvance] skipped issue=${row.issue_id} reason=${qcAdvance.reason}`);
+        continue;
+      }
       const response = await postRelay({ issue_id: row.issue_id, to_stage: targetStage,
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
-        evidence: completionEvidence(row, targetStage, route, { ok: false }),
+        evidence: completionEvidence(row, targetStage, route, qcAdvance),
         ...(route ? { routing_classification: route } : {}) });
       if (response.ok) {
         advanced.push(row.issue_id);
