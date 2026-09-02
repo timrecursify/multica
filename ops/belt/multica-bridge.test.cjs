@@ -45,6 +45,8 @@ const {
   retryEscalationLoop,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
+  relayDiagnosisRerun,
+  diagnosisRerunErrorStatus,
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
@@ -113,6 +115,57 @@ test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', asyn
   const result = await rerunParkedDiagnosis(client, { issue_id: '123e4567-e89b-42d3-a456-426614174000', idempotency_key: 'rerun-0001' });
   assert.deepEqual(result, { ok: true, replay: true, task_id: 'existing-task' });
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
+});
+
+test('Parked diagnosis rerun has stable request and ticket-state errors', async () => {
+  assert.equal(diagnosisRerunErrorStatus('invalid_request'), 400);
+  assert.equal(diagnosisRerunErrorStatus('issue_not_found'), 404);
+  assert.equal(diagnosisRerunErrorStatus('parked_issue_required'), 409);
+  const client = { query: async (sql) => {
+    if (sql.includes('FROM issue WHERE')) return { rowCount: 1, rows: [{ status: 'Queue' }] };
+    return { rowCount: 0, rows: [] };
+  } };
+  const result = await rerunParkedDiagnosis(client, {
+    issue_id: '123e4567-e89b-42d3-a456-426614174000', idempotency_key: 'rerun-0001'
+  });
+  assert.deepEqual(result, { ok: false, error: 'parked_issue_required' });
+});
+
+test('Parked diagnosis rerun logs a sanitized structured database failure', async () => {
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+  const workspaceId = '223e4567-e89b-42d3-a456-426614174000';
+  const queries = [];
+  const failure = Object.assign(new Error('legacy ticket metadata is malformed'), {
+    code: '22P02', constraint: 'issue_metadata_check', stack: 'Error: legacy ticket metadata is malformed\n  at fixture'
+  });
+  const client = { async connect() {}, async end() {}, async query(sql) {
+    queries.push(sql);
+    if (sql.includes('FROM issue WHERE')) return { rowCount: 1, rows: [{ id: issueId, workspace_id: workspaceId, status: 'Parked' }] };
+    if (sql.includes('operator_rerun_idem_key') || sql.includes("status IN ('queued'")) return { rowCount: 0, rows: [] };
+    if (sql.includes('SELECT failure_reason, error')) throw failure;
+    return { rowCount: 0, rows: [] };
+  } };
+  const res = { status: 0, body: '', ends: 0, writeHead(status) { this.status = status; }, end(body = '') { this.ends++; this.body = body; } };
+  const logs = [];
+  const originalError = console.error;
+  setTestClientFactory(() => client);
+  console.error = (line) => logs.push(line);
+  try {
+    await relayDiagnosisRerun({}, res, { agent_token: 'test-relay-secret', issue_id: issueId,
+      idempotency_key: 'rerun-0001', agent_token_should_not_log: 'secret' });
+  } finally {
+    console.error = originalError;
+    setTestClientFactory(null);
+  }
+  assert.equal(res.status, 500);
+  assert.deepEqual(JSON.parse(res.body), { error: 'internal_error' });
+  assert.equal(res.ends, 1);
+  assert.equal(queries.filter((sql) => sql === 'ROLLBACK').length, 1);
+  const event = JSON.parse(logs.at(-1));
+  assert.deepEqual(event, { event: 'parked_diagnosis_rerun_error', issue_id: issueId,
+    workspace_id: workspaceId, error_name: 'Error', error_message: failure.message,
+    error_code: '22P02', error_constraint: 'issue_metadata_check', stack: failure.stack });
+  assert.doesNotMatch(logs.at(-1), /agent_token_should_not_log|secret/);
 });
 
 test('relay status authority is transaction-local', async () => {
