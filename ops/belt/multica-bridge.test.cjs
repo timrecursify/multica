@@ -325,6 +325,61 @@ test('artifact lookup accepts canonical metadata and ignores prose', async () =>
   }
 });
 
+test('In Progress -> In Review dispatch requires canonical implementation evidence', async () => {
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  const prUrl = 'https://github.com/acme/relay/pull/42';
+  const response = () => ({ status: 0, body: '', writeHead(status) { this.status = status; },
+    end(body = '') { this.body = body; } });
+  const invoke = async (metadata) => {
+    const calls = [];
+    const issue = { id: issueId, number: 1531, workspace_id: 'workspace-1', status: 'In Progress',
+      description: '', parent_issue_id: null, title: 'handoff', priority: 'medium', metadata };
+    const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+      calls.push({ sql, values });
+      if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [issue] };
+      if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'In Review' }] };
+      if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'In Review' }] };
+      if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'In Review', alt_next_stages: [] }] };
+      if (sql.includes('FROM relay_stage_agent_pool')) return { rows: [{ agent_id: 'agent-1', owner_id: 'agent-1', agent_name: 'qc',
+        archived_at: null, agent_status: 'idle', instructions: 'In Review', model: 'gpt-5.6-sol',
+        thinking_level: 'low', max_concurrent_tasks: 2, selected_runtime_id: 'runtime-1',
+        selected_runtime_provider: 'codex', active_task_count: 0, last_selected_at: null }] };
+      if (sql.includes('SELECT count(*)::int AS n FROM agent_task_queue')) return { rows: [{ n: 0 }] };
+      if (sql.includes('FROM agent_task_queue\n          WHERE issue_id') && sql.includes('FOR UPDATE')) return { rows: [] };
+      if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) return { rowCount: 1, rows: [{ id: issueId, status: 'In Review' }] };
+      if (sql.includes('INSERT INTO agent_task_queue (')) return { rows: [{ id: 'qc-task-1' }] };
+      if (sql.includes('INSERT INTO relay_run_log')) return { rows: [{ id: 'relay-log-1' }] };
+      return { rowCount: 0, rows: [] };
+    } };
+    const res = response();
+    setTestClientFactory(() => client);
+    try { await relayAdvance({ headers: {} }, res, { issue_id: issueId, to_stage: 'In Review', agent_token: 'test-relay-secret' }); }
+    finally { setTestClientFactory(null); }
+    return { res, calls };
+  };
+
+  const valid = await invoke({ pr_url: prUrl, bound_sha: sha });
+  assert.equal(valid.res.status, 200);
+  assert.equal(JSON.parse(valid.res.body).task_id, 'qc-task-1');
+  const inserts = valid.calls.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue ('));
+  assert.equal(inserts.length, 1);
+  assert.match(inserts[0].values[6], new RegExp(`ticket 1531; PR ${prUrl}; bound SHA ${sha}`));
+
+  for (const metadata of [
+    {}, { pr_url: prUrl }, { bound_sha: sha },
+    { pr_url: 'not a URL', bound_sha: sha },
+    { pr_url: prUrl, bound_sha: sha.toUpperCase() },
+    { head_sha: sha, commit_sha: sha, note: `PR ${prUrl} SHA ${sha}` }
+  ]) {
+    const rejected = await invoke(metadata);
+    assert.equal(rejected.res.status, 409);
+    assert.equal(JSON.parse(rejected.res.body).error, 'implementation_evidence_required');
+    assert.equal(rejected.calls.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue (')), false);
+    assert.equal(rejected.calls.some(({ sql }) => sql === 'ROLLBACK'), true);
+  }
+});
+
 test('operator re-scope admits only the exact issue UUID and completed Sol-low NO-SHA block', async () => {
   const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
     status: 'In Review', metadata: {} };
