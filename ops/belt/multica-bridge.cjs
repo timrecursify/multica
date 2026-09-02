@@ -1806,6 +1806,7 @@ async function relayAdvance(req, res, body) {
         intendedStage: parkedAudit?.intendedStage || null,
         attempts: parkedAudit?.attempts || 0,
         taskCount: parkedAudit?.taskCount || 0,
+        callerAudit: parkedAudit,
         terminalExit: explicitTerminalExit
           ? { operator_marker: true, reason: reason.trim() }
           : null

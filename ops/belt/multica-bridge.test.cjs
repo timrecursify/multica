@@ -1216,6 +1216,18 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.ok(issue.rows[0].metadata.human_review_release_at);
       assert.equal(log.rows.length, 1);
     });
+    await t.test('persists caller CI/CD parking evidence in the relay audit row', async () => {
+      const issueId = '45454545-4545-4545-4545-454545454545';
+      await insertIssue(issueId);
+      const audit = { cicd_worker: { reason: 'no PR referenced', pr_state: null,
+        pr_url: null, checked_at: '2026-09-02T00:00:00.000Z' } };
+      const res = await invoke({ issue_id: issueId, to_stage: 'Parked', parked_audit: audit });
+      assert.equal(res.status, 200);
+      const log = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
+      assert.equal(log.rows[0].parked_audit.cicd_worker.reason, 'no PR referenced');
+      assert.deepEqual(log.rows[0].parked_audit.cicd_worker, audit.cicd_worker);
+      assert.equal(log.rows[0].parked_audit.trigger, 'relay_advance');
+    });
     await t.test('rejects a missing operator header without a task', async () => {
       const issueId = '55555555-5555-5555-5555-555555555555'; await insertIssue(issueId);
       const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved' });

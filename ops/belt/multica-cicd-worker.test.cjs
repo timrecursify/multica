@@ -128,10 +128,18 @@ async function testCompletionAdmission() {
   setup('', 'MERGED');
   await worker.sweep();
   assert.equal(calls[0][1], 'Parked'); // no PR -> Parked
+  assert.deepEqual(calls[0].slice(0, 4), ['closed', 'Parked', null, 'no PR referenced']);
+  assert.deepEqual({ ...calls[0][4].cicd_worker, checked_at: 'timestamp' }, {
+    reason: 'no PR referenced', pr_state: null, pr_url: null, checked_at: 'timestamp'
+  });
   calls.length = 0;
   setup('https://github.com/timrecursify/sk-cli/pull/1', 'CLOSED');
   await worker.sweep();
   assert.equal(calls[0][1], 'Parked'); // CLOSED -> Parked
+  assert.deepEqual({ ...calls[0][4].cicd_worker, checked_at: 'timestamp' }, {
+    reason: 'timrecursify/sk-cli#1 closed without merge', pr_state: 'CLOSED',
+    pr_url: 'https://github.com/timrecursify/sk-cli/pull/1', checked_at: 'timestamp'
+  });
   calls.length = 0; issue = { id: 'wait', number: 12, workspace_id: 'gsp' };
   setup('https://github.com/timrecursify/sk-cli/pull/2', 'MERGED', false);
   await worker.sweep();

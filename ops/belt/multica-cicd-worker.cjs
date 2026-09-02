@@ -80,8 +80,10 @@ async function routeFinishedPR(issue, note) {
   log(`DONE #${issue.number} — ${note}`);
 }
 
-async function park(issue, reason) {
-  await relay(issue.id, 'Parked', null, reason, { cicd_worker: reason });
+async function park(issue, reason, prState = null, prUrl = null) {
+  await relay(issue.id, 'Parked', null, reason, { cicd_worker: {
+    reason, pr_state: prState, pr_url: prUrl, checked_at: new Date().toISOString()
+  } });
   await closePendingTask(issue.id);
   log(`PARKED #${issue.number} — ${reason}`);
 }
@@ -250,7 +252,9 @@ async function sweep() {
       }
       const closed = states.filter(s2 => s2.info.state === 'CLOSED');
       if (closed.length) {
-        await park(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '));
+        const first = closed[0];
+        await park(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '),
+          first.info.state, `https://github.com/${first.pr.repo}/pull/${first.pr.num}`);
         continue;
       }
       const openStates = states.filter(s2 => s2.info.state !== 'MERGED');
