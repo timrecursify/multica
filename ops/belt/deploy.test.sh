@@ -12,6 +12,7 @@ grep -q 'gsp-multica-worker.*held by' "$guard_source"
 grep -q 'readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver gsp-multica-worker multica-relay-advance)' "$guard_source"
 bash -n "$guard_source"
 tmp_dir="$(mktemp -d)"
+source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 mkdir -p "$tmp_dir/gsp-multica/parity" "$tmp_dir/gsp-multica/fleet" "$tmp_dir/tools" "$tmp_dir/multica-doctrine"
 
@@ -47,7 +48,7 @@ for rel in "${files[@]}"; do
 done
 
 dry_log="$tmp_dir/dry-run.log"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run >"$dry_log"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run --source-commit "$source_sha" >"$dry_log"
 grep -q 'Would copy .*/parked-diagnosis.cjs to .*/gsp-multica/parked-diagnosis.cjs' "$dry_log"
 grep -q 'Would copy .*/parked-entry-audit.cjs to .*/gsp-multica/parked-entry-audit.cjs' "$dry_log"
 grep -q 'Would copy .*/parity/relay-dead-rows.cjs to .*/gsp-multica/parity/relay-dead-rows.cjs' "$dry_log"
@@ -59,7 +60,7 @@ grep -q 'Would copy .*/cicd-deploy-evidence.cjs to .*/cicd-deploy-evidence.cjs' 
 manifest_dir="$tmp_dir/manifest"
 cp -a -- "$root_dir/." "$manifest_dir/"
 sed -i '/parked-diagnosis\.cjs/d' "$manifest_dir/deploy.sh"
-if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$manifest_dir/deploy.sh" --apply >"$tmp_dir/missing-dependency.log" 2>&1; then
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$manifest_dir/deploy.sh" --apply --source-commit "$source_sha" >"$tmp_dir/missing-dependency.log" 2>&1; then
   echo 'expected missing runtime dependency rejection' >&2
   exit 1
 fi
@@ -70,7 +71,7 @@ grep -q 'Would\|Copied\|Backed up' "$tmp_dir/missing-dependency.log" && {
 }
 
 if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" BELT_DEPLOY_FAIL_INDEX=2 \
-   "$root_dir/deploy.sh" --apply >"$tmp_dir/fail.log" 2>&1; then
+   "$root_dir/deploy.sh" --apply --source-commit "$source_sha" >"$tmp_dir/fail.log" 2>&1; then
   echo 'expected injected deployment failure' >&2
   exit 1
 fi
@@ -87,8 +88,13 @@ for rel in "${files[@]}"; do
 done
 
 apply_log="$tmp_dir/apply.log"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$apply_log"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" >"$tmp_dir/verify.log"
+worktree_source_backup="$tmp_dir/worktree-source-backup"
+cp -- "$root_dir/multica-cicd-worker.cjs" "$worktree_source_backup"
+printf '\ndirty worktree bytes must not deploy\n' >> "$root_dir/multica-cicd-worker.cjs"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --source-commit "$source_sha" >"$apply_log"
+git -C "$root_dir/../.." show "$source_sha:ops/belt/multica-cicd-worker.cjs" | cmp -s - "$tmp_dir/multica-cicd-worker.cjs"
+cp -- "$worktree_source_backup" "$root_dir/multica-cicd-worker.cjs"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" "$source_sha" >"$tmp_dir/verify.log"
 grep -q "Match: $tmp_dir/cicd-deploy-evidence.cjs" "$tmp_dir/verify.log"
 receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$apply_log")"
 [[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }
@@ -100,10 +106,16 @@ BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" 
 [[ ! -e "$tmp_dir/cicd-deploy-evidence.cjs" ]] || { echo 'rollback did not remove deploy evidence target' >&2; exit 1; }
 [[ ! -e "$tmp_dir/gsp-multica/relay-completion-admission.cjs" ]] || { echo 'rollback did not remove completion admission target' >&2; exit 1; }
 
+before_corrupt="$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" BELT_DEPLOY_CORRUPT_INDEX=2 "$root_dir/deploy.sh" --apply --source-commit "$source_sha" >"$tmp_dir/corrupt.log" 2>&1; then
+  echo 'expected post-copy mismatch rejection' >&2; exit 1
+fi
+[[ "$before_corrupt" == "$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")" ]] || { echo 'post-copy mismatch did not restore prior targets' >&2; exit 1; }
+
 before_bridge="$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")"
 cp -- "$root_dir/cicd-deploy-evidence.cjs" "$tmp_dir/cicd-deploy-evidence.cjs"
 printf '\nstale-runtime\n' >> "$tmp_dir/multica-cicd-worker.cjs"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-cicd-worker >"$tmp_dir/selective.log"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --source-commit "$source_sha" --only multica-cicd-worker >"$tmp_dir/selective.log"
 cmp -s -- "$root_dir/multica-cicd-worker.cjs" "$tmp_dir/multica-cicd-worker.cjs"
 [[ "$before_bridge" == "$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")" ]]
 grep -q 'Backed up .*/multica-cicd-worker.cjs' "$tmp_dir/selective.log"
