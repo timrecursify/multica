@@ -137,6 +137,30 @@ function spendPreflight(agent, selectedRuntime = {}) {
   return { ok: true, cap };
 }
 
+function completedTaskMadeProgress(task) {
+  if (!task || task.status !== 'completed') return false;
+  const context = task.context || {};
+  if (context.to_stage === 'Human Review') return true;
+  if (context.operator_release || context.operator_terminal_exit ||
+      context.operator_rescope || context.operator_rescope_issue_id ||
+      context.terminal_exit) return true;
+  return Boolean(task.has_completed_relay || task.has_linked_pr ||
+    task.has_result_pr || task.has_qc_verdict || task.has_binding_spec);
+}
+
+function noProgressAdmission(completedTasks, limit) {
+  const ceiling = Number(limit);
+  if (!Number.isInteger(ceiling) || ceiling < 1) {
+    return { ok: false, reason: 'invalid_stage_cycle_limit' };
+  }
+  const consecutive = (completedTasks || []).findIndex(completedTaskMadeProgress);
+  const count = consecutive === -1 ? (completedTasks || []).length : consecutive;
+  return count < ceiling
+    ? { ok: true, consecutive, ceiling }
+    : { ok: false, reason: 'no_progress', consecutive: count, ceiling,
+        disposition: 'Parked' };
+}
+
 function beltRoutingAdmission(agent, selectedRuntime = {}) {
   const name = String(agent?.name || agent?.agent_name || '').toLowerCase();
   const model = String(agent?.model || '').toLowerCase();
@@ -236,6 +260,8 @@ module.exports = {
   crossStageExecutionAdmission,
   retryAdmission,
   spendPreflight,
+  completedTaskMadeProgress,
+  noProgressAdmission,
   beltRoutingAdmission,
   QUOTA_PAUSE_MAX_AGE_MS,
   quotaPauseClearance,

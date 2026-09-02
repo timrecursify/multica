@@ -3,9 +3,33 @@ const test = require('node:test');
 const fs = require('node:fs');
 const { Client } = require('pg');
 const { qcCompletionAdvance, processParkedDiagnoses,
-  requeueStrandedTasks, requeueTriggerSummary } = require('./multica-relay-advance-daemon.cjs');
+  requeueStrandedTasks, requeueTriggerSummary,
+  pauseNoProgressLanes } = require('./multica-relay-advance-daemon.cjs');
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+
+test('lane breaker pauses after the existing consecutive-failure threshold', async () => {
+  const queries = [];
+  const tasks = Array.from({ length: 3 }, (_, index) => ({
+    id: `task-${index}`, agent_id: 'agent-1', issue_id: 'issue-1', status: 'completed',
+    context: { to_stage: 'In Review' }, has_completed_relay: false,
+    has_linked_pr: false, has_result_pr: false, has_qc_verdict: false,
+    has_binding_spec: false
+  }));
+  const client = { query: async (sql, values = []) => {
+    queries.push({ sql, values });
+    if (sql.includes('WITH ranked AS')) return { rows: tasks };
+    if (sql.includes('UPDATE agent')) return { rowCount: 1, rows: [{ id: 'agent-1',
+      workspace_id: 'workspace-1', agent_name: 'qc-lane', paused_at: '2026-09-02T00:00:00Z' }] };
+    if (sql.includes('INSERT INTO activity_log')) return { rowCount: 1, rows: [] };
+    if (['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql)) return { rows: [] };
+    throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
+  }, release() {} };
+  await pauseNoProgressLanes({ dbPool: { connect: async () => client } });
+  const activity = queries.find(({ sql }) => sql.includes('INSERT INTO activity_log'));
+  assert.equal(JSON.parse(activity.values[1]).reason, 'no_progress_streak');
+  assert.equal(JSON.parse(activity.values[1]).consecutive_failures, 3);
+});
 
 test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async (t) => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');

@@ -7,6 +7,7 @@ const {
   isBundledChild,
   instructionCompatibility,
   spendPreflight,
+  noProgressAdmission,
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,
@@ -753,6 +754,25 @@ async function replaceStageTask(client, task) {
       [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
     );
   return { taskId, relayLogId: log.rows[0]?.id || null };
+}
+
+async function completedStageTasksSinceProgress(client, issueId, stage, limit) {
+  const result = await client.query(
+    `SELECT t.status, t.context,
+            EXISTS (SELECT 1 FROM relay_run_log r WHERE r.task_id = t.id AND r.status = 'completed') AS has_completed_relay,
+            EXISTS (SELECT 1 FROM issue_pull_request ipr WHERE ipr.issue_id = t.issue_id AND ipr.linked_at >= t.created_at) AS has_linked_pr,
+            NULLIF(BTRIM(COALESCE(t.result->>'pr_url', '')), '') IS NOT NULL AS has_result_pr,
+            EXISTS (SELECT 1 FROM qc_verdict q WHERE q.issue_id = t.issue_id AND q.created_at >= t.created_at) AS has_qc_verdict,
+            EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = t.issue_id AND c.created_at >= t.created_at
+              AND c.content LIKE '%## Spec%' AND c.content LIKE '%## Evidence%') AS has_binding_spec
+       FROM agent_task_queue t
+      WHERE t.issue_id = $1 AND t.status = 'completed'
+        AND t.context->>'to_stage' = $2 AND t.trigger_comment_id IS NULL
+        AND COALESCE(t.context->>'kind', '') <> 'retry_escalation'
+      ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC
+      LIMIT $3`, [issueId, stage, limit]
+  );
+  return result.rows;
 }
 
 // Link the Queue -> In Progress bookkeeping hop to the builder task that
@@ -1648,6 +1668,25 @@ async function relayAdvance(req, res, body) {
           expected_model: preflight.expected_model, expected_effort: preflight.expected_effort }));
         return;
       }
+      const operatorDriven = operatorCapBypass || noArtifactRescope ||
+        operator_release === true || operator_terminal_exit === true ||
+        operator_rescope_issue_id != null;
+      const recentCompleted = operatorDriven ? [] : await completedStageTasksSinceProgress(
+        client, issue.id, to_stage, STAGE_CYCLE_LIMIT
+      );
+      const progressAdmission = noProgressAdmission(recentCompleted, STAGE_CYCLE_LIMIT);
+      if (!operatorDriven && !progressAdmission.ok) {
+        parkedAudit = { trigger: "no_progress", reason: "no_progress",
+          intendedStage: to_stage, attempts: progressAdmission.consecutive,
+          taskCount: progressAdmission.consecutive };
+        console.warn(JSON.stringify({ event: "relay_no_progress_parked",
+          issue_id: issue.id, stage: to_stage,
+          completed_without_progress: progressAdmission.consecutive,
+          ceiling: progressAdmission.ceiling }));
+        to_stage = "Parked";
+        stage = {};
+      }
+      if (to_stage !== "Parked") {
       // A stage re-entry creates a fresh task, so per-task max_attempts does not
       // stop a QC FAIL loop. Count every historical task for this issue and
       // target stage before admitting another paid call; once the ceiling is
@@ -1747,6 +1786,7 @@ async function relayAdvance(req, res, body) {
           escalation_owner: stage.agent_name,
           deadline: retryEscalation.deadline
         }));
+      }
       }
     }
 

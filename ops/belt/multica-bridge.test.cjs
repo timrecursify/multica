@@ -1196,6 +1196,8 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
       author_type text, author_id uuid, content text, type text, created_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".issue_pull_request (issue_id uuid NOT NULL,
+      pull_request_id uuid NOT NULL, linked_at timestamptz DEFAULT now());
       CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, verdict text,
       work_product_md5 text, created_at timestamptz DEFAULT now());`);
     await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
@@ -1246,12 +1248,17 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(res.status, 403); assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
       assert.equal((await admin.query(`SELECT count(*)::int AS n FROM "${schema}".agent_task_queue WHERE issue_id = $1`, [issueId])).rows[0].n, 0);
     });
-    await t.test('requires retry escalation source evidence without the marker', async () => {
+    await t.test('parks completed same-stage tasks at the no-progress limit', async () => {
       const issueId = '66666666-6666-6666-6666-666666666666'; await insertIssue(issueId);
       await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context) VALUES
         ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'), ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
       const res = await invoke({ issue_id: issueId, to_stage: 'In Progress' });
-      assert.equal(res.status, 409); assert.equal(JSON.parse(res.body).error, 'retry_escalation_source_task_required');
+      assert.equal(res.status, 200);
+      const parked = await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId]);
+      const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log
+        WHERE issue_id = $1 AND to_stage = 'Parked'`, [issueId]);
+      assert.equal(parked.rows[0].status, 'Parked');
+      assert.equal(audit.rows[0].parked_audit.reason, 'no_progress');
     });
     await t.test('rejects the relay secret as an operator header', async () => {
       const issueId = '77777777-7777-7777-7777-777777777777'; await insertIssue(issueId);
