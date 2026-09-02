@@ -1137,7 +1137,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           FROM ranked
          WHERE rn <= $1::int
         UNION ALL
-        SELECT budgeted.*, CASE WHEN stage_task_count >= $4::int
+        SELECT budgeted.*, NULL::bigint AS rn,
+               CASE WHEN stage_task_count >= $4::int
               THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
           FROM budgeted
          WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int
