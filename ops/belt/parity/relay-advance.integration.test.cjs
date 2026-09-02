@@ -175,6 +175,42 @@ async function closeDeadRowsTick(dbPool, postRelay) {
   }
 }
 
+async function convertQcEvidenceTick(db, postRelay) {
+  const client = await db.dbPool.connect();
+  try {
+    return await convertCompletedQcEvidence(client, { postRelay, logger: { log() {} } });
+  } finally { client.release(); }
+}
+
+test('QC evidence conversion skips more than 100 marker-less tasks to reach a later marker', async () => {
+  const db = await deadRowsDb();
+  const posts = [];
+  try {
+    await db.admin.query(`INSERT INTO ${db.schema}.issue (id, workspace_id, number)
+      SELECT 'dead-issue-' || lpad(n::text, 3, '0'), 'workspace-1', n + 10
+        FROM generate_series(1, 101) n`);
+    await db.admin.query(`INSERT INTO ${db.schema}.agent_task_queue
+      (id, issue_id, agent_id, status, context, result, created_at)
+      SELECT 'dead-task-' || lpad(n::text, 3, '0'), 'dead-issue-' || lpad(n::text, 3, '0'),
+        'fixture-agent', 'completed', '{"to_stage":"In Review"}'::jsonb,
+        '{"output":"QC completed without evidence"}'::jsonb, now()
+        FROM generate_series(1, 101) n`);
+    await db.admin.query(`INSERT INTO ${db.schema}.issue (id, workspace_id, number)
+      VALUES ('marker-issue', 'workspace-1', 999)`);
+    await db.admin.query(`INSERT INTO ${db.schema}.agent_task_queue
+      (id, issue_id, agent_id, status, context, result, created_at)
+      VALUES ('marker-task', 'marker-issue', 'fixture-agent', 'completed',
+        '{"to_stage":"In Review"}'::jsonb, $1::jsonb, now())`,
+    [JSON.stringify({ output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}` })]);
+
+    assert.deepEqual([...await convertQcEvidenceTick(db, async (payload) => {
+      posts.push(payload);
+      return { status: 201 };
+    })], ['marker-task']);
+    assert.deepEqual(posts.map((payload) => payload.issue_id), ['marker-issue']);
+  } finally { await db.close(); }
+});
+
 async function insertNoArtifactCandidate(db, { id, status = 'In Review', metadata = {} }) {
   await db.admin.query(`INSERT INTO ${db.schema}.issue (id, workspace_id, number, status, metadata)
     VALUES ($1, 'workspace-1', 2, $2, $3::jsonb)`, [id, status, JSON.stringify(metadata)]);

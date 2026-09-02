@@ -39,6 +39,7 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
       WHERE t.status = 'completed' AND t.context->>'to_stage' = 'In Review'
+        AND t.result->>'output' LIKE '%QC_EVIDENCE_JSON=%'
         AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
         AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
         AND NOT EXISTS (
