@@ -28,8 +28,8 @@ name with documented defaults pointing at the current install.
 ## Initial import
 
 The files here were copied byte-for-byte from the running home-directory tree on
-2026-08-31 (bridge SHA `9387e6a8…`, daemon `381e553b…`, cicd-worker
-`94f03726…`, archiver `37489eda…`). Three small edits intentionally made the
+2026-08-31 (bridge SHA `9387e6a8…`, daemon `7edb2154…`, cicd-worker
+`9220a91c…`, archiver `37489eda…`). Three small edits intentionally made the
 tracked copies environment/template-driven rather than hard-coded to one host:
 
 1. `fleet/ecosystem.gsp-belt.config.js.in` — the template pins only the

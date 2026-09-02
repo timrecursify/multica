@@ -14,6 +14,8 @@ export MULTICA_WORKSPACE_ID="00000000-0000-4000-8000-000000000001"
 HOST="$WORK/host"
 mkdir -p "$HOST"
 mkdir -p "$HOST/ops" && cp -R "$ROOT" "$HOST/ops/gsp-belt"
+# A clean checkout can be read-only. This is a disposable mutation fixture.
+chmod -R u+w "$HOST/ops/gsp-belt"
 git -C "$HOST" init -q
 git -C "$HOST" add -A
 git -C "$HOST" -c user.email=t@t -c user.name=t commit -qm base
@@ -36,10 +38,25 @@ if [[ $rc -ne 0 ]] && grep -q "guard\[secret-embedded\]" "$SECRET_OUT"; then
 else
   echo "FAIL: embedded-secret guard did not flag"; cat "$SECRET_OUT"; exit 1
 fi
+rm -f "$HOST/ops/gsp-belt/worker/bad.cjs"
+
+echo "== guard flags stale documented provenance checksum =="
+PROVENANCE_OUT="$WORK/provenance.out"
+sed -i 's/9387e6a885aa0c1a70791ed3f5f9e43280ae90c5c1a1e32a61925d57369f38a5/0000000000000000000000000000000000000000000000000000000000000000/' "$HOST/ops/gsp-belt/MANIFEST.md"
+set +e
+"$GUARD" --checkout "$HOST" > "$PROVENANCE_OUT" 2>&1
+rc=$?
+set -e
+if [[ $rc -ne 0 ]] && grep -q "guard\[provenance\]" "$PROVENANCE_OUT"; then
+  echo "PASS: provenance guard flags a stale documented checksum"
+else
+  echo "FAIL: provenance guard did not flag"; cat "$PROVENANCE_OUT"; exit 1
+fi
+# Restore a valid fixture before exercising the independent unmanaged-path case.
+sed -i 's/0000000000000000000000000000000000000000000000000000000000000000/9387e6a885aa0c1a70791ed3f5f9e43280ae90c5c1a1e32a61925d57369f38a5/' "$HOST/ops/gsp-belt/MANIFEST.md"
 
 echo "== guard flags unmanaged home-directory script reference =="
 UNMAN_OUT="$WORK/un.out"
-rm -f "$HOST/ops/gsp-belt/worker/bad.cjs"
 printf '#!/bin/bash\nexec /home/newadmin/gsp-multica/multica-bridge.cjs\n' > "$HOST/ops/gsp-belt/fleet/bad.sh"
 set +e
 "$GUARD" --checkout "$HOST" > "$UNMAN_OUT" 2>&1

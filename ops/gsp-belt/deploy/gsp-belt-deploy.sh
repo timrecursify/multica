@@ -69,16 +69,26 @@ fi
 commit_sha="$(cd "$checkout_root" && git rev-parse "$ref^{commit}")"
 echo "source commit     = $commit_sha"
 
+# Do not read deployment inputs from the caller's worktree after resolving the
+# ref: it may contain uncommitted edits or be switched concurrently.  Archive
+# the exact commit into a private tree and use that tree exclusively below.
+source_tree="$(mktemp -d "${TMPDIR:-/tmp}/gsp-belt-source.XXXXXX")"
+trap 'rm -rf "$source_tree"' EXIT
+if ! (cd "$checkout_root" && git archive --format=tar "$commit_sha" | tar -x -C "$source_tree"); then
+  echo "Error: could not materialize commit $commit_sha" >&2
+  exit 1
+fi
+
 # ---- validate manifest + required env names BEFORE any mutation ----
 echo "== validation (no PM2 mutation yet) =="
 fail=0
 for base in "$MANIFEST_REL" "$ECO_TEMPLATE_REL" "$FINGERPRINT_REL"; do
-  [[ -f "$checkout_root/$base" ]] || { echo "  REQUIRED MISSING: $base"; fail=1; }
+  [[ -f "$source_tree/$base" ]] || { echo "  REQUIRED MISSING: $base"; fail=1; }
 done
-mapfile -t manifest_files < <(sed -nE 's/^\| `([^`]*)` .*/\1/p' "$checkout_root/$MANIFEST_REL" 2>/dev/null | sort -u)
+mapfile -t manifest_files < <(sed -nE 's/^\| `([^`]*)` .*/\1/p' "$source_tree/$MANIFEST_REL" 2>/dev/null | sort -u)
 for rel in "${manifest_files[@]}"; do
   [[ -n "$rel" ]] || continue
-  [[ -f "$checkout_root/$rel" ]] || { echo "  MANIFEST source untracked/missing: $rel"; fail=1; }
+  [[ -f "$source_tree/$rel" ]] || { echo "  MANIFEST source untracked/missing: $rel"; fail=1; }
 done
 for name in ${REQUIRED_ENV_NAMES//,/ }; do
   [[ -n "${!name:-}" ]] || { echo "  env missing: $name"; fail=1; }
@@ -118,7 +128,7 @@ fi
 
 # ---- capture current (prior) script paths BEFORE mutating anything ----
 state_dir="$(mktemp -d "${TMPDIR:-/tmp}/gsp-belt-deploy.XXXXXX")"
-trap 'rm -rf "$state_dir"' EXIT
+trap 'rm -rf "$state_dir" "$source_tree"' EXIT
 prior_json="$state_dir/prior-pm2.json"
 "$PM2" jlist >"$prior_json" 2>/dev/null || true
 declare -A prev_paths
@@ -132,11 +142,11 @@ done
 
 # ---- install immutable release (idempotent, deterministic) ----
 mkdir -p "$release_dir/ops/gsp-belt"
-cp -R "$checkout_root/ops/gsp-belt/." "$release_dir/ops/gsp-belt/"
+cp -R "$source_tree/ops/gsp-belt/." "$release_dir/ops/gsp-belt/"
 rm -f "$release_dir/$RENDERED_ECO_REL"
 gsp_release="$release_dir/ops/gsp-belt"
 sed "s|__GSP_BELT_RELEASE__|$gsp_release|g" \
-  "$checkout_root/$ECO_TEMPLATE_REL" > "$release_dir/$RENDERED_ECO_REL"
+  "$source_tree/$ECO_TEMPLATE_REL" > "$release_dir/$RENDERED_ECO_REL"
 
 deploy_eco() { # deploy_eco <rendered-eco-path>; returns 0 when pm2 accepted it
   "$PM2" startOrReload "$1" >/dev/null 2>&1
@@ -176,7 +186,7 @@ fi
 # ---- rollback: re-materialize an ecosystem pointing back at prior script paths ----
 echo "DEPLOY/VERIFY FAILED — rolling back to previous script paths"
 rollback_eco="$release_dir/rollback-ecosystem.gsp-belt.config.js"
-python3 - "$checkout_root/$ECO_TEMPLATE_REL" "$rollback_eco" "${app_arr[*]}" "$prior_json" <<'PY'
+python3 - "$source_tree/$ECO_TEMPLATE_REL" "$rollback_eco" "${app_arr[*]}" "$prior_json" <<'PY'
 import json, sys, re
 template, out, apps, prev_json = sys.argv[1], sys.argv[2], sys.argv[3].split(), sys.argv[4]
 try:

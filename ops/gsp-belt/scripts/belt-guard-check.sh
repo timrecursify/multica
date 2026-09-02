@@ -37,6 +37,22 @@ if [[ -f "$MANIFEST" ]]; then
   done < <(sed -nE 's/^\| `([^`]*)` .*/\1/p' "$MANIFEST" | sort -u)
 fi
 
+# 1b. Migration provenance must describe the exact tracked bytes.  The
+# provenance table uses full SHA-256 values, so a documentation drift is a
+# deploy-blocking failure rather than a misleading audit trail.
+if [[ -f "$MANIFEST" ]]; then
+  while IFS='|' read -r _ raw_file raw_hash _; do
+    rel="$(echo "$raw_file" | tr -d ' `')"
+    expected="$(echo "$raw_hash" | tr -d ' `')"
+    [[ "$rel" == ops/gsp-belt/* && "$expected" =~ ^[0-9a-f]{64}$ ]] || continue
+    actual="$(sha256sum "$checkout_root/$rel" | cut -d' ' -f1)"
+    if [[ "$actual" != "$expected" ]]; then
+      echo "guard[provenance]: $rel checksum differs from MANIFEST.md"
+      fail=1
+    fi
+  done < "$MANIFEST"
+fi
+
 # 2. Deployed release matches source (drift), if a release is supplied.
 if [[ -n "$release_dir" && -f "$MANIFEST" ]]; then
   sed -nE 's/^\| `([^`]*)` .*/\1/p' "$MANIFEST" | sort -u | while IFS= read -r rel; do

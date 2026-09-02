@@ -87,12 +87,23 @@ git -C "$HOST" add -A
 git -C "$HOST" -c user.email=t@t -c user.name=t commit -qm "restore"
 goodsha="$(git -C "$HOST" rev-parse HEAD)"
 
-# --- (d) successful deploy: apps resolve into selected release ---
+# --- (d) an uncommitted worktree divergence never reaches the release ---
+printf '\n// UNCOMMITTED_WORKTREE_MARKER\n' >> "$HOST/ops/gsp-belt/worker/multica-cicd-worker.cjs"
+printf '\n// UNCOMMITTED_TEMPLATE_MARKER\n' >> "$HOST/ops/gsp-belt/fleet/ecosystem.gsp-belt.config.js.in"
+
+# --- (e) successful deploy: apps resolve into selected immutable release ---
 unset FAKE_FAIL_FLAG
 if "$DEPLOY" --ref "$goodsha" --checkout "$HOST" --release "$RELEASE1"; then
   echo "PASS: deploy exits 0"
 else
   echo "FAIL: deploy exit != 0"; exit 1
+fi
+if ! grep -q "UNCOMMITTED_WORKTREE_MARKER" "$RELEASE1/ops/gsp-belt/worker/multica-cicd-worker.cjs" \
+  && ! grep -q "UNCOMMITTED_TEMPLATE_MARKER" "$RELEASE1/ops/gsp-belt/fleet/ecosystem.gsp-belt.config.js.in" \
+  && ! grep -q "UNCOMMITTED_TEMPLATE_MARKER" "$RELEASE1/ops/gsp-belt/fleet/ecosystem.gsp-belt.config.js"; then
+  echo "PASS: release bytes came from committed ref, not worktree"
+else
+  echo "FAIL: uncommitted worktree bytes reached release"; exit 1
 fi
 python3 - "$FAKE_PM2_STATE" "$RELEASE1" <<'PY'
 import json,sys
@@ -103,7 +114,7 @@ for a in apps:
 print("PASS: all apps resolve into selected release")
 PY
 
-# --- (e) simulated reload failure triggers automatic rollback ---
+# --- (f) simulated reload failure triggers automatic rollback ---
 export FAKE_FAIL_FLAG="$WORK/failflag"
 if "$DEPLOY" --ref "$goodsha" --checkout "$HOST" --release "$RELEASE2" >"$WORK/rollback.log" 2>&1; then
   echo "NOTE: deploy unexpectedly succeeded despite simulated failure; inspecting"
