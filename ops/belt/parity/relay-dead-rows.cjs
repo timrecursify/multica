@@ -41,6 +41,7 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
       WHERE t.status = 'completed' AND t.context->>'to_stage' = 'In Review'
         AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
         AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+        AND t.result->>'output' LIKE '%QC_EVIDENCE_JSON=%'
         AND NOT EXISTS (
           SELECT 1 FROM qc_verdict verdict WHERE verdict.issue_id = t.issue_id
             AND verdict.created_at >= t.created_at)

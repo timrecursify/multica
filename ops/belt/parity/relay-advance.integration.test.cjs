@@ -175,6 +175,44 @@ async function closeDeadRowsTick(dbPool, postRelay) {
   }
 }
 
+async function qcEvidenceTick(db, postRelay) {
+  const client = await db.dbPool.connect();
+  try {
+    return await convertCompletedQcEvidence(client, { postRelay, logger: { log() {} } });
+  } finally { client.release(); }
+}
+
+test('QC evidence conversion skips over 100 marker-less tasks before applying its limit', async () => {
+  const db = await deadRowsDb();
+  const posts = [];
+  try {
+    await db.admin.query(`INSERT INTO ${db.schema}.issue (id, workspace_id, number)
+      SELECT 'markerless-' || lpad(n::text, 3, '0'), 'workspace-1', n + 10
+        FROM generate_series(1, 101) n`);
+    await db.admin.query(`INSERT INTO ${db.schema}.agent_task_queue
+      (id, issue_id, agent_id, status, context, result, completed_at, created_at)
+      SELECT 'markerless-task-' || lpad(n::text, 3, '0'),
+             'markerless-' || lpad(n::text, 3, '0'), 'fixture-agent', 'completed',
+             '{"to_stage":"In Review"}'::jsonb, '{"output":"completed without marker"}'::jsonb,
+             now(), now()
+        FROM generate_series(1, 101) n`);
+    await db.admin.query(`INSERT INTO ${db.schema}.issue (id, workspace_id, number)
+      VALUES ('zz-marker-issue', 'workspace-1', 999)`);
+    await db.admin.query(`INSERT INTO ${db.schema}.agent_task_queue
+      (id, issue_id, agent_id, status, context, result, completed_at, created_at)
+      VALUES ('marker-task', 'zz-marker-issue', 'fixture-agent', 'completed',
+        '{"to_stage":"In Review"}'::jsonb, $1::jsonb, now(), now())`,
+    [JSON.stringify({ output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}` })]);
+
+    const converted = await qcEvidenceTick(db, async (payload) => {
+      posts.push(payload);
+      return { status: 201 };
+    });
+    assert.deepEqual([...converted], ['marker-task']);
+    assert.deepEqual(posts.map((payload) => payload.issue_id), ['zz-marker-issue']);
+  } finally { await db.close(); }
+});
+
 async function insertNoArtifactCandidate(db, { id, status = 'In Review', metadata = {} }) {
   await db.admin.query(`INSERT INTO ${db.schema}.issue (id, workspace_id, number, status, metadata)
     VALUES ($1, 'workspace-1', 2, $2, $3::jsonb)`, [id, status, JSON.stringify(metadata)]);
