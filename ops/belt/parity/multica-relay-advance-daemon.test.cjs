@@ -17,7 +17,7 @@ test('requeue candidate SQL binds the stage array with a real PostgreSQL client'
   const sql = source.slice(start + 1, end);
   assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
   assert.match(sql, /LIMIT \$1::int/);
-  const params = [3, ['Queue', 'In Progress', 'Spec', 'In Review']];
+  const params = [3, ['Queue', 'In Progress', 'Spec', 'In Review'], 120];
   const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
   try {
     await client.connect();
@@ -116,6 +116,7 @@ function strandedFixture(overrides = {}) {
     number: 159,
     stage: 'Queue',
     dead_task_updated_at: new Date().toISOString(),
+    dead_task_created_at: new Date(Date.now() - 121 * 60 * 1000).toISOString(),
     metadata: {},
     dead_task_id: '123e4567-e89b-42d3-a456-426614174000',
     dead_task_status: 'failed',
@@ -171,7 +172,7 @@ function strandedHarness(fixtures) {
     if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
     if (sql.includes('pg_advisory_xact_lock') || sql.includes('FROM issue WHERE id')) return { rows: [] };
     if (sql.includes('FROM agent_task_queue') && sql.includes('FOR UPDATE')) return { rows: [] };
-    if (sql.includes('count(*)::int AS n')) return { rows: [{ n: 1 }] };
+    if (sql.includes('count(*)::int AS n')) return { rows: [{ n: fixtures[0].history_count ?? 1 }] };
     if (sql.includes('INSERT INTO agent_task_queue')) {
       return { rows: [{ id: '623e4567-e89b-42d3-a456-426614174000' }] };
     }
@@ -324,6 +325,34 @@ test('completed latest task needs an unconsumed failed relay row', () => {
   assert.match(requeue, /closed_log\.status = 'failed'/);
   assert.match(requeue, /closed_log\.parked_audit->>'requeue_task_id' IS NULL/);
   assert.match(requeue, /UPDATE relay_run_log[\s\S]*\{requeue_task_id\}/);
+});
+
+test('completed In Review task without a later verdict is requeued once after the queue TTL', async () => {
+  const fixture = strandedFixture({ dead_task_status: 'completed', stage: 'In Review',
+    instructions: 'In Review', failure_reason: null });
+  const harness = strandedHarness([fixture]);
+  await harness.run();
+  assert.equal(harness.queries.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue')).length, 1);
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const requeue = source.slice(source.indexOf('async function requeueStrandedTasks'),
+    source.indexOf('function diagnosisText'));
+  assert.match(requeue, /t\.created_at < NOW\(\) - \(\$3::bigint \* INTERVAL '1 minute'\)/);
+  assert.match(requeue, /FROM qc_verdict qv[\s\S]*qv\.created_at >= t\.created_at/);
+});
+
+test('completed In Review task with a later verdict is not eligible for requeue', async () => {
+  const harness = strandedHarness([strandedFixture({ dead_task_status: 'completed', stage: 'In Review',
+    instructions: 'In Review', eligible: false })]);
+  await harness.run();
+  assert.equal(harness.queries.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue')), false);
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /NOT EXISTS \(\s*SELECT 1 FROM qc_verdict qv[\s\S]*qv\.created_at >= t\.created_at/);
+});
+
+test('completed task without stage progress remains subject to the stage cycle cap', async () => {
+  const harness = strandedHarness([strandedFixture({ dead_task_status: 'completed', history_count: 2 })]);
+  await harness.run();
+  assert.equal(harness.queries.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue')), false);
 });
 
 test('completed task with a completed relay row is not admitted', () => {

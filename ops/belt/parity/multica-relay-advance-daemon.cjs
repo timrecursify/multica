@@ -876,7 +876,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
       `SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage,
               i.created_at AS issue_created_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
-              t.attempt, t.max_attempts, t.failure_reason, t.updated_at AS dead_task_updated_at,
+              t.attempt, t.max_attempts, t.failure_reason, t.created_at AS dead_task_created_at,
+              t.updated_at AS dead_task_updated_at,
               t.result AS dead_task_result, t.error AS dead_task_error,
               closed_log.id AS closed_relay_log_id,
               build.result AS build_task_result,
@@ -930,8 +931,33 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
             OR t.status IN ('failed', 'cancelled')
             OR (
               t.status = 'completed'
-              AND closed_log.status = 'failed'
-              AND closed_log.parked_audit->>'requeue_task_id' IS NULL
+              AND (
+                -- Preserve the one-shot retry of a relay row that explicitly
+                -- failed before the worker completed.
+                (closed_log.status = 'failed'
+                 AND closed_log.parked_audit->>'requeue_task_id' IS NULL)
+                -- A completed worker can also fail to advance the stage: QC
+                -- may not record a verdict, and build stages may not write a
+                -- completed relay row. Wait the existing queue TTL so a
+                -- normal asynchronous completion still has time to land.
+                OR (
+                  t.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
+                  AND (
+                    (i.status = 'In Review' AND NOT EXISTS (
+                      SELECT 1 FROM qc_verdict qv
+                       WHERE qv.issue_id = i.id
+                         AND qv.created_at >= t.created_at
+                    ))
+                    OR
+                    (i.status <> 'In Review' AND NOT EXISTS (
+                      SELECT 1 FROM relay_run_log completed_log
+                       WHERE completed_log.issue_id = i.id
+                         AND completed_log.status = 'completed'
+                         AND completed_log.created_at >= t.created_at
+                    ))
+                  )
+                )
+              )
             )
           )
           AND NOT EXISTS (
@@ -953,7 +979,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           AND i.parent_issue_id IS NULL
         ORDER BY i.created_at ASC
         LIMIT $1::int`,
-      [REQUEUE_BATCH, REQUEUE_STAGES]
+      [REQUEUE_BATCH, REQUEUE_STAGES, QUEUED_TASK_TTL_MINUTES]
     );
 
     if (candidates.rows.length === 0) return;
