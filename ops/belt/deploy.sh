@@ -37,6 +37,7 @@ declare -a sources=(
   "$root_dir/parked-diagnosis.cjs"
   "$root_dir/parked-entry-audit.cjs"
   "$root_dir/parity/multica-relay-advance-daemon.cjs"
+  "$root_dir/parity/relay-dead-rows.cjs"
   "$root_dir/multica-cicd-worker.cjs"
   "$root_dir/multica-archiver.cjs"
   "$root_dir/belt-config-guard.sh"
@@ -56,6 +57,7 @@ declare -a targets=(
   "$runtime_root/gsp-multica/parked-diagnosis.cjs"
   "$runtime_root/gsp-multica/parked-entry-audit.cjs"
   "$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
+  "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs"
   "$runtime_root/multica-cicd-worker.cjs"
   "$runtime_root/multica-archiver.cjs"
   "$runtime_root/tools/belt-config-guard.sh"
@@ -70,7 +72,7 @@ declare -a targets=(
 )
 
 selected() {
-  [[ -z "$only_target" || ( "$only_target" == multica-cicd-worker && "$1" -eq 5 ) ]]
+  [[ -z "$only_target" || "${sources[$1]##*/}" == "$only_target.cjs" ]]
 }
 
 invalid=0
@@ -120,6 +122,7 @@ for index in "${!sources[@]}"; do
   [[ "${targets[$index]}" == "$runtime_root/gsp-multica/guardrails.cjs" ||
      "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ||
      "${targets[$index]}" == "$runtime_root/gsp-multica/parked-entry-audit.cjs" ||
+     "${targets[$index]}" == "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs" ||
      "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2

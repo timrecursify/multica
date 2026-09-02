@@ -16,6 +16,7 @@ const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
   diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
+const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -26,6 +27,7 @@ const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
 const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
+let advanceTickInFlight = false;
 
 function uniqueFullSha(value) {
   const matches = [...String(value || '').matchAll(FULL_SHA_RE)]
@@ -300,6 +302,18 @@ async function markRelayLogFailedById(client, logId) {
   }
 }
 
+async function failMissingQcVerdict(client, logId) {
+  return client.query(
+    `UPDATE relay_run_log
+        SET status = 'failed',
+            parked_audit = jsonb_set(
+              COALESCE(parked_audit, '{}'::jsonb),
+              '{reason}', to_jsonb('qc_verdict_missing_after_task_created'::text))
+      WHERE id = $1 AND status = 'pending'`,
+    [logId]
+  );
+}
+
 async function holdQcEvidenceMismatch(client, logId) {
   return client.query(
     `UPDATE relay_run_log
@@ -414,8 +428,14 @@ async function enqueuePassWithoutRelayRows({ dbPool = pool, logger = console } =
 }
 
 async function advanceTick() {
-  await enqueuePassWithoutRelayRows();
-  await findAndAdvanceTasks();
+  if (advanceTickInFlight) return;
+  advanceTickInFlight = true;
+  try {
+    await enqueuePassWithoutRelayRows();
+    await findAndAdvanceTasks();
+  } finally {
+    advanceTickInFlight = false;
+  }
 }
 
 async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
@@ -423,6 +443,8 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   const client = await dbPool.connect();
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
+    await closeDeadRelayRows(client, { terminalStages: [...TERMINAL_STAGES],
+      requestRetryEscalation, postRelay, logger, logPrefix: LOG_PREFIX });
 
     // Correlate strictly on the task that owns the relay log. Advance only
     // genuinely completed tasks; a failed task must never move work forward.
@@ -507,6 +529,14 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
+        AND NOT (
+          rrl.to_stage = 'In Review'
+          AND NOT EXISTS (
+            SELECT 1 FROM qc_verdict missing_verdict
+             WHERE missing_verdict.issue_id = atq.issue_id
+               AND missing_verdict.created_at >= atq.created_at
+          )
+        )
       ORDER BY rrl.created_at ASC
       LIMIT 20`;
 
@@ -724,10 +754,10 @@ function postToRelay(payload) {
   });
 }
 
-function requestRetryEscalation(row, reason) {
+function requestRetryEscalation(row, reason, relay = postToRelay) {
   const taskId = row.task_id || row.dead_task_id;
   const triggerStage = row.to_stage || row.stage;
-  return postToRelay({
+  return relay({
     issue_id: row.issue_id,
     to_stage: 'Spec',
     agent_token: RELAY_AGENT_SECRET,
