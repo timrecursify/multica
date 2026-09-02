@@ -1514,10 +1514,19 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       const issueId = 'abababab-abab-abab-abab-abababababab'; await insertIssue(issueId, 'Rejected');
       await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
         VALUES ($1, $2, 'PASS', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context)
+        SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}'
+          FROM generate_series(1, 7)`, [agentId, issueId, workspaceId]);
       const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true,
         reason: 'reopen verified PASS', current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' }, { 'x-relay-operator-secret': 'test-operator-secret' });
       assert.equal(res.status, 200);
       assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'In Review');
+      const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log
+        WHERE issue_id = $1 AND from_stage = 'Rejected' ORDER BY id DESC LIMIT 1`, [issueId]);
+      assert.deepEqual(audit.rows[0].parked_audit, { terminal_exit: { operator_marker: true,
+        reason: 'reopen verified PASS' }, operator_cap_bypass: true,
+        reason: 'reopen verified PASS' });
     });
     await t.test('admits the exact sk advance Rejected PASS reopen request shape', async () => {
       const issueId = 'aeaeaeae-aeae-aeae-aeae-aeaeaeaeaeae'; await insertIssue(issueId, 'Rejected');
@@ -1545,6 +1554,10 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
     });
     await t.test('authenticated operator release exits Parked and audits the reason', async () => {
       const issueId = '88888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context)
+        SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"Queue"}'
+          FROM generate_series(1, 7)`, [agentId, issueId, workspaceId]);
       const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true, reason: 'approved' },
         { 'x-relay-operator-secret': 'test-operator-secret' });
       assert.equal(res.status, 200);
@@ -1751,6 +1764,7 @@ test('terminal exits preserve the configured archiver path and require an authen
     source.indexOf('const noArtifactRescope'));
   assert.doesNotMatch(guard, /terminal_stage_relay_exit_forbidden/);
   assert.match(source, /sourceStageResult\.rows\[0\]\?\.next_stage === to_stage/);
+  assert.match(source, /TERMINAL_STAGES = new Set\(\["Done", "Cancelled", "Archived", "Rejected"\]\)/);
   assert.match(source, /operator_terminal_exit === true/);
   assert.match(source, /RELAY_OPERATOR_SECRET/);
   assert.match(source, /x-relay-operator-secret/);
@@ -1759,6 +1773,8 @@ test('terminal exits preserve the configured archiver path and require an authen
   assert.match(source, /terminal_exit: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
   assert.match(source, /parked_audit/);
   assert.match(source, /terminalExit: explicitTerminalExit/);
+  assert.match(source, /!cycle\.ok && !operatorCapBypass/);
+  assert.match(source, /!lifetime\.ok && !operatorCapBypass/);
 });
 
 test('identical relay and operator secrets disable explicit terminal exits', () => {
