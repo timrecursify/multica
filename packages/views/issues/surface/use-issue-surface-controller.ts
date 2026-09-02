@@ -319,7 +319,7 @@ export function useIssueSurfaceController({
     effectiveViewMode === "swimlane";
   const usesServerFacets =
     usesTable || usesServerStatusSurface || usesServerGroupSurface;
-  const serverStatuses = useMemo<IssueStatus[]>(
+  const fallbackServerStatuses = useMemo<IssueStatus[]>(
     () => {
       const visible =
         statusFilters.length > 0
@@ -514,6 +514,19 @@ export function useIssueSurfaceController({
       usesServerStatusSurface ||
       ((usesTable || usesServerGroupSurface) && activeTableFacet !== null),
   });
+  // The backend owns the lifecycle. Its status facet is ordered by the
+  // workspace configuration, so use those keys for columns instead of the
+  // client-side compatibility list. Keep the latter only while the first
+  // facet request is unresolved.
+  const serverStatuses = useMemo<IssueStatus[]>(() => {
+    const facet = tableFacetsQuery.data?.facets.find(
+      (candidate) => candidate.kind === "status",
+    );
+    if (!facet) return fallbackServerStatuses;
+    const facetStatuses = facet.values.map((value) => value.key as IssueStatus);
+    if (statusFilters.length === 0) return facetStatuses;
+    return facetStatuses.filter((status) => statusFilters.includes(status));
+  }, [fallbackServerStatuses, statusFilters, tableFacetsQuery.data]);
   // The header chip's count, kept on its own query rather than folded into the
   // submenu facet request above. Two reasons: that request is deliberately
   // lazy (an always-on facet would re-enable it for Table/grouped surfaces on

@@ -148,4 +148,47 @@ describe("useIssueStatusBranches", () => {
 
     queryClient.clear();
   });
+
+  it("keeps a facet stage that is absent from the static lifecycle list", async () => {
+    const parked = { ...makeIssue("issue-1"), status: "Parked" as IssueStatus };
+    const listIssueTableRows = vi.fn(async (request: IssueTableRowsRequest) => ({
+      query_fingerprint: "test",
+      group_key: request.group_key,
+      parent_id: null,
+      total: 0,
+      rows: [{ issue: parked, direct_child_count: 0 }],
+      branch_total: 1,
+      next_cursor: null,
+    }));
+    setApiInstance({ listIssueTableRows } as unknown as ApiClient);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+
+    const { result } = renderHook(
+      () => useIssueStatusBranches({
+        wsId: "ws-1",
+        query,
+        statuses: ["Parked" as IssueStatus],
+        facets: {
+          query_fingerprint: "test",
+          total: 1,
+          facets: [{ kind: "status", values: [{ key: "Parked", count: 1 }] }],
+        },
+        facetsPending: false,
+        facetsFetching: false,
+        enabled: true,
+      }),
+      { wrapper: wrapper(queryClient) },
+    );
+
+    await waitFor(() => {
+      expect(result.current.pagination["Parked"]?.total).toBe(1);
+      expect(result.current.issues).toEqual([parked]);
+    });
+    expect(listIssueTableRows).toHaveBeenCalledWith(
+      expect.objectContaining({ group_key: "status:Parked" }),
+    );
+    queryClient.clear();
+  });
 });
