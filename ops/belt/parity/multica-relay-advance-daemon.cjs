@@ -1106,6 +1106,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
         const history = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1 AND context->>'to_stage' = $2
+              AND trigger_comment_id IS NULL
               AND ($3::timestamptz IS NULL OR created_at >= $3)`,
           [row.issue_id, row.stage, releaseAt]
         );
@@ -1119,6 +1120,7 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
         const lifetimeHistory = await client.query(
           `SELECT count(*)::int AS n FROM agent_task_queue
             WHERE issue_id = $1
+              AND trigger_comment_id IS NULL
               AND ($2::timestamptz IS NULL OR created_at >= $2)`,
           [row.issue_id, releaseAt]
         );

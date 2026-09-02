@@ -141,13 +141,13 @@ test('recovery ceilings count queued tasks that never started', () => {
     require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8'
   );
   const stageHistory = source.match(
-    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1 AND context->>'to_stage' = \$2\s+AND \(\$3::timestamptz IS NULL OR created_at >= \$3\)/
+    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1 AND context->>'to_stage' = \$2\s+AND trigger_comment_id IS NULL\s+AND \(\$3::timestamptz IS NULL OR created_at >= \$3\)/
   );
   const lifetimeHistory = source.match(
-    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1\s+AND \(\$2::timestamptz IS NULL OR created_at >= \$2\)/
+    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1\s+AND trigger_comment_id IS NULL\s+AND \(\$2::timestamptz IS NULL OR created_at >= \$2\)/
   );
-  assert.ok(stageHistory, 'stage ceiling must count every created task');
-  assert.ok(lifetimeHistory, 'lifetime ceiling must count every created task');
+  assert.ok(stageHistory, 'stage ceiling must count every non-comment task');
+  assert.ok(lifetimeHistory, 'lifetime ceiling must count every non-comment task');
 });
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
