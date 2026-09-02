@@ -11,10 +11,51 @@ process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-wor
 const { qcBounceDecision } = require('../multica-bridge.cjs');
 const { enqueuePassWithoutRelayRows, findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
 const { parseArgs, recover } = require('../recover-stranded-qc-pass.cjs');
-const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
+const { closeDeadRelayRows, convertCompletedQcEvidence } = require('./relay-dead-rows.cjs');
 
 const SHA = 'c909401ef7a4a438348eb5ceda33839211721524';
 const MD5 = '76becea4ab970644b7a21220665a1619';
+
+function marker(overrides = {}) {
+  return { verdict: 'PASS', work_product_md5: MD5, bound_sha: SHA, observed_sha: SHA,
+    failure_class: 'none', qualifying: true, model: 'gpt-5.6-sol', effort: 'low', ...overrides };
+}
+
+test('completed valid QC marker converts once and preserves its relay task identity', async () => {
+  const task = { id: '11111111-1111-4111-8111-111111111111', issue_id: 'issue-1', number: 42,
+    agent_name: 'qc-sol-low', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}` } };
+  const payloads = [];
+  const client = { query: async () => ({ rows: [task] }) };
+  const converted = await convertCompletedQcEvidence(client, {
+    postRelay: async (payload) => { payloads.push(payload); return { status: 201 }; }, logger: { log() {} }
+  });
+  assert.deepEqual([...converted], [task.id]);
+  assert.equal(payloads[0].qc_task_id, task.id);
+  assert.equal(payloads[0].idem_key, `qc-42-${SHA}-PASS`);
+});
+
+test('missing, duplicate, and SHA-mismatched markers never convert', async () => {
+  const invalid = [
+    { id: '1', issue_id: 'a', result: { output: '' }, agent_name: 'qc', number: 1 },
+    { id: '2', issue_id: 'b', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker())}\nQC_EVIDENCE_JSON=${JSON.stringify(marker())}` }, agent_name: 'qc', number: 2 },
+    { id: '3', issue_id: 'c', result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(marker({ observed_sha: '0123456789012345678901234567890123456789' }))}` }, agent_name: 'qc', number: 3 }
+  ];
+  const payloads = [];
+  const client = { query: async () => ({ rows: invalid }) };
+  assert.deepEqual([...await convertCompletedQcEvidence(client, {
+    postRelay: async (payload) => { payloads.push(payload); return { status: 201 }; }, logger: { log() {} }
+  })], []);
+  assert.equal(payloads.length, 0);
+});
+
+test('QC evidence conversion flag off is a clean no-op', async () => {
+  let queried = false;
+  const converted = await convertCompletedQcEvidence({ query: async () => { queried = true; return { rows: [] }; } }, {
+    postRelay: async () => ({ status: 201 }), env: { RELAY_QC_EVIDENCE_CONVERSION: 'off' }
+  });
+  assert.deepEqual([...converted], []);
+  assert.equal(queried, false);
+});
 
 async function deadRowsDb() {
   const schema = `relay_dead_rows_${Date.now()}_${Math.random().toString(16).slice(2)}`;

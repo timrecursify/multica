@@ -136,13 +136,13 @@ test('stage cycle breaker escalates repeated task creation to Sol-low re-spec', 
   });
 });
 
-test('budget predicate excludes only completed verdict-less In Review tasks', () => {
+test('budget predicate counts a completed In Review task with a post-completion verdict', () => {
   const predicate = budgetCountPredicate();
   assert.match(predicate, /context->>'to_stage' IS DISTINCT FROM 'In Review'/);
   assert.match(predicate, /status IS DISTINCT FROM 'completed'/);
   assert.match(predicate, /verdict\.checker_id = agent_id/);
   assert.match(predicate, /verdict\.created_at >= started_at/);
-  assert.match(predicate, /verdict\.created_at <= completed_at/);
+  assert.doesNotMatch(predicate, /verdict\.created_at <= completed_at/);
 });
 
 test('bridge and daemon use the same budget predicate', () => {

@@ -225,6 +225,7 @@ function validateRelayVerdict(payload) {
   const required = ["issue_id", "checker", "verdict", "work_product_md5", "bound_sha", "observed_sha", "failure_class", "qualifying", "model", "effort", "idem_key"];
   if (required.some((key) => !(key in payload))) return "missing_fields";
   if (!UUID_RE.test(payload.issue_id)) return "invalid_issue_id";
+  if (payload.qc_task_id != null && !UUID_RE.test(payload.qc_task_id)) return "invalid_qc_task_id";
   if (typeof payload.checker !== "string" || !IDENTITY_RE.test(payload.checker)) return "invalid_checker";
   if (payload.verdict !== "PASS" && payload.verdict !== "FAIL") return "invalid_verdict";
   if (typeof payload.work_product_md5 !== "string" || !MD5_RE.test(payload.work_product_md5)) return "invalid_work_product_md5";
@@ -258,7 +259,7 @@ async function latestQcVerdict(client, issueId) {
   return result.rows[0] || null;
 }
 
-async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
+async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explicitTaskId = null) {
   const result = await client.query(
     `SELECT t.id, t.agent_id, t.status, t.context, t.result, a.name AS agent_name
        FROM agent_task_queue t
@@ -268,9 +269,10 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId) {
         AND t.context->>'to_stage' = 'In Review'
         AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
         AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+        AND ($3::uuid IS NULL OR t.id = $3::uuid)
       ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
       LIMIT 1 FOR UPDATE`,
-    [issueId, workspaceId]
+    [issueId, workspaceId, explicitTaskId]
   );
   return result.rows[0] || null;
 }
@@ -375,14 +377,27 @@ async function latestQcNoArtifactSignal(client, issue) {
     isNoArtifactQcBlock(row.content)));
 }
 
-function qcTaskEvidenceMismatch(task, payload) {
+function qcTaskEvidence(task) {
   const output = task.result && typeof task.result === "object" ? task.result.output : null;
-  if (typeof output !== "string") return "qc_task_evidence_required";
+  if (typeof output !== "string") return null;
   const matches = [...output.matchAll(/^QC_EVIDENCE_JSON=(\{[^\r\n]*\})$/gm)];
-  if (matches.length !== 1) return "qc_task_evidence_required";
+  if (matches.length !== 1) return null;
   let evidence;
-  try { evidence = JSON.parse(matches[0][1]); } catch { return "qc_task_evidence_required"; }
-  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return "qc_task_evidence_required";
+  try { evidence = JSON.parse(matches[0][1]); } catch { return null; }
+  if (!evidence || typeof evidence !== "object" || Array.isArray(evidence)) return null;
+  if ((evidence.verdict !== "PASS" && evidence.verdict !== "FAIL") ||
+      !MD5_RE.test(String(evidence.work_product_md5 || "")) ||
+      !SHA_RE.test(String(evidence.bound_sha || "")) ||
+      !SHA_RE.test(String(evidence.observed_sha || "")) ||
+      String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase() ||
+      !FAILURE_CLASSES.has(evidence.failure_class) || typeof evidence.qualifying !== "boolean" ||
+      evidence.model !== "gpt-5.6-sol" || evidence.effort !== "low") return null;
+  return evidence;
+}
+
+function qcTaskEvidenceMismatch(task, payload) {
+  const evidence = qcTaskEvidence(task);
+  if (!evidence) return "qc_task_evidence_required";
   if (evidence.verdict !== payload.verdict) return "qc_task_verdict_mismatch";
   if (String(evidence.work_product_md5 || "").toLowerCase() !== payload.work_product_md5.toLowerCase()) return "qc_task_work_product_mismatch";
   if (String(evidence.bound_sha || "").toLowerCase() !== payload.bound_sha.toLowerCase() ||
@@ -1084,7 +1099,8 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 404, "issue_not_found");
     }
-    const qcTask = await latestCompletedSolLowQcTask(client, payload.issue_id, issue.rows[0].workspace_id);
+    const qcTask = await latestCompletedSolLowQcTask(client, payload.issue_id,
+      issue.rows[0].workspace_id, payload.qc_task_id || null);
     if (!qcTask) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "completed_sol_low_qc_required");
@@ -2085,6 +2101,7 @@ module.exports = {
   validateRelayVerdict,
   qcBounceDecision,
   latestCompletedSolLowQcTask,
+  qcTaskEvidence,
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
