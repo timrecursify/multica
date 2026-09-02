@@ -55,7 +55,15 @@ readonly BUILD_AGENT=gsp-build-deepseek-flash-1
 # cap was not available; this is reallocation inside a fixed 20. 12 is the floor
 # Tim set for the build lane and must not go lower.
 readonly WANT_BUILD_CAPACITY=12
+readonly WANT_RELAY_STAGE_CYCLE_LIMIT=2
+readonly WANT_RELAY_LIFETIME_TASK_LIMIT=6
 readonly GUARDED_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver gsp-multica-worker)
+# These are enforced from the deployed PM2 environment, not merely mirrored
+# from relay defaults. Both relay owners must share the same bounded budgets.
+readonly RELAY_CAP_EXPECTATIONS=(
+  "gsp-multica-bridge|${WANT_RELAY_STAGE_CYCLE_LIMIT}|${WANT_RELAY_LIFETIME_TASK_LIMIT}"
+  "multica-relay-advance|${WANT_RELAY_STAGE_CYCLE_LIMIT}|${WANT_RELAY_LIFETIME_TASK_LIMIT}"
+)
 # Apps that must be RUNNING, checked by status rather than by guardrails.
 # multica-relay-advance is here but NOT in GUARDED_APPS: it is not defined in
 # ECOSYSTEM, so it is restarted by name and cannot be started via --only.
@@ -210,6 +218,53 @@ sys.exit(0 if a and a[0]['pm2_env'].get('max_restarts') else 1)
     fi
   done
   "$PM2" save >/dev/null 2>&1 || unfixable+=("pm2 save failed; guardrails may not survive a reboot")
+}
+
+relay_caps_match() {
+  local expected_stage="$1" expected_lifetime="$2" actual_stage="$3" actual_lifetime="$4"
+  [[ "$actual_stage" == "$expected_stage" && "$actual_lifetime" == "$expected_lifetime" ]]
+}
+
+relay_cap_values() {
+  local app="$1"
+  "$PM2" jlist 2>/dev/null | python3 -c '
+import json,sys
+app=sys.argv[1]
+try:
+    rows=json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+rows=[row for row in rows if row.get("name")==app]
+if not rows:
+    raise SystemExit(1)
+env=rows[0].get("pm2_env", {}).get("env", {})
+print(f"{env.get('"'"'RELAY_STAGE_CYCLE_LIMIT'"'"','"'"''"'"')}|{env.get('"'"'RELAY_LIFETIME_TASK_LIMIT'"'"','"'"''"'"')}")
+' "$app"
+}
+
+guard_relay_caps() {
+  local spec app want_stage want_lifetime values actual_stage actual_lifetime
+  for spec in "${RELAY_CAP_EXPECTATIONS[@]}"; do
+    IFS='|' read -r app want_stage want_lifetime <<<"$spec"
+    values=$(relay_cap_values "$app") || {
+      unfixable+=("could not inspect relay caps for $app")
+      continue
+    }
+    IFS='|' read -r actual_stage actual_lifetime <<<"$values"
+    if relay_caps_match "$want_stage" "$want_lifetime" "$actual_stage" "$actual_lifetime"; then
+      continue
+    fi
+    if RELAY_STAGE_CYCLE_LIMIT="$want_stage" RELAY_LIFETIME_TASK_LIMIT="$want_lifetime" \
+      "$PM2" restart "$app" --update-env >/dev/null 2>&1 &&
+      values=$(relay_cap_values "$app") &&
+      IFS='|' read -r actual_stage actual_lifetime <<<"$values" &&
+      relay_caps_match "$want_stage" "$want_lifetime" "$actual_stage" "$actual_lifetime"; then
+      fixed+=("relay caps re-applied to $app")
+    else
+      unfixable+=("$app relay caps are ${actual_stage:-unset}/${actual_lifetime:-unset}, expected ${want_stage}/${want_lifetime}")
+    fi
+  done
+  "$PM2" save >/dev/null 2>&1 || unfixable+=("pm2 save failed; relay caps may not survive a reboot")
 }
 
 # 3. Only a genuinely active autopilot may hold an armed trigger.
@@ -912,7 +967,7 @@ guard_unshipped_closures() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-guard_wrapper; guard_tower_process; guard_pm2; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 for f in "${fixed[@]:-}";     do [[ -n "$f" ]] && echo "belt-config-guard: FIXED $f"; done
 for u in "${unfixable[@]:-}"; do [[ -n "$u" ]] && echo "belt-config-guard: UNFIXABLE $u" >&2; done

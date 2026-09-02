@@ -34,6 +34,21 @@ MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT='' assert_i
 assert_eq missing "$(tower_concurrency_state 'multica-daemon/server daemon start')" 'missing Tower concurrency flag'
 assert_eq correct "$(tower_concurrency_state "multica-daemon/server daemon start --max-concurrent-tasks=${expected_cap}")" 'configured Tower concurrency flag'
 assert_eq mismatched "$(tower_concurrency_state "multica-daemon/server daemon start --max-concurrent-tasks=$((expected_cap + 1))")" 'mismatched Tower concurrency flag'
+for expected in "${RELAY_CAP_EXPECTATIONS[@]}"; do
+  IFS='|' read -r app expected_stage expected_lifetime <<<"$expected"
+  if ! relay_caps_match "$expected_stage" "$expected_lifetime" "$expected_stage" "$expected_lifetime"; then
+    printf 'belt config guard test: expected relay caps rejected for %s\n' "$app" >&2
+    exit 1
+  fi
+  if relay_caps_match "$expected_stage" "$expected_lifetime" "$((expected_stage + 1))" "$expected_lifetime"; then
+    printf 'belt config guard test: stage-cycle relay cap drift accepted for %s\n' "$app" >&2
+    exit 1
+  fi
+  if relay_caps_match "$expected_stage" "$expected_lifetime" "$expected_stage" "$((expected_lifetime + 1))"; then
+    printf 'belt config guard test: lifetime-task relay cap drift accepted for %s\n' "$app" >&2
+    exit 1
+  fi
+done
 wrapper_fixture="$(mktemp)"
 trap 'rm -f -- "$wrapper_fixture"' EXIT
 printf '%s\n' '  --max-concurrent-tasks="$cap_raw"' >"$wrapper_fixture"
