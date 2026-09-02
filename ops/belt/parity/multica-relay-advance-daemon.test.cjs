@@ -391,6 +391,17 @@ test('zero-task Queue fixture creates attempt one without retry admission', asyn
   assert.equal(harness.queries.some(({ sql }) => sql.includes('max(EXTRACT(epoch')), false);
 });
 
+test('stranded recovery selects enabled stage-pool members before legacy owners', async () => {
+  const harness = strandedHarness([strandedFixture({ stage: 'In Review' })]);
+  await harness.run();
+  const candidate = harness.queries.find(({ sql }) => sql.includes('WITH stranded AS'));
+  assert.match(candidate.sql, /FROM relay_stage_pool policy/);
+  assert.match(candidate.sql, /JOIN relay_stage_agent_pool member/);
+  assert.match(candidate.sql, /policy\.stage_name = i\.status/);
+  assert.match(candidate.sql, /NOT EXISTS \(\s*SELECT 1 FROM relay_stage_pool policy/);
+  assert.match(candidate.sql, /ORDER BY owner_priority, active_task_count/);
+});
+
 test('In Review requeue summary supplies the QC PR URL and full SHA', () => {
   const summary = requeueTriggerSummary(strandedFixture({ stage: 'In Review', number: 159,
     build_task_result: { pr_url: 'https://github.com/timrecursify/multica/pull/1',
