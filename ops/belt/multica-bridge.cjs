@@ -1087,6 +1087,15 @@ async function relayVerdict(req, res, payload) {
     relayVerdictError(res, 400, invalid);
     return;
   }
+  const externalQc = payload.operator_external_qc === true;
+  const externalQcAllowed = externalQc && !OPERATOR_SECRET_DISABLED &&
+    typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+    req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET &&
+    typeof payload.reason === "string" && payload.reason.trim() !== "";
+  if (externalQc && !externalQcAllowed) {
+    relayVerdictError(res, 403, "operator_external_qc_secret_or_reason_required");
+    return;
+  }
   const client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
   try {
     await client.connect();
@@ -1128,21 +1137,22 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 404, "issue_not_found");
     }
-    const qcTask = await latestCompletedSolLowQcTask(client, payload.issue_id,
+    const qcTask = externalQc ? { id: null, agent_id: null, agent_name: payload.checker,
+      completed_at: new Date(0) } : await latestCompletedSolLowQcTask(client, payload.issue_id,
       issue.rows[0].workspace_id, payload.qc_task_id || null);
     if (!qcTask) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "completed_sol_low_qc_required");
     }
-    const evidenceMismatch = qcTaskEvidenceMismatch(qcTask, payload);
+    const evidenceMismatch = externalQc ? null : qcTaskEvidenceMismatch(qcTask, payload);
     if (evidenceMismatch) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, evidenceMismatch);
     }
     const notes = [
-      `relay_task_id=${qcTask.id}`,
-      `relay_agent_id=${qcTask.agent_id}`,
-      `relay_agent_name=${qcTask.agent_name}`,
+      externalQc ? `operator_external_qc=${payload.reason.trim()}` : `relay_task_id=${qcTask.id}`,
+      externalQc ? `operator_callsign=${payload.checker}` : `relay_agent_id=${qcTask.agent_id}`,
+      externalQc ? null : `relay_agent_name=${qcTask.agent_name}`,
       typeof payload.notes === "string" && payload.notes.length <= 2000 ? payload.notes : null,
     ].filter(Boolean).join("\n");
     const current = await client.query(
@@ -1150,7 +1160,7 @@ async function relayVerdict(req, res, payload) {
          FROM qc_verdict WHERE issue_id = $1 FOR UPDATE`, [payload.issue_id]
     );
     const currentVerdict = current.rows[0];
-    const currentFromBoundTask = currentVerdict &&
+    const currentFromBoundTask = !externalQc && currentVerdict &&
       currentVerdict.checker_id === qcTask.agent_id &&
       String(currentVerdict.notes || "").includes(`relay_task_id=${qcTask.id}`);
     if (replay && currentVerdict && !currentFromBoundTask &&
@@ -1169,6 +1179,7 @@ async function relayVerdict(req, res, payload) {
           payload.model, payload.effort, payload.idem_key, notes]
       );
     }
+    if (externalQc) console.log(`[relay/verdict] operator_external_qc callsign=${payload.checker} reason=${payload.reason.trim()}`);
     if (!currentFromBoundTask) {
       if (currentVerdict) {
         await client.query(

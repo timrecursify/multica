@@ -569,6 +569,32 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   }
 });
 
+test('operator external QC requires its distinct secret and Sol-low evidence lane', async () => {
+  const writes = [];
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    if (/FROM agent_task_queue t/.test(sql)) assert.fail('external QC must not read a task row');
+    if (/FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/INSERT INTO qc_attempt|INSERT INTO qc_verdict/.test(sql)) writes.push(values);
+    return { rows: [] };
+  } };
+  const call = async (payload, headers = {}) => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({ headers }, res, { agent_token: 'test-relay-secret', ...payload });
+    return { ...res, json: JSON.parse(res.body) };
+  };
+  setTestClientFactory(() => client);
+  try {
+    const external = { ...validVerdict, idem_key: 'external-qc-accepted-0001', operator_external_qc: true, reason: 'outside belt PR QC' };
+    assert.equal((await call(external, { 'x-relay-operator-secret': 'test-operator-secret' })).status, 201);
+    assert.match(writes[0][11], /operator_external_qc=outside belt PR QC/);
+    assert.equal((await call({ ...external, idem_key: 'external-qc-no-secret-0002' })).status, 403);
+    const wrongLane = await call({ ...external, idem_key: 'external-qc-wrong-lane-003', model: 'other-model' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+    assert.equal(wrongLane.json.error, 'invalid_qc_lane');
+  } finally { setTestClientFactory(null); }
+});
+
 test('PASS replay writes once, but an older bound task cannot replace a newer FAIL', async () => {
   const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'pass-agent',
     agent_name: 'qc-sol-low-pass', context: {}, result: qcResult(), completed_at: '2026-01-01T00:00:00Z' };
