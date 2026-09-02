@@ -392,16 +392,21 @@ var identifierNumberRe = regexp.MustCompile(`(?i)^[a-z]+-(\d+)$`)
 func parseQueryNumber(q string) (int, bool) {
 	q = strings.TrimSpace(q)
 	// Check for identifier pattern like "MUL-123"
-	if m := identifierNumberRe.FindStringSubmatch(q); m != nil {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			return n, true
+	parsePositiveInt32 := func(s string) (int, bool) {
+		// PostgreSQL stores issue.number as integer (int32). Parsing with
+		// Atoi follows the host word size, which can accept values that the
+		// database cannot bind to this column.
+		n, err := strconv.ParseInt(s, 10, 32)
+		if err != nil || n <= 0 {
+			return 0, false
 		}
+		return int(n), true
 	}
-	// Check for bare number
-	if n, err := strconv.Atoi(q); err == nil && n > 0 {
-		return n, true
+	if m := identifierNumberRe.FindStringSubmatch(q); m != nil {
+		return parsePositiveInt32(m[1])
 	}
-	return 0, false
+	// Check for bare number.
+	return parsePositiveInt32(q)
 }
 
 // searchResult holds a raw row from the dynamic search query.
