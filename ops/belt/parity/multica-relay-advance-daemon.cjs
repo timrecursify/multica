@@ -43,6 +43,10 @@ function reconcileCreateLimit(value = RECONCILE_MAX_CREATE_PER_CYCLE) {
 }
 
 async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } = {}) {
+  if (process.env.RECONCILE_DISPATCH_HOLD === '1') {
+    logger.log('Reconcile cycle: held (RECONCILE_DISPATCH_HOLD=1)');
+    return null;
+  }
   const client = await dbPool.connect();
   try {
     const results = await reconcileCycle(client, { maxCreatePerCycle: reconcileCreateLimit(maxCreate) });
@@ -105,12 +109,13 @@ async function buildCompletionRoute(client, row) {
     [row.issue_id]);
   const match = comments.rows.map(({ content }) => String(content || '').match(
     /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i)).find(Boolean);
-  if (!match) return { kind: 'no_pr', toStage: 'Done' };
+  // No PR: Sol-low decides whether the work product closes the ticket (Tim 2026-09-02: closed means work behind it).
+  if (!match) return { kind: 'no_pr', toStage: 'In Review' };
   const repo = `${match[1]}/${match[2]}`;
   const pr = JSON.parse(github(['pr', 'view', match[0], '--json',
     'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
   const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
-  if (route.reason === 'non_runtime_pr_not_merged' && pr.mergeStateStatus === 'MERGEABLE' &&
+  if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
       greenChecks(pr.statusCheckRollup)) {
     github(['pr', 'merge', match[0], '--squash', '--admin']);
     return { ...route, toStage: 'Done', kind: 'merge_only_admin_merged', repo,
