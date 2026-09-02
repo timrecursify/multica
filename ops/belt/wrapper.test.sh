@@ -47,6 +47,8 @@ wait "$pid"
 assert_wrapper_rejects() {
   local label="$1" expected="$2" stderr="$fake/$1.stderr" status
   shift 2
+  # Each rejection must happen before the fake daemon can receive argv.
+  rm -f -- "$capture"
   if env "$@" MULTICA_DAEMON_LOCK_FILE="$fake/$label.lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$stderr"; then
     echo "$label unexpectedly succeeded" >&2
     return 1
@@ -55,6 +57,7 @@ assert_wrapper_rejects() {
   fi
   [[ "$status" -eq 64 ]]
   [[ "$(<"$stderr")" == "$expected" ]]
+  [[ ! -e "$capture" ]]
 }
 assert_wrapper_rejects cap-bad \
   'multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer' \
@@ -62,6 +65,12 @@ assert_wrapper_rejects cap-bad \
 assert_wrapper_rejects cap-empty \
   'multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=
+assert_wrapper_rejects root-relative \
+  'multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path' \
+  MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_WORKSPACES_ROOT=relative
+assert_wrapper_rejects root-empty \
+  'multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path' \
+  MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_WORKSPACES_ROOT=
 assert_wrapper_rejects cwd-relative \
   'multica-daemon-wrapper: MULTICA_DAEMON_CWD must be an existing absolute directory' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD=relative CAPTURE_FILE="$capture"
