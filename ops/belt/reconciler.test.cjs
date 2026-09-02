@@ -72,12 +72,33 @@ test("insert conflict is already-live and budgets bound creation", async () => {
   assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
-test("cycle returns required counts", async () => {
+test("cycle returns per-issue results", async () => {
   const db = harness();
   const original = db.query;
   db.query = async (sql, values) => sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count\n            FROM issue WHERE")
     ? { rows: [issue] } : original(sql, values);
-  assert.deepEqual(await reconcileCycle(db, { evaluate: ok }), { created: 1, skipped: 0, humanReview: 0, alreadyLive: 0 });
+  assert.deepEqual(await reconcileCycle(db, { evaluate: ok }), [{ action: "created", taskId: "task-1" }]);
+});
+
+test("cycle rolls back a throwing issue and reconciles the next issue", async () => {
+  const second = { ...issue, id: "77777777-7777-4777-8777-777777777777" };
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count\n            FROM issue WHERE")) {
+      return { rows: [issue, second] };
+    }
+    if (sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count, parent_issue_id") &&
+        values[0] === issue.id) throw new Error("first issue fails");
+    return original(sql, values);
+  };
+  const results = await reconcileCycle(db, { evaluate: ok });
+  assert.deepEqual(results, [
+    { action: "error", issueId: issue.id, message: "first issue fails" },
+    { action: "created", taskId: "task-1" }
+  ]);
+  assert.ok(db.calls.some((call) => call.sql === "ROLLBACK"));
+  assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")));
 });
 
 test("lifetime and per-stage attempt ceilings move the issue to Human Review", async () => {

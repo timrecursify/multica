@@ -19,7 +19,7 @@ const EVIDENCE = Object.freeze({
   shipped: ['ciSuccess', 'mergeDeployReceipt', 'reviewedSha'],
   return: ['ciFailureOrAbsent', 'mergeConflictEvidence'],
   retryEscalation: ['retry_escalation'],
-  review: ['namedBlocker'],
+  review: ['blocker'],
   decision: ['recordedDecision', 'destinationEvidence'],
   cancelled: ['boardOwnerAuthority', 'reason'],
   archived: ['signedArchivePlanReceipt']
@@ -90,7 +90,8 @@ function evaluate({ from, to, actor, evidence = {}, ...request } = {}) {
       !(evidence.completedSolLowTask || evidence.externalReviewReceipt)) {
     return { ok: false, code: 'evidence_missing' };
   }
-  if (!requiredEvidence.every((field) => evidence[field])) {
+  if (!requiredEvidence.every((field) => evidence[field] ||
+      (field === 'blocker' && evidence.namedBlocker))) {
     return { ok: false, code: 'evidence_missing' };
   }
   if (evidence.qcRequired === true && !evidence.qualifyingPass) {
