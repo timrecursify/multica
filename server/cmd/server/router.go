@@ -1196,6 +1196,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 					// are admin-gated below).
 					r.Get("/runtime-profiles", h.ListRuntimeProfiles)
 					r.Get("/runtime-profiles/{profileId}", h.GetRuntimeProfile)
+					r.Get("/relay-stage-pools", h.ListRelayStagePools)
 				})
 				// Admin-level access
 				r.Group(func(r chi.Router) {
