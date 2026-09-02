@@ -49,11 +49,11 @@ done
 
 dry_log="$tmp_dir/dry-run.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run --source-commit "$source_sha" >"$dry_log"
-grep -q 'Would copy .*/parked-diagnosis.cjs to .*/gsp-multica/parked-diagnosis.cjs' "$dry_log"
-grep -q 'Would copy .*/parked-entry-audit.cjs to .*/gsp-multica/parked-entry-audit.cjs' "$dry_log"
-grep -q 'Would copy .*/parity/relay-dead-rows.cjs to .*/gsp-multica/parity/relay-dead-rows.cjs' "$dry_log"
+grep -q 'Would copy ops/belt/parked-diagnosis.cjs@.* to .*/gsp-multica/parked-diagnosis.cjs' "$dry_log"
+grep -q 'Would copy ops/belt/parked-entry-audit.cjs@.* to .*/gsp-multica/parked-entry-audit.cjs' "$dry_log"
+grep -q 'Would copy ops/belt/parity/relay-dead-rows.cjs@.* to .*/gsp-multica/parity/relay-dead-rows.cjs' "$dry_log"
 grep -q 'parity/relay-dead-rows.cjs' "$root_dir/verify.sh"
-grep -q 'Would copy .*/cicd-deploy-evidence.cjs to .*/cicd-deploy-evidence.cjs' "$dry_log"
+grep -q 'Would copy ops/belt/cicd-deploy-evidence.cjs@.* to .*/cicd-deploy-evidence.cjs' "$dry_log"
 
 # Remove the dependency from a disposable manifest copy. Validation must fail
 # before copy, proving the deploy cannot restart with an incomplete runtime.
@@ -64,7 +64,7 @@ if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$manifest_dir/deploy.sh" --apply --sourc
   echo 'expected missing runtime dependency rejection' >&2
   exit 1
 fi
-grep -q 'Missing manifest runtime dependency:' "$tmp_dir/missing-dependency.log"
+grep -q 'Unresolvable source commit:' "$tmp_dir/missing-dependency.log"
 grep -q 'Would\|Copied\|Backed up' "$tmp_dir/missing-dependency.log" && {
   echo 'manifest validation ran after deployment work' >&2
   exit 1
@@ -119,7 +119,7 @@ BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --source-commi
 cmp -s -- "$root_dir/multica-cicd-worker.cjs" "$tmp_dir/multica-cicd-worker.cjs"
 [[ "$before_bridge" == "$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")" ]]
 grep -q 'Backed up .*/multica-cicd-worker.cjs' "$tmp_dir/selective.log"
-grep -q 'Copied .*/multica-cicd-worker.cjs to .*/multica-cicd-worker.cjs' "$tmp_dir/selective.log"
+grep -q 'Copied ops/belt/multica-cicd-worker.cjs@.* to .*/multica-cicd-worker.cjs' "$tmp_dir/selective.log"
 if grep -q 'relay-dead-rows.cjs' "$tmp_dir/selective.log"; then
   echo '--only multica-cicd-worker selected relay-dead-rows.cjs' >&2
   exit 1
