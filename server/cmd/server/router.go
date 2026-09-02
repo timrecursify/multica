@@ -1127,6 +1127,20 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Post("/{taskId}/requeue", h.RequeueOrphanedTask)
 	})
 
+	// GSP-806 operator control surface. Same service-authenticated
+	// MULTICA_OPERATOR_SECRET bearer as the task-queue repair API above.
+	// Board-scoped: each call targets the selected board's own backend, so the
+	// workspace_id path segment is validated against that instance and a
+	// caller-supplied id can never switch boards.
+	r.Route("/api/operator", func(r chi.Router) {
+		r.Use(operatorAuth)
+		r.Route("/workspaces/{workspaceId}/agents", func(r chi.Router) {
+			r.Get("/", h.ListWorkspaceOperatorAgents)
+			r.Get("/{ref}", h.GetWorkspaceOperatorAgent)
+			r.Patch("/{ref}", h.UpdateWorkspaceOperatorAgent)
+		})
+	})
+
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))

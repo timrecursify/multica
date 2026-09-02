@@ -3398,6 +3398,56 @@ func (q *Queries) GetAgentInWorkspace(ctx context.Context, arg GetAgentInWorkspa
 	return i, err
 }
 
+const getAgentInWorkspaceByName = `-- name: GetAgentInWorkspaceByName :one
+SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier FROM agent
+WHERE workspace_id = $1 AND name = $2 AND kind = 'user'
+LIMIT 1
+`
+
+type GetAgentInWorkspaceByNameParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Name        string      `json:"name"`
+}
+
+// Resolve one user agent by its exact (case-sensitive) name inside a
+// workspace. Backs the operator roster resolve-by-name path (GSP-806):
+// agent names are unique per (workspace_id, name).
+func (q *Queries) GetAgentInWorkspaceByName(ctx context.Context, arg GetAgentInWorkspaceByNameParams) (Agent, error) {
+	row := q.db.QueryRow(ctx, getAgentInWorkspaceByName, arg.WorkspaceID, arg.Name)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.RuntimeMode,
+		&i.RuntimeConfig,
+		&i.Visibility,
+		&i.Status,
+		&i.MaxConcurrentTasks,
+		&i.OwnerID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Description,
+		&i.RuntimeID,
+		&i.Instructions,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
+		&i.CustomEnv,
+		&i.CustomArgs,
+		&i.McpConfig,
+		&i.Model,
+		&i.ThinkingLevel,
+		&i.ComposioToolkitAllowlist,
+		&i.PermissionMode,
+		&i.Kind,
+		&i.SystemKey,
+		&i.DisabledRuntimeSkills,
+		&i.ServiceTier,
+	)
+	return i, err
+}
+
 const getAgentRecentRateLimitFailures = `-- name: GetAgentRecentRateLimitFailures :one
 SELECT
     count(*)::int AS failure_count,
@@ -3855,6 +3905,28 @@ func (q *Queries) GetLatestTaskRolloutMissing(ctx context.Context, arg GetLatest
 	var session_rollout_missing bool
 	err := row.Scan(&session_rollout_missing)
 	return session_rollout_missing, err
+}
+
+const getRelayStageConfig = `-- name: GetRelayStageConfig :one
+SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages FROM relay_stage_config
+WHERE stage_name = $1
+`
+
+// One exact relay stage by name. Returns a single row or sql.ErrNoRows so an
+// operator can never mutate a stage that is not configured.
+func (q *Queries) GetRelayStageConfig(ctx context.Context, stageName string) (RelayStageConfig, error) {
+	row := q.db.QueryRow(ctx, getRelayStageConfig, stageName)
+	var i RelayStageConfig
+	err := row.Scan(
+		&i.ID,
+		&i.StageName,
+		&i.NextStage,
+		&i.AgentID,
+		&i.AgentName,
+		&i.CreatedAt,
+		&i.AltNextStages,
+	)
+	return i, err
 }
 
 const getWorkspaceAgentActivity30d = `-- name: GetWorkspaceAgentActivity30d :many
@@ -4960,6 +5032,42 @@ func (q *Queries) ListQueuedClaimCandidatesByRuntimes(ctx context.Context, arg L
 			&i.RegenerateQuickActionsFor,
 			&i.DaemonID,
 			&i.WorkspaceID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listRelayStageConfig = `-- name: ListRelayStageConfig :many
+SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages FROM relay_stage_config
+ORDER BY id ASC
+`
+
+// The full relay stage configuration in canonical id order. Backs the
+// operator read surface (GSP-806): every configured source stage plus its
+// primary successor and any alternate successors.
+func (q *Queries) ListRelayStageConfig(ctx context.Context) ([]RelayStageConfig, error) {
+	rows, err := q.db.Query(ctx, listRelayStageConfig)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []RelayStageConfig{}
+	for rows.Next() {
+		var i RelayStageConfig
+		if err := rows.Scan(
+			&i.ID,
+			&i.StageName,
+			&i.NextStage,
+			&i.AgentID,
+			&i.AgentName,
+			&i.CreatedAt,
+			&i.AltNextStages,
 		); err != nil {
 			return nil, err
 		}
@@ -6911,6 +7019,38 @@ func (q *Queries) SetDeferredChannelIssueTaskRuntimeOverlay(ctx context.Context,
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setRelayStageOwner = `-- name: SetRelayStageOwner :one
+UPDATE relay_stage_config
+SET agent_id = $2,
+    agent_name = $3
+WHERE stage_name = $1
+RETURNING id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages
+`
+
+type SetRelayStageOwnerParams struct {
+	StageName string      `json:"stage_name"`
+	AgentID   pgtype.UUID `json:"agent_id"`
+	AgentName pgtype.Text `json:"agent_name"`
+}
+
+// Atomically set (or clear) the relay stage owner for ONE exact transition.
+// The stage is looked up by source stage_name; agent_id/agent_name are caller
+// validated. Returns the updated row so the caller echoes the effect.
+func (q *Queries) SetRelayStageOwner(ctx context.Context, arg SetRelayStageOwnerParams) (RelayStageConfig, error) {
+	row := q.db.QueryRow(ctx, setRelayStageOwner, arg.StageName, arg.AgentID, arg.AgentName)
+	var i RelayStageConfig
+	err := row.Scan(
+		&i.ID,
+		&i.StageName,
+		&i.NextStage,
+		&i.AgentID,
+		&i.AgentName,
+		&i.CreatedAt,
+		&i.AltNextStages,
+	)
+	return i, err
 }
 
 const setTaskDeliveredCommentIDs = `-- name: SetTaskDeliveredCommentIDs :one

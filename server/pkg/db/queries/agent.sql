@@ -1944,3 +1944,34 @@ WHERE agent_id = $1
   AND status = 'failed'
   AND failure_reason = 'agent_error.provider_capacity_or_rate_limit'
   AND completed_at >= $2;
+
+-- name: ListRelayStageConfig :many
+-- The full relay stage configuration in canonical id order. Backs the
+-- operator read surface (GSP-806): every configured source stage plus its
+-- primary successor and any alternate successors.
+SELECT * FROM relay_stage_config
+ORDER BY id ASC;
+
+-- name: GetRelayStageConfig :one
+-- One exact relay stage by name. Returns a single row or sql.ErrNoRows so an
+-- operator can never mutate a stage that is not configured.
+SELECT * FROM relay_stage_config
+WHERE stage_name = $1;
+
+-- name: SetRelayStageOwner :one
+-- Atomically set (or clear) the relay stage owner for ONE exact transition.
+-- The stage is looked up by source stage_name; agent_id/agent_name are caller
+-- validated. Returns the updated row so the caller echoes the effect.
+UPDATE relay_stage_config
+SET agent_id = $2,
+    agent_name = $3
+WHERE stage_name = $1
+RETURNING *;
+
+-- name: GetAgentInWorkspaceByName :one
+-- Resolve one user agent by its exact (case-sensitive) name inside a
+-- workspace. Backs the operator roster resolve-by-name path (GSP-806):
+-- agent names are unique per (workspace_id, name).
+SELECT * FROM agent
+WHERE workspace_id = $1 AND name = $2 AND kind = 'user'
+LIMIT 1;
