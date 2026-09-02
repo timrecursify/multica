@@ -1,4 +1,5 @@
 const { Pool } = require('pg');
+const { currentStrictPass } = require('./qc-strict-evidence.cjs');
 
 function parseArgs(args) {
   let mode = 'dry-run';
@@ -69,12 +70,17 @@ async function recover(client, { mode }) {
   await client.query('BEGIN');
   try {
     const candidates = await client.query(CANDIDATE_SQL);
+    // Keep recovery on the same exact-one-attempt contract as deploy/Done.
+    const strictCandidates = [];
+    for (const candidate of candidates.rows) {
+      if (await currentStrictPass(client, candidate.issue_id)) strictCandidates.push(candidate);
+    }
     if (mode === 'dry-run') {
       await client.query('ROLLBACK');
-      return { mode, candidates: candidates.rows, reopened: [] };
+      return { mode, candidates: strictCandidates, reopened: [] };
     }
     const reopened = [];
-    for (const row of candidates.rows) {
+    for (const row of strictCandidates) {
       const result = await client.query(
         `UPDATE relay_run_log
             SET status = 'pending'
@@ -84,7 +90,7 @@ async function recover(client, { mode }) {
       reopened.push(...result.rows);
     }
     await client.query('COMMIT');
-    return { mode, candidates: candidates.rows, reopened };
+    return { mode, candidates: strictCandidates, reopened };
   } catch (err) {
     try { await client.query('ROLLBACK'); } catch (_) {}
     throw err;

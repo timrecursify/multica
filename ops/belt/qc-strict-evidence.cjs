@@ -16,4 +16,18 @@ async function currentStrictPass(db, issueId) {
   const result = await db.query(STRICT_CURRENT_PASS_SQL, [issueId]);
   return result.rows[0] || null;
 }
-module.exports = { STRICT_CURRENT_PASS_SQL, currentStrictPass };
+function strictEvidenceFromRow(row, verdictMd5) {
+  const bound = String(row.qc_attempt_bound_sha || '').toLowerCase();
+  const observed = String(row.qc_attempt_observed_sha || '').toLowerCase();
+  const md5 = String(row.qc_attempt_work_product_md5 || '').toLowerCase();
+  const evidenceAgentId = row.qc_attempt_evidence_agent_id || row.task_agent_id;
+  const ok = row.qc_attempt_verdict === 'PASS' && row.qc_attempt_qualifying === true &&
+    row.qc_attempt_evidence_agent_model === 'gpt-5.6-sol' &&
+    row.qc_attempt_evidence_agent_effort === 'low' &&
+    row.qc_verdict_checker_id === evidenceAgentId &&
+    /^[0-9a-f]{40}$/.test(bound) && bound === observed && md5 === verdictMd5;
+  return ok ? { ok: true, boundSha: bound,
+    evidenceTaskId: row.qc_attempt_evidence_task_id || row.task_id }
+    : { ok: false, reason: 'qc_attempt_binding_required' };
+}
+module.exports = { STRICT_CURRENT_PASS_SQL, currentStrictPass, strictEvidenceFromRow };

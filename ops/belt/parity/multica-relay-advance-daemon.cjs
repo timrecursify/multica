@@ -21,6 +21,7 @@ const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
 const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
+const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -83,8 +84,7 @@ function qcCompletionAdvance(row) {
   }
   const md5 = String(row.qc_verdict_work_product_md5 || '').toLowerCase();
   if (!MD5_RE.test(md5)) return { ok: false, reason: 'qc_work_product_md5_required' };
-  const strict = strictQcAttempt(row, md5);
-  if (!strict) return { ok: false, reason: 'qc_attempt_binding_required' };
+  const strict = strictEvidenceFromRow(row, md5);
   return strict.ok ? { ok: true, workProductMd5: md5, boundSha: strict.boundSha,
     evidenceTaskId: strict.evidenceTaskId } : strict;
 }
