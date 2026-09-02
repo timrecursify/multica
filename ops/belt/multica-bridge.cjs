@@ -154,6 +154,16 @@ async function rerunParkedDiagnosis(client, payload) {
   });
   return taskId ? { ok: true, replay: false, task_id: taskId } : { ok: false, error: 'diagnosis_owner_or_capacity_unavailable' };
 }
+
+// This is deliberately an exact database-error allowlist. A missing runtime
+// for the selected diagnosis owner is an ineligible-state refusal; other
+// database failures remain unexpected and must retain their 500 response.
+function parkedDiagnosisRerunRefusal(err) {
+  if (err?.code === '23514' && err.constraint === 'agent_task_queue_active_requires_runtime') {
+    return 'diagnosis_runtime_unavailable';
+  }
+  return null;
+}
 const IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "access"]);
 const RETRY_ESCALATION_REASONS = new Set([
@@ -1997,7 +2007,7 @@ async function relayAdvance(req, res, body) {
 
 async function relayDiagnosisRerun(req, res, payload) {
   if (!RELAY_AGENT_SECRET || payload.agent_token !== RELAY_AGENT_SECRET) return relayVerdictError(res, 403, 'invalid_token');
-  const client = new Client({ connectionString: MULTICA_DB });
+  const client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
   try {
     await client.connect();
     await client.query('BEGIN');
@@ -2011,7 +2021,16 @@ async function relayDiagnosisRerun(req, res, payload) {
     res.end(JSON.stringify(result));
   } catch (err) {
     await client.query('ROLLBACK').catch(() => {});
-    relayVerdictError(res, 500, 'internal_error');
+    console.error(JSON.stringify({
+      event: 'relay_parked_diagnosis_rerun_failed',
+      issue_id: payload.issue_id,
+      message: err?.message,
+      stack: err?.stack,
+      ...(err?.code ? { code: err.code } : {}),
+      ...(err?.constraint ? { constraint: err.constraint } : {})
+    }));
+    const refusal = parkedDiagnosisRerunRefusal(err);
+    relayVerdictError(res, refusal ? 409 : 500, refusal || 'internal_error');
   } finally { await client.end().catch(() => {}); }
 }
 
@@ -2130,5 +2149,7 @@ module.exports = {
   capEscalationVerified,
   retryEscalationLoop,
   authorizeRelayStatusWrites,
-  rerunParkedDiagnosis
+  rerunParkedDiagnosis,
+  relayDiagnosisRerun,
+  parkedDiagnosisRerunRefusal
 };
