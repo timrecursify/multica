@@ -205,3 +205,10 @@ test('quota circuit pauses only after consecutive money failures', () => {
   assert.deepEqual(quotaCircuitAdmission(['402', 'timeout', '402']),
     { pause: false, consecutive: 1, ceiling: 3 });
 });
+
+test('quota circuit ignores a quota failure outside the pause window', () => {
+  const now = Date.parse('2026-09-02T02:00:00.000Z');
+  assert.deepEqual(quotaCircuitAdmission([{ failure_reason: 'provider_quota_limit',
+    updated_at: new Date(now - QUOTA_PAUSE_MAX_AGE_MS - 1).toISOString() }], 1, { now }),
+  { pause: false, consecutive: 0, ceiling: 1 });
+});

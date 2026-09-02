@@ -212,13 +212,20 @@ function assertRoutableStageOwners(rows) {
   }
 }
 
-function quotaCircuitAdmission(failureReasons, limit = 3) {
+function quotaCircuitAdmission(failures, limit = 3, { now = Date.now(),
+  maxAgeMs = QUOTA_PAUSE_MAX_AGE_MS } = {}) {
   const ceiling = Number(limit);
   if (!Number.isInteger(ceiling) || ceiling < 1) {
     return { pause: true, reason: 'invalid_quota_failure_limit' };
   }
   let consecutive = 0;
-  for (const reason of failureReasons || []) {
+  for (const failure of failures || []) {
+    const reason = typeof failure === 'object' && failure !== null
+      ? failure.failure_reason : failure;
+    const updatedAt = typeof failure === 'object' && failure !== null
+      ? failure.updated_at : null;
+    if (updatedAt && (!Number.isFinite(Date.parse(updatedAt)) ||
+      now - Date.parse(updatedAt) > maxAgeMs)) break;
     if (!/\b402\b|provider_quota_limit|payment[ _-]?required/i.test(String(reason || ''))) break;
     consecutive += 1;
   }

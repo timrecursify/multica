@@ -7,6 +7,7 @@ const {
   stageCycleAdmission,
   lifetimeTaskAdmission,
   quotaCircuitAdmission,
+  QUOTA_PAUSE_MAX_AGE_MS,
   crossStageExecutionAdmission,
   quotaPauseClearance,
   quotaPauseFlipLogLine
@@ -868,14 +869,14 @@ const INFRA_FAILURE_REASONS = [
 // agent forever (the agent_task_queue trigger rejects an archived assignee). The
 // stage contract is the authority on who owns a stage, so a re-owned stage heals
 // its own strays.
-async function requeueStrandedTasks({ dbPool = pool } = {}) {
+async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } = {}) {
   const client = await dbPool.connect();
   try {
     const candidates = await client.query(
       `SELECT i.id AS issue_id, i.workspace_id, i.number, i.priority, i.status AS stage,
               i.created_at AS issue_created_at, i.metadata,
               t.id AS dead_task_id, t.status AS dead_task_status,
-              t.attempt, t.max_attempts, t.failure_reason,
+              t.attempt, t.max_attempts, t.failure_reason, t.updated_at AS dead_task_updated_at,
               t.result AS dead_task_result, t.error AS dead_task_error,
               closed_log.id AS closed_relay_log_id,
               build.result AS build_task_result,
@@ -1102,21 +1103,25 @@ async function requeueStrandedTasks({ dbPool = pool } = {}) {
           console.log(`${LOG_PREFIX} [requeue] DEFERRED #${row.number}: ${crossStage.reason} tasks=${crossStage.active_task_ids.join(',')} stages=${crossStage.active_stages.join(',')}`);
           continue;
         }
-        if (quotaCircuitAdmission([row.failure_reason], 1).pause) {
+        if (quotaCircuitAdmission([{
+          failure_reason: row.failure_reason,
+          updated_at: row.dead_task_updated_at
+        }], 1).pause) {
           const recentFailures = await client.query(
-            `SELECT failure_reason FROM agent_task_queue
+            `SELECT failure_reason, updated_at FROM agent_task_queue
               WHERE agent_id = $1 AND status = 'failed'
+                AND updated_at > NOW() - ($3::bigint * INTERVAL '1 millisecond')
               ORDER BY created_at DESC LIMIT $2`,
-            [row.agent_id, QUOTA_FAILURE_LIMIT]
+            [row.agent_id, QUOTA_FAILURE_LIMIT, QUOTA_PAUSE_MAX_AGE_MS]
           );
           const circuit = quotaCircuitAdmission(
-            recentFailures.rows.map((failure) => failure.failure_reason), QUOTA_FAILURE_LIMIT
+            recentFailures.rows, QUOTA_FAILURE_LIMIT
           );
           const quotaPause = circuit.pause
             ? await pauseQuotaLane(client, row, circuit.consecutive)
             : null;
           await client.query('COMMIT');
-          const moved = await postToRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
+          const moved = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
             agent_token: RELAY_AGENT_SECRET, reason: 'payment_required_402' });
           if (quotaPause) {
             logQuotaPauseFlip({ agent_name: quotaPause.agent_name,
