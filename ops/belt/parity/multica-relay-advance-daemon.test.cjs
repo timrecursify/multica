@@ -115,7 +115,7 @@ function strandedFixture(overrides = {}) {
     workspace_id: '323e4567-e89b-42d3-a456-426614174000',
     number: 159,
     stage: 'Queue',
-    updated_at: '2026-09-01T21:46:00Z',
+    dead_task_updated_at: new Date().toISOString(),
     metadata: {},
     dead_task_id: '123e4567-e89b-42d3-a456-426614174000',
     dead_task_status: 'failed',
@@ -144,6 +144,7 @@ function strandedFixture(overrides = {}) {
 
 function strandedHarness(fixtures) {
   const queries = [];
+  const relayPosts = [];
   let consumedClosedRow = false;
   const client = { query: async (sql, values = []) => {
     queries.push({ sql, values });
@@ -157,6 +158,16 @@ function strandedHarness(fixtures) {
       return { rows: fixtures.map((row) => ({ agent_id: row.agent_id, cap: 1, in_flight: 0 })) };
     }
     if (sql.includes('max(EXTRACT(epoch')) return { rows: [{ age: 0 }] };
+    if (sql.includes('SELECT failure_reason, updated_at FROM agent_task_queue')) {
+      return { rows: fixtures[0].recent_quota_failures || [] };
+    }
+    if (sql.includes('UPDATE agent') && sql.includes("'quota_paused', true")) {
+      return { rowCount: 1, rows: [{ id: fixtures[0].agent_id, workspace_id: fixtures[0].workspace_id,
+        agent_name: fixtures[0].agent_name, paused_at: new Date().toISOString() }] };
+    }
+    if (sql.includes("INSERT INTO activity_log") && sql.includes("'relay_lane_paused'")) {
+      return { rows: [] };
+    }
     if (sql === 'BEGIN' || sql === 'COMMIT' || sql === 'ROLLBACK') return { rows: [] };
     if (sql.includes('pg_advisory_xact_lock') || sql.includes('FROM issue WHERE id')) return { rows: [] };
     if (sql.includes('FROM agent_task_queue') && sql.includes('FOR UPDATE')) return { rows: [] };
@@ -171,7 +182,10 @@ function strandedHarness(fixtures) {
     if (sql.includes('INSERT INTO relay_run_log')) return { rows: [] };
     throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
   }, release() {} };
-  return { queries, client, run: () => requeueStrandedTasks({ dbPool: { connect: async () => client } }) };
+  return { queries, relayPosts, client, run: () => requeueStrandedTasks({
+    dbPool: { connect: async () => client },
+    postRelay: async (payload) => { relayPosts.push(payload); return { status: 200 }; }
+  }) };
 }
 
 function loadRequeueDaemon() {
@@ -187,6 +201,35 @@ test('stranded-task fixture redispatches a cancelled-only task', async () => {
   assert.ok(insert);
   assert.match(insert.values[3], /"source":"relay-requeue"/);
   assert.match(insert.values[3], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
+});
+
+test('stale quota failure requeues without pausing its lane or posting Human Review', async () => {
+  const harness = strandedHarness([strandedFixture({
+    failure_reason: 'provider_quota_limit',
+    dead_task_updated_at: new Date(Date.now() - 16 * 60 * 1000).toISOString()
+  })]);
+  await harness.run();
+  const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
+  assert.ok(insert);
+  assert.equal(insert.values[5], 2);
+  assert.equal(harness.queries.some(({ sql }) => sql.includes('SELECT failure_reason, updated_at')), false);
+  assert.deepEqual(harness.relayPosts, []);
+});
+
+test('fresh quota failures at the limit pause the lane and send the ticket to Human Review', async () => {
+  const now = new Date().toISOString();
+  const harness = strandedHarness([strandedFixture({
+    failure_reason: 'provider_quota_limit', dead_task_updated_at: now,
+    recent_quota_failures: Array.from({ length: 3 }, () => ({
+      failure_reason: 'provider_quota_limit', updated_at: now
+    }))
+  })]);
+  await harness.run();
+  assert.ok(harness.queries.some(({ sql }) => sql.includes('SELECT failure_reason, updated_at')));
+  assert.ok(harness.queries.some(({ sql }) => sql.includes("'relay_lane_paused'")));
+  assert.deepEqual(harness.relayPosts, [{ issue_id: '223e4567-e89b-42d3-a456-426614174000',
+    to_stage: 'Human Review', agent_token: undefined, reason: 'payment_required_402' }]);
+  assert.equal(harness.queries.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue')), false);
 });
 
 test('zero-task Queue fixture creates attempt one without retry admission', async () => {
@@ -447,7 +490,7 @@ test('Registered discovery covers every configured workspace', () => {
 test('all parity dispositions use relay authority rather than direct issue status writes', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.doesNotMatch(source, /UPDATE issue SET status/);
-  assert.match(source, /postToRelay\(\{ issue_id: row\.issue_id, to_stage: 'Human Review'/);
+  assert.match(source, /postRelay\(\{ issue_id: row\.issue_id, to_stage: 'Human Review'/);
   assert.match(source, /reason: 'payment_required_402'/);
 });
 
