@@ -94,6 +94,23 @@ test('no-artifact rescope treats 409 as a non-retrying skip', async () => {
   assert.ok(logs.some((line) => line.includes('status=409')));
 });
 
+test('no-artifact rescope 409 logs skipped and never rescoped', async () => {
+  const logs = [];
+  await rescopeCompletedNoArtifactQc({ query: async () => ({ rows: [noArtifactTask()] }) }, {
+    postRelay: async () => ({ status: 409 }), logger: { log: (line) => logs.push(line) }
+  });
+  assert.deepEqual(logs.filter((line) => line.includes('[qc-no-artifact-skipped]')).length, 1);
+  assert.deepEqual(logs.filter((line) => line.includes('[qc-no-artifact-rescoped]')).length, 0);
+});
+
+test('no-artifact rescope 2xx logs rescoped exactly once', async () => {
+  const logs = [];
+  await rescopeCompletedNoArtifactQc({ query: async () => ({ rows: [noArtifactTask()] }) }, {
+    postRelay: async () => ({ status: 201 }), logger: { log: (line) => logs.push(line) }
+  });
+  assert.equal(logs.filter((line) => line.includes('[qc-no-artifact-rescoped]')).length, 1);
+});
+
 test('no-artifact rescope respects RELAY_NOARTIFACT_RESCOPE_BATCH', async () => {
   let queryValues;
   const tasks = [noArtifactTask('first'), noArtifactTask('second')];
@@ -120,7 +137,8 @@ async function deadRowsDb() {
     id text PRIMARY KEY, issue_id text NOT NULL, agent_id text, workspace_id text NOT NULL DEFAULT 'workspace-1',
     status text NOT NULL, context jsonb, result jsonb, completed_at timestamptz, created_at timestamptz NOT NULL)`);
   await admin.query(`CREATE TABLE ${schema}.issue (
-    id text PRIMARY KEY, workspace_id text NOT NULL, number integer NOT NULL, status text NOT NULL DEFAULT 'In Review')`);
+  id text PRIMARY KEY, workspace_id text NOT NULL, number integer NOT NULL, status text NOT NULL DEFAULT 'In Review',
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb)`);
   await admin.query(`CREATE TABLE ${schema}.agent (
     id text PRIMARY KEY, workspace_id text NOT NULL, name text NOT NULL, model text,
     thinking_level text, runtime_config jsonb)`);
@@ -156,6 +174,44 @@ async function closeDeadRowsTick(dbPool, postRelay) {
     client.release();
   }
 }
+
+async function insertNoArtifactCandidate(db, { id, status = 'In Review', metadata = {} }) {
+  await db.admin.query(`INSERT INTO ${db.schema}.issue (id, workspace_id, number, status, metadata)
+    VALUES ($1, 'workspace-1', 2, $2, $3::jsonb)`, [id, status, JSON.stringify(metadata)]);
+  await db.admin.query(`INSERT INTO ${db.schema}.agent_task_queue
+    (id, issue_id, agent_id, status, context, result, created_at)
+    VALUES ($1, $2, 'fixture-agent', 'completed', '{"to_stage":"In Review"}'::jsonb,
+      '{"output":"QC-BLOCKED: no implementation SHA or PR exists. NO-SHA."}'::jsonb, now())`,
+  [`task-${id}`, id]);
+}
+
+async function rescopeTick(db, postRelay) {
+  const client = await db.dbPool.connect();
+  try {
+    return await rescopeCompletedNoArtifactQc(client, { postRelay, logger: { log() {} } });
+  } finally { client.release(); }
+}
+
+test('no-artifact rescope does not select an issue with a consumed rescope marker', async () => {
+  const db = await deadRowsDb();
+  const posts = [];
+  try {
+    await insertNoArtifactCandidate(db, { id: 'consumed-issue',
+      metadata: { no_artifact_rescope_consumed_at: '2026-09-02T06:03:27Z' } });
+    assert.deepEqual([...await rescopeTick(db, async (payload) => { posts.push(payload); return { status: 201 }; })], []);
+    assert.deepEqual(posts, []);
+  } finally { await db.close(); }
+});
+
+test('no-artifact rescope does not select an issue that left In Review', async () => {
+  const db = await deadRowsDb();
+  const posts = [];
+  try {
+    await insertNoArtifactCandidate(db, { id: 'moved-issue', status: 'Queue' });
+    assert.deepEqual([...await rescopeTick(db, async (payload) => { posts.push(payload); return { status: 201 }; })], []);
+    assert.deepEqual(posts, []);
+  } finally { await db.close(); }
+});
 
 test('persistent dead rows claim once across successive and concurrent ticks', async () => {
   const db = await deadRowsDb();
