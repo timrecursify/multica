@@ -273,6 +273,7 @@ type TaskResult struct {
 	// abandoned as unresumable (GH #6066). Forwarded on every terminal path,
 	// including the completed one: a fresh-session retry that SUCCEEDS is
 	// precisely when the abandoned id would otherwise stay selectable.
-	RetiredSessionID string           `json:"-"`
-	Usage            []TaskUsageEntry `json:"usage,omitempty"` // per-model token usage
+	RetiredSessionID string              `json:"-"`
+	Publication      *PublicationReceipt `json:"publication,omitempty"`
+	Usage            []TaskUsageEntry    `json:"usage,omitempty"` // per-model token usage
 }

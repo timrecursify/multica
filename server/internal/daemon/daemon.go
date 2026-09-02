@@ -203,6 +203,7 @@ type terminalTaskReport struct {
 	// run on the issue or chat can select it again, however many clean rows
 	// still reference it.
 	retiredSessionID string
+	publication      *PublicationReceipt
 }
 
 type executionEnvironmentCommand func() ([]string, error)
@@ -5063,6 +5064,14 @@ func (d *Daemon) acquireLocalDirectoryLockIfNeeded(ctx context.Context, task Tas
 func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result TaskResult, taskLog *slog.Logger) {
 	switch result.Status {
 	case "completed":
+		publication, pubErr := verifyGitPublication(result.WorkDir)
+		if pubErr != nil {
+			taskLog.Error("implementation commit is not published", "error", pubErr)
+			if failErr := d.reportTerminalTask(ctx, terminalTaskReport{kind: terminalTaskReportFail, taskID: taskID, errorMessage: pubErr.Error(), sessionID: result.SessionID, workDir: result.WorkDir, failureReason: "artifact_unpublished", sessionRolloutMissing: result.SessionRolloutMissing, retiredSessionID: result.RetiredSessionID}); failErr != nil {
+				taskLog.Error("report unpublished artifact failed", "error", failErr)
+			}
+			return
+		}
 		taskLog.Info("task completed", "status", result.Status)
 		err := d.reportTerminalTask(ctx, terminalTaskReport{
 			kind:                  terminalTaskReportComplete,
@@ -5074,6 +5083,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			workDir:               result.WorkDir,
 			sessionRolloutMissing: result.SessionRolloutMissing,
 			retiredSessionID:      result.RetiredSessionID,
+			publication:           publication,
 		})
 		if err == nil {
 			return
@@ -5170,7 +5180,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.prURL, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
+		return d.client.CompleteTaskWithPublication(ctx, report.taskID, report.output, report.branchName, report.prURL, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID, report.publication)
 	case terminalTaskReportFail:
 		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID)
 	default:
