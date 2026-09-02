@@ -136,9 +136,33 @@ async function closeDeadRelayRows(client, { terminalStages, requestRetryEscalati
         AND rrl.to_stage = 'In Review'
         AND atq.status = 'completed'
         AND NOT EXISTS (
-          SELECT 1 FROM qc_verdict verdict
+          -- A verdict may be recorded before a redundant relay task is
+          -- created.  Admit only the same formal evidence relationship used
+          -- by the advance daemon; timestamps alone are not evidence.
+          SELECT 1
+            FROM qc_verdict verdict
+            INNER JOIN qc_attempt attempt
+                    ON attempt.issue_id = verdict.issue_id
+                   AND attempt.verdict = 'PASS'
+                   AND attempt.qualifying = true
+                   AND attempt.work_product_md5 = verdict.work_product_md5
+            INNER JOIN agent_task_queue evidence_task
+                    ON evidence_task.issue_id = attempt.issue_id
+                   AND evidence_task.id::text = substring(
+                         attempt.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+            INNER JOIN agent evidence_agent
+                    ON evidence_agent.id = evidence_task.agent_id
            WHERE verdict.issue_id = atq.issue_id
-             AND verdict.created_at >= atq.created_at)`
+             AND verdict.verdict = 'PASS'
+             AND verdict.checker_id = evidence_task.agent_id
+             AND evidence_agent.workspace_id = evidence_task.workspace_id
+             AND COALESCE(evidence_agent.model,
+                          evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
+             AND COALESCE(evidence_agent.thinking_level,
+                          evidence_agent.runtime_config->>'reasoning_effort') = 'low'
+             AND lower(attempt.bound_sha) = lower(attempt.observed_head)
+             AND attempt.bound_sha ~* '^[0-9a-f]{40}$'
+             AND attempt.work_product_md5 ~* '^[0-9a-f]{32}$')`
   );
   for (const row of candidates.rows) {
     const claimed = await client.query(

@@ -621,14 +621,6 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
-        AND NOT (
-          rrl.to_stage = 'In Review'
-          AND NOT EXISTS (
-            SELECT 1 FROM qc_verdict missing_verdict
-             WHERE missing_verdict.issue_id = atq.issue_id
-               AND missing_verdict.created_at >= atq.created_at
-          )
-        )
       ORDER BY rrl.created_at ASC
       LIMIT 20`;
 
