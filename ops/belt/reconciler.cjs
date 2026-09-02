@@ -1,4 +1,5 @@
 "use strict";
+const { stageEligibility } = require("./stage-outcome.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
@@ -68,6 +69,7 @@ function settingsFor(options = {}) {
     defaultMaxAttempts: positive(options.defaultMaxAttempts || process.env.RECONCILE_DEFAULT_MAX_ATTEMPTS, 2),
     issueCooldownMinutes: positive(options.issueCooldownMinutes || process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
     completedStageCooldownMinutes: positive(options.completedStageCooldownMinutes || process.env.RECONCILE_COMPLETED_STAGE_COOLDOWN_MINUTES, 720),
+    typedOutcomes: options.typedOutcomes ?? process.env.RECONCILE_TYPED_OUTCOMES === "1",
     budget: options.budget || { created: 0, byAgent: new Map() }
   };
 }
@@ -138,6 +140,14 @@ async function reconcileIssue(client, issueId, options = {}) {
       await client.query("COMMIT");
       const reason = recent.status === "completed" ? "completed_stage_cooldown" : "issue_cooldown";
       return { action: "skipped", reason, taskId: recent.id };
+    }
+    if (options.typedOutcomes) {
+      // GSP-1826: a recorded outcome for this stage with unchanged inputs is final until the inputs change.
+      const eligibility = await stageEligibility(client, issue.id, issue.status);
+      if (!eligibility.eligible) {
+        await client.query("COMMIT");
+        return { action: "skipped", reason: eligibility.reason };
+      }
     }
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
     const attempt = Number(stageAttempts.rows[0]?.attempt || 0);

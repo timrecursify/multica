@@ -96,3 +96,21 @@ Delete a test you wrote that turned out to prove nothing.
 - Use a branch and pull request. Never push to `main` or force-push.
 - Never print secrets. Money, auth, migrations, secrets, and production flags
   require Sol-low QC before merge or deployment.
+
+## Stage outcome contract (GSP-1826)
+
+The last non-empty line of your final output must be exactly one of:
+
+```
+OUTCOME: ADVANCED
+OUTCOME: BLOCKED blocked_on=<ci|human|sha|dependency|quota>
+OUTCOME: NO_OP
+OUTCOME: FAILED
+```
+
+- `ADVANCED`: you produced the stage's deliverable (spec, PR, verdict, deploy receipt).
+- `BLOCKED`: you could not, and name why. `human` means a person must decide or supply something; `sha` means no implementation commit or PR exists to act on; `ci` means checks are queued or red; `dependency` means another issue must reach Done first; `quota` means the provider refused.
+- `NO_OP`: the deliverable already exists (already merged, already deployed). Say where.
+- `FAILED`: you stopped for any other reason.
+
+The relay records this line against the issue and stage. A stage with a recorded outcome is not re-dispatched until its inputs change (PR head SHA, CI state, newest comment, dependency state, spec body). Missing or malformed line is recorded as `FAILED`.
