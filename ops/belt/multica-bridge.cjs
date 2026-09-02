@@ -421,6 +421,43 @@ function qcTaskEvidenceMismatch(task, payload) {
   return null;
 }
 
+// Deploy admission is deliberately narrower than "there is a PR".  A PR is
+// useful work-product context, but is not proof that the current QC result is
+// bound to the reviewed tree.  The verdict, attempt, and completed Sol-low
+// task must all agree; the task id is durably bound by relayVerdict() in the
+// attempt notes.
+async function deployArtifactAdmission(client, issue) {
+  if (issue.metadata?.artifact_admission === "non_code") {
+    return { admitted: true, kind: "non_code" };
+  }
+  const result = await client.query(
+    `SELECT qa.work_product_md5, qa.bound_sha, qa.observed_head, qa.verdict,
+            qa.qualifying, qa.model, qa.effort, t.id AS evidence_task_id
+       FROM qc_verdict qv
+       JOIN qc_attempt qa
+         ON qa.issue_id = qv.issue_id
+        AND qa.work_product_md5 = qv.work_product_md5
+        AND qa.verdict = 'PASS' AND qa.qualifying = true
+        AND qa.model = 'gpt-5.6-sol' AND qa.effort = 'low'
+       JOIN agent_task_queue t
+         ON t.issue_id = qa.issue_id
+        AND t.id::text = substring(qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+        AND t.agent_id = qv.checker_id
+        AND t.status = 'completed'
+      WHERE qv.issue_id = $1
+        AND qv.verdict = 'PASS'
+      ORDER BY qa.created_at DESC
+      LIMIT 1`, [issue.id]
+  );
+  const evidence = result.rows[0];
+  const valid = evidence && MD5_RE.test(String(evidence.work_product_md5 || "")) &&
+    SHA_RE.test(String(evidence.bound_sha || "")) &&
+    SHA_RE.test(String(evidence.observed_head || "")) &&
+    String(evidence.bound_sha).toLowerCase() === String(evidence.observed_head).toLowerCase();
+  return valid ? { admitted: true, kind: "qc_artifact", evidence_task_id: evidence.evidence_task_id } :
+    { admitted: false, reason: "artifact_admission_required" };
+}
+
 function retryEscalationReason(reason) {
   const match = String(reason || "").match(/^retry_escalation:([a-z_]+)$/);
   return match && RETRY_ESCALATION_REASONS.has(match[1]) ? match[1] : null;
@@ -1228,6 +1265,7 @@ async function relayAdvance(req, res, body) {
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
     let escalationLoop = false;
+    let artifactAdmissionRefused = false;
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -1540,6 +1578,30 @@ async function relayAdvance(req, res, body) {
             source_task_id: sourceTaskId
           }));
         }
+      }
+    }
+
+    // Deploy artifact-admission guard. Unlike ordinary
+    // validation failures this is committed to Parked so a caller replay
+    // cannot repurchase a dispatch loop.
+    if (to_stage === "CI/CD & Deploy") {
+      const admission = await deployArtifactAdmission(client, issue);
+      if (!admission.admitted) {
+        artifactAdmissionRefused = true;
+        parkedAudit = {
+          trigger: "artifact_admission_required",
+          reason: "artifact_admission_required",
+          intendedStage: "CI/CD & Deploy"
+        };
+        to_stage = "Parked";
+        console.warn(JSON.stringify({
+          event: "relay_advance_rejected",
+          reason: "artifact_admission_required",
+          issue_id: issue.id,
+          from_stage: issue.status,
+          intended_stage: "CI/CD & Deploy",
+          disposition: "Parked"
+        }));
       }
     }
 
@@ -1895,7 +1957,12 @@ async function relayAdvance(req, res, body) {
         success: true,
         issue: result.rows[0],
         task_id: null,
-        relay_log_id: relayLogId
+        relay_log_id: relayLogId,
+        ...(artifactAdmissionRefused ? {
+          admission_refused: true,
+          error: "artifact_admission_required",
+          disposition: "Parked"
+        } : {})
       }));
       return;
     }
@@ -2120,6 +2187,7 @@ module.exports = {
   latestCompletedSolLowQcTask,
   qcTaskEvidence,
   qcTaskEvidenceMismatch,
+  deployArtifactAdmission,
   relayVerdict,
   relayAdvance,
   setTestClientFactory(factory) { testClientFactory = factory; },
