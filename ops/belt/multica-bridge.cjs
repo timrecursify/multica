@@ -28,6 +28,9 @@ const RELAY_OPERATOR_SECRET = process.env.RELAY_OPERATOR_SECRET;
 const OPERATOR_SECRET_DISABLED = typeof RELAY_OPERATOR_SECRET === "string" &&
   RELAY_OPERATOR_SECRET.length > 0 && RELAY_OPERATOR_SECRET === RELAY_AGENT_SECRET;
 const SSO_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID;
+// This is the bridge's existing system actor identity for records without an
+// assigned agent, such as authenticated operator admissions.
+const SYSTEM_ACTOR_ID = "00000000-0000-0000-0000-000000000000";
 
 // One canonical login (Cloudflare Access) serving several isolated client
 // workspaces. The hostname the user arrived on decides which workspace they
@@ -533,7 +536,7 @@ async function recordRetryEscalation(client, issue, escalation) {
     `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
      SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
       WHERE NOT EXISTS (SELECT 1 FROM comment WHERE issue_id = $1::uuid AND content = $4::text)`,
-    [issue.id, issue.workspace_id, "00000000-0000-0000-0000-000000000000", content]);
+    [issue.id, issue.workspace_id, SYSTEM_ACTOR_ID, content]);
   await client.query(
     `INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
      VALUES ($1::uuid, $2::uuid, 'system', 'relay_retry_escalated', $3::jsonb)`,
@@ -1149,6 +1152,7 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, evidenceMismatch);
     }
+    const checkerId = externalQc ? SYSTEM_ACTOR_ID : qcTask.agent_id;
     const notes = [
       externalQc ? `operator_external_qc=${payload.reason.trim()}` : `relay_task_id=${qcTask.id}`,
       externalQc ? `operator_callsign=${payload.checker}` : `relay_agent_id=${qcTask.agent_id}`,
@@ -1186,7 +1190,7 @@ async function relayVerdict(req, res, payload) {
           `UPDATE qc_verdict SET checker_id = $2, checker_name = $3, verdict = $4,
                   work_product_md5 = $5, notes = $6, created_at = NOW()
             WHERE issue_id = $1`,
-          [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
+          [payload.issue_id, checkerId, qcTask.agent_name, payload.verdict,
             payload.work_product_md5, notes]
         );
       } else {
@@ -1194,7 +1198,7 @@ async function relayVerdict(req, res, payload) {
           `INSERT INTO qc_verdict
              (issue_id, checker_id, checker_name, verdict, work_product_md5, notes)
            VALUES ($1, $2, $3, $4, $5, $6)`,
-          [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
+          [payload.issue_id, checkerId, qcTask.agent_name, payload.verdict,
             payload.work_product_md5, notes]
         );
       }
@@ -1202,10 +1206,14 @@ async function relayVerdict(req, res, payload) {
     await client.query("COMMIT");
     res.writeHead(replay ? 200 : 201, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, replay, issue_id: payload.issue_id,
-      checker_id: qcTask.agent_id, work_product_md5: payload.work_product_md5 }));
+      checker_id: checkerId, work_product_md5: payload.work_product_md5 }));
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("[relay/verdict] ERROR:", err.message);
+    if (err.code === "23505") return relayVerdictError(res, 409, "qc_verdict_conflict");
+    if (/^(22|23)/.test(String(err.code || ""))) {
+      return relayVerdictError(res, 422, "invalid_qc_verdict");
+    }
     relayVerdictError(res, 500, "internal_error");
   } finally {
     await client.end().catch(() => {});

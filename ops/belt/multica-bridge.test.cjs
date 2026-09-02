@@ -505,7 +505,7 @@ test('explicit QC task binding selects that completed task instead of the newest
 test('verdict route never trusts a caller supplied checker identity', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.doesNotMatch(source, /RELAY_QC_ACTOR_ID/);
-  assert.match(source, /checker_id: qcTask\.agent_id/);
+  assert.match(source, /checker_id: checkerId/);
   assert.match(source, /payload\.checker/);
   assert.match(source, /qcTask\.agent_name/);
   assert.match(source, /qc_task_sha_mismatch/);
@@ -589,6 +589,9 @@ test('operator external QC requires its distinct secret and Sol-low evidence lan
     const external = { ...validVerdict, idem_key: 'external-qc-accepted-0001', operator_external_qc: true, reason: 'outside belt PR QC' };
     assert.equal((await call(external, { 'x-relay-operator-secret': 'test-operator-secret' })).status, 201);
     assert.match(writes[0][11], /operator_external_qc=outside belt PR QC/);
+    assert.deepEqual(writes[1].slice(0, 3), [validVerdict.issue_id,
+      '00000000-0000-0000-0000-000000000000', external.checker],
+    'external QC verdict insert uses the bridge system actor and operator callsign');
     assert.equal((await call({ ...external, idem_key: 'external-qc-no-secret-0002' })).status, 403);
     const wrongLane = await call({ ...external, idem_key: 'external-qc-wrong-lane-003', model: 'other-model' }, { 'x-relay-operator-secret': 'test-operator-secret' });
     assert.equal(wrongLane.json.error, 'invalid_qc_lane');
