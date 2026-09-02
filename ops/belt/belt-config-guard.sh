@@ -815,15 +815,7 @@ guard_stranded_spec() {
   local number
   while read -r number; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    "${PSQL[@]}" -c "UPDATE issue SET status='Registered',
-         metadata = coalesce(metadata,'{}'::jsonb) ||
-           jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
-       WHERE number=${number} AND workspace_id='${GSP_WS}' AND status='Spec';" >/dev/null 2>&1 </dev/null || continue
-    if "$SK" multica advance "$number" --to "Spec" --board gsp >/dev/null 2>&1 </dev/null; then
-      fixed+=("gsp#${number} had no live scoper task; re-flown through Registered so the scoper runs (GSP-836)")
-    else
-      unfixable+=("gsp#${number} is stranded in Spec with no scoper task and could not be re-flown (GSP-836)")
-    fi
+    recover_stranded_spec_flight "$number"
   done < <("${PSQL[@]}" -c "
     SELECT i.number FROM issue i
     WHERE i.status='Spec' AND i.workspace_id='${GSP_WS}'
@@ -832,6 +824,61 @@ guard_stranded_spec() {
       AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
                        WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
     ORDER BY i.created_at LIMIT 25;" 2>/dev/null)
+}
+
+spec_refly_reset() {
+  SPEC_REFLOW_OUTPUT=$("${PSQL[@]}" -c "WITH reset AS (
+      UPDATE issue AS i SET status='Registered',
+        metadata = coalesce(metadata,'{}'::jsonb) ||
+          jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
+      WHERE number=${1} AND workspace_id='${GSP_WS}' AND status='Spec'
+        AND parent_issue_id IS NULL
+        AND coalesce(metadata->>'spec_reflies','0')::int < 3
+        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
+                        WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
+      RETURNING id
+    ) SELECT count(*) FROM reset;" 2>&1 </dev/null)
+  SPEC_REFLOW_RC=$?
+}
+
+spec_refly_advance() {
+  SPEC_REFLOW_OUTPUT=$("$SK" multica advance "$1" --to "Spec" --board gsp 2>&1 </dev/null)
+  SPEC_REFLOW_RC=$?
+}
+
+redact_spec_refly_diagnostic() {
+  printf '%s' "$1" | tr '\n' ' ' | sed -E -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' -e 's/((token|password|secret|api[_-]?key)[=:])[[:space:]]*[^[:space:]]+/\1[REDACTED]/Ig' | cut -c1-400
+}
+
+spec_refly_receipt_valid() {
+  jq -e '(.success == true) and (.issue.status == "Spec") and ((.task_id | type) == "string") and (.task_id | length > 0)' >/dev/null 2>&1 <<<"$1"
+}
+
+recover_stranded_spec_flight() {
+  local number="$1" reset_output relay_output diagnostic
+  spec_refly_reset "$number"; reset_output="$SPEC_REFLOW_OUTPUT"
+  if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
+    diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
+    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=reset exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
+    return 0
+  fi
+  if [[ "$(tr -d '[:space:]' <<<"$reset_output")" != "1" ]]; then
+    diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
+    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=reset-row-count exit=0 diagnostic=${diagnostic}")
+    return 0
+  fi
+  spec_refly_advance "$number"; relay_output="$SPEC_REFLOW_OUTPUT"
+  if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
+    diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
+    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=relay exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
+    return 0
+  fi
+  if ! spec_refly_receipt_valid "$relay_output"; then
+    diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
+    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=receipt exit=0 diagnostic=${diagnostic}")
+    return 0
+  fi
+  fixed+=("gsp#${number} had no live scoper task; reset exactly once and re-flown to Spec with a scoper task receipt")
 }
 
 # Row 7 (CI/CD & Deploy -> Done) has NO agent, so nothing ever performs the last

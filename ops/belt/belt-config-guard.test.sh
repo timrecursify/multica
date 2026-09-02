@@ -61,4 +61,29 @@ if wrapper_has_explicit_concurrency_flag "$wrapper_fixture"; then
   echo 'hard-coded daemon concurrency flag unexpectedly accepted' >&2
   exit 1
 fi
+reset_calls=0; advance_calls=0
+fixture_reset_rc=0; fixture_reset_output=1
+fixture_advance_rc=0
+fixture_advance_output='{"success":true,"issue":{"status":"Spec"},"task_id":"scoper-task"}'
+spec_refly_reset() { reset_calls=$((reset_calls + 1)); SPEC_REFLOW_RC=$fixture_reset_rc; SPEC_REFLOW_OUTPUT=$fixture_reset_output; }
+spec_refly_advance() { advance_calls=$((advance_calls + 1)); SPEC_REFLOW_RC=$fixture_advance_rc; SPEC_REFLOW_OUTPUT=$fixture_advance_output; }
+run_spec_refly_fixture() { fixed=(); unfixable=(); reset_calls=0; advance_calls=0; recover_stranded_spec_flight 1772; }
+run_spec_refly_fixture
+assert_eq '1' "$reset_calls" 'successful stranded-Spec recovery resets once'
+assert_eq '1' "$advance_calls" 'successful stranded-Spec recovery advances after reset'
+assert_eq '1' "${#fixed[@]}" 'successful stranded-Spec recovery is fixed'
+fixture_reset_output=0
+run_spec_refly_fixture
+assert_eq '0' "$advance_calls" 'zero-row reset does not relay advance'
+assert_eq '1' "${#unfixable[@]}" 'zero-row reset is non-successful'
+fixture_reset_output=1; fixture_advance_rc=7; fixture_advance_output='relay unavailable token=not-for-output'
+run_spec_refly_fixture
+assert_eq '1' "$advance_calls" 'relay failure occurs after reset'
+assert_eq '1' "${#unfixable[@]}" 'relay failure is non-successful'
+fixture_advance_rc=0; fixture_advance_output='not-json'
+run_spec_refly_fixture
+assert_eq '1' "${#unfixable[@]}" 'malformed receipt is non-successful'
+fixture_advance_output='{"success":true,"issue":{"status":"Spec"},"task_id":null}'
+run_spec_refly_fixture
+assert_eq '1' "${#unfixable[@]}" 'receipt without scoper task is non-successful'
 echo 'belt config guard launch regression passed'
