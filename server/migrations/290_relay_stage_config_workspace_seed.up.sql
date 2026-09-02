@@ -36,7 +36,7 @@ VALUES
   (15, 'da3c5c5c-a123-4567-b999-c3ed1820da00', 'In Progress', 'In Review', '76818b0c-a30e-487c-9cc6-1682d8601ac4', 'ppp-qc-sol-low-1', ARRAY['Queue']),
   (16, 'da3c5c5c-a123-4567-b999-c3ed1820da00', 'In Review', 'CI/CD & Deploy', '325c3138-ad54-4041-95c1-b77857569da6', 'ppp-deploy-sol-low-1', ARRAY['Human Review','In Progress']),
   (17, 'da3c5c5c-a123-4567-b999-c3ed1820da00', 'Human Review', 'CI/CD & Deploy', '325c3138-ad54-4041-95c1-b77857569da6', 'ppp-deploy-sol-low-1', ARRAY['Cancelled','In Progress','In Review']),
-  (18, 'da3c5c5c-a123-4567-b999-c3ed1820da00', 'CI/CD & Deploy', 'Done', '325c3138-ad54-4041-95c1-b77857569da6', 'ppp-deploy-sol-low-1', ARRAY['In Progress','Queue','Spec']),
+  (18, 'da3c5c5c-a123-4567-b999-c3ed1820da00', 'CI/CD & Deploy', 'Done', '325c3138-ad54-4041-95c1-b77857569da6', 'ppp-deploy-sol-low-1', ARRAY['In Progress','Queue','Spec','Human Review']),
   (19, 'da3c5c5c-a123-4567-b999-c3ed1820da00', 'Done', 'Archived', NULL, NULL, ARRAY['CI/CD & Deploy']),
   (20, 'da3c5c5c-a123-4567-b999-c3ed1820da00', 'Archived', NULL, NULL, NULL, ARRAY['CI/CD & Deploy']),
   (21, 'da3c5c5c-a123-4567-b999-c3ed1820da00', 'Cancelled', NULL, NULL, NULL, NULL),

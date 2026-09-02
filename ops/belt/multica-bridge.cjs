@@ -1223,8 +1223,6 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
-    // The bridge owns only the atomic status change. Reconciliation observes
-    // this committed transition and creates the one current-stage task.
     const policy = evaluate({ from: issue.status, to: requestedStage,
       actor: relayActor(req, issue.status, requestedStage), evidence: transitionEvidence(body) });
     if (!policy.ok) {
@@ -1234,15 +1232,6 @@ async function relayAdvance(req, res, body) {
       res.end(JSON.stringify({ error: policy.code }));
       return;
     }
-    const transitionUpdate = await client.query(
-      `UPDATE "issue" SET status = $1, updated_at = NOW()
-        WHERE id = $2 RETURNING id, status`, [requestedStage, issue_id]
-    );
-    await client.query("COMMIT");
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ success: true, issue: transitionUpdate.rows[0], task_id: null,
-      relay_log_id: null }));
-    return;
     // Recovery has already counted the cap history, but status changes must
     // remain relay-owned.  This authenticated receipt uses the same atomic
     // disposition authority as synchronous admission and is replay-safe.
