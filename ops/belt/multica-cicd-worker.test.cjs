@@ -109,7 +109,7 @@ async function testCompletionAdmission() {
   const calls = [];
   const retries = new Map();
   let issue = { id: 'closed', number: 11, workspace_id: 'gsp' };
-  const setup = (content, state, deployed = false) => worker.setTestDependencies({
+  const setup = (content, state, deployed = false, github) => worker.setTestDependencies({
     pool: { query: async (sql, params) => {
       if (sql.includes("FROM issue WHERE status")) return { rows: [issue] };
       if (sql.includes('FROM comment')) return { rows: [{ content }] };
@@ -122,7 +122,7 @@ async function testCompletionAdmission() {
       }
       return { rows: [] };
     } }, relay: async (...args) => calls.push(args),
-    gh: () => JSON.stringify({ state, mergeable: 'MERGEABLE', headRefOid: 'head', createdAt: '2026-09-01T00:00:00Z', mergedAt: '2026-09-01T01:00:00Z', mergeCommit: { oid: 'merge' } }),
+    gh: github || (() => JSON.stringify({ state, mergeable: 'MERGEABLE', headRefOid: 'head', createdAt: '2026-09-01T00:00:00Z', mergedAt: '2026-09-01T01:00:00Z', mergeCommit: { oid: 'merge' } })),
     deployed: () => deployed,
   });
   setup('', 'MERGED');
@@ -132,6 +132,19 @@ async function testCompletionAdmission() {
   assert.deepEqual({ ...calls[0][4].cicd_worker, checked_at: 'timestamp' }, {
     reason: 'no PR referenced', pr_state: null, pr_url: null, checked_at: 'timestamp'
   });
+  calls.length = 0;
+  const githubCalls = [];
+  issue = { id: 'ambiguous', number: 12, workspace_id: 'gsp' };
+  setup('PR #42', 'MERGED', false, (...args) => {
+    githubCalls.push(args);
+    throw new Error('GitHub must not be called for a bare PR reference');
+  });
+  await worker.sweep();
+  assert.equal(githubCalls.length, 0);
+  assert.deepEqual(calls[0].slice(0, 4), [
+    'ambiguous', 'Parked', null, 'ambiguous PR reference, no repository',
+  ]);
+  assert.doesNotMatch(JSON.stringify(githubCalls), /timrecursify\/ppp/);
   calls.length = 0;
   setup('https://github.com/timrecursify/sk-cli/pull/1', 'CLOSED');
   await worker.sweep();

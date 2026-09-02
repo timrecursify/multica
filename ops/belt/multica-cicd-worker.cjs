@@ -127,14 +127,6 @@ function countCiFailure(issue, pr, sha, ci) {
   return count;
 }
 
-function findPR(work) {
-  const url = (work || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i);
-  if (url) return { repo: `${url[1]}/${url[2]}`, num: url[3] };
-  const bare = (work || '').match(/\bPR\s*#(\d+)/i);
-  if (bare) return { repo: 'timrecursify/ppp', num: bare[1] };
-  return null;
-}
-
 // A flight can cite more than one pull request, and taking the first match
 // closes it against whichever happened to be mentioned most recently. gsp#83
 // cites sk-cli#316 (merged) and sk-cli#498 (open): the single-match read shipped
@@ -151,9 +143,11 @@ function findAllPRs(work) {
     const k = `${pr.repo}#${pr.num}`;
     if (!seen.has(k)) { seen.add(k); out.push(pr); }
   }
-  if (out.length) return out;
-  const bare = (work || '').match(/\bPR\s*#(\d+)/i);
-  return bare ? [{ repo: 'timrecursify/ppp', num: bare[1] }] : [];
+  return out;
+}
+
+function hasBarePRReference(work) {
+  return /\bPR\s*#\d+/i.test(work || '');
 }
 
 // Green means every completed run on THIS head SHA succeeded. A run list
@@ -236,13 +230,19 @@ async function sweep() {
          ORDER BY created_at DESC LIMIT 40`, [issue.id]);
       const seenPR = new Set();
       const prs = [];
+      let hasBarePR = false;
       for (const row of w.rows) {
-        for (const cand of findAllPRs(row.content || '')) {
+        const content = row.content || '';
+        hasBarePR ||= hasBarePRReference(content);
+        for (const cand of findAllPRs(content)) {
           const k = `${cand.repo}#${cand.num}`;
           if (!seenPR.has(k)) { seenPR.add(k); prs.push(cand); }
         }
       }
-      if (!prs.length) { await park(issue, 'no PR referenced'); continue; }
+      if (!prs.length) {
+        await park(issue, hasBarePR ? 'ambiguous PR reference, no repository' : 'no PR referenced');
+        continue;
+      }
 
       // Resolve every referenced PR first, then decide once.
       const states = [];
@@ -262,11 +262,9 @@ async function sweep() {
         const missing = states.filter(s2 => !deployEvidence({ ...s2.pr, ...s2.info }));
         if (!missing.length) { await routeFinishedPR(issue, 'all referenced PRs merged and deployed'); continue; }
         const reason = `deploy evidence pending for ${missing.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', ')}`;
-        if (missing.some(s2 => s2.pr.repo === 'timrecursify/ppp')) {
-          const exit = await pool.query(`SELECT 1 FROM relay_stage_config WHERE workspace_id=$1 AND stage_name='Deploy pending'`, [issue.workspace_id]);
-          if (exit.rows.length) { await relay(issue.id, 'Deploy pending', null, reason); await closePendingTask(issue.id); }
-          else await deployPending(issue, reason);
-        } else log(`HOLD #${issue.number} ${reason}`);
+        const exit = await pool.query(`SELECT 1 FROM relay_stage_config WHERE workspace_id=$1 AND stage_name='Deploy pending'`, [issue.workspace_id]);
+        if (exit.rows.length) { await relay(issue.id, 'Deploy pending', null, reason); await closePendingTask(issue.id); }
+        else await deployPending(issue, reason);
         continue;
       }
       if (openStates.length > 1) {
