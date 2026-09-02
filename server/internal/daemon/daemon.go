@@ -1739,6 +1739,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 
+	// A hard process death (including an OOM kill) cannot report terminal
+	// callbacks for work already claimed by this daemon.  Once startup has
+	// registered the replacement runtimes, ask the server to atomically mark
+	// that predecessor work as runtime_recovery and create its normal retry
+	// children.  This is deliberately after preflight: before registration the
+	// daemon has no runtime identity with which to authorize the recovery call.
+	//
+	// The request is best-effort per runtime.  A transient API failure must not
+	// make a healthy daemon exit; the runtime sweeper remains the backstop and
+	// the next restart retries this targeted recovery.
+	d.recoverOrphanedTasks(ctx)
+
 	// Deregister runtimes on shutdown (uses a fresh context since ctx will be cancelled).
 	defer d.deregisterRuntimes()
 
@@ -1819,6 +1831,21 @@ func (d *Daemon) deregisterRuntimes() {
 		d.logger.Warn("failed to deregister runtimes on shutdown", "error", err)
 	} else {
 		d.logger.Info("deregistered runtimes", "count", len(runtimeIDs))
+	}
+}
+
+// recoverOrphanedTasks returns claimed work from a previous daemon process to
+// the server's runtime_recovery retry path.  It runs only after this process
+// has successfully registered its replacement runtimes, so it cannot reclaim
+// work owned by another live daemon.
+func (d *Daemon) recoverOrphanedTasks(ctx context.Context) {
+	for _, runtimeID := range d.allRuntimeIDs() {
+		recoveryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := d.client.RecoverOrphans(recoveryCtx, runtimeID)
+		cancel()
+		if err != nil {
+			d.logger.Warn("recover orphaned tasks at daemon startup failed", "runtime_id", runtimeID, "error", err)
+		}
 	}
 }
 
@@ -5092,11 +5119,20 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		failureReason := result.FailureReason
 		if failureReason == "" {
 			if result.Status == "cancelled" {
-				// "cancelled" is a deliberate non-failure terminal
-				// state masquerading as a failure_reason — preserved
-				// outside the canonical taxonomy so the UI can render
-				// it differently from a real failure.
-				failureReason = "cancelled"
+				if ctx.Err() != nil {
+					// A cancelled task under the daemon root context is a process
+					// shutdown, not an operator/user cancellation.  Classify it as
+					// runtime_recovery so FailTask creates the normal retry child.
+					// User/server cancellation leaves the root context live and keeps
+					// its terminal cancelled meaning.
+					failureReason = "runtime_recovery"
+				} else {
+					// "cancelled" is a deliberate non-failure terminal
+					// state masquerading as a failure_reason — preserved
+					// outside the canonical taxonomy so the UI can render
+					// it differently from a real failure.
+					failureReason = "cancelled"
+				}
 			} else {
 				// MUL-2946: classify the agent's comment text so the
 				// failure_reason lands in the refined taxonomy

@@ -3958,6 +3958,13 @@ func TestReportTaskResult_NonCompletedHitsFailEndpoint(t *testing.T) {
 			wantFailureReason: "cancelled",
 		},
 		{
+			name:              "cancelled under daemon shutdown retries as runtime recovery",
+			status:            "cancelled",
+			comment:           "task cancelled by daemon shutdown",
+			failureReasonIn:   "",
+			wantFailureReason: "runtime_recovery",
+		},
+		{
 			name:              "unknown status routes through classifier",
 			status:            "weird_new_status",
 			comment:           "rate limit reached",
@@ -3972,8 +3979,14 @@ func TestReportTaskResult_NonCompletedHitsFailEndpoint(t *testing.T) {
 			srv := httptest.NewServer(rec.handler(t))
 			t.Cleanup(srv.Close)
 
+			ctx := context.Background()
+			if tc.wantFailureReason == "runtime_recovery" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
 			d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
-			d.reportTaskResult(context.Background(), "task-x", TaskResult{
+			d.reportTaskResult(ctx, "task-x", TaskResult{
 				Status:        tc.status,
 				Comment:       tc.comment,
 				SessionID:     "ses-x",
