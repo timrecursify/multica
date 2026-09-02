@@ -763,13 +763,42 @@ test('runtime-evidence recovery is one-shot, typed, and stays on relay authority
   assert.doesNotMatch(diagnosis, /UPDATE issue SET status/);
 });
 
-test('a released escalation-loop diagnosis consumes only retry_escalation', () => {
-  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  const diagnosis = source.slice(source.indexOf('async function processParkedDiagnoses'),
-    source.indexOf('function startDaemon'));
-  assert.match(diagnosis, /task\.context\?\.reason_code === 'escalation_loop'/);
-  assert.match(diagnosis, /metadata = COALESCE\(metadata, '\{\}'::jsonb\) - 'retry_escalation'/);
-  assert.doesNotMatch(diagnosis, /- 'parked_release_once'/);
+test('Parked diagnosis releases clear retry escalation regardless of reason, while holds retain it', async () => {
+  const run = async ({ result, reasonCode }) => {
+    const task = { id: randomUUID(), issue_id: randomUUID(), workspace_id: randomUUID(), number: 43,
+      status: 'Parked', context: { reason_code: reasonCode }, result };
+    const issue = { metadata: { retry_escalation: { trigger_stage: 'Queue' }, preserved: true } };
+    const queries = [];
+    const client = { query: async (sql, values = []) => {
+      queries.push({ sql, values });
+      if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+      if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+      if (sql.includes('FROM issue_spec')) return { rows: [{ id: randomUUID() }] };
+      if (sql.includes('UPDATE issue SET metadata = jsonb_set')) {
+        issue.metadata.parked_release_once = true;
+        issue.metadata.parked_release_at = 'released';
+        delete issue.metadata.retry_escalation;
+      }
+      return { rows: [] };
+    }, release() {} };
+    await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+      relayPost: async () => ({ ok: true, status: 200 }) });
+    return { issue, queries };
+  };
+
+  const matchingRelease = await run({ result: 'outcome: fixable', reasonCode: 'escalation_loop' });
+  const rerunRelease = await run({ result: 'outcome: fixable', reasonCode: 'operator_parked_diagnosis_rerun' });
+  const held = await run({ result: 'outcome: genuinely_blocked\nblocker: awaiting operator input',
+    reasonCode: 'operator_parked_diagnosis_rerun' });
+
+  for (const released of [matchingRelease, rerunRelease]) {
+    assert.deepEqual(released.issue.metadata, { preserved: true, parked_release_once: true,
+      parked_release_at: 'released' });
+    const update = released.queries.find(({ sql }) => sql.includes('UPDATE issue SET metadata = jsonb_set'));
+    assert.match(update.sql, /- 'retry_escalation'/);
+  }
+  assert.deepEqual(held.issue.metadata, { retry_escalation: { trigger_stage: 'Queue' }, preserved: true });
+  assert.ok(!held.queries.some(({ sql }) => sql.includes("- 'retry_escalation'")));
 });
 
 test('diagnosis release retries every non-2xx response and records the attempt', () => {
