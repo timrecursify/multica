@@ -20,6 +20,7 @@ const {
   isBookkeepingTransition,
   recordBookkeepingHandoff,
   validateRelayVerdict,
+  hasCurrentPassWorkProduct,
   latestCompletedSolLowQcTask,
   qcTaskEvidenceMismatch,
   relayVerdict,
@@ -1469,6 +1470,32 @@ test('lifetime ceiling applies an auditable terminal rejection instead of a re-s
   assert.match(source, /task_count: taskCount, target_stage: to_stage/);
   assert.match(source, /disposition: lifetime\.disposition, disposition_applied: applied/);
   assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
+});
+
+test('operator cap release requires the current PASS work-product hash', async () => {
+  const client = { query: async () => ({ rows: [{ verdict: 'PASS',
+    work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e' }] }) };
+  assert.equal(await hasCurrentPassWorkProduct(client, 'issue-1',
+    'E41D8CD98F00B204E9800998ECF8427E'), true);
+  assert.equal(await hasCurrentPassWorkProduct(client, 'issue-1',
+    'd41d8cd98f00b204e9800998ecf8427e'), false);
+});
+
+test('PASS verdict cap escalation is held for an authenticated operator release, never rejected', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /operator_cap_release === true/);
+  assert.match(source, /operator_cap_release_secret_required/);
+  assert.match(source, /operator_cap_release_pass_required/);
+  assert.match(source, /operator_cap_release_required/);
+  assert.match(source, /operator_cap_release: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
+  const cycleCap = source.slice(source.indexOf('const cycle = stageCycleAdmission'),
+    source.indexOf('const lifetimeHistory'));
+  assert.match(cycleCap, /if \(passVerdictProtected\) \{[\s\S]*?operator_cap_release_required[\s\S]*?return;/);
+  assert.ok(cycleCap.indexOf('operator_cap_release_required') < cycleCap.indexOf('applyDisposition'));
+  const lifetimeCap = source.slice(source.indexOf('const lifetime = lifetimeTaskAdmission'),
+    source.indexOf('// Never advance an issue into another execution lane'));
+  assert.match(lifetimeCap, /if \(passVerdictProtected\) \{[\s\S]*?operator_cap_release_required[\s\S]*?return;/);
+  assert.ok(lifetimeCap.indexOf('operator_cap_release_required') < lifetimeCap.indexOf('applyDisposition'));
 });
 
 test('parking records a reason and hands off one Sol-low diagnosis', () => {

@@ -272,6 +272,13 @@ async function latestQcVerdict(client, issueId) {
   return result.rows[0] || null;
 }
 
+async function hasCurrentPassWorkProduct(client, issueId, workProductMd5) {
+  const latest = await latestQcVerdict(client, issueId);
+  return latest?.verdict === "PASS" && typeof workProductMd5 === "string" &&
+    MD5_RE.test(workProductMd5) && MD5_RE.test(String(latest.work_product_md5 || "")) &&
+    workProductMd5.toLowerCase() === String(latest.work_product_md5 || "").toLowerCase();
+}
+
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explicitTaskId = null) {
   const result = await client.query(
       `SELECT t.id, t.agent_id, t.status, t.context, t.result, t.completed_at,
@@ -1198,7 +1205,7 @@ async function relayAdvance(req, res, body) {
   let client;
   try {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit, cap_refusal,
-      operator_rescope_issue_id, operator_terminal_exit, operator_release } = body;
+      operator_rescope_issue_id, operator_terminal_exit, operator_release, operator_cap_release } = body;
     
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
@@ -1333,7 +1340,14 @@ async function relayAdvance(req, res, body) {
       !OPERATOR_SECRET_DISABLED &&
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
-    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease;
+    const explicitOperatorCapReleaseRequested = issue.status === "In Review" &&
+      to_stage === "CI/CD & Deploy" && operator_cap_release === true &&
+      typeof reason === "string" && reason.trim() !== "";
+    const explicitOperatorCapRelease = explicitOperatorCapReleaseRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease || explicitOperatorCapRelease;
     if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
         OPERATOR_SECRET_DISABLED) {
       await client.query("ROLLBACK");
@@ -1351,6 +1365,21 @@ async function relayAdvance(req, res, body) {
         error: "terminal_stage_operator_secret_conflict",
         message: "operator human review releases require a valid operator secret"
       }));
+      return;
+    }
+    if (explicitOperatorCapReleaseRequested && !explicitOperatorCapRelease) {
+      await client.query("ROLLBACK");
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "operator_cap_release_secret_required",
+        message: "operator cap releases require a valid operator secret" }));
+      return;
+    }
+    if (explicitOperatorCapRelease &&
+        !await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5)) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "operator_cap_release_pass_required",
+        message: "operator cap releases require the current PASS work-product hash" }));
       return;
     }
     if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit) {
@@ -1743,10 +1772,19 @@ async function relayAdvance(req, res, body) {
         [issue.id, to_stage, releaseAt]
       );
       const cycle = stageCycleAdmission(history.rows[0]?.n || 0, STAGE_CYCLE_LIMIT);
+      const passVerdictProtected = issue.status === "In Review" &&
+        (await latestQcVerdict(client, issue.id))?.verdict === "PASS";
       const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
         client, issue, to_stage, reason, parkedEvidenceQcRelease
       );
       if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope) {
+        if (passVerdictProtected) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "operator_cap_release_required",
+            message: "a PASS-verdict ticket requires an authenticated operator cap release" }));
+          return;
+        }
         const taskCount = history.rows[0]?.n || 0;
         const applied = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
           ceiling: cycle.ceiling, task_count: taskCount, target_stage: to_stage,
@@ -1770,6 +1808,13 @@ async function relayAdvance(req, res, body) {
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
       if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope) {
+        if (passVerdictProtected) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "operator_cap_release_required",
+            message: "a PASS-verdict ticket requires an authenticated operator cap release" }));
+          return;
+        }
         const taskCount = lifetimeHistory.rows[0]?.n || 0;
         const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
           ceiling: lifetime.ceiling, task_count: taskCount, target_stage: to_stage,
@@ -1946,6 +1991,9 @@ async function relayAdvance(req, res, body) {
         ...(explicitTerminalExit ? {
           terminal_exit: { operator_marker: true, reason: reason.trim() }
         } : {}),
+        ...(explicitOperatorCapRelease ? {
+          operator_cap_release: { operator_marker: true, reason: reason.trim() }
+        } : {}),
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
@@ -1962,6 +2010,9 @@ async function relayAdvance(req, res, body) {
         relayAudit: operatorCapBypass ? JSON.stringify({
           ...(explicitTerminalExit ? {
             terminal_exit: { operator_marker: true, reason: reason.trim() }
+          } : {}),
+          ...(explicitOperatorCapRelease ? {
+            operator_cap_release: { operator_marker: true, reason: reason.trim() }
           } : {}),
           operator_cap_bypass: true,
           reason: reason.trim()
@@ -2117,6 +2168,7 @@ module.exports = {
   recordBookkeepingHandoff,
   validateRelayVerdict,
   qcBounceDecision,
+  hasCurrentPassWorkProduct,
   latestCompletedSolLowQcTask,
   qcTaskEvidence,
   qcTaskEvidenceMismatch,
