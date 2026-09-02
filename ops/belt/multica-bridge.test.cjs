@@ -1812,6 +1812,49 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
 });
 
+test('CI/CD & Deploy can return to configured Human Review without dispatch', async () => {
+  const issue = { id: '223e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
+    status: 'CI/CD & Deploy', description: '', parent_issue_id: null, title: 'review blocker',
+    priority: 'high', metadata: {} };
+  const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
+    if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Human Review' }] };
+    if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Done' }] };
+    if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Done', alt_next_stages: ['Human Review'] }] };
+    if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
+      persisted.issue.status = values[0];
+      return { rowCount: 1, rows: [{ id: persisted.issue.id, status: persisted.issue.status }] };
+    }
+    if (sql.includes('UPDATE relay_run_log') && sql.includes("SET status = 'completed'")) return { rows: [] };
+    if (sql.includes('INSERT INTO relay_run_log')) {
+      const row = { id: 'human-review-log-1', issue_id: values[0], from_stage: values[1],
+        to_stage: values[2], task_id: null, status: 'completed' };
+      persisted.relay_run_log.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+    return { rowCount: 0, rows: [] };
+  } };
+  const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayAdvance({ headers: { 'x-relay-operator-secret': 'test-operator-secret' } }, res, {
+      issue_id: issue.id, to_stage: 'Human Review', reason: 'deployment access blocker',
+      evidence: { blocker: 'deployment access blocker' }, agent_token: 'test-relay-secret'
+    });
+  } finally {
+    setTestClientFactory(null);
+  }
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body).issue.status, 'Human Review');
+  assert.equal(JSON.parse(res.body).task_id, null);
+  assert.equal(JSON.parse(res.body).relay_log_id, 'human-review-log-1');
+  assert.equal(persisted.issue.status, 'Human Review');
+  assert.deepEqual(persisted.relay_run_log, [{ id: 'human-review-log-1', issue_id: issue.id,
+    from_stage: 'CI/CD & Deploy', to_stage: 'Human Review', task_id: null, status: 'completed' }]);
+  assert.deepEqual(persisted.agent_task_queue, []);
+});
+
 test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const guard = source.slice(source.indexOf('const issue = issueResult.rows[0];'),
