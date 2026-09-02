@@ -42,6 +42,7 @@ const {
   verifiedRetryEscalation,
   retryEscalationSourceTask,
   capEscalationVerified,
+  retryEscalationLoop,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
   isTerminalStage,
@@ -69,15 +70,16 @@ test('comment-reply tasks do not consume lifetime or stage-cycle cap history', a
       workspace_id uuid NOT NULL, context jsonb NOT NULL DEFAULT '{}'::jsonb,
       trigger_comment_id uuid, created_at timestamptz NOT NULL DEFAULT now()
     )`);
-    const task = async (issueId, stage, reply) => admin.query(
+    const task = async (issueId, stage, reply, kind = null) => admin.query(
       `INSERT INTO ${schema}.agent_task_queue (agent_id, issue_id, workspace_id, context, trigger_comment_id)
-       VALUES ($1, $2, $3, jsonb_build_object('to_stage', $4::text), $5)`,
-      [agentId, issueId, workspaceId, stage, reply ? commentId : null]
+       VALUES ($1, $2, $3, jsonb_strip_nulls(jsonb_build_object('to_stage', $4::text, 'kind', $6::text)), $5)`,
+      [agentId, issueId, workspaceId, stage, reply ? commentId : null, kind]
     );
     for (let index = 0; index < 6; index += 1) await task(lifetimeIssueId, 'Queue', true);
     await task(lifetimeIssueId, 'Queue', false);
     for (let index = 0; index < 2; index += 1) await task(cycleIssueId, 'Queue', true);
     await task(cycleIssueId, 'Queue', false);
+    await task(cycleIssueId, 'Queue', false, 'retry_escalation');
     const client = new Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(`SET search_path TO ${schema}`);
@@ -86,7 +88,7 @@ test('comment-reply tasks do not consume lifetime or stage-cycle cap history', a
         assert.equal(await capEscalationVerified(client, { id: lifetimeIssueId, metadata: {} },
           'lifetime_task_limit', 'Queue'), false);
       });
-      await t.test('two comment replies plus one same-stage task advances without stage_cycle_limit', async () => {
+      await t.test('comment replies and an escalation task do not consume the stage-cycle cap', async () => {
         assert.equal(await capEscalationVerified(client, { id: cycleIssueId, metadata: {} },
           'stage_cycle_limit', 'Queue'), false);
       });
@@ -137,6 +139,13 @@ test('retry escalation accepts only named bounded triggers', () => {
   assert.equal(retryEscalationReason('retry_escalation:stage_cycle_limit'), 'stage_cycle_limit');
   assert.equal(retryEscalationReason('retry_escalation:delete_everything'), null);
   assert.equal(retryEscalationReason('completion_failed'), null);
+});
+
+test('a second retry escalation for one stage is parked', () => {
+  assert.equal(retryEscalationLoop({ metadata: { retry_escalation: {
+    trigger_stage: 'Spec' } } }, 'Spec'), true);
+  assert.equal(retryEscalationLoop({ metadata: { retry_escalation: {
+    trigger_stage: 'Queue' } } }, 'Spec'), false);
 });
 
 test('completion escalation is bound to one exact completed failed task', async () => {
@@ -340,9 +349,9 @@ test('technical QC block cannot route to Human Review and exact re-scope bypasse
   assert.match(source, /technical_human_review_forbidden/);
   assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
   assert.match(source,
-    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&\s+!noArtifactRescope && !retryEscalation/);
+    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !escalationLoop &&\s+!noArtifactRescope && !retryEscalation/);
   assert.match(source,
-    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !retryEscalation/);
+    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !escalationLoop && !retryEscalation/);
   assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
   assert.match(source, /operator_rescope_issue_id: issue\.id/);
 });

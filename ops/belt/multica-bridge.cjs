@@ -422,6 +422,7 @@ async function capEscalationVerified(client, issue, trigger, stage) {
       `SELECT count(*)::int AS n FROM agent_task_queue
         WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
           AND trigger_comment_id IS NULL
+          AND COALESCE(context->>'kind', '') <> 'retry_escalation'
           AND ($3::timestamptz IS NULL OR created_at >= $3::timestamptz)`,
       [issue.id, stage, since]);
     return Number(history.rows[0]?.n || 0) >= STAGE_CYCLE_LIMIT;
@@ -434,6 +435,12 @@ async function capEscalationVerified(client, issue, trigger, stage) {
         AND ($2::timestamptz IS NULL OR created_at >= $2::timestamptz)`,
     [issue.id, since]);
   return Number(history.rows[0]?.n || 0) >= LIFETIME_TASK_LIMIT;
+}
+
+// One Sol-low re-spec is a bounded handoff. A second escalation for the same
+// stage is evidence that the handoff did not break the cycle, so park it.
+function retryEscalationLoop(issue, stage) {
+  return issue.metadata?.retry_escalation?.trigger_stage === stage;
 }
 
 async function verifiedRetryEscalation(client, issue, body) {
@@ -1162,6 +1169,7 @@ async function relayAdvance(req, res, body) {
 
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
+    let escalationLoop = false;
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -1206,6 +1214,13 @@ async function relayAdvance(req, res, body) {
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "retry_escalation_evidence_required" }));
       return;
+    }
+    if (retryEscalation && retryEscalationLoop(issue, retryEscalation.trigger_stage)) {
+      escalationLoop = true;
+      parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
+        attempts: 2, taskCount: 2 };
+      to_stage = "Parked";
+      retryEscalation = null;
     }
     const targetStageResult = await client.query(
       "SELECT stage_name FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
@@ -1641,6 +1656,7 @@ async function relayAdvance(req, res, body) {
         `SELECT count(*)::int AS n FROM agent_task_queue
           WHERE issue_id = $1 AND context->>'to_stage' = $2
             AND trigger_comment_id IS NULL
+            AND COALESCE(context->>'kind', '') <> 'retry_escalation'
             AND ($3::timestamptz IS NULL OR created_at >= $3)`,
         [issue.id, to_stage, releaseAt]
       );
@@ -1648,7 +1664,13 @@ async function relayAdvance(req, res, body) {
       const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
         client, issue, to_stage, reason, parkedEvidenceQcRelease
       );
-      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
+      if (!cycle.ok && !operatorCapBypass && retryEscalationLoop(issue, issue.status)) {
+        escalationLoop = true;
+        parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
+          attempts: 2, taskCount: 2 };
+        to_stage = "Parked";
+      }
+      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !escalationLoop &&
           !noArtifactRescope && !retryEscalation) {
         const sourceTaskId = await retryEscalationSourceTask(
           client, issue, body.relay_source_task_id
@@ -1689,7 +1711,13 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !retryEscalation) {
+      if (!lifetime.ok && !operatorCapBypass && retryEscalationLoop(issue, issue.status)) {
+        escalationLoop = true;
+        parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
+          attempts: 2, taskCount: 2 };
+        to_stage = "Parked";
+      }
+      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !escalationLoop && !retryEscalation) {
         const sourceTaskId = await retryEscalationSourceTask(
           client, issue, body.relay_source_task_id
         );
@@ -2064,6 +2092,7 @@ module.exports = {
   verifiedRetryEscalation,
   retryEscalationSourceTask,
   capEscalationVerified,
+  retryEscalationLoop,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis
 };
