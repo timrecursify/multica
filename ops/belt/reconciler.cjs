@@ -37,10 +37,6 @@ function ownerSql() {
            ORDER BY pool.last_selected_at NULLS FIRST, pool.agent_id LIMIT 1`;
 }
 
-function lifetimeTasksSql() {
-  return "SELECT count(*)::int AS count FROM agent_task_queue WHERE issue_id = $1::uuid AND trigger_comment_id IS NULL";
-}
-
 function stageAttemptsSql() {
   return `SELECT COALESCE(max(attempt), 0)::int AS attempt,
                  COALESCE(max(max_attempts), $3::int)::int AS max_attempts
@@ -53,36 +49,15 @@ function taskContext(stage) {
   return { source: "reconcile", kind: "stage_task", to_stage: stage };
 }
 
-function policyFor(options) {
-  if (options.evaluate) return options.evaluate;
-  return require("./transition-policy.cjs").evaluate;
-}
-
 function settingsFor(options = {}) {
   const positive = (value, fallback) => Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : fallback;
   return {
     ...options,
     maxCreatePerCycle: positive(options.maxCreatePerCycle || process.env.RECONCILE_MAX_CREATE_PER_CYCLE, 25),
     maxCreatePerAgent: positive(options.maxCreatePerAgent || process.env.RECONCILE_MAX_CREATE_PER_AGENT, 3),
-    lifetimeTaskLimit: positive(options.lifetimeTaskLimit || process.env.RECONCILE_LIFETIME_TASK_LIMIT, 6),
     defaultMaxAttempts: positive(options.defaultMaxAttempts || process.env.RECONCILE_DEFAULT_MAX_ATTEMPTS, 2),
     budget: options.budget || { created: 0, byAgent: new Map() }
   };
-}
-
-async function moveToHumanReview(client, issue, reason, options) {
-  const verdict = policyFor(options)({
-    from: issue.status, to: "Human Review", actor: "system", evidence: { blocker: reason }
-  });
-  if (!verdict?.ok) throw new Error(`reconcile policy rejected Human Review: ${reason}`);
-  await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
-  await client.query("UPDATE issue SET status = 'Human Review', updated_at = NOW() WHERE id = $1::uuid", [issue.id]);
-  await client.query(
-    `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
-     VALUES ($1::uuid, $2, 'Human Review', 'pending', jsonb_build_object('reason', $3::text))`,
-    [issue.id, issue.status, reason]
-  );
-  return { action: "human_review", reason };
 }
 
 async function reconcileIssue(client, issueId, options = {}) {
@@ -112,38 +87,25 @@ async function reconcileIssue(client, issueId, options = {}) {
       return { action: "skipped", reason: "stale_stage_running" };
     }
     if (current.length > 1) {
-      const result = await moveToHumanReview(client, issue, "duplicate_live_task", options);
+      const extras = current.filter((task) => UNSTARTED.includes(task.status)).slice(current.some((task) => task.status === "running") ? 0 : 1);
+      if (extras.length) await client.query(
+        "UPDATE agent_task_queue SET status = 'cancelled', completed_at = NOW(), failure_reason = 'reconcile_duplicate' WHERE id = ANY($1::uuid[])",
+        [extras.map((task) => task.id)]
+      );
       await client.query("COMMIT");
-      return result;
+      return { action: "already_live", taskId: current[0].id, cancelledDuplicates: extras.length };
     }
     if (current.length === 1) {
       await client.query("COMMIT");
       return { action: "already_live", taskId: current[0].id };
     }
-    if (options.isRetryExhausted?.(issue)) {
-      const result = await moveToHumanReview(client, issue, "retry_exhausted", options);
-      await client.query("COMMIT");
-      return result;
-    }
-    const lifetime = await client.query(lifetimeTasksSql(), [issue.id]);
-    if (Number(lifetime.rows[0]?.count || 0) >= options.lifetimeTaskLimit) {
-      const result = await moveToHumanReview(client, issue, "lifetime_task_limit", options);
-      await client.query("COMMIT");
-      return result;
-    }
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
     const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
-    const maxAttempts = Number(stageAttempts.rows[0]?.max_attempts || options.defaultMaxAttempts);
-    if (attempt >= maxAttempts) {
-      const result = await moveToHumanReview(client, issue, "stage_attempt_limit", options);
-      await client.query("COMMIT");
-      return result;
-    }
+    const maxAttempts = Math.max(Number(stageAttempts.rows[0]?.max_attempts || 0), options.defaultMaxAttempts, attempt + 1);
     const owner = (await client.query(ownerSql(), [issue.workspace_id, issue.status])).rows[0];
     if (!owner) {
-      const result = await moveToHumanReview(client, issue, "unresolved_owner", options);
       await client.query("COMMIT");
-      return result;
+      return { action: "skipped", reason: "unresolved_owner" };
     }
     if (options.budget.created >= options.maxCreatePerCycle ||
         (options.budget.byAgent.get(owner.agent_id) || 0) >= options.maxCreatePerAgent) {
@@ -213,4 +175,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql, taskContext, reconcileIssue, reconcileCycle };

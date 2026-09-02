@@ -34,15 +34,14 @@ test('requires evidence and never accepts request booleans as authority', () => 
     evidence: { recordedDecision: true, isOperator: true } }).code, 'request_boolean_authority_denied');
 });
 
-test('permits every reconciler blocker reason for the Human Review fallback', () => {
+test('permits Human Review only when an operator records a blocker', () => {
   assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system', evidence: {} }).ok, false);
-  for (const blocker of ['lifetime_task_limit', 'retry_exhausted', 'unresolved_owner',
-    'duplicate_live_task', 'stale_stage_running', 'quota', 'policy_fault']) {
-    assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system',
-      evidence: { blocker } }).ok, true, blocker);
+  for (const from of ['Spec', 'Queue', 'In Progress', 'In Review', 'CI/CD & Deploy']) {
+    assert.equal(evaluate({ from, to: 'Human Review', actor: 'system',
+      evidence: { blocker: 'technical_reason' } }).code, 'actor_denied', from);
+    assert.equal(evaluate({ from, to: 'Human Review', actor: 'operator',
+      evidence: { blocker: 'money_or_destructive_decision' } }).ok, true, from);
   }
-  assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system',
-    evidence: { namedBlocker: 'legacy worker blocker' } }).ok, true);
 });
 
 test('requires destination evidence after Human Review and QC PASS when risk requires it', () => {

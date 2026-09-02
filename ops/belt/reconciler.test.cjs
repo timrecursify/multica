@@ -102,21 +102,15 @@ test("cycle rolls back a throwing issue and reconciles the next issue", async ()
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")));
 });
 
-test("lifetime and per-stage attempt ceilings move the issue to Human Review", async () => {
-  for (const [sqlMatch, row, reason] of [
-    ["count(*)::int AS count", { count: 6 }, "lifetime_task_limit"],
-    ["max(attempt)", { attempt: 2, max_attempts: 2 }, "stage_attempt_limit"]
-  ]) {
-    const db = harness();
-    const original = db.query;
-    db.query = async (sql, values) => sql.includes(sqlMatch) ? { rows: [row] } : original(sql, values);
-    assert.equal((await reconcileIssue(db, issue.id, { evaluate: ok })).reason, reason);
-    assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
-    const relayAuthority = db.calls.findIndex((call) => call.sql.includes("set_config('multica.relay_authorized', 'on', true)"));
-    const issueUpdate = db.calls.findIndex((call) => call.sql.includes("UPDATE issue SET status = 'Human Review'"));
-    assert.ok(relayAuthority >= 0 && relayAuthority < issueUpdate);
-    assert.ok(db.calls.some((call) => call.sql.includes("jsonb_build_object('reason', $3::text)")));
-  }
+test("per-stage attempt ceiling grows to admit a new task", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values) => sql.includes("max(attempt)")
+    ? { rows: [{ attempt: 2, max_attempts: 2 }] } : original(sql, values);
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), { action: "created", taskId: "task-1" });
+  const insert = db.calls.find((call) => call.sql.includes("INSERT INTO agent_task_queue"));
+  assert.equal(insert.values[7], 3);
+  assert.equal(insert.values[8], 3);
 });
 
 test("two reconciler sessions converge on one task", async () => {
@@ -149,18 +143,19 @@ test("two reconciler sessions converge on one task", async () => {
   assert.equal(shared.live.length, 1);
 });
 
-test("duplicate live task fails closed into Human Review", async () => {
+test("duplicate live tasks cancel unstarted extras and keep one", async () => {
   const db = harness({ live: ["a", "b"].map((id) => ({ id, status: "queued", context: taskContext("Queue") })) });
-  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), { action: "human_review", reason: "duplicate_live_task" });
-  assert.ok(db.calls.some((call) => call.sql.includes("UPDATE issue SET status = 'Human Review'")));
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "already_live", taskId: "a", cancelledDuplicates: 1
+  });
+  const cancelled = db.calls.find((call) => call.sql.includes("failure_reason = 'reconcile_duplicate'"));
+  assert.deepEqual(cancelled.values, [["b"]]);
 });
 
-test("missing owner and exhausted retry move the issue atomically to Human Review", async () => {
+test("missing owner skips the issue without a new task", async () => {
   const missing = harness({ owner: null });
-  assert.equal((await reconcileIssue(missing, issue.id, { evaluate: ok })).reason, "unresolved_owner");
-  const exhausted = harness();
-  assert.equal((await reconcileIssue(exhausted, issue.id, { evaluate: ok, isRetryExhausted: () => true })).reason, "retry_exhausted");
-  assert.equal(exhausted.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
+  assert.deepEqual(await reconcileIssue(missing, issue.id, { evaluate: ok }), { action: "skipped", reason: "unresolved_owner" });
+  assert.equal(missing.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
 test("agent without a runtime is skipped for the next eligible pool agent", async () => {
