@@ -3,6 +3,7 @@ const { URL } = require("url");
 const { Client } = require("pg");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
+const { execFileSync } = require("child_process");
 const {
   isBundledChild,
   instructionCompatibility,
@@ -123,6 +124,32 @@ const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 const RERUN_IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
+
+// This deliberately reads only the canonical link tables.  issue.pr_url and
+// comment text are presentation/provenance data, not authority to skip work.
+async function mergedPrEvidence(client, issue, evidence) {
+  const sha = evidence && evidence.sha;
+  if (!SHA_RE.test(String(sha || ''))) return { ok: false, reason: 'invalid_sha' };
+  const linked = await client.query(
+    `SELECT pr.repo_owner || '/' || pr.repo_name AS repository, pr.html_url, pr.head_sha, pr.merged_at
+       FROM github_pull_request pr JOIN issue_pull_request link ON link.pull_request_id=pr.id
+      WHERE link.issue_id=$1 AND NOT link.reference_only AND pr.state='merged' AND pr.merged_at IS NOT NULL
+      UNION ALL
+     SELECT pr.repo_owner || '/' || pr.repo_name, pr.html_url, pr.head_sha, pr.merged_at
+       FROM vcs_pull_request pr JOIN issue_vcs_pull_request link ON link.pull_request_id=pr.id
+      WHERE link.issue_id=$1 AND NOT link.reference_only AND pr.state='merged' AND pr.merged_at IS NOT NULL`, [issue.id]);
+  if (linked.rows.length !== 1) return { ok: false, reason: linked.rows.length ? 'ambiguous_linked_pr' : 'missing_linked_pr' };
+  const pr = linked.rows[0];
+  if (String(pr.head_sha).toLowerCase() !== String(sha).toLowerCase()) return { ok: false, reason: 'sha_mismatch' };
+  try {
+    // gh uses the installation/user credential already configured for the belt.
+    const repo = pr.repository;
+    const defaultBranch = execFileSync('gh', ['api', `repos/${repo}`, '--jq', '.default_branch'], { encoding: 'utf8', timeout: 20000 }).trim();
+    const relation = execFileSync('gh', ['api', `repos/${repo}/compare/${sha}...${defaultBranch}`, '--jq', '.status'], { encoding: 'utf8', timeout: 20000 }).trim();
+    if (!['ahead', 'identical'].includes(relation)) return { ok: false, reason: 'sha_not_on_default_branch' };
+    return { ok: true, pr: { ...pr, default_branch: defaultBranch, verified_at: new Date().toISOString(), sha } };
+  } catch (_) { return { ok: false, reason: 'github_verification_failed' }; }
+}
 
 async function authorizeRelayStatusWrites(client) {
   await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
@@ -1231,6 +1258,39 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    const evidenceRequested = body.merged_pr_evidence === true ||
+      (body.merged_pr_evidence && typeof body.merged_pr_evidence === 'object');
+    const evidenceOperator = evidenceRequested && !OPERATOR_SECRET_DISABLED &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    let evidenceTransition = false;
+    let evidenceAudit = null;
+    if (evidenceRequested) {
+      if (!evidenceOperator) {
+        await client.query("ROLLBACK");
+        res.writeHead(403, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "merged_pr_evidence_operator_required" }));
+        return;
+      }
+      if (!['Spec', 'Queue', 'In Progress'].includes(issue.status) || to_stage !== 'CI/CD & Deploy') {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "merged_pr_evidence_source_stage_invalid" }));
+        return;
+      }
+      const verified = await mergedPrEvidence(client, issue,
+        typeof body.merged_pr_evidence === 'object' ? body.merged_pr_evidence : body);
+      if (!verified.ok) {
+        await client.query("ROLLBACK");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: verified.reason }));
+        return;
+      }
+      evidenceTransition = true;
+      evidenceAudit = { merged_pr_evidence: { source_stage: issue.status, pr_url: verified.pr.html_url,
+        repository: verified.pr.repository, default_branch: verified.pr.default_branch,
+        verified_sha: verified.pr.sha, merged_at: verified.pr.merged_at,
+        verified_at: verified.pr.verified_at } };
+    }
     const noArtifactRescope = await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
@@ -1428,7 +1488,7 @@ async function relayAdvance(req, res, body) {
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
     if (!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&
-        !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) &&
+        !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) && !evidenceTransition &&
         !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
@@ -1594,7 +1654,7 @@ async function relayAdvance(req, res, body) {
 
     const ownerStage = retryEscalation ? "Registered" :
       ownerStageForTransition(issue.status, to_stage);
-    let stage = isNoDispatchArrivalStage(to_stage) ? {} : (retryEscalation
+    let stage = (isNoDispatchArrivalStage(to_stage) || evidenceTransition) ? {} : (retryEscalation
       ? await selectRetryEscalationOwner(client, issue)
       : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage));
     if (retryEscalation) {
@@ -1898,6 +1958,16 @@ async function relayAdvance(req, res, body) {
       }
     }
 
+    if (evidenceTransition) {
+      relayLogId = await ensureCompletedRelayLog(client, issue_id, issue.status, to_stage);
+      await client.query(`UPDATE relay_run_log SET parked_audit=$2::jsonb WHERE id=$1`,
+        [relayLogId, JSON.stringify(evidenceAudit)]);
+      await client.query("COMMIT");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ success: true, issue: result.rows[0], task_id: null, relay_log_id: relayLogId }));
+      return;
+    }
+
     if (isNoDispatchArrivalStage(to_stage)) {
       // Parked has already written its completed, dedicated audit row above.
       // Other no-dispatch arrivals need a regular completed relay log.
@@ -2154,4 +2224,5 @@ module.exports = {
   retryEscalationLoop,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis
+  ,mergedPrEvidence
 };
