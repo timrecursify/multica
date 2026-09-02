@@ -388,7 +388,7 @@ export function useIssueStatusBranches({
         ];
       }),
     ) as IssueStatusPagination;
-  }, [branchData, counts, enabled, loadMore, retry]);
+  }, [branchData, counts, enabled, loadMore, retry, statuses]);
 
   const issues = useMemo(
     () => statuses.flatMap((status) => branchData.get(status)?.rows ?? []),
