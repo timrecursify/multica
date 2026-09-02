@@ -334,6 +334,23 @@ var issueUsageCmd = &cobra.Command{
 	RunE:  runIssueUsage,
 }
 
+var issueEscalationLoopAuditCmd = &cobra.Command{
+	Use: "escalation-loop-audit", Short: "Run the fixed GSP/PPP read-only escalation-loop audit",
+	Args: exactArgs(0), RunE: runIssueEscalationLoopAudit,
+}
+
+func runIssueEscalationLoopAudit(cmd *cobra.Command, _ []string) error {
+	client, err := newAPIClient(cmd)
+	if err != nil {
+		return err
+	}
+	var report any
+	if err := client.GetJSON(cmd.Context(), "/api/issues/audits/escalation-loop", &report); err != nil {
+		return err
+	}
+	return json.NewEncoder(cmd.OutOrStdout()).Encode(report)
+}
+
 var issueRerunCmd = &cobra.Command{
 	Use:   "rerun <id>",
 	Short: "Re-enqueue an issue's current agent assignment as a fresh task",
@@ -462,6 +479,7 @@ func init() {
 	issueCmd.AddCommand(issueRunsCmd)
 	issueCmd.AddCommand(issueRunMessagesCmd)
 	issueCmd.AddCommand(issueUsageCmd)
+	issueCmd.AddCommand(issueEscalationLoopAuditCmd)
 	issueCmd.AddCommand(issueRerunCmd)
 	issueCmd.AddCommand(issueCancelTaskCmd)
 	issueCmd.AddCommand(issueSearchCmd)

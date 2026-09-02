@@ -1381,6 +1381,7 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 
 			// Issues
 			r.Route("/api/issues", func(r chi.Router) {
+				r.Get("/audits/escalation-loop", h.EscalationLoopAudit)
 				r.Post("/table/groups", h.ListIssueTableGroups)
 				r.Post("/table/rows", h.ListIssueTableRows)
 				r.Post("/table/facets", h.ListIssueTableFacets)
