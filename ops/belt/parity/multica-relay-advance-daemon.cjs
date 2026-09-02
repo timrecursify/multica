@@ -951,8 +951,20 @@ const INFRA_FAILURE_REASONS = [
   'timeout',
   'queued_expired',
   'cancelled',
-  'stream_disconnected'
+  'stream_disconnected',
+  'agent_error.provider_quota_limit'
 ];
+
+function isInfrastructureFailure(reason) {
+  return INFRA_FAILURE_REASONS.includes(reason || 'cancelled');
+}
+
+function selectReplayAttempt(row) {
+  if (!row.dead_task_id) return 1;
+  const noArtifact = row.dead_task_status === 'completed';
+  const infra = isInfrastructureFailure(row.failure_reason);
+  return (noArtifact || !infra) ? row.attempt + 1 : row.attempt;
+}
 
 // The relay only ever creates a task at the MOMENT a ticket transitions into a
 // stage (multica-bridge.cjs). If that task later dies while the ticket is still
@@ -1223,7 +1235,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           expected_effort: preflight.expected_effort }));
         continue;
       }
-      const infra = INFRA_FAILURE_REASONS.includes(row.failure_reason || 'cancelled');
+      const infra = isInfrastructureFailure(row.failure_reason);
       if (infra && !coldStart) {
         const headroom = await client.query(
           `SELECT COALESCE(max(EXTRACT(epoch FROM (now() - created_at)) / 60), 0) AS age
@@ -1242,9 +1254,13 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           continue;
         }
       }
-      const attempt = coldStart ? 1
-        : !infra ? row.attempt + 1
-        : row.attempt;
+      // noArtifact must be checked BEFORE infra: a completed task has a NULL
+      // failure_reason, which coalesces to 'cancelled' -- an INFRA reason --
+      // and infra replays reuse the same attempt number. Left in that order
+      // the retry would never consume an attempt and these tickets would
+      // requeue forever, which is the QC bounce loop that burned 134 paid
+      // calls on a single ticket. A missing verdict is a real failed try.
+      const attempt = selectReplayAttempt(row);
       const maxAttempts = row.max_attempts == null ? 2 : row.max_attempts;
       try {
         await client.query('BEGIN');
@@ -1645,4 +1661,5 @@ function startDaemon() {
 if (require.main === module) startDaemon();
 
 module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
-  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon };
+  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
+  INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt };
