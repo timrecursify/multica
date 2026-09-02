@@ -7,6 +7,8 @@ runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/home/newadmin}"
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
   "$root_dir/guardrails.cjs"
+  "$root_dir/parked-diagnosis.cjs"
+  "$root_dir/parked-runtime-verification.cjs"
   "$root_dir/parked-entry-audit.cjs"
   "$root_dir/parity/multica-relay-advance-daemon.cjs"
   "$root_dir/parity/relay-dead-rows.cjs"
@@ -25,6 +27,8 @@ declare -a sources=(
 declare -a targets=(
   "$runtime_root/gsp-multica/multica-bridge.cjs"
   "$runtime_root/gsp-multica/guardrails.cjs"
+  "$runtime_root/gsp-multica/parked-diagnosis.cjs"
+  "$runtime_root/gsp-multica/parked-runtime-verification.cjs"
   "$runtime_root/gsp-multica/parked-entry-audit.cjs"
   "$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
   "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs"

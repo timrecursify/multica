@@ -19,6 +19,7 @@ declare -a files=(
   "gsp-multica/multica-bridge.cjs"
   "gsp-multica/guardrails.cjs"
   "gsp-multica/parked-diagnosis.cjs"
+  "gsp-multica/parked-runtime-verification.cjs"
   "gsp-multica/parked-entry-audit.cjs"
   "gsp-multica/parity/multica-relay-advance-daemon.cjs"
   "gsp-multica/parity/relay-dead-rows.cjs"
@@ -37,7 +38,7 @@ declare -a files=(
 )
 
 for rel in "${files[@]}"; do
-  [[ "$rel" == gsp-multica/guardrails.cjs || "$rel" == gsp-multica/parked-diagnosis.cjs || "$rel" == gsp-multica/parked-entry-audit.cjs || "$rel" == gsp-multica/parity/relay-dead-rows.cjs || "$rel" == cicd-deploy-evidence.cjs || "$rel" == gsp-multica/relay-completion-admission.cjs ]] && continue
+  [[ "$rel" == gsp-multica/guardrails.cjs || "$rel" == gsp-multica/parked-diagnosis.cjs || "$rel" == gsp-multica/parked-runtime-verification.cjs || "$rel" == gsp-multica/parked-entry-audit.cjs || "$rel" == gsp-multica/parity/relay-dead-rows.cjs || "$rel" == cicd-deploy-evidence.cjs || "$rel" == gsp-multica/relay-completion-admission.cjs ]] && continue
   source_file="$root_dir/${rel##*/}"
   [[ "$rel" == gsp-multica/parity/* ]] && source_file="$root_dir/parity/${rel##*/}"
   [[ "$rel" == gsp-multica/fleet/* ]] && source_file="$root_dir/${rel##*/}"
@@ -49,6 +50,7 @@ done
 dry_log="$tmp_dir/dry-run.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run >"$dry_log"
 grep -q 'Would copy .*/parked-diagnosis.cjs to .*/gsp-multica/parked-diagnosis.cjs' "$dry_log"
+grep -q 'Would copy .*/parked-runtime-verification.cjs to .*/gsp-multica/parked-runtime-verification.cjs' "$dry_log"
 grep -q 'Would copy .*/parked-entry-audit.cjs to .*/gsp-multica/parked-entry-audit.cjs' "$dry_log"
 grep -q 'Would copy .*/parity/relay-dead-rows.cjs to .*/gsp-multica/parity/relay-dead-rows.cjs' "$dry_log"
 grep -q 'parity/relay-dead-rows.cjs' "$root_dir/verify.sh"
@@ -76,7 +78,7 @@ if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" BELT_DEPLOY_FAIL_INDEX=2 \
 fi
 for rel in "${files[@]}"; do
   target="$tmp_dir/$rel"
-  if [[ "$rel" == gsp-multica/guardrails.cjs || "$rel" == gsp-multica/parked-diagnosis.cjs || "$rel" == gsp-multica/parked-entry-audit.cjs || "$rel" == gsp-multica/parity/relay-dead-rows.cjs || "$rel" == cicd-deploy-evidence.cjs || "$rel" == gsp-multica/relay-completion-admission.cjs ]]; then
+  if [[ "$rel" == gsp-multica/guardrails.cjs || "$rel" == gsp-multica/parked-diagnosis.cjs || "$rel" == gsp-multica/parked-runtime-verification.cjs || "$rel" == gsp-multica/parked-entry-audit.cjs || "$rel" == gsp-multica/parity/relay-dead-rows.cjs || "$rel" == cicd-deploy-evidence.cjs || "$rel" == gsp-multica/relay-completion-admission.cjs ]]; then
     [[ ! -e "$target" ]] || { echo "new target survived rollback: $rel" >&2; exit 1; }
   else
     source_file="$root_dir/${rel##*/}"
@@ -95,6 +97,7 @@ receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$appl
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" >/dev/null
 [[ ! -e "$tmp_dir/gsp-multica/guardrails.cjs" ]] || { echo 'rollback did not remove new target' >&2; exit 1; }
 [[ ! -e "$tmp_dir/gsp-multica/parked-diagnosis.cjs" ]] || { echo 'rollback did not remove parked diagnosis target' >&2; exit 1; }
+[[ ! -e "$tmp_dir/gsp-multica/parked-runtime-verification.cjs" ]] || { echo 'rollback did not remove parked verification target' >&2; exit 1; }
 [[ ! -e "$tmp_dir/gsp-multica/parked-entry-audit.cjs" ]] || { echo 'rollback did not remove parked entry audit target' >&2; exit 1; }
 [[ ! -e "$tmp_dir/gsp-multica/parity/relay-dead-rows.cjs" ]] || { echo 'rollback did not remove relay dead rows target' >&2; exit 1; }
 [[ ! -e "$tmp_dir/cicd-deploy-evidence.cjs" ]] || { echo 'rollback did not remove deploy evidence target' >&2; exit 1; }

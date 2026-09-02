@@ -19,6 +19,7 @@ const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
 const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
+const { processParkedRuntimeVerifications } = require('../parked-runtime-verification.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -1634,11 +1635,15 @@ function startDaemon() {
   setInterval(cleanupStalePendingRows, 300000);
   setInterval(requeueStrandedTasks, 60000);
   setInterval(processParkedDiagnoses, 30000);
+  setInterval(() => processParkedRuntimeVerifications({ verificationPool: pool, relayPost: postToRelay })
+    .catch(err => console.error(`${LOG_PREFIX} Error in parked runtime verification pass: ${err.message}`)), 30000);
   setInterval(reconcileQuotaPauses, 60000);
   advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
   cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
+  processParkedRuntimeVerifications({ verificationPool: pool, relayPost: postToRelay })
+    .catch(err => console.error(`${LOG_PREFIX} Error in parked runtime verification pass: ${err.message}`));
   reconcileQuotaPauses().catch(err => console.error(`${LOG_PREFIX} Error in quota-pause reconciliation: ${err.message}`));
 }
 

@@ -87,3 +87,21 @@ and `ids.failed`, and does not prevent later candidates or the final receipt.
 It is an operator one-shot and is not part of the runtime deploy manifest;
 rollback is a no-op because dry-run performs no writes and apply writes only the
 ticket comment, blocker metadata, and diagnosis task.
+
+## Runtime-evidence verification lane
+
+The relay also performs a bounded, deterministic verification pass for only
+`Parked` tickets held by the exact `runtime_evidence_unverified` blocker after
+an `already_fixed` diagnosis. It does not call a model or enqueue a diagnosis.
+It accepts only a same-issue durable `task:`, `qc:`, or `activity:` reference;
+missing or malformed evidence remains Parked with a named blocker. A verified
+PASS hash follows the terminal relay route; otherwise it is released to `In Review`
+with `runtime_evidence_verified:<reference>` for QC.
+
+Preview the same cohort without writes, then use explicit apply (both default
+to 25 and may be constrained to one workspace):
+
+```bash
+node ops/belt/backfill-parked-runtime-verification.cjs --dry-run --workspace <UUID>
+node ops/belt/backfill-parked-runtime-verification.cjs --apply --workspace <UUID>
+```
