@@ -15,7 +15,8 @@ async function firstDurableEvidence(client, issueId) {
   return rows.rows[0]?.ref || null;
 }
 
-async function processParkedRuntimeVerifications({ verificationPool, relayPost, workspaceId, batch = DEFAULT_BATCH, issueIds = null } = {}) {
+async function processParkedRuntimeVerifications({ verificationPool, relayPost, workspaceId, batch = DEFAULT_BATCH, issueIds = null,
+  findEvidence = firstDurableEvidence, verifyEvidence = verifyRuntimeEvidence, findPassMD5 = currentPassWorkProductMD5 } = {}) {
   if (!workspaceId) throw new Error('workspaceId is required');
   const client = await verificationPool.connect(); let writes = 0;
   try {
@@ -37,14 +38,14 @@ async function processParkedRuntimeVerifications({ verificationPool, relayPost, 
           SELECT $1::uuid, $2::uuid, $3::uuid, 'running', 0, jsonb_build_object('kind', $4::text, 'no_builder', true, 'no_diagnosis', true, 'verification_requested', true, 'verification_processed', false), 'deterministic parked runtime verification'
           WHERE NOT EXISTS (SELECT 1 FROM agent_task_queue v WHERE v.issue_id = $2::uuid AND v.context->>'kind' = $4::text AND v.context->>'verification_processed' <> 'true') RETURNING id`, [diagnosis.rows[0].agent_id, row.id, workspaceId, PARK_RUNTIME_VERIFICATION_KIND]);
         const taskId = reserved.rows[0]?.id; if (!taskId) { await client.query('ROLLBACK'); continue; }
-        const evidence = await firstDurableEvidence(client, row.id);
-        const verified = evidence && await verifyRuntimeEvidence(client, row.id, evidence, taskId);
+        const evidence = await findEvidence(client, row.id);
+        const verified = evidence && await verifyEvidence(client, row.id, evidence, taskId);
         if (!verified) {
           await client.query(`UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('parked_blocker', 'runtime_evidence_unverified_no_durable_reference'), updated_at = NOW() WHERE id = $1::uuid`, [row.id]);
           await client.query(`UPDATE agent_task_queue SET status = 'completed', completed_at = NOW(), context = context || jsonb_build_object('verification_processed', true, 'verification_result', 'unverified') WHERE id = $1::uuid`, [taskId]);
           await client.query('COMMIT'); writes++; continue;
         }
-        const md5 = await currentPassWorkProductMD5(client, row.id);
+        const md5 = await findPassMD5(client, row.id);
         await client.query(`UPDATE issue SET metadata = (COALESCE(metadata, '{}'::jsonb) - 'parked_blocker') || jsonb_build_object('runtime_evidence_verified', $2::text, 'parked_release_once', true), updated_at = NOW() WHERE id = $1::uuid`, [row.id, evidence]);
         await client.query(`UPDATE agent_task_queue SET status = 'completed', completed_at = NOW(), context = context || jsonb_build_object('verification_processed', true, 'verification_evidence', $2::text, 'verification_result', 'verified') WHERE id = $1::uuid`, [taskId, evidence]);
         await client.query('COMMIT'); writes++;
