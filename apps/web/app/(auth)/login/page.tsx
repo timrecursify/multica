@@ -78,6 +78,9 @@ function LoginPageContent() {
 
   const [desktopToken, setDesktopToken] = useState<string | null>(null);
   const [desktopError, setDesktopError] = useState("");
+  const isSyntheticTicketsHost =
+    typeof window !== "undefined" &&
+    window.location.hostname.toLowerCase().replace(/\.$/, "") === "tickets.synthetic.jp";
   const hasOnboarded = useHasOnboarded();
 
   // Latched once auth has been observed settled as logged-out on this page.
@@ -233,6 +236,14 @@ function LoginPageContent() {
           : undefined
       }
       onTokenObtained={setLoggedInCookie}
+      logo={
+        isSyntheticTicketsHost ? (
+          <div className="synthetic-login-brand" aria-label="Synthetic">
+            <span aria-hidden="true">S</span>
+            <strong>Synthetic</strong>
+          </div>
+        ) : undefined
+      }
       extra={
         <span className="text-caption text-muted-foreground">
           {t(($) => $.web.prefer_desktop)}{" "}

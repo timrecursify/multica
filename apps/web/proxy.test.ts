@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { NextRequest } from "next/server";
 import { MULTICA_LOCALE_HEADER } from "./lib/locale-routing";
-import { proxy } from "./proxy";
+import { isPppTicketsHost, proxy } from "./proxy";
 
 function makeRequest(
   path: string,
@@ -207,6 +207,21 @@ describe("proxy runtime upstream rewrites", () => {
 });
 
 describe("proxy root and locale handling", () => {
+  it("delegates the PPP tickets login to the canonical PPP auth screen", () => {
+    const res = proxy(makeRequest("/login", {}, "tickets.preciouspicspro.com"));
+
+    expect(res.status).toBe(307);
+    expect(res.headers.get("location")).toBe(
+      "https://auth.preciouspicspro.com/login?returnTo=https%3A%2F%2Ftickets.preciouspicspro.com%2Flogin",
+    );
+  });
+
+  it("recognizes only the exact PPP tickets hostname", () => {
+    expect(isPppTicketsHost("tickets.preciouspicspro.com.")).toBe(true);
+    expect(isPppTicketsHost("tickets.synthetic.jp")).toBe(false);
+    expect(isPppTicketsHost("tickets.preciouspicspro.com.evil.test")).toBe(false);
+  });
+
   it("redirects logged-in root visits to the last workspace", () => {
     const res = proxy(
       makeRequest("/", {
