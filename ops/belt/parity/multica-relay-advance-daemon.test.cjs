@@ -9,53 +9,66 @@ const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
 
-test('completed assignment task in In Review is adopted once by exact task and workspace', async () => {
-  const workspaceId = '123e4567-e89b-42d3-a456-426614174000';
-  const taskId = '223e4567-e89b-42d3-a456-426614174000';
-  const issueId = '323e4567-e89b-42d3-a456-426614174000';
-  const queries = [];
-  let adopted = false;
-  const client = { async query(sql, values = []) {
-    queries.push({ sql, values });
-    if (sql === 'BEGIN' || sql === 'COMMIT') return { rows: [] };
-    if (sql.includes('INSERT INTO relay_run_log')) {
-      if (adopted) return { rowCount: 0, rows: [] };
-      adopted = true;
-      return { rowCount: 1, rows: [{ id: 'relay-log-1', issue_id: issueId, task_id: taskId }] };
-    }
-    throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
-  }, release() {} };
-  const options = { dbPool: { connect: async () => client }, workspaceId,
-    logger: { log() {}, error() {} } };
-  const first = await adoptUnloggedInReviewTasks(options);
-  const second = await adoptUnloggedInReviewTasks(options);
-  assert.deepEqual(first, [{ id: 'relay-log-1', issue_id: issueId, task_id: taskId }]);
-  assert.deepEqual(second, []);
-  const adoption = queries.find(({ sql }) => sql.includes('INSERT INTO relay_run_log'));
-  assert.deepEqual(adoption.values, [workspaceId, 20]);
-  assert.match(adoption.sql, /i\.workspace_id = \$1::uuid/);
-  assert.match(adoption.sql, /atq\.id AS task_id/);
-  assert.match(adoption.sql, /existing\.task_id = atq\.id/);
-  assert.match(adoption.sql, /FOR UPDATE OF i, atq SKIP LOCKED/);
-  assert.match(adoption.sql, /existing\.task_id = c\.task_id/);
-  assert.match(adoption.sql, /'In Progress', 'In Review', c\.agent_id, c\.task_id, 'pending'/);
-  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  assert.match(source, /INNER JOIN relay_run_log rrl ON rrl\.task_id = atq\.id AND rrl\.status = \$1/);
-});
-
-test('assignment adoption cannot select an equal issue number from another workspace', () => {
-  // GSP-1465 and PPP-1465 are distinct issues: this pass must have no number
-  // predicate to accidentally bridge them.
-  const gspFixture = { workspace_id: '123e4567-e89b-42d3-a456-426614174000', number: 1465 };
-  const pppFixture = { workspace_id: '423e4567-e89b-42d3-a456-426614174000', number: 1465 };
-  assert.equal(gspFixture.number, pppFixture.number);
-  assert.notEqual(gspFixture.workspace_id, pppFixture.workspace_id);
-  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  const adoption = source.slice(source.indexOf('async function adoptUnloggedInReviewTasks'),
-    source.indexOf('async function advanceTick'));
-  assert.match(adoption, /i\.workspace_id = \$1::uuid/);
-  assert.match(adoption, /atq\.issue_id = i\.id/);
-  assert.doesNotMatch(adoption, /i\.number|atq\.number/);
+test('assignment adoption inserts only the assigned configured QC task once and is workspace-safe', async () => {
+  const schema = `assignment_adoption_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const admin = new Client({ connectionString: TEST_DATABASE_URL });
+  const workspaceId = randomUUID();
+  const otherWorkspaceId = randomUUID();
+  const issueId = randomUUID();
+  const otherIssueId = randomUUID();
+  const qcAgentId = randomUUID();
+  const staleAgentId = randomUUID();
+  const assignedTaskId = randomUUID();
+  const staleTaskId = randomUUID();
+  const otherTaskId = randomUUID();
+  let testPool;
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA ${schema};
+      CREATE TABLE ${schema}.issue (id uuid PRIMARY KEY, workspace_id uuid NOT NULL,
+        number integer NOT NULL, status text NOT NULL, assignee_type text, assignee_id uuid);
+      CREATE TABLE ${schema}.relay_stage_config (workspace_id uuid NOT NULL, stage_name text NOT NULL,
+        next_stage text, agent_id uuid);
+      CREATE TABLE ${schema}.agent_task_queue (id uuid PRIMARY KEY, issue_id uuid NOT NULL,
+        workspace_id uuid NOT NULL, agent_id uuid NOT NULL, status text NOT NULL, completed_at timestamptz);
+      CREATE TABLE ${schema}.relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL,
+        from_stage text, to_stage text, agent_id uuid, task_id uuid, status text NOT NULL);`);
+    await admin.query(`INSERT INTO ${schema}.relay_stage_config VALUES
+      ($1, 'In Review', 'CI/CD & Deploy', $2),
+      ($1, 'In Progress', 'In Review', $3),
+      ($4, 'In Review', 'CI/CD & Deploy', $3),
+      ($4, 'In Progress', 'In Review', $3)`, [workspaceId, randomUUID(), qcAgentId, otherWorkspaceId]);
+    await admin.query(`INSERT INTO ${schema}.issue VALUES
+      ($1, $2, 1465, 'In Review', 'agent', $3),
+      ($4, $5, 1465, 'In Review', 'agent', $3)`,
+    [issueId, workspaceId, qcAgentId, otherIssueId, otherWorkspaceId]);
+    await admin.query(`INSERT INTO ${schema}.agent_task_queue VALUES
+      ($1, $2, $3, $4, 'completed', now()),
+      ($5, $2, $3, $6, 'completed', now() - interval '1 hour'),
+      ($7, $8, $9, $4, 'completed', now())`,
+    [assignedTaskId, issueId, workspaceId, qcAgentId, staleTaskId, staleAgentId,
+      otherTaskId, otherIssueId, otherWorkspaceId]);
+    testPool = new (require('pg').Pool)({ connectionString: TEST_DATABASE_URL });
+    const dbPool = { connect: async () => {
+      const client = await testPool.connect();
+      await client.query(`SET search_path TO ${schema}, public`);
+      return client;
+    } };
+    const options = { dbPool, workspaceId, logger: { log() {}, error() {} } };
+    assert.equal((await adoptUnloggedInReviewTasks(options)).length, 1);
+    assert.deepEqual((await admin.query(`SELECT issue_id, task_id, agent_id, from_stage, to_stage, status
+      FROM ${schema}.relay_run_log`)).rows, [{ issue_id: issueId, task_id: assignedTaskId,
+      agent_id: qcAgentId, from_stage: 'In Progress', to_stage: 'In Review', status: 'pending' }]);
+    assert.equal((await admin.query(`SELECT count(*)::int AS n FROM ${schema}.relay_run_log r
+      INNER JOIN ${schema}.agent_task_queue t ON r.task_id = t.id AND r.status = 'pending'
+      WHERE t.id = $1`, [assignedTaskId])).rows[0].n, 1);
+    assert.deepEqual(await adoptUnloggedInReviewTasks(options), []);
+    assert.equal((await admin.query(`SELECT count(*)::int AS n FROM ${schema}.relay_run_log`)).rows[0].n, 1);
+  } finally {
+    if (testPool) await testPool.end();
+    try { await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); } catch (_) {}
+    await admin.end();
+  }
 });
 
 test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async (t) => {
