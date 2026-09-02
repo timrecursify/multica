@@ -8,6 +8,7 @@ async function testFinishedRoutes() {
   worker.setTestDependencies({
     pool: { query: async (sql, params) => {
       queries.push({ sql, params });
+      if (sql.includes('FROM qc_attempt')) return { rows: [] };
       if (sql.includes('FROM qc_verdict')) return { rows: [{ verdict: 'FAIL', work_product_md5: 'stale' }] };
       return { rows: [] };
     } },
@@ -16,15 +17,14 @@ async function testFinishedRoutes() {
   await worker.routeFinishedPR({ id: 'issue-1', number: 1 }, 'PR merged');
   assert.deepStrictEqual(calls, [[
     'issue-1', 'In Progress', null,
-    'RETURN:In Progress — PR merged; latest QC is FAIL',
+    'RETURN:In Progress — PR merged; current QC lacks strict SHA-bound evidence',
   ]]);
   assert.match(queries[1].sql, /context->>'to_stage'='CI\/CD & Deploy'/);
 
   calls.length = 0;
   worker.setTestDependencies({
-    pool: { query: async (sql) => sql.includes('FROM qc_verdict')
-      ? { rows: [{ verdict: 'PASS', work_product_md5: 'md5' }] }
-      : { rows: [] } },
+    pool: { query: async (sql) => sql.includes('FROM qc_attempt')
+      ? { rows: [{ verdict: 'PASS', work_product_md5: 'md5' }] } : { rows: [] } },
   });
   await worker.routeFinishedPR({ id: 'issue-2', number: 2 }, 'PR merged');
   assert.deepStrictEqual(calls, [['issue-2', 'Done', 'md5']]);

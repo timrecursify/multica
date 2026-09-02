@@ -35,6 +35,16 @@ const CANDIDATE_SQL = `SELECT DISTINCT ON (i.id)
    AND rsc.next_stage = 'CI/CD & Deploy'
    AND verdict.verdict = 'PASS'
    AND verdict.work_product_md5 ~* '^[0-9a-f]{32}$'
+   AND EXISTS (
+     SELECT 1 FROM qc_attempt qa
+      JOIN agent_task_queue t ON t.issue_id=qa.issue_id
+       AND t.id::text=substring(qa.notes FROM 'relay_task_id=([0-9a-f-]{36})') AND t.status='completed'
+      JOIN agent a ON a.id=t.agent_id
+     WHERE qa.issue_id=i.id AND qa.work_product_md5=verdict.work_product_md5
+       AND qa.verdict='PASS' AND qa.qualifying=true AND qa.bound_sha ~* '^[0-9a-f]{40}$'
+       AND lower(qa.bound_sha)=lower(qa.observed_head) AND t.agent_id=verdict.checker_id
+       AND a.model='gpt-5.6-sol' AND a.thinking_level='low'
+   )
    AND NOT EXISTS (
      SELECT 1 FROM relay_run_log pending
       WHERE pending.issue_id = i.id AND pending.status = 'pending'
