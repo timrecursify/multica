@@ -464,15 +464,25 @@ async function adoptUnloggedInReviewTasks({ dbPool = pool, workspaceId = WORKSPA
       `WITH candidates AS (
          SELECT i.id AS issue_id, atq.agent_id, atq.id AS task_id
            FROM issue i
-           JOIN relay_stage_config rsc
+         JOIN relay_stage_config rsc
              ON rsc.workspace_id = i.workspace_id
             AND rsc.stage_name = i.status
-           JOIN agent_task_queue atq
+         JOIN agent_task_queue atq
              ON atq.issue_id = i.id
             AND atq.workspace_id = i.workspace_id
+         -- The task was made by assigning the QC owner of the preceding
+         -- In Progress -> In Review handoff.  Current-stage config names the
+         -- deploy owner, so it cannot identify this QC task.
+         JOIN relay_stage_config qc_stage
+             ON qc_stage.workspace_id = i.workspace_id
+            AND qc_stage.stage_name = 'In Progress'
+            AND qc_stage.next_stage = 'In Review'
+            AND qc_stage.agent_id = atq.agent_id
           WHERE i.workspace_id = $1::uuid
             AND i.status = 'In Review'
             AND rsc.next_stage = 'CI/CD & Deploy'
+            AND i.assignee_type = 'agent'
+            AND i.assignee_id = atq.agent_id
             AND atq.status = 'completed'
             AND NOT EXISTS (
               SELECT 1 FROM relay_run_log existing
