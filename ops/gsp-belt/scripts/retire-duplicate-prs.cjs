@@ -1,32 +1,11 @@
 #!/usr/bin/env node
 'use strict';
-// Owner-operated only.  Dry run never calls a mutating gh command.
-const fs = require('fs');
-const { execFileSync } = require('child_process');
-const CLUSTERS = [[44,63,179,196,215],[66,157,231],[145,185],[69,77],[43,51],[67,153]];
-const args = process.argv.slice(2); const fixtureArg = args.indexOf('--fixture');
-const fixture = fixtureArg >= 0 ? JSON.parse(fs.readFileSync(args[fixtureArg + 1], 'utf8')) : null;
-const apply = args.includes('--apply'); const confirm = args.includes('--confirm-owner-close');
-const canonicalArg = args.find(x => x.startsWith('--canonicals='));
-const canonicals = new Map((canonicalArg ? canonicalArg.split('=')[1] : '').split(',').filter(Boolean).map(p => p.split(':').map(Number)));
-function gh(a) { return JSON.parse(execFileSync('gh', a, { encoding: 'utf8' })); }
-function record(pr) {
-  if (fixture) return fixture[String(pr)];
-  const v = gh(['pr','view',String(pr),'-R','timrecursify/multica','--json','number,state,mergeable,headRefOid,body,statusCheckRollup']);
-  // Live evidence is deliberately obtained from the authoritative DB by the
-  // operator wrapper; absent a mapped issue this safely remains non-admitted.
-  return { ...v, ci: (v.statusCheckRollup || []).every(x => x.status === 'COMPLETED' && x.conclusion === 'SUCCESS') ? 'green' : 'not-green', qc: null };
-}
-function admitted(r) { return r && r.state === 'OPEN' && r.mergeable === 'MERGEABLE' && r.ci === 'green' && r.qc && r.qc.verdict === 'PASS' && r.qc.qualifying === true && r.qc.model === 'gpt-5.6-sol' && r.qc.effort === 'low' && r.qc.bound_sha === r.headRefOid; }
-for (let i = 0; i < CLUSTERS.length; i++) {
-  const members = CLUSTERS[i], rows = members.map(n => [n, record(n)]);
-  console.log(`cluster ${i + 1}: ${members.map(n => '#' + n).join('/')}`);
-  for (const [n, r] of rows) console.log(`  #${n} state=${r?.state || 'UNKNOWN'} head=${r?.headRefOid || 'unknown'} ci=${r?.ci || 'unknown'} qc=${r?.qc ? `${r.qc.verdict}/${r.qc.bound_sha}` : 'missing'}`);
-  const canonical = canonicals.get(i + 1);
-  if (!apply) { console.log('  proposed canonical: OWNER SELECTION REQUIRED; superseded: none'); continue; }
-  const selected = rows.find(([n]) => n === canonical)?.[1];
-  if (!confirm || !canonical || !admitted(selected)) { console.log('  SKIP: explicit confirmed, admitted canonical required'); continue; }
-  for (const [n] of rows) if (n !== canonical) {
-    execFileSync('gh', ['pr','close',String(n),'-R','timrecursify/multica','--comment',`Superseded by #${canonical}; closed by repository owner duplicate-cleanup confirmation.`], { stdio: 'inherit' });
-  }
-}
+// Owner-operated only. This module intentionally never merges PRs.
+const fs=require('fs'),{execFileSync}=require('child_process');
+const CLUSTERS=[[44,63,179,196,215],[66,157,231],[145,185],[69,77],[43,51],[67,153]];
+function ciStatus(r){return Array.isArray(r)&&r.length&&r.every(x=>x.status==='COMPLETED'&&x.conclusion==='SUCCESS')?'green':'not-green'}
+function admitted(r){return !!(r&&!r.error&&r.state==='OPEN'&&r.mergeable==='MERGEABLE'&&r.ci==='green'&&r.qc&&r.qc.verdict==='PASS'&&r.qc.qualifying===true&&r.qc.model==='gpt-5.6-sol'&&r.qc.effort==='low'&&r.qc.bound_sha===r.headRefOid)}
+async function liveRecord(n,{gh,pool}){let pr;try{pr=JSON.parse(gh(['pr','view',String(n),'-R','timrecursify/multica','--json','number,state,mergeable,headRefOid,statusCheckRollup']))}catch(e){return{error:`GitHub lookup failed: ${String(e.message||e)}`}}try{const {rows:links}=await pool.query(`SELECT ipr.issue_id FROM github_pull_request pr JOIN issue_pull_request ipr ON ipr.pull_request_id=pr.id WHERE pr.repo_owner=$1 AND pr.repo_name=$2 AND pr.pr_number=$3`,['timrecursify','multica',n]);if(links.length!==1)return{...pr,ci:ciStatus(pr.statusCheckRollup),qc:null,error:links.length?'multiple persisted issue mappings':'no persisted issue mapping'};const {rows:qcs}=await pool.query('SELECT verdict,bound_sha,qualifying,model,effort FROM qc_attempt WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1',[links[0].issue_id]);return{...pr,ci:ciStatus(pr.statusCheckRollup),qc:qcs[0]||null}}catch(e){return{...pr,ci:ciStatus(pr.statusCheckRollup),qc:null,error:`authoritative QC lookup failed: ${String(e.message||e)}`}}}
+async function cleanup({fixture=null,gh,pool,close,clusters=CLUSTERS,canonicals=new Map(),apply=false,confirmed=false,log=console.log}){const get=async n=>fixture?(fixture[String(n)]||{error:'fixture member missing'}):liveRecord(n,{gh,pool});for(let i=0;i<clusters.length;i++){const members=clusters[i],rows=await Promise.all(members.map(async n=>[n,await get(n)]));log(`cluster ${i+1}: ${members.map(n=>'#'+n).join('/')}`);for(const[n,r]of rows)log(`  #${n} state=${r?.state||'UNKNOWN'} head=${r?.headRefOid||'unknown'} ci=${r?.ci||'unknown'} qc=${r?.qc?`${r.qc.verdict}/${r.qc.bound_sha}`:'missing'}${r?.error?` reason=${r.error}`:''}`);const canonical=canonicals.get(i+1),selected=rows.find(([n])=>n===canonical)?.[1],invalid=rows.some(([,r])=>!r||r.error||r.state!=='OPEN');if(!apply){log('  proposed canonical: OWNER SELECTION REQUIRED; superseded: none');continue}if(!confirmed||!members.includes(canonical)||!admitted(selected)||invalid){log('  SKIP: confirmed admitted canonical and complete open cluster required');continue}for(const[n]of rows)if(n!==canonical)await close(n,`Superseded by #${canonical}; closed by repository owner duplicate-cleanup confirmation.`)}}
+function main(){const args=process.argv.slice(2),at=args.indexOf('--fixture'),fixture=at>=0?JSON.parse(fs.readFileSync(args[at+1],'utf8')):null,raw=args.find(x=>x.startsWith('--canonicals=')),canonicals=new Map((raw?raw.split('=')[1]:'').split(',').filter(Boolean).map(x=>x.split(':').map(Number))),gh=a=>execFileSync('gh',a,{encoding:'utf8'});let pool=null;if(!fixture){const env=fs.readFileSync(process.env.GSP_BELT_SECRETS_ENV_FILE||'/home/newadmin/.secrets/multica-remote/remote-bridge.env','utf8'),url=env.split('\n').find(x=>x.startsWith('DATABASE_URL=')).slice(13).trim(),{Pool}=require(process.env.GSP_BELT_PG_MODULE||'/home/newadmin/node_modules/pg');pool=new Pool({connectionString:url})}cleanup({fixture,gh,pool,canonicals,apply:args.includes('--apply'),confirmed:args.includes('--confirm-owner-close'),close:(n,note)=>execFileSync('gh',['pr','close',String(n),'-R','timrecursify/multica','--comment',note],{stdio:'inherit'})}).finally(()=>pool&&pool.end())}
+if(require.main===module)main();module.exports={CLUSTERS,admitted,ciStatus,liveRecord,cleanup};
