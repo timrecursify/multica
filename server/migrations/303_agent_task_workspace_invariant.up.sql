@@ -23,6 +23,13 @@ BEGIN
         RAISE EXCEPTION 'agent task workspace invariant violated: agent workspace is missing';
     END IF;
 
+    -- A caller must not be able to smuggle a conflicting task workspace past
+    -- this trigger.  The agent is authoritative for source-less tasks, but a
+    -- supplied value is still an assertion that must agree.
+    IF NEW.workspace_id IS NOT NULL AND NEW.workspace_id <> agent_workspace THEN
+        RAISE EXCEPTION 'agent task workspace invariant violated: task workspace differs from agent workspace';
+    END IF;
+
     -- Always persist the agent-owned workspace, including historical rows.
     NEW.workspace_id := agent_workspace;
 
