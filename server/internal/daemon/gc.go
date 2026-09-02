@@ -129,25 +129,26 @@ func (d *Daemon) runGC(ctx context.Context) {
 		stats.bytesReclaimed += storeBytes
 	}
 
-	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 {
-		d.logger.Info("gc: cycle complete",
-			"cleaned", stats.cleaned,
-			"orphaned", stats.orphaned,
-			"skipped", stats.skipped,
-			"artifact_dirs", stats.artifactDirs,
-			"artifact_removed", stats.artifactRemoved,
-			"codex_session_stores_reclaimed", stats.storesReclaimed,
-			"hermes_memory_stores_reclaimed", stats.hermesMemoryStoresReclaimed,
-			"repo_caches_reclaimed", stats.repoCachesReclaimed,
-			"bytes_reclaimed", stats.bytesReclaimed,
-			"quarantined_dirty", stats.quarantinedDirty,
-			"quarantined_unpushed", stats.quarantinedUnpushed,
-			"quarantined_unknown", stats.quarantinedUnknown,
-			"process_held", stats.processHeld,
-			"removal_failed", stats.removalFailed,
-			"by_pattern", stats.byPattern,
-		)
-	}
+	// Emit every completed cycle, including audit-only cycles that reclaim
+	// nothing.  The zeroes are useful: operators need to distinguish an empty
+	// candidate set from a pass that deferred or quarantined every candidate.
+	d.logger.Info("gc: cycle complete",
+		"cleaned", stats.cleaned,
+		"orphaned", stats.orphaned,
+		"skipped", stats.skipped,
+		"artifact_dirs", stats.artifactDirs,
+		"artifact_removed", stats.artifactRemoved,
+		"codex_session_stores_reclaimed", stats.storesReclaimed,
+		"hermes_memory_stores_reclaimed", stats.hermesMemoryStoresReclaimed,
+		"repo_caches_reclaimed", stats.repoCachesReclaimed,
+		"bytes_reclaimed", stats.bytesReclaimed,
+		"quarantined_dirty", stats.quarantinedDirty,
+		"quarantined_unpushed", stats.quarantinedUnpushed,
+		"quarantined_unknown", stats.quarantinedUnknown,
+		"process_held", stats.processHeld,
+		"removal_failed", stats.removalFailed,
+		"by_pattern", stats.byPattern,
+	)
 }
 
 // gcWorkspace scans task directories inside a single workspace directory.
@@ -378,6 +379,14 @@ func (d *Daemon) safeIssueRemoval(taskDir string) string {
 		}
 		branch, err := run(repo, "symbolic-ref", "--quiet", "--short", "HEAD")
 		if err != nil || branch == "" {
+			return "check-failed"
+		}
+		// A stale origin/<branch> can make an unpushed commit look safe after a
+		// different machine has rewritten or deleted the remote branch. Refresh
+		// precisely this branch (not origin/HEAD or every remote ref) under the
+		// same timeout and low-priority command wrapper before comparing it.
+		remoteRef := "refs/heads/" + branch + ":refs/remotes/origin/" + branch
+		if _, err = run(repo, "fetch", "--quiet", "origin", remoteRef); err != nil {
 			return "check-failed"
 		}
 		if _, err = run(repo, "rev-parse", "--verify", "origin/"+branch); err != nil {
