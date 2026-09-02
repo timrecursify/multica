@@ -2,7 +2,7 @@
 'use strict';
 const fs=require('fs'),http=require('http'),{execFileSync}=require('child_process');
 const {admit}=require('./merge-admission.cjs');
-function findAllPRs(work){const out=[],seen=new Set(),re=/https?:\/\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/gi;let m;while((m=re.exec(work||''))){const p={repo:`${m[1]}/${m[2]}`,num:m[3]},k=`${p.repo}#${p.num}`;if(!seen.has(k)){seen.add(k);out.push(p)}}return out}
+function findAllPRs(work){const out=[],seen=new Set(),re=/github[.]com\/([^/]+)\/([^/]+)\/pull\/([0-9]+)/gi;let m;while((m=re.exec(work||''))){const p={repo:`${m[1]}/${m[2]}`,num:m[3]},k=`${p.repo}#${p.num}`;if(!seen.has(k)){seen.add(k);out.push(p)}}return out}
 function createWorker({pool,gh,relay=async()=>{},log=console.log,mergeEnabled=true}){
  async function verdict(id){const {rows}=await pool.query('SELECT verdict,bound_sha,qualifying,model,effort FROM qc_attempt WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 1',[id]);return rows[0]||null}
  async function finish(issue,note){await pool.query("UPDATE agent_task_queue SET status='completed' WHERE issue_id=$1 AND status IN ('queued','dispatched')",[issue.id]);await relay(issue.id,'Done');log(`DONE #${issue.number} — ${note}`)}
