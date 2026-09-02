@@ -205,27 +205,30 @@ test('scoper pool selects the least-loaded eligible Sol-low owner', async () => 
   const client = { query: async (sql, values) => {
     calls.push({ sql, values });
     if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/SELECT id FROM relay_stage_pool/.test(sql)) return { rows: [{ id: 'pool-1' }] };
     return { rows: [scoper({ agent_id: 'agent-b', active_task_count: 0 }),
       scoper({ agent_id: 'agent-a', active_task_count: 1 })] };
   } };
   const owner = await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec');
   assert.equal(owner.agent_id, 'agent-b');
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
-  assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
+  assert.match(calls[2].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
   assert.deepEqual(calls[0].values, ['workspace-1', 'Registered']);
-  assert.deepEqual(calls[1].values, ['workspace-1', 'Spec']);
+  assert.deepEqual(calls[2].values, ['workspace-1', 'Spec']);
 });
 
 test('configured stage pool fails closed when its members are incompatible', async () => {
   const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
-    ? { rows: [] } : { rows: [scoper({ instructions: 'Own Queue tickets only.' })] } };
+    ? { rows: [] } : /SELECT id FROM relay_stage_pool/.test(sql)
+      ? { rows: [{ id: 'pool-1' }] } : { rows: [scoper({ instructions: 'Own Queue tickets only.' })] } };
   await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
     /No eligible stage owner in pool/);
 });
 
 test('configured stage pool does not overfill an agent concurrency limit', async () => {
   const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
-    ? { rows: [] } : { rows: [scoper({ active_task_count: 1, max_concurrent_tasks: 1 })] } };
+    ? { rows: [] } : /SELECT id FROM relay_stage_pool/.test(sql)
+      ? { rows: [{ id: 'pool-1' }] } : { rows: [scoper({ active_task_count: 1, max_concurrent_tasks: 1 })] } };
   await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
     /No eligible stage owner in pool/);
 });
@@ -236,11 +239,26 @@ test('empty stage pool preserves the canonical relay owner fallback', async () =
   const client = { query: async (sql) => {
     calls.push(sql);
     if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/SELECT id FROM relay_stage_pool/.test(sql)) return { rows: [] };
     if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
     return { rows: [fallback] };
   } };
   assert.equal(await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'), fallback);
-  assert.match(calls[2], /FROM relay_stage_config/);
+  assert.match(calls[3], /FROM relay_stage_config/);
+});
+
+test('configured disabled stage pool fails closed instead of using legacy owner', async () => {
+  await assert.rejects(
+    selectPoolOwner({
+      async query(sql) {
+        if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+        if (/SELECT id FROM relay_stage_pool/.test(sql)) return { rows: [{ id: 'pool-1' }] };
+        if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
+        throw new Error(`unexpected query: ${sql}`);
+      },
+    }, 'ws-1', 'Spec', 'Queue'),
+    /configured pool/
+  );
 });
 
 test('pool selection applies to Queue and rotates equal-load agents', async () => {
@@ -254,14 +272,15 @@ test('pool selection applies to Queue and rotates equal-load agents', async () =
   const client = { query: async (sql, values) => {
     calls.push({ sql, values });
     if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/SELECT id FROM relay_stage_pool/.test(sql)) return { rows: [{ id: 'pool-1' }] };
     if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: builders };
     return { rows: [] };
   } };
   const selected = await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue');
   assert.equal(selected.agent_id, 'builder-older');
-  assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
-  assert.match(calls[2].sql, /SET last_selected_at = NOW/);
-  assert.deepEqual(calls[2].values, ['workspace-1', 'Queue', 'builder-older']);
+  assert.match(calls[2].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
+  assert.match(calls[3].sql, /SET last_selected_at = NOW/);
+  assert.deepEqual(calls[3].values, ['workspace-1', 'Queue', 'builder-older']);
 });
 
 test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {

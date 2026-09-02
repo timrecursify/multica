@@ -6,4 +6,6 @@ DROP TRIGGER IF EXISTS relay_stage_pool_agent_liveness ON agent;
 DROP FUNCTION IF EXISTS relay_stage_pool_require_member();
 ALTER TABLE relay_stage_agent_pool DROP CONSTRAINT IF EXISTS relay_stage_agent_pool_pool_id_fkey;
 ALTER TABLE relay_stage_agent_pool DROP COLUMN IF EXISTS pool_id;
+-- relay_stage_agent_pool predates this migration.  Do not recreate or erase
+-- it: its existing rows remain the legacy binding after pool identity is gone.
 DROP TABLE IF EXISTS relay_stage_pool;

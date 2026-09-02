@@ -24,13 +24,26 @@ CREATE INDEX relay_stage_agent_pool_pool_id_idx ON relay_stage_agent_pool(pool_i
 CREATE OR REPLACE FUNCTION relay_stage_pool_require_member()
 RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE target uuid;
+DECLARE affected_pool uuid;
 BEGIN
   IF TG_TABLE_NAME = 'relay_stage_agent_pool' THEN
     target := COALESCE(NEW.pool_id, OLD.pool_id);
   ELSIF TG_TABLE_NAME = 'relay_stage_pool' THEN
     target := COALESCE(NEW.id, OLD.id);
   ELSE
-    SELECT m.pool_id INTO target FROM relay_stage_agent_pool m WHERE m.agent_id = COALESCE(NEW.id, OLD.id) LIMIT 1;
+    -- An agent can belong to multiple pools, so validate every affected pool
+    -- when the agent is archived or moved between workspaces.
+    FOR affected_pool IN
+      SELECT m.pool_id FROM relay_stage_agent_pool m
+       WHERE m.agent_id = COALESCE(NEW.id, OLD.id)
+    LOOP
+      IF EXISTS (SELECT 1 FROM relay_stage_pool p WHERE p.id = affected_pool AND p.enabled
+        AND NOT EXISTS (SELECT 1 FROM relay_stage_agent_pool m JOIN agent a ON a.id = m.agent_id
+          WHERE m.pool_id = p.id AND m.enabled AND a.archived_at IS NULL AND a.workspace_id = p.workspace_id)) THEN
+        RAISE EXCEPTION 'enabled relay stage pool must contain an enabled live same-workspace member';
+      END IF;
+    END LOOP;
+    RETURN NULL;
   END IF;
   IF EXISTS (SELECT 1 FROM relay_stage_pool p WHERE p.id = target AND p.enabled
     AND NOT EXISTS (SELECT 1 FROM relay_stage_agent_pool m JOIN agent a ON a.id = m.agent_id

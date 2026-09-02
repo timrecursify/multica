@@ -642,6 +642,14 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
   // Selection and the rotation update share the relay transaction. The advisory
   // lock makes equal-load choices stable under concurrent advances.
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, ownerStage]);
+  // A legacy owner is a compatibility path only while this stage has never
+  // been configured as a pool.  A disabled/empty configured pool must remain
+  // observable and retryable instead of silently dispatching paid work to the
+  // legacy owner.
+  const configured = await client.query(
+    `SELECT id FROM relay_stage_pool WHERE workspace_id = $1 AND stage_name = $2`,
+    [workspaceId, toStage]
+  );
   const result = await client.query(
     `SELECT p.agent_id, p.pool_id, a.name AS agent_name, a.id AS owner_id, a.runtime_id, a.archived_at,
             a.status AS agent_status, a.instructions, a.model, a.thinking_level,
@@ -666,7 +674,12 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
        ) active ON true
       WHERE p.workspace_id = $1 AND p.stage_name = $2 AND p.enabled = true
       ORDER BY active_task_count, p.last_selected_at NULLS FIRST, p.agent_id`, [workspaceId, toStage]);
-  if (result.rows.length === 0) return null;
+  if (result.rows.length === 0) {
+    if (configured.rows.length > 0) {
+      throw new Error(`No eligible stage owner in configured pool: ${workspaceId}/${toStage}`);
+    }
+    return null;
+  }
   const eligible = result.rows.filter((row) => row.archived_at === null &&
     ["idle", "working"].includes(row.agent_status) && row.selected_runtime_id &&
     Number(row.active_task_count) < Number(row.max_concurrent_tasks) &&
