@@ -37,7 +37,7 @@ declare -a files=(
 )
 
 for rel in "${files[@]}"; do
-  [[ "$rel" == gsp-multica/guardrails.cjs || "$rel" == gsp-multica/parked-diagnosis.cjs || "$rel" == gsp-multica/parked-entry-audit.cjs || "$rel" == gsp-multica/parity/relay-dead-rows.cjs || "$rel" == gsp-multica/relay-completion-admission.cjs ]] && continue
+  [[ "$rel" == gsp-multica/guardrails.cjs || "$rel" == gsp-multica/parked-diagnosis.cjs || "$rel" == gsp-multica/parked-entry-audit.cjs || "$rel" == gsp-multica/parity/relay-dead-rows.cjs || "$rel" == cicd-deploy-evidence.cjs || "$rel" == gsp-multica/relay-completion-admission.cjs ]] && continue
   source_file="$root_dir/${rel##*/}"
   [[ "$rel" == gsp-multica/parity/* ]] && source_file="$root_dir/parity/${rel##*/}"
   [[ "$rel" == gsp-multica/fleet/* ]] && source_file="$root_dir/${rel##*/}"
@@ -76,7 +76,7 @@ if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" BELT_DEPLOY_FAIL_INDEX=2 \
 fi
 for rel in "${files[@]}"; do
   target="$tmp_dir/$rel"
-  if [[ "$rel" == gsp-multica/guardrails.cjs || "$rel" == gsp-multica/parked-diagnosis.cjs || "$rel" == gsp-multica/parked-entry-audit.cjs || "$rel" == gsp-multica/parity/relay-dead-rows.cjs || "$rel" == gsp-multica/relay-completion-admission.cjs ]]; then
+  if [[ "$rel" == gsp-multica/guardrails.cjs || "$rel" == gsp-multica/parked-diagnosis.cjs || "$rel" == gsp-multica/parked-entry-audit.cjs || "$rel" == gsp-multica/parity/relay-dead-rows.cjs || "$rel" == cicd-deploy-evidence.cjs || "$rel" == gsp-multica/relay-completion-admission.cjs ]]; then
     [[ ! -e "$target" ]] || { echo "new target survived rollback: $rel" >&2; exit 1; }
   else
     source_file="$root_dir/${rel##*/}"
@@ -101,6 +101,7 @@ BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" 
 [[ ! -e "$tmp_dir/gsp-multica/relay-completion-admission.cjs" ]] || { echo 'rollback did not remove completion admission target' >&2; exit 1; }
 
 before_bridge="$(sha256sum "$tmp_dir/gsp-multica/multica-bridge.cjs")"
+cp -- "$root_dir/cicd-deploy-evidence.cjs" "$tmp_dir/cicd-deploy-evidence.cjs"
 printf '\nstale-runtime\n' >> "$tmp_dir/multica-cicd-worker.cjs"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-cicd-worker >"$tmp_dir/selective.log"
 cmp -s -- "$root_dir/multica-cicd-worker.cjs" "$tmp_dir/multica-cicd-worker.cjs"
