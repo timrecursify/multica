@@ -1,9 +1,11 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
+const { randomUUID } = require('node:crypto');
 const { Client } = require('pg');
 const { qcCompletionAdvance, processParkedDiagnoses,
   requeueStrandedTasks, requeueTriggerSummary } = require('./multica-relay-advance-daemon.cjs');
+const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
 
@@ -50,6 +52,59 @@ test('PASS sweep SQL plans against the PostgreSQL test schema when qc_verdict is
     const result = await client.query(`EXPLAIN ${sql}`);
     assert.ok(Array.isArray(result.rows));
   } finally {
+    await client.end();
+  }
+});
+
+test('Parked issue creates a diagnosis task against the PostgreSQL test DB', async () => {
+  const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
+  const workspaceId = randomUUID();
+  const issueId = randomUUID();
+  const agentId = randomUUID();
+  const runtimeId = randomUUID();
+  try {
+    await client.connect();
+    await client.query('BEGIN');
+    const relations = await client.query(`SELECT relname FROM pg_class
+      WHERE relname = ANY($1::text[]) AND relkind = 'r'`, [['comment', 'qc_verdict']]);
+    const present = new Set(relations.rows.map((row) => row.relname));
+    if (!present.has('qc_verdict')) await client.query(`CREATE TABLE qc_verdict (
+      id integer, issue_id uuid NOT NULL, verdict text, created_at timestamptz DEFAULT now())`);
+    if (!present.has('comment')) await client.query(`CREATE TABLE comment (
+      issue_id uuid NOT NULL, workspace_id uuid NOT NULL, author_type text NOT NULL,
+      author_id uuid NOT NULL, content text NOT NULL, type text NOT NULL)`);
+    await client.query(`INSERT INTO workspace (id, name, slug)
+      VALUES ($1::uuid, $2::text, $3::text)`,
+    [workspaceId, 'Parked diagnosis test', `parked-diagnosis-${workspaceId.slice(0, 8)}`]);
+    await client.query(`INSERT INTO agent_runtime (
+      id, workspace_id, name, runtime_mode, provider, device_info
+    ) VALUES ($1::uuid, $2::uuid, 'Parked diagnosis test runtime', 'cloud', 'codex', '')`,
+    [runtimeId, workspaceId]);
+    await client.query(`INSERT INTO agent (
+      id, workspace_id, name, runtime_mode, runtime_config, status,
+      max_concurrent_tasks, instructions, model, runtime_id
+    ) VALUES (
+      $1::uuid, $2::uuid, 'gsp-parked-diagnosis-sol-low-test', 'cloud',
+      $3::jsonb, 'idle', 1, $4::text, 'gpt-5.6-sol', $5::uuid
+    )`, [agentId, workspaceId,
+      JSON.stringify({ model: 'gpt-5.6-sol', reasoning_effort: 'low', role: 'diagnosis' }),
+      'Parked diagnosis: classify fixable, already_fixed, duplicate, genuinely_blocked.', runtimeId]);
+    await client.query(`INSERT INTO issue (
+      id, workspace_id, title, status, priority, creator_id, number
+    ) VALUES ($1::uuid, $2::uuid, 'Parked diagnosis integration issue', 'Parked', 'low', $3::uuid, 1)`,
+    [issueId, workspaceId, randomUUID()]);
+
+    const taskId = await recordParkAndQueueDiagnosis(client, {
+      id: issueId, workspace_id: workspaceId, status: 'Parked', priority: 'low'
+    }, { reason: 'integration_test' });
+
+    assert.match(taskId, /^[0-9a-f-]{36}$/i);
+    const task = await client.query(`SELECT agent_id, issue_id, status, context->>'kind' AS kind
+      FROM agent_task_queue WHERE id = $1::uuid`, [taskId]);
+    assert.deepEqual(task.rows, [{ agent_id: agentId, issue_id: issueId,
+      status: 'queued', kind: 'parked_diagnosis' }]);
+  } finally {
+    try { await client.query('ROLLBACK'); } catch (_) {}
     await client.end();
   }
 });
