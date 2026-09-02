@@ -3,11 +3,11 @@ set -euo pipefail
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 fake="$(mktemp -d)"; trap 'rm -rf "$fake"' EXIT
 cat >"$fake/daemon" <<'EOF'
-#!/usr/bin/env bash
-if [[ "$*" == 'daemon start --help' ]]; then
-  if [[ "${HANG_HELP:-0}" == 1 ]]; then sleep 3; fi
-  if [[ "${FAIL_HELP:-0}" == 1 ]]; then exit 17; fi
-  if [[ "${DAEMON_SUPPORTS_WORKSPACES_FLAG:-1}" == 1 ]]; then
+#!/bin/sh
+if [ "$*" = 'daemon start --help' ]; then
+  if [ "${HANG_HELP:-0}" = 1 ]; then sleep 3; fi
+  if [ "${FAIL_HELP:-0}" = 1 ]; then exit 17; fi
+  if [ "${DAEMON_SUPPORTS_WORKSPACES_FLAG:-1}" = 1 ]; then
     printf '%s\n' '      --workspaces-root string Base directory for task workspaces'
   else
     printf '%s\n' '      --max-concurrent-tasks int Max tasks running in parallel'
@@ -18,7 +18,7 @@ printf '%s\n' "$*" >"${CAPTURE_FILE:?}"
 printf 'cap=%s root=%s daemon_root=%s workspaces=%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" "${MULTICA_DAEMON_WORKSPACES_ROOT:-}" "${MULTICA_WORKSPACES_ROOT:-}" "${DISCOVERED_WORKSPACES:-2}" >>"${CAPTURE_FILE}"
 printf 'go_path=%s\n' "${PATH%%:*}" >>"${CAPTURE_FILE}"
 printf 'cwd=%s\n' "$PWD" >>"${CAPTURE_FILE}"
-if [[ "${HOLD_DAEMON:-0}" == 1 ]]; then sleep 3; fi
+if [ "${HOLD_DAEMON:-0}" = 1 ]; then sleep 3; fi
 EOF
 chmod +x "$fake/daemon"
 daemon_cwd="$fake/daemon-root"
