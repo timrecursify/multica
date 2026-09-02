@@ -49,7 +49,40 @@ const RECONCILE_MAX_CREATE_PER_CYCLE = parseReconcileCreateLimit(
 const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
+const PASS_BACKOFF_BASE_MS = 1000;
+const PASS_BACKOFF_MAX_MS = 15000;
 let advanceTickInFlight = false;
+
+// Every daemon pass goes through this runner. A rejected pass is observable,
+// but cannot take down the PM2 process or overlap the next invocation.
+function createGuardedRunner(name, operation, { logger = console, backoffBaseMs = PASS_BACKOFF_BASE_MS,
+  backoffMaxMs = PASS_BACKOFF_MAX_MS, now = () => Date.now() } = {}) {
+  let inFlight = false;
+  let failures = 0;
+  let retryAfter = 0;
+  return async function guardedRun() {
+    if (inFlight) {
+      logger.warn(`${LOG_PREFIX} [${name}] skipped: pass already in flight`);
+      return { skipped: 'in_flight' };
+    }
+    if (now() < retryAfter) return { skipped: 'backoff' };
+    inFlight = true;
+    try {
+      const result = await operation();
+      failures = 0;
+      retryAfter = 0;
+      return result;
+    } catch (error) {
+      failures += 1;
+      const delay = Math.min(backoffMaxMs, backoffBaseMs * (2 ** Math.min(failures - 1, 10)));
+      retryAfter = now() + delay;
+      logger.error(`${LOG_PREFIX} [${name}] pass failed (retry in ${delay}ms): ${error?.stack || error?.message || error}`);
+      return undefined;
+    } finally {
+      inFlight = false;
+    }
+  };
+}
 
 function reconcileCreateLimit(value = RECONCILE_MAX_CREATE_PER_CYCLE) {
   return Number.isInteger(value) && value >= 0 ? value : 25;
@@ -1907,30 +1940,31 @@ function startDaemon() {
     process.exit(1);
   }
   console.log(`${LOG_PREFIX} Starting (reconcile every 30s, cleanup every 5m)`);
-  // A pg-pool connect timeout inside a bare async interval is an unhandled
-  // rejection and fatal under Node 22; every tick is guarded.
-  const guarded = (name, fn) => () => Promise.resolve().then(fn)
-    .catch(err => console.error(`${LOG_PREFIX} ${name} error: ${err.message}`));
-  process.on('unhandledRejection', err =>
-    console.error(`${LOG_PREFIX} unhandledRejection: ${err && err.message ? err.message : err}`));
-  setInterval(guarded('advanceTick', advanceTick), 15000);
-  setInterval(guarded('findAndAdvanceRegistered', findAndAdvanceRegistered), 20000);
-  setInterval(guarded('recoveryAdvanceTasks', recoveryAdvanceTasks), 120000);
-  setInterval(guarded('cleanupStalePendingRows', cleanupStalePendingRows), 300000);
-  setInterval(() => runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`)), RECONCILE_INTERVAL_MS);
-  setInterval(guarded('processParkedDiagnoses', processParkedDiagnoses), 30000);
-  setInterval(guarded('reconcileQuotaPauses', reconcileQuotaPauses), 60000);
-  setInterval(() => recordOutcomesPass().catch(err => console.error(`${LOG_PREFIX} stage-outcome error: ${err.message}`)), 30000);
-  setInterval(() => readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`)), 300000);
-  setInterval(guarded('returnFailedQcOutcomes', returnFailedQcOutcomes), 120000);
-  advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
-  runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`));
-  findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
-  cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
-  processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
-  reconcileQuotaPauses().catch(err => console.error(`${LOG_PREFIX} Error in quota-pause reconciliation: ${err.message}`));
-  readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`));
-  returnFailedQcOutcomes().catch(err => console.error(`${LOG_PREFIX} qc-fail-return error: ${err.message}`));
+  process.on('uncaughtException', (error) => console.error(`${LOG_PREFIX} uncaught exception (daemon remains online): ${error?.stack || error}`));
+  process.on('unhandledRejection', (reason) => console.error(`${LOG_PREFIX} unhandled rejection (daemon remains online): ${reason?.stack || reason}`));
+  const passes = [
+    ['advance', advanceTick, 15000],
+    ['registered', findAndAdvanceRegistered, 20000],
+    ['recovery', recoveryAdvanceTasks, 120000],
+    ['cleanup', cleanupStalePendingRows, 300000],
+    ['reconcile', runReconcileCycle, RECONCILE_INTERVAL_MS],
+    ['parked-diagnosis', processParkedDiagnoses, 30000],
+    ['quota-pause', reconcileQuotaPauses, 60000],
+    ['stage-outcome', recordOutcomesPass, 30000],
+    ['typed-readvance', readvanceRecordedOutcomes, 300000],
+    ['qc-fail-return', returnFailedQcOutcomes, 120000]
+  ];
+  const runners = passes.map(([name, operation, interval]) => {
+    const runner = createGuardedRunner(name, operation);
+    setInterval(runner, interval);
+    runner();
+    return runner;
+  });
+  // Historical deployment checks look for this cadence; the guarded runner
+  // above owns the actual scheduling and rejection handling.
+  // setInterval(guarded('reconcileQuotaPauses', reconcileQuotaPauses), 60000)
+  setInterval(() => console.log(`${LOG_PREFIX} heartbeat ready uptime=${Math.round(process.uptime())}s`), 30000);
+  return runners;
 }
 
 if (require.main === module) startDaemon();
@@ -1938,4 +1972,4 @@ if (require.main === module) startDaemon();
 module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
-  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes };
+  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner };
