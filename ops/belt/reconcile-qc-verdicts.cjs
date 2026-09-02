@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 // Reconcile legacy verdicts before the qc_attempt binding trigger is enabled.
 // It never guesses from branches or prose: only structured task fields can rebound.
-const { Pool } = require('pg');
 const { currentStrictPass } = require('./qc-strict-evidence.cjs');
 
 function parseArgs(args) {
@@ -12,16 +11,20 @@ function parseArgs(args) {
 }
 
 const LEGACY_SQL = `SELECT v.id AS verdict_id, v.issue_id, v.checker_id, v.checker_name,
-       v.verdict, v.work_product_md5, t.id AS task_id, t.result, a.name AS agent_name
+       v.verdict, v.work_product_md5, COALESCE(t.match_count, 0) AS match_count,
+       t.task_id, t.result, t.agent_name
   FROM qc_verdict v
   LEFT JOIN LATERAL (
-    SELECT t.id, t.result, a.name FROM agent_task_queue t JOIN agent a ON a.id=t.agent_id
+    SELECT count(*)::int AS match_count,
+      (array_agg(t.id ORDER BY t.completed_at DESC, t.id DESC))[1] AS task_id,
+      (array_agg(t.result ORDER BY t.completed_at DESC, t.id DESC))[1] AS result,
+      (array_agg(a.name ORDER BY t.completed_at DESC, t.id DESC))[1] AS agent_name
+      FROM agent_task_queue t JOIN agent a ON a.id=t.agent_id
      WHERE t.issue_id=v.issue_id AND t.agent_id=v.checker_id AND t.status='completed'
        AND a.model='gpt-5.6-sol' AND a.thinking_level='low'
        AND t.result->>'work_product_md5'=v.work_product_md5
        AND t.result->>'bound_sha' ~* '^[0-9a-f]{40}$'
        AND lower(t.result->>'bound_sha')=lower(t.result->>'observed_sha')
-     ORDER BY t.completed_at DESC, t.id DESC LIMIT 2
   ) t ON true
  WHERE v.verdict='PASS' ORDER BY v.created_at, v.id`;
 
@@ -32,7 +35,8 @@ async function reconcile(client, { mode }) {
     const receipts = [];
     for (const row of rows) {
       if (await currentStrictPass(client, row.issue_id)) continue;
-      const exact = row.task_id && row.result?.bound_sha && row.result?.observed_sha;
+      const exact = Number(row.match_count) === 1 && row.task_id &&
+        row.result?.bound_sha && row.result?.observed_sha;
       const receipt = { issue_id: row.issue_id, verdict_id: row.verdict_id,
         action: exact ? 'rebound' : 'quarantined', task_id: row.task_id || null };
       receipts.push(receipt);
@@ -59,6 +63,7 @@ async function reconcile(client, { mode }) {
 
 async function main() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
+  const { Pool } = require('pg');
   const pool = new Pool({ connectionString: process.env.DATABASE_URL }); const client = await pool.connect();
   try { console.log(JSON.stringify(await reconcile(client, parseArgs(process.argv.slice(2))))); }
   finally { client.release(); await pool.end(); }
