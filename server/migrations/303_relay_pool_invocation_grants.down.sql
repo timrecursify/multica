@@ -1,0 +1,2 @@
+-- Deliberately non-destructive: relay pool grants can be shared with another
+-- pool or explicitly managed by the agent owner.

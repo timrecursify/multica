@@ -144,6 +144,19 @@ func (h *Handler) ReplaceRelayStagePool(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusInternalServerError, "failed to save relay pool member")
 			return
 		}
+		// Relay pool membership is an explicit workspace-wide dispatch grant.
+		// Keep it additive: a member may be shared by another pool or have a
+		// user-managed grant, so removing it from this replacement must not
+		// narrow its invocation permission.
+		if _, err = tx.Exec(r.Context(), `
+UPDATE agent SET permission_mode = 'public_to' WHERE id = $1::uuid;
+INSERT INTO agent_invocation_target (agent_id, target_type, target_id)
+VALUES ($1::uuid, 'workspace', $2::uuid)
+ON CONFLICT (agent_id, target_type, target_id) DO NOTHING
+`, id, workspaceID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to grant relay pool member invocation")
+			return
+		}
 	}
 	if err = tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to commit relay pool update")
