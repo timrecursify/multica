@@ -1496,11 +1496,15 @@ async function relayAdvance(req, res, body) {
         }));
       }
     }
+    const rejectedPassTerminalExit = issue.status === "Rejected" &&
+      to_stage === "In Review" && explicitTerminalExit &&
+      await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
     if (!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&
         !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) &&
+        !rejectedPassTerminalExit &&
         !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
