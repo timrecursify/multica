@@ -65,12 +65,11 @@ test('Parked issue creates a diagnosis task against the PostgreSQL test DB', asy
   try {
     await client.connect();
     await client.query('BEGIN');
-    const relations = await client.query(`SELECT relname FROM pg_class
-      WHERE relname = ANY($1::text[]) AND relkind = 'r'`, [['comment', 'qc_verdict']]);
-    const present = new Set(relations.rows.map((row) => row.relname));
-    if (!present.has('qc_verdict')) await client.query(`CREATE TABLE qc_verdict (
+    const relations = await client.query(`SELECT to_regclass('public.comment') AS comment_name,
+      to_regclass('public.qc_verdict') AS qc_verdict_name`);
+    if (!relations.rows[0].qc_verdict_name) await client.query(`CREATE TABLE qc_verdict (
       id integer, issue_id uuid NOT NULL, verdict text, created_at timestamptz DEFAULT now())`);
-    if (!present.has('comment')) await client.query(`CREATE TABLE comment (
+    if (!relations.rows[0].comment_name) await client.query(`CREATE TABLE comment (
       issue_id uuid NOT NULL, workspace_id uuid NOT NULL, author_type text NOT NULL,
       author_id uuid NOT NULL, content text NOT NULL, type text NOT NULL)`);
     await client.query(`INSERT INTO workspace (id, name, slug)

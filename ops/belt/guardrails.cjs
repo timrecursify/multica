@@ -174,6 +174,21 @@ function stageCycleAdmission(taskCount, limit = 2) {
     : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Spec', escalation: 'sol_low_respec' };
 }
 
+function budgetCountPredicate(taskAlias = '') {
+  const task = taskAlias ? `${taskAlias}.` : '';
+  return `AND (
+    ${task}context->>'to_stage' IS DISTINCT FROM 'In Review'
+    OR ${task}status IS DISTINCT FROM 'completed'
+    OR EXISTS (
+      SELECT 1 FROM qc_verdict verdict
+       WHERE verdict.issue_id = ${task}issue_id
+         AND verdict.checker_id = ${task}agent_id
+         AND verdict.created_at >= ${task}started_at
+         AND verdict.created_at <= ${task}completed_at
+    )
+  )`;
+}
+
 function lifetimeTaskAdmission(taskCount, limit = 6) {
   const count = Number(taskCount);
   const ceiling = Number(limit);
@@ -247,6 +262,7 @@ module.exports = {
   QUOTA_PAUSE_MAX_AGE_MS,
   quotaPauseClearance,
   quotaPauseFlipLogLine,
+  budgetCountPredicate,
   stageCycleAdmission,
   lifetimeTaskAdmission,
   isExecutionStage,

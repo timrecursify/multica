@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const {
   isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
   crossStageExecutionAdmission,
-  retryAdmission, spendPreflight, beltRoutingAdmission, stageCycleAdmission, lifetimeTaskAdmission,
+  retryAdmission, spendPreflight, beltRoutingAdmission, budgetCountPredicate, stageCycleAdmission, lifetimeTaskAdmission,
   isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
   quotaCircuitAdmission, QUOTA_PAUSE_MAX_AGE_MS, quotaPauseClearance, quotaPauseFlipLogLine
 } = require('./guardrails.cjs');
@@ -136,18 +136,24 @@ test('stage cycle breaker escalates repeated task creation to Sol-low re-spec', 
   });
 });
 
-test('recovery ceilings count queued tasks that never started', () => {
+test('budget predicate excludes only completed verdict-less In Review tasks', () => {
+  const predicate = budgetCountPredicate();
+  assert.match(predicate, /context->>'to_stage' IS DISTINCT FROM 'In Review'/);
+  assert.match(predicate, /status IS DISTINCT FROM 'completed'/);
+  assert.match(predicate, /verdict\.checker_id = agent_id/);
+  assert.match(predicate, /verdict\.created_at >= started_at/);
+  assert.match(predicate, /verdict\.created_at <= completed_at/);
+});
+
+test('bridge and daemon use the same budget predicate', () => {
+  const predicate = budgetCountPredicate().replace(/\s+/g, ' ').trim();
+  const bridge = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const source = fs.readFileSync(
     require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8'
   );
-  const stageHistory = source.match(
-    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1 AND context->>'to_stage' = \$2\s+AND trigger_comment_id IS NULL\s+AND \(\$3::timestamptz IS NULL OR created_at >= \$3\)/
-  );
-  const lifetimeHistory = source.match(
-    /SELECT count\(\*\)::int AS n FROM agent_task_queue\s+WHERE issue_id = \$1\s+AND trigger_comment_id IS NULL\s+AND \(\$2::timestamptz IS NULL OR created_at >= \$2\)/
-  );
-  assert.ok(stageHistory, 'stage ceiling must count every non-comment task');
-  assert.ok(lifetimeHistory, 'lifetime ceiling must count every non-comment task');
+  assert.equal((bridge.match(/\$\{budgetCountPredicate\(\)\}/g) || []).length, 4);
+  assert.equal((source.match(/\$\{budgetCountPredicate\(\)\}/g) || []).length, 2);
+  assert.ok(predicate.includes("verdict.checker_id = agent_id"));
 });
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
