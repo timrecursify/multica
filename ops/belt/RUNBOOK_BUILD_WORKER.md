@@ -21,7 +21,12 @@ comment with the error and stop.
 1. Read the issue and comments. Identify the single requested outcome.
 2. Implement the minimum change in a fresh clone or managed worktree.
 3. Run the narrowest check that proves the acceptance criteria.
-4. Commit, push the ticket branch, and open a pull request when code changed.
+4. Commit, push the ticket branch, and open a pull request when code changed. Resolve
+   the remote PR head and require it to be one reachable lowercase 40-character SHA
+   equal to the local pushed commit. Atomically record that exact pair as issue
+   metadata `pr_url` and `bound_sha` before advancing. If either value is missing,
+   mismatched, or unreachable, report the blocked build and do not advance. For
+   no-code work, record `NO-SHA` in the comment and create no implementation metadata.
 5. Post the work-product comment below.
 6. Advance `Queue` to `In Progress`, then `In Progress` to `In Review`, with
    `sk multica advance "$NUMBER" --to "In Progress" --board "$BOARD"`.

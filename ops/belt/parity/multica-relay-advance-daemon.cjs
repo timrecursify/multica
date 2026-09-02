@@ -101,17 +101,16 @@ function requeueTriggerSummary(row, coldStart) {
     ? `Relay cold start: never dispatched in ${row.stage}`
     : `Relay requeue: stranded in ${row.stage} (${row.failure_reason || 'cancelled'})`;
   if (row.stage !== 'In Review') return prefix;
-  const result = row.build_task_result || {};
-  const prUrl = result.pr_url || row.metadata?.pr_url;
-  const headSha = result.head_sha || result.bound_sha || row.metadata?.head_sha ||
-    row.metadata?.bound_sha || row.metadata?.commit_sha;
-  if (!prUrl || !/^[0-9a-f]{40}$/i.test(headSha || '')) {
+  const prUrl = String(row.metadata?.pr_url || '');
+  const boundSha = String(row.metadata?.bound_sha || '');
+  if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9][0-9]*\/?$/.test(prUrl) ||
+      !/^[a-f0-9]{40}$/.test(boundSha)) {
     return `${prefix}\nQC input: PR/SHA unknown: issue FAIL verdict per runbook`;
   }
   const board = row.metadata?.board ||
     (row.workspace_id === WORKSPACE_ID ? 'gsp' : 'prod');
   return `${prefix}\nQC input: ticket ${row.number}; board ${board}; ` +
-    `PR ${prUrl}; head SHA ${headSha}`;
+    `PR ${prUrl}; bound SHA ${boundSha}`;
 }
 
 // Deliberately small: the DeepSeek build lane is paid, so a backlog drains at a

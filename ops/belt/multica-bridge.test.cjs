@@ -34,6 +34,7 @@ const {
   consumeParkedQcRecovery,
   isNoArtifactQcBlock,
   operatorRescopeIssueId,
+  implementationEvidence,
   issueImplementationArtifact,
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
@@ -266,18 +267,20 @@ test('operator re-scope request is explicit and bound to one UUID', () => {
   assert.equal(operatorRescopeIssueId(null, 'RETURN:Spec — retry this ticket'), null);
 });
 
-test('artifact lookup rejects any verdict, builder work product, or issue PR/SHA', async () => {
-  for (const field of ['has_qc_verdict', 'has_builder_artifact', 'has_comment_artifact']) {
-    const client = { query: async (sql, values) => {
-      assert.match(sql, /FROM qc_verdict/);
-      assert.match(sql, /context->>'to_stage' = 'Queue'/);
-      assert.match(sql, /FROM comment/);
-      assert.deepEqual(values, ['issue-1']);
-      return { rows: [{ has_qc_verdict: false, has_builder_artifact: false,
-        has_comment_artifact: false, [field]: true }] };
-    } };
-    assert.equal(await issueImplementationArtifact(client, 'issue-1'), true);
-  }
+test('implementation evidence accepts only the canonical GitHub PR and lowercase full SHA pair', async () => {
+  const metadata = { pr_url: 'https://github.com/timrecursify/multica/pull/1531',
+    bound_sha: 'c909401ef7a4a438348eb5ceda33839211721524' };
+  assert.deepEqual(implementationEvidence(metadata), { prUrl: metadata.pr_url, boundSha: metadata.bound_sha });
+  assert.equal(implementationEvidence({ ...metadata, bound_sha: metadata.bound_sha.toUpperCase() }), null);
+  assert.equal(implementationEvidence({ ...metadata, pr_url: 'https://github.com/timrecursify/multica/issues/1531' }), null);
+  const client = { query: async () => { throw new Error('metadata evidence must not scan prose'); } };
+  assert.equal(await issueImplementationArtifact(client, { id: 'issue-1', metadata }), true);
+  assert.equal(await issueImplementationArtifact({ query: async (sql, values) => {
+    assert.match(sql, /FROM qc_verdict/);
+    assert.doesNotMatch(sql, /agent_task_queue|FROM comment/);
+    assert.deepEqual(values, ['issue-1']);
+    return { rows: [{ has_qc_verdict: false }] };
+  } }, { id: 'issue-1', metadata: {} }), false);
 });
 
 test('operator re-scope admits only the exact issue UUID and completed Sol-low NO-SHA block', async () => {
