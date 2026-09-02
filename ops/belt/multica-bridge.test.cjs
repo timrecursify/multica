@@ -41,11 +41,61 @@ const {
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
+  capEscalationVerified,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
+
+test('comment-reply tasks do not consume lifetime or stage-cycle cap history', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') {
+    return t.skip('integration test requires the Multica test DATABASE_URL');
+  }
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  const schema = `relay_comment_caps_${Date.now()}`;
+  const workspaceId = '323e4567-e89b-42d3-a456-426614174000';
+  const agentId = '423e4567-e89b-42d3-a456-426614174000';
+  const lifetimeIssueId = '123e4567-e89b-42d3-a456-426614174000';
+  const cycleIssueId = '223e4567-e89b-42d3-a456-426614174000';
+  const commentId = '523e4567-e89b-42d3-a456-426614174000';
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`CREATE TABLE ${schema}.agent_task_queue (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(), agent_id uuid NOT NULL, issue_id uuid NOT NULL,
+      workspace_id uuid NOT NULL, context jsonb NOT NULL DEFAULT '{}'::jsonb,
+      trigger_comment_id uuid, created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const task = async (issueId, stage, reply) => admin.query(
+      `INSERT INTO ${schema}.agent_task_queue (agent_id, issue_id, workspace_id, context, trigger_comment_id)
+       VALUES ($1, $2, $3, jsonb_build_object('to_stage', $4::text), $5)`,
+      [agentId, issueId, workspaceId, stage, reply ? commentId : null]
+    );
+    for (let index = 0; index < 6; index += 1) await task(lifetimeIssueId, 'Queue', true);
+    await task(lifetimeIssueId, 'Queue', false);
+    for (let index = 0; index < 2; index += 1) await task(cycleIssueId, 'Queue', true);
+    await task(cycleIssueId, 'Queue', false);
+    const client = new Client({ connectionString: databaseUrl });
+    await client.connect();
+    await client.query(`SET search_path TO ${schema}`);
+    try {
+      await t.test('six comment replies plus one stage task advances without lifetime_task_limit', async () => {
+        assert.equal(await capEscalationVerified(client, { id: lifetimeIssueId, metadata: {} },
+          'lifetime_task_limit', 'Queue'), false);
+      });
+      await t.test('two comment replies plus one same-stage task advances without stage_cycle_limit', async () => {
+        assert.equal(await capEscalationVerified(client, { id: cycleIssueId, metadata: {} },
+          'stage_cycle_limit', 'Queue'), false);
+      });
+    } finally { await client.end(); }
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+    await admin.end();
+  }
+});
 
 test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', async () => {
   const calls = [];
@@ -1131,7 +1181,8 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       issue_id uuid NOT NULL, workspace_id uuid NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0,
       runtime_id uuid, context jsonb NOT NULL DEFAULT '{}'::jsonb, trigger_summary text, force_fresh_session boolean,
       originator_source text, trigger_evidence_kind text, result jsonb, error text, completed_at timestamptz,
-      prepare_lease_expires_at timestamptz, failure_reason text, created_at timestamptz NOT NULL DEFAULT now());
+      prepare_lease_expires_at timestamptz, failure_reason text, trigger_comment_id uuid,
+      created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
