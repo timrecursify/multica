@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
+const { Pool } = require('pg');
 const { reconcileQuotaPauses } = require('./multica-relay-advance-daemon.cjs');
 
 const OLD_PAUSE = {
@@ -11,6 +12,7 @@ const OLD_PAUSE = {
   budget_exhausted: false
 };
 const NOW = () => Date.parse('2026-09-01T12:16:00.000Z');
+const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
 
 function mockClient(responses, events) {
   return {
@@ -24,6 +26,44 @@ function mockClient(responses, events) {
     release() { events.push('release'); }
   };
 }
+
+test('quota-pause reconciliation clears an expired pause and records its resume', async () => {
+  const schema = `quota_pause_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const admin = new Pool({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`CREATE TABLE ${schema}.agent (
+      id text PRIMARY KEY, workspace_id text NOT NULL, name text, runtime_config jsonb, updated_at timestamptz NOT NULL)`);
+    await admin.query(`CREATE TABLE ${schema}.build_budget (
+      workspace_id text NOT NULL, scope text NOT NULL, state text NOT NULL,
+      spent_ticks bigint NOT NULL, reserved_ticks bigint NOT NULL, limit_ticks bigint NOT NULL)`);
+    await admin.query(`CREATE TABLE ${schema}.activity_log (
+      workspace_id text NOT NULL, issue_id text, actor_type text NOT NULL, action text NOT NULL, details jsonb NOT NULL)`);
+    await admin.query(`INSERT INTO ${schema}.agent (id, workspace_id, name, runtime_config, updated_at)
+      VALUES ('agent-1', 'workspace-1', 'DeepSeek Builder',
+        '{"quota_paused": true, "quota_paused_at": "2026-09-01T12:00:00.000Z"}',
+        '2026-09-01T12:00:00.000Z')`);
+    const dbPool = { connect: async () => {
+      const client = await admin.connect();
+      await client.query(`SET search_path TO ${schema}, public`);
+      return client;
+    } };
+    await reconcileQuotaPauses({ connect: dbPool.connect, now: NOW, onError: (err) => { throw err; } });
+    const agent = await admin.query(`SELECT runtime_config FROM ${schema}.agent WHERE id = 'agent-1'`);
+    const activity = await admin.query(`SELECT action, details FROM ${schema}.activity_log`);
+    assert.equal(agent.rows[0].runtime_config.quota_paused, undefined);
+    assert.equal(agent.rows[0].runtime_config.quota_paused_at, undefined);
+    assert.equal(agent.rows[0].runtime_config.quota_pause_clear_reason, 'build_budget_not_exhausted');
+    assert.deepEqual(activity.rows, [{ action: 'relay_lane_resumed', details: {
+      agent_id: 'agent-1', agent_name: 'DeepSeek Builder',
+      paused_at: '2026-09-01T12:00:00.000Z', reason: 'build_budget_not_exhausted',
+      timestamp: agent.rows[0].runtime_config.quota_pause_cleared_at
+    } }]);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
 
 test('quota-pause clear emits its flip only after commit', async () => {
   const events = [];
