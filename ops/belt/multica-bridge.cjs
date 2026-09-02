@@ -18,6 +18,8 @@ const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvide
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const { currentStrictPass } = require("./qc-strict-evidence.cjs");
+const { evaluate } = require("./transition-policy.cjs");
+const { validateQcVerdict } = require("./qc-verdict-policy.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -299,8 +301,8 @@ async function hasCurrentPassWorkProduct(client, issueId, workProductMd5) {
 
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explicitTaskId = null) {
   const result = await client.query(
-      `SELECT t.id, t.agent_id, t.status, t.context, t.result, t.completed_at,
-              a.name AS agent_name
+      `SELECT t.id, t.issue_id, t.workspace_id, t.agent_id, t.status, t.context, t.result, t.completed_at,
+              a.name AS agent_name, a.model, a.thinking_level, a.runtime_config
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
@@ -721,89 +723,17 @@ async function authorizeCicdReturnCapBypass(client, issueId, capBypass) {
 }
 
 async function replaceStageTask(client, task) {
-  // The issue row lock normally serializes relayAdvance callers. Keep the
-  // enqueue primitive safe for recovery/replay callers too: the predicate and
-  // insert must share a stage-specific transaction lock or simultaneous
-  // retries can both observe no active successor.
-  if (task.serialize) {
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
-      task.issueId, task.toStage
-    ]);
-  }
-  const context = typeof task.context === 'string' ? JSON.parse(task.context) : task.context;
-  if (!isBuilderDispatchAllowed(context)) {
-    throw new Error('builder dispatcher rejected a no_builder diagnosis task');
-  }
-  // The issue row is locked by relayAdvance. Cancel only unstarted relay work
-  // for another execution stage before making the successor visible. Running
-  // paid work and manual/disposition tasks are deliberately preserved.
-  await client.query(
-    `UPDATE agent_task_queue
-        SET status = 'cancelled', completed_at = NOW(),
-            prepare_lease_expires_at = NULL,
-            failure_reason = 'relay_stage_transition_superseded'
-      WHERE issue_id = $1
-        AND status::text = ANY($2::text[])
-        AND context ? 'to_stage'
-        AND COALESCE(context->>'source', '') NOT LIKE 'manual%'
-        AND context->>'to_stage' NOT IN
-            ('Human Review', 'Parked', 'Rejected', 'Done', 'Archived', 'Cancelled')
-        AND COALESCE(context->>'to_stage', '') IS DISTINCT FROM $3`,
-    [task.issueId, REPLACEABLE_TASK_STATUSES, task.toStage]
-  );
+  throw new Error('task creation is reconciler-owned');
+}
 
-  const inserted = await client.query(
-    `INSERT INTO agent_task_queue (
-       agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
-       trigger_summary, force_fresh_session, originator_source,
-       trigger_evidence_kind
-     )
-     SELECT $1, $2, $3, 'queued', $4, $5, $6::jsonb, $7, TRUE,
-            'unattributed', 'relay_stage_transition'
-      WHERE NOT EXISTS (
-        SELECT 1 FROM agent_task_queue active
-         WHERE active.issue_id = $2
-           AND active.status::text = ANY($8::text[])
-           AND active.context->>'to_stage' = $9
-      )
-       ON CONFLICT DO NOTHING
-       RETURNING id`,
-    [task.agentId, task.issueId, task.workspaceId, task.priority, task.runtimeId, task.context,
-      task.triggerSummary, LIVE_TASK_STATUSES, task.toStage]
-  );
+function relayActor(req) {
+  return !OPERATOR_SECRET_DISABLED && RELAY_OPERATOR_SECRET &&
+    req.headers['x-relay-operator-secret'] === RELAY_OPERATOR_SECRET ? 'operator' : 'system';
+}
 
-  const taskId = inserted.rows[0]?.id || await existingStageTask(
-    client, task.issueId, task.toStage
-  );
-  if (!taskId) {
-    throw new Error(`relay successor task was not created for issue ${task.issueId} stage ${task.toStage}`);
-  }
-
-  const log = task.relayAudit
-    ? await client.query(
-      `INSERT INTO relay_run_log (
-         issue_id, from_stage, to_stage, agent_id, task_id, status, parked_audit
-       )
-       SELECT $1, $2, $3, $4, $5, 'pending', $6::jsonb
-        WHERE NOT EXISTS (
-          SELECT 1 FROM relay_run_log
-           WHERE issue_id = $1 AND task_id = $5
-        )
-       RETURNING id`,
-      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId, task.relayAudit]
-    ) : await client.query(
-      `INSERT INTO relay_run_log (
-         issue_id, from_stage, to_stage, agent_id, task_id, status
-       )
-       SELECT $1, $2, $3, $4, $5, 'pending'
-        WHERE NOT EXISTS (
-          SELECT 1 FROM relay_run_log
-           WHERE issue_id = $1 AND task_id = $5
-        )
-       RETURNING id`,
-      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
-    );
-  return { taskId, relayLogId: log.rows[0]?.id || null };
+function transitionEvidence(body) {
+  return body && typeof body.evidence === 'object' && !Array.isArray(body.evidence)
+    ? body.evidence : {};
 }
 
 // Link the Queue -> In Progress bookkeeping hop to the builder task that
@@ -1091,9 +1021,9 @@ async function relayVerdict(req, res, payload) {
     relayVerdictError(res, 403, "invalid_token");
     return;
   }
-  const invalid = validateRelayVerdict(payload);
-  if (invalid) {
-    relayVerdictError(res, 400, invalid);
+  if (!payload || typeof payload !== 'object' || !UUID_RE.test(String(payload.issue_id || '')) ||
+      typeof payload.idem_key !== 'string' || !IDEM_KEY_RE.test(payload.idem_key)) {
+    relayVerdictError(res, 400, 'invalid_payload');
     return;
   }
   const externalQc = payload.operator_external_qc === true;
@@ -1152,6 +1082,16 @@ async function relayVerdict(req, res, payload) {
     if (!qcTask) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "completed_sol_low_qc_required");
+    }
+    const verdict = validateQcVerdict(externalQc
+      ? { actor: { type: 'operator', authenticated: true, external_receipt: payload.reason }, evidence: payload }
+      : { actor: { type: 'worker', authenticated_task_id: qcTask.id }, task: {
+        ...qcTask, agent: { model: qcTask.model, thinking_level: qcTask.thinking_level,
+          runtime_config: qcTask.runtime_config }
+      }, evidence: payload });
+    if (!verdict.ok) {
+      await client.query("ROLLBACK");
+      return relayVerdictError(res, 409, verdict.reason);
     }
     const evidenceMismatch = externalQc ? null : qcTaskEvidenceMismatch(qcTask, payload);
     if (evidenceMismatch) {
@@ -1281,6 +1221,25 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    // The bridge owns only the atomic status change. Reconciliation observes
+    // this committed transition and creates the one current-stage task.
+    const policy = evaluate({ from: issue.status, to: requestedStage,
+      actor: relayActor(req), evidence: transitionEvidence(body) });
+    if (!policy.ok) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: policy.code }));
+      return;
+    }
+    const transitionUpdate = await client.query(
+      `UPDATE "issue" SET status = $1, updated_at = NOW()
+        WHERE id = $2 RETURNING id, status`, [requestedStage, issue_id]
+    );
+    await client.query("COMMIT");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true, issue: transitionUpdate.rows[0], task_id: null,
+      relay_log_id: null }));
+    return;
     // Recovery has already counted the cap history, but status changes must
     // remain relay-owned.  This authenticated receipt uses the same atomic
     // disposition authority as synchronous admission and is replay-safe.
