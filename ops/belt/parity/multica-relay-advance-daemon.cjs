@@ -1203,9 +1203,9 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
         }], 1).pause) {
           const recentFailures = await client.query(
             `SELECT failure_reason, updated_at FROM agent_task_queue
-              WHERE agent_id = $1 AND status = 'failed'
+              WHERE agent_id = $1::uuid AND status = 'failed'
                 AND updated_at > NOW() - ($3::bigint * INTERVAL '1 millisecond')
-              ORDER BY created_at DESC LIMIT $2`,
+              ORDER BY created_at DESC LIMIT $2::integer`,
             [row.agent_id, QUOTA_FAILURE_LIMIT, QUOTA_PAUSE_MAX_AGE_MS]
           );
           const circuit = quotaCircuitAdmission(

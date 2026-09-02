@@ -33,6 +33,42 @@ test('requeue candidate SQL binds the stage array with a real PostgreSQL client'
   }
 });
 
+test('quota-failure lookup uses typed binds against PostgreSQL', async () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const marker = 'SELECT failure_reason, updated_at FROM agent_task_queue';
+  const start = source.indexOf('`', source.indexOf(marker) - 20);
+  const end = source.indexOf('`', start + 1);
+  assert.ok(start >= 0 && end > start, 'quota-failure SQL must be present');
+  const sql = source.slice(start + 1, end);
+  assert.match(sql, /agent_id = \$1::uuid/);
+  assert.match(sql, /LIMIT \$2::integer/);
+  assert.match(sql, /\$3::bigint/);
+
+  const schema = `quota_failure_lookup_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+  const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
+  const agentId = randomUUID();
+  try {
+    await client.connect();
+    await client.query(`CREATE SCHEMA ${schema}`);
+    await client.query(`CREATE TABLE ${schema}.agent_task_queue (
+      agent_id uuid NOT NULL, status text NOT NULL, failure_reason text,
+      updated_at timestamptz NOT NULL, created_at timestamptz NOT NULL)`);
+    await client.query(`INSERT INTO ${schema}.agent_task_queue
+      (agent_id, status, failure_reason, updated_at, created_at) VALUES
+      ($1::uuid, 'failed', 'provider_quota_limit', NOW(), NOW() - INTERVAL '2 seconds'),
+      ($1::uuid, 'failed', 'provider_quota_limit', NOW(), NOW() - INTERVAL '1 second'),
+      ($1::uuid, 'failed', 'provider_quota_limit', NOW() - INTERVAL '2 hours', NOW() - INTERVAL '3 seconds')`, [agentId]);
+    await client.query(`SET search_path TO ${schema}, public`);
+    const result = await client.query(sql, [agentId, 2, 60_000]);
+    assert.equal(result.rows.length, 2);
+    assert.deepEqual(result.rows.map((row) => row.failure_reason),
+      ['provider_quota_limit', 'provider_quota_limit']);
+  } finally {
+    try { await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`); } catch (_) {}
+    await client.end();
+  }
+});
+
 test('PASS sweep SQL plans against the PostgreSQL test schema when qc_verdict is available', async (t) => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const start = source.indexOf('`WITH candidates AS (');
