@@ -736,6 +736,37 @@ test('non-QC gated stages remain manual', () => {
     { ok: false, reason: 'manual_gated_stage' });
 });
 
+test('completed-task advance scans the 100-row head-of-line hold window', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const advance = source.slice(source.indexOf('async function findAndAdvanceTasks'),
+    source.indexOf('async function recoveryAdvanceTasks'));
+  assert.match(advance, /ORDER BY rrl\.created_at ASC\s+LIMIT 100/);
+});
+
+test('manual gated completions close their relay ledger without an automatic transition', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const advance = source.slice(source.indexOf('async function findAndAdvanceTasks'),
+    source.indexOf('async function recoveryAdvanceTasks'));
+  assert.match(advance, /qcAdvance\.reason === 'manual_gated_stage'[\s\S]*markRelayLogCompletedById\(client, row\.log_id\)/);
+});
+
+test('unbound completed Sol-low QC closes its relay ledger for reconciler redispatch', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const advance = source.slice(source.indexOf('async function findAndAdvanceTasks'),
+    source.indexOf('async function recoveryAdvanceTasks'));
+  assert.match(advance, /completed_sol_low_pass_required', 'qc_attempt_binding_required'[\s\S]*markRelayLogFailedById\(client, row\.log_id\)/);
+});
+
+test('both Registered recovery paths carry policy-required registered evidence', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const recovery = source.slice(source.indexOf('async function recoveryAdvanceTasks'),
+    source.indexOf('// A task killed by the fleet'));
+  assert.equal(evaluate({ from: 'Registered', to: 'Spec', actor: 'system',
+    evidence: { registeredIssue: 'issue-1', selectedWorkspace: 'workspace-1' } }).ok, true);
+  assert.equal((recovery.match(/evidence: \{ registeredIssue:/g) || []).length, 2);
+  assert.match(recovery, /selectedWorkspace: row\.workspace_id \|\| true/);
+});
+
 test('relay daemon scopes stage configuration to each issue workspace', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /rsc\.workspace_id = i\.workspace_id/);
