@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql } = require("./reconciler.cjs");
+const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
 const ok = () => ({ ok: true });
@@ -30,6 +30,7 @@ test("query builders hold the live status invariant", () => {
   assert.match(ownerSql(), /a.archived_at IS NULL/);
   assert.match(ownerSql(), /a.status IN \('idle', 'working'\)/);
   assert.match(ownerSql(), /COALESCE\(own_runtime.id, online_runtime.id\) IS NOT NULL/);
+  assert.match(stageAttemptsSql(), /\$3::int/);
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
 });
 
@@ -111,6 +112,10 @@ test("lifetime and per-stage attempt ceilings move the issue to Human Review", a
     db.query = async (sql, values) => sql.includes(sqlMatch) ? { rows: [row] } : original(sql, values);
     assert.equal((await reconcileIssue(db, issue.id, { evaluate: ok })).reason, reason);
     assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
+    const relayAuthority = db.calls.findIndex((call) => call.sql.includes("set_config('multica.relay_authorized', 'on', true)"));
+    const issueUpdate = db.calls.findIndex((call) => call.sql.includes("UPDATE issue SET status = 'Human Review'"));
+    assert.ok(relayAuthority >= 0 && relayAuthority < issueUpdate);
+    assert.ok(db.calls.some((call) => call.sql.includes("jsonb_build_object('reason', $3::text)")));
   }
 });
 

@@ -22,7 +22,7 @@ const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
-const { issueCandidatesSql, reconcileCycle } = require('../reconciler.cjs');
+const { reconcileCycle } = require('../reconciler.cjs');
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
@@ -42,22 +42,10 @@ function reconcileCreateLimit(value = RECONCILE_MAX_CREATE_PER_CYCLE) {
   return Number.isInteger(value) && value > 0 ? value : 25;
 }
 
-function limitReconcileCandidates(client, maxCreate) {
-  return {
-    ...client,
-    async query(sql, values) {
-      const result = await client.query(sql, values);
-      return sql === issueCandidatesSql()
-        ? { ...result, rows: result.rows.slice(0, reconcileCreateLimit(maxCreate)) }
-        : result;
-    }
-  };
-}
-
 async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } = {}) {
   const client = await dbPool.connect();
   try {
-    const results = await reconcileCycle(limitReconcileCandidates(client, maxCreate));
+    const results = await reconcileCycle(client, { maxCreatePerCycle: reconcileCreateLimit(maxCreate) });
     logger.log(`${LOG_PREFIX} reconciled ${results.length} ticket(s)`);
     return results;
   } finally {
@@ -1717,4 +1705,4 @@ if (require.main === module) startDaemon();
 module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
-  limitReconcileCandidates, runReconcileCycle };
+  runReconcileCycle };

@@ -43,7 +43,7 @@ function lifetimeTasksSql() {
 
 function stageAttemptsSql() {
   return `SELECT COALESCE(max(attempt), 0)::int AS attempt,
-                 COALESCE(max(max_attempts), $3)::int AS max_attempts
+                 COALESCE(max(max_attempts), $3::int)::int AS max_attempts
             FROM agent_task_queue
            WHERE issue_id = $1::uuid AND context->>'to_stage' = $2
              AND trigger_comment_id IS NULL`;
@@ -75,10 +75,11 @@ async function moveToHumanReview(client, issue, reason, options) {
     from: issue.status, to: "Human Review", actor: "system", evidence: { blocker: reason }
   });
   if (!verdict?.ok) throw new Error(`reconcile policy rejected Human Review: ${reason}`);
+  await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
   await client.query("UPDATE issue SET status = 'Human Review', updated_at = NOW() WHERE id = $1::uuid", [issue.id]);
   await client.query(
     `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
-     VALUES ($1::uuid, $2, 'Human Review', 'pending', jsonb_build_object('reason', $3))`,
+     VALUES ($1::uuid, $2, 'Human Review', 'pending', jsonb_build_object('reason', $3::text))`,
     [issue.id, issue.status, reason]
   );
   return { action: "human_review", reason };
@@ -199,6 +200,7 @@ async function reconcileCycle(client, options = {}) {
       result = await reconcileIssue(client, issue.id, settings);
     } catch (error) {
       result = { action: "error", issueId: issue.id, message: error.message };
+      console.error(`Reconcile issue error: issue=${issue.id} status=${issue.status} ${error.message}`);
     }
     results.push(result);
     if (result.action === "created") counts.created += 1;
