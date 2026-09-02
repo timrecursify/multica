@@ -1072,48 +1072,14 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
             ORDER BY completed_at DESC NULLS LAST, created_at DESC LIMIT 1
          ) build ON true
          JOIN LATERAL (
-           SELECT owner.* FROM (
-             SELECT rsc.stage_name AS from_stage, member.agent_id,
-                    COALESCE(a.runtime_mode, 'local') AS runtime_mode,
-                    a.name AS agent_name, a.instructions, a.model, a.thinking_level,
-                    a.max_concurrent_tasks, a.runtime_config, a.archived_at,
-                    0 AS owner_priority, member.last_selected_at,
-                    (SELECT count(*) FROM agent_task_queue active
-                      WHERE active.agent_id = member.agent_id
-                        AND active.status IN ('queued', 'dispatched', 'running',
-                                              'waiting_local_directory', 'deferred')) AS active_task_count
-               FROM relay_stage_pool policy
-               JOIN relay_stage_agent_pool member
-                 ON member.workspace_id = policy.workspace_id
-                AND member.stage_name = policy.stage_name AND member.enabled = true
-               JOIN agent a ON a.id = member.agent_id
-                 AND a.workspace_id = member.workspace_id AND a.archived_at IS NULL
-               JOIN relay_stage_config rsc ON rsc.workspace_id = policy.workspace_id
-                AND rsc.next_stage = policy.stage_name
-              WHERE policy.workspace_id = i.workspace_id AND policy.stage_name = i.status
-                AND policy.enabled = true
-                AND a.status IN ('idle', 'working')
-                AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
-             UNION ALL
-             SELECT rsc.stage_name AS from_stage, rsc.agent_id,
-                    COALESCE(a.runtime_mode, 'local') AS runtime_mode,
-                    a.name AS agent_name, a.instructions, a.model, a.thinking_level,
-                    a.max_concurrent_tasks, a.runtime_config, a.archived_at,
-                    1 AS owner_priority, NULL::timestamptz AS last_selected_at,
-                    0::bigint AS active_task_count
-               FROM relay_stage_config rsc
-               JOIN agent a ON a.id = rsc.agent_id
-                 AND a.workspace_id = rsc.workspace_id AND a.archived_at IS NULL
-              WHERE rsc.workspace_id = i.workspace_id AND rsc.next_stage = i.status
-                AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
-                AND NOT EXISTS (
-                  SELECT 1 FROM relay_stage_pool policy
-                   WHERE policy.workspace_id = i.workspace_id
-                     AND policy.stage_name = i.status AND policy.enabled = true)
-           ) owner
-           ORDER BY owner_priority, active_task_count,
-                    last_selected_at NULLS FIRST, agent_id
-           LIMIT 1
+           SELECT rsc.stage_name AS from_stage, rsc.agent_id,
+                  COALESCE(a.runtime_mode, 'local') AS runtime_mode,
+                  a.name AS agent_name, a.instructions, a.model, a.thinking_level, a.max_concurrent_tasks, a.runtime_config, a.archived_at
+             FROM relay_stage_config rsc
+             JOIN agent a ON a.id = rsc.agent_id AND a.workspace_id = rsc.workspace_id AND a.archived_at IS NULL
+            WHERE rsc.workspace_id = i.workspace_id AND rsc.next_stage = i.status
+              AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true'
+            ORDER BY rsc.id LIMIT 1
          ) r ON true
         WHERE i.status = ANY($2::text[])
           -- t.id IS NULL is the cold start: a ticket that reached this stage
