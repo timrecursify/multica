@@ -305,8 +305,9 @@ test('stranded-task fixture redispatches a cancelled-only task', async () => {
   await harness.run();
   const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
   assert.ok(insert);
-  assert.match(insert.values[3], /"source":"relay-requeue"/);
-  assert.match(insert.values[3], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
+  assert.equal(insert.values[2], '323e4567-e89b-42d3-a456-426614174000');
+  assert.match(insert.values[4], /"source":"relay-requeue"/);
+  assert.match(insert.values[4], /"requeue_of_task":"123e4567-e89b-42d3-a456-426614174000"/);
 });
 
 test('stale quota failure requeues without pausing its lane or posting Human Review', async () => {
@@ -317,7 +318,7 @@ test('stale quota failure requeues without pausing its lane or posting Human Rev
   await harness.run();
   const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
   assert.ok(insert);
-  assert.equal(insert.values[5], 2);
+  assert.equal(insert.values[6], 2);
   assert.equal(harness.queries.some(({ sql }) => sql.includes('SELECT failure_reason, updated_at')), false);
   assert.deepEqual(harness.relayPosts, []);
 });
@@ -344,7 +345,7 @@ test('zero-task Queue fixture creates attempt one without retry admission', asyn
   await harness.run();
   const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
   assert.ok(insert);
-  assert.equal(insert.values[5], 1);
+  assert.equal(insert.values[6], 1);
   assert.equal(harness.queries.some(({ sql }) => sql.includes('max(EXTRACT(epoch')), false);
 });
 
@@ -413,8 +414,8 @@ test('completed task with failed closed relay row is requeued with stage instruc
   await harness.run();
   const insert = harness.queries.find(({ sql }) => sql.includes('INSERT INTO agent_task_queue'));
   assert.ok(insert);
-  assert.match(insert.values[3], /"to_stage":"In Review"/);
-  assert.match(insert.values[3], /"requeue_of_relay_log":"closed-relay-log"/);
+  assert.match(insert.values[4], /"to_stage":"In Review"/);
+  assert.match(insert.values[4], /"requeue_of_relay_log":"closed-relay-log"/);
   const record = harness.queries.find(({ sql }) => sql.includes('UPDATE relay_run_log') &&
     sql.includes("requeue_task_id"));
   assert.deepEqual(record.values, ['closed-relay-log', '623e4567-e89b-42d3-a456-426614174000']);
