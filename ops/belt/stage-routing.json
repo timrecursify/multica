@@ -2,10 +2,13 @@
   "risk_paths": [
     "**/auth/**",
     "**/*auth*",
+    "**/billing/**",
     "**/*billing*",
+    "**/stripe/**",
     "**/*stripe*",
     "**/migrations/**",
     "**/*secret*",
+    "**/feature-flags/**",
     "**/*feature-flag*",
     "**/*feature_flag*"
   ],

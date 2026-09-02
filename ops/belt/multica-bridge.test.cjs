@@ -15,6 +15,8 @@ process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-wor
 test('stage routing applies only the required QC and deploy lanes', () => {
   assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
     files: ['server/migrations/999_risk.up.sql'] }), { kind: 'risk', toStage: 'In Review' });
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/ppp', state: 'OPEN',
+    files: ['apps/billing/server/src/listener.ts'] }), { kind: 'risk', toStage: 'In Review' });
   assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
     files: ['ops/belt/multica-bridge.cjs'] }), { kind: 'runtime', toStage: 'CI/CD & Deploy' });
   assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'MERGED',
