@@ -124,8 +124,8 @@ function diagnosisOutcomeAction({ outcome, evidenceVerified = false, duplicateIs
     return { action: 'close', status: 'Cancelled', duplicateIssueId };
   }
   const holdReason = missingOutcome ? 'Sol-low diagnosis response omitted an explicit outcome'
-    : invalidAlreadyFixed ? 'runtime_evidence_unverified'
-      : invalidDuplicate ? 'duplicate response did not resolve a same-workspace duplicate_of target'
+    : invalidAlreadyFixed ? `Sol-low diagnosis: ${blocker || outcome}; rejected: runtime_evidence_unverified`
+      : invalidDuplicate ? `Sol-low diagnosis: ${blocker || outcome}; rejected: duplicate response did not resolve a same-workspace duplicate_of target`
         : outcome === 'genuinely_blocked' && !blocker
           ? 'genuinely_blocked response omitted a named blocker'
           : `Sol-low diagnosis: ${blocker || outcome}`;

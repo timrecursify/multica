@@ -64,6 +64,14 @@ test('validated Parked outcomes map to bounded state actions', () => {
     { action: 'release', status: 'Parked', nextStage: 'Spec' });
 });
 
+test('invalid already-fixed diagnosis preserves its named blocker', () => {
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'already_fixed', blocker: 'missing durable task evidence',
+    invalidAlreadyFixed: true }), {
+    action: 'hold', status: 'Parked',
+    blocker: 'Sol-low diagnosis: missing durable task evidence; rejected: runtime_evidence_unverified'
+  });
+});
+
 test('diagnosis evidence and owner validation fail closed', () => {
   const uuid = '123e4567-e89b-12d3-a456-426614174000';
   assert.equal(diagnosisEvidence('outcome: already_fixed\nruntime_evidence: task:' + uuid), 'task:' + uuid);

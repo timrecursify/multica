@@ -1381,6 +1381,21 @@ test('every direct Parked transition is routed through the dedicated audit write
   assert.match(source, /trigger: parkedAudit\?\.trigger \|\| "relay_advance"/);
 });
 
+test('an escalation-loop Parked arrival records one idempotent diagnosis handoff', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const parkedArrival = source.slice(source.indexOf('if (to_stage === "Parked" && result.rowCount > 0)'),
+    source.indexOf('if (isNoDispatchArrivalStage(to_stage))'));
+  assert.match(parkedArrival, /if \(escalationLoop === true && result\.rowCount > 0\)/);
+  assert.match(parkedArrival, /recordParkAndQueueDiagnosis\(client, issue, \{\s*\.\.\.parkedAudit, reason: 'escalation_loop'/s);
+  assert.match(parkedArrival, /result\.rowCount > 0/);
+});
+
+test('repeated escalation-loop diagnosis handoffs use the existing task idempotency key', () => {
+  const source = fs.readFileSync(require.resolve('./parked-diagnosis.cjs'), 'utf8');
+  assert.match(source, /WHERE issue_id = \$2::uuid AND context->>'kind' = \$7::text/);
+  assert.match(source, /ON CONFLICT DO NOTHING/);
+});
+
 test('QC bounce ceiling changes hands to an exact Sol-low Spec task, never Parked', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const bounce = source.slice(source.indexOf('// A QC FAIL sends the ticket back'),
