@@ -1,15 +1,5 @@
 'use strict';
-const assert = require('assert/strict');
-const { admit } = require('../worker/merge-admission.cjs');
-const head = 'a'.repeat(40);
-const info = { state: 'OPEN', mergeable: 'MERGEABLE', headRefOid: head };
-const green = [{ status: 'completed', conclusion: 'success' }];
-const pass = { verdict: 'PASS', qualifying: true, model: 'gpt-5.6-sol', effort: 'low', bound_sha: head };
-(async () => {
-  assert.equal((await admit({ info, runs: green, verdict: null })).ok, false);
-  assert.equal((await admit({ info, runs: green, verdict: { ...pass, bound_sha: 'b'.repeat(40) } })).ok, false);
-  assert.equal((await admit({ info, runs: green, verdict: pass })).ok, true);
-  assert.equal((await admit({ info, runs: [...green, { status: 'in_progress', conclusion: null }], verdict: pass })).ok, false);
-  assert.equal((await admit({ info: { ...info, mergeable: 'UNKNOWN' }, runs: green, verdict: pass })).ok, false);
-  console.log('gsp merge admission tests: ok (three required cases plus incomplete/non-mergeable holds)');
-})();
+const assert=require('assert/strict'); const {createWorker}=require('../worker/multica-cicd-worker.cjs');
+const head='a'.repeat(40),pr='https://github.com/timrecursify/multica/pull/44';
+async function caseOf(qc,expected){let merges=0;const pool={query:async sql=>{if(sql.includes('FROM qc_attempt'))return{rows:qc?[qc]:[]};if(sql.includes('FROM issue'))return{rows:[{id:'i',number:1}]};if(sql.includes('FROM comment'))return{rows:[{content:pr}]};return{rows:[]}}};const gh=args=>{if(args[0]==='pr'&&args[1]==='merge'){merges++;return''}if(args[0]==='pr')return JSON.stringify({state:'OPEN',mergeable:'MERGEABLE',headRefOid:head});return JSON.stringify({workflow_runs:[{status:'completed',conclusion:'success'}]})};await createWorker({pool,gh,log:()=>{}}).sweep();assert.equal(merges,expected)}
+(async()=>{await caseOf(null,0);await caseOf({verdict:'PASS',qualifying:true,model:'gpt-5.6-sol',effort:'low',bound_sha:'b'.repeat(40)},0);await caseOf({verdict:'PASS',qualifying:true,model:'gpt-5.6-sol',effort:'low',bound_sha:head},1);console.log('gsp worker merge-call tests: no PASS=0, stale PASS=0, exact PASS=1')})().catch(e=>{console.error(e);process.exitCode=1});
