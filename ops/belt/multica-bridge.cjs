@@ -734,8 +734,24 @@ function relayActor(req, from, to) {
 }
 
 function transitionEvidence(body) {
-  return body && typeof body.evidence === 'object' && !Array.isArray(body.evidence)
-    ? body.evidence : {};
+  const evidence = body && typeof body.evidence === 'object' && !Array.isArray(body.evidence)
+    ? { ...body.evidence } : {};
+  // The daemon's retry escalation carries its cause in `reason`; expose it as
+  // the retryEscalation evidence key the transition policy requires.
+  const escalation = retryEscalationReason(body && body.reason);
+  if (escalation && evidence.retry_escalation == null) evidence.retry_escalation = escalation;
+  // `sk multica return` posts `RETURN:<stage> — <reason>` with no evidence
+  // object; the stated reason is the retry/return evidence for the In Progress
+  // hops from In Review and CI/CD & Deploy.
+  const returned = String(body && body.reason || "").match(/^RETURN:[^—]+—\s*(.+)$/s);
+  if (returned) {
+    const cause = returned[1].trim();
+    if (evidence.implementationFail == null) evidence.implementationFail = cause;
+    if (evidence.retryRemaining == null) evidence.retryRemaining = true;
+    if (evidence.ciFailureOrAbsent == null) evidence.ciFailureOrAbsent = cause;
+    if (evidence.mergeConflictEvidence == null) evidence.mergeConflictEvidence = cause;
+  }
+  return evidence;
 }
 
 // Link the Queue -> In Progress bookkeeping hop to the builder task that
