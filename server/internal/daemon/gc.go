@@ -275,7 +275,10 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 			return 0
 		}
 		bytes := dirSize(taskDir)
-		d.cleanTaskDir(taskDir)
+		if !d.cleanTaskDir(taskDir) {
+			stats.skipped++
+			return 0
+		}
 		stats.cleaned++
 		stats.bytesReclaimed += bytes
 		return 1
@@ -285,7 +288,10 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 			return 0
 		}
 		bytes := dirSize(taskDir)
-		d.cleanTaskDir(taskDir)
+		if !d.cleanTaskDir(taskDir) {
+			stats.skipped++
+			return 0
+		}
 		stats.orphaned++
 		stats.bytesReclaimed += bytes
 		return 1
@@ -476,6 +482,19 @@ func isAccessNotFound(err error) bool {
 }
 
 func (d *Daemon) gcDecisionIssue(ctx context.Context, taskDir string, meta *execenv.GCMeta) gcAction {
+	// New metadata identifies the exact task which created this environment.
+	// An issue can be reopened and dispatched repeatedly, so its terminal board
+	// state is not sufficient ownership proof for a specific old workdir.
+	if taskID := strings.TrimSpace(meta.TaskID); taskID != "" {
+		status, err := d.client.GetTaskGCCheck(ctx, taskID)
+		if err != nil || !isAgentTaskTerminal(status.Status) || status.CompletedAt.IsZero() || time.Since(status.CompletedAt) <= d.cfg.GCTTL {
+			return gcActionSkip
+		}
+		return gcActionClean
+	}
+
+	// Legacy metadata predates task_id. Preserve its conservative issue-based
+	// behavior; it cannot prove exact task ownership and is never upgraded.
 	if strings.TrimSpace(meta.IssueID) == "" {
 		return d.orphanByMTime(taskDir, "empty issue id")
 	}
@@ -709,12 +728,14 @@ func isAgentTaskTerminal(status string) bool {
 }
 
 // cleanTaskDir removes a task directory and logs the result.
-func (d *Daemon) cleanTaskDir(taskDir string) {
+func (d *Daemon) cleanTaskDir(taskDir string) bool {
 	if err := os.RemoveAll(taskDir); err != nil {
 		d.logger.Warn("gc: remove task dir failed", "dir", taskDir, "error", err)
+		return false
 	} else {
 		d.logger.Info("gc: removed", "dir", taskDir)
 	}
+	return true
 }
 
 // cleanTaskArtifacts walks taskDir and deletes every directory whose basename
