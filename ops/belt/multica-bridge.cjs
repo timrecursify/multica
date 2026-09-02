@@ -1562,6 +1562,7 @@ async function relayAdvance(req, res, body) {
         !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) &&
         !classifiedBuildExit &&
         !rejectedPassTerminalExit &&
+        !explicitTerminalExit &&
         !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
