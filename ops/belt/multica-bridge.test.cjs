@@ -22,6 +22,7 @@ const {
   validateRelayVerdict,
   latestCompletedSolLowQcTask,
   qcTaskEvidenceMismatch,
+  deployArtifactAdmission,
   relayVerdict,
   relayAdvance,
   setTestClientFactory,
@@ -48,6 +49,37 @@ const {
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
+
+test('deploy admission accepts a correctly bound current QC artifact', async () => {
+  const client = { query: async () => ({ rows: [{
+    work_product_md5: 'a'.repeat(32), bound_sha: 'b'.repeat(40),
+    observed_head: 'b'.repeat(40), evidence_task_id: 'qc-task-1'
+  }] }) };
+  assert.deepEqual(await deployArtifactAdmission(client, { id: 'issue-1', metadata: {} }), {
+    admitted: true, kind: 'qc_artifact', evidence_task_id: 'qc-task-1'
+  });
+});
+
+test('deploy admission refuses missing or invalid artifacts without treating PR text as evidence', async () => {
+  let sql = '';
+  const client = { query: async (query) => {
+    sql = query;
+    return { rows: [{ work_product_md5: 'not-an-md5', bound_sha: 'a'.repeat(40),
+      observed_head: 'b'.repeat(40), evidence_task_id: 'qc-task-1' }] };
+  } };
+  const result = await deployArtifactAdmission(client, { id: 'issue-1',
+    metadata: { artifact_admission: 'code', pr: 'https://github.com/owner/repo/pull/1' } });
+  assert.deepEqual(result, { admitted: false, reason: 'artifact_admission_required' });
+  assert.doesNotMatch(sql, /FROM comment|pull\/[0-9]/i);
+});
+
+test('deploy admission accepts only the explicit non_code classification without a QC artifact', async () => {
+  let queried = false;
+  const result = await deployArtifactAdmission({ query: async () => { queried = true; return { rows: [] }; } },
+    { id: 'issue-1', metadata: { artifact_admission: 'non_code' } });
+  assert.deepEqual(result, { admitted: true, kind: 'non_code' });
+  assert.equal(queried, false);
+});
 
 test('comment-reply tasks do not consume lifetime or stage-cycle cap history', async (t) => {
   const databaseUrl = process.env.DATABASE_URL;
@@ -601,6 +633,10 @@ test('runbook-shaped verdicts advance through the relay handler', async () => {
       const latest = verdicts.at(-1);
       return { rows: latest ? [{ verdict: latest[3], work_product_md5: latest[4] }] : [] };
     }
+    if (/FROM qc_verdict qv/.test(sql)) return { rows: [{
+      work_product_md5: validVerdict.work_product_md5, bound_sha: validVerdict.bound_sha,
+      observed_head: validVerdict.observed_sha, evidence_task_id: task.id
+    }] };
     if (/FROM qc_verdict/.test(sql)) return { rows: [] };
     if (/INSERT INTO qc_attempt/.test(sql)) attempts.push(values);
     if (/INSERT INTO qc_verdict/.test(sql)) verdicts.push(values);
@@ -1480,7 +1516,7 @@ test('repeated escalation-loop diagnosis handoffs use the existing task idempote
 test('QC bounce ceiling changes hands to an exact Sol-low Spec task, never Parked', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const bounce = source.slice(source.indexOf('// A QC FAIL sends the ticket back'),
-    source.indexOf('// Enforcement point: no deploy, no Done.'));
+    source.indexOf('// Deploy artifact-admission guard.'));
   assert.match(bounce, /reason: "qc_bounce_ceiling"/);
   assert.match(bounce, /source_task_id: sourceTaskId/);
   assert.match(bounce, /to_stage = "Spec"/);
