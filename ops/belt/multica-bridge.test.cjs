@@ -522,6 +522,43 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   }
 });
 
+test('replayed verdict restores one fresh checker-bound verdict row', async () => {
+  const attempts = new Map();
+  const verdicts = [];
+  const task = { id: 'task-replay', agent_id: 'agent-replay', agent_name: 'qc-sol-low-replay',
+    context: {}, result: qcResult() };
+  const prior = { issue_id: validVerdict.issue_id, checker_name: task.agent_name,
+    verdict: validVerdict.verdict, work_product_md5: validVerdict.work_product_md5,
+    bound_sha: validVerdict.bound_sha, observed_head: validVerdict.observed_sha,
+    failure_class: validVerdict.failure_class, qualifying: validVerdict.qualifying,
+    model: validVerdict.model, effort: validVerdict.effort };
+  attempts.set(validVerdict.idem_key, prior);
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: attempts.has(values[0]) ? [attempts.get(values[0])] : [] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
+    if (/checker_id = \$2/.test(sql) && /FROM qc_verdict/.test(sql)) {
+      return { rows: verdicts.length ? [{ id: 1 }] : [] };
+    }
+    if (/FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/INSERT INTO qc_verdict/.test(sql)) verdicts.push(values);
+    return { rows: [] };
+  } };
+  const post = async () => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...validVerdict });
+    return res;
+  };
+  setTestClientFactory(() => client);
+  try {
+    assert.equal((await post()).status, 200);
+    assert.equal(verdicts.length, 1);
+    assert.equal(verdicts[0][1], task.agent_id);
+    assert.equal((await post()).status, 200);
+    assert.equal(verdicts.length, 1);
+  } finally { setTestClientFactory(null); }
+});
+
 test('runbook-shaped verdicts advance through the relay handler', async () => {
   const attempts = [];
   const verdicts = [];
