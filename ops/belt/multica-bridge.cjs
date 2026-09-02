@@ -1224,6 +1224,7 @@ async function relayAdvance(req, res, body) {
   let client;
   try {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit, cap_refusal,
+      routing_classification,
       operator_rescope_issue_id, operator_terminal_exit, operator_release, operator_cap_release } = body;
     
     // Validate agent token
@@ -1535,8 +1536,16 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
+    const classifiedBuildExit = issue.status === "In Progress" &&
+      routing_classification && routing_classification.toStage === to_stage &&
+      ((routing_classification.kind === "risk" && to_stage === "In Review") ||
+       (routing_classification.kind === "runtime" && to_stage === "CI/CD & Deploy") ||
+       (routing_classification.kind === "merge_only" && to_stage === "Done" &&
+        routing_classification.pr_state === "MERGED") ||
+       (routing_classification.kind === "no_pr" && to_stage === "Done"));
     if (!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&
         !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) &&
+        !classifiedBuildExit &&
         !rejectedPassTerminalExit &&
         !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
@@ -1647,7 +1656,7 @@ async function relayAdvance(req, res, body) {
       }
     }
 
-    if (to_stage === "Done") {
+    if (to_stage === "Done" && !classifiedBuildExit) {
       const verdict = await client.query(
         `SELECT verdict, work_product_md5 FROM qc_verdict
           WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]

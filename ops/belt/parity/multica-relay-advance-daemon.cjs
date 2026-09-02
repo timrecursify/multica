@@ -1,5 +1,7 @@
 const http = require('http');
 const { Pool } = require('pg');
+const { execFileSync } = require('child_process');
+const { classifyStageRoute } = require('../stage-routing.cjs');
 const {
   instructionCompatibility,
   retryAdmission,
@@ -30,6 +32,24 @@ const MD5_RE = /^[0-9a-f]{32}$/i;
 const FULL_SHA_RE = /(^|[^0-9a-f])([0-9a-f]{40})(?![0-9a-f])/ig;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
 let advanceTickInFlight = false;
+
+function github(args) {
+  return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
+}
+
+async function buildCompletionRoute(client, row) {
+  if (row.to_stage !== 'In Progress' || row.next_stage !== 'In Review') return null;
+  const comments = await client.query(
+    `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`,
+    [row.issue_id]);
+  const match = comments.rows.map(({ content }) => String(content || '').match(
+    /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i)).find(Boolean);
+  if (!match) return { kind: 'no_pr', toStage: 'Done' };
+  const repo = `${match[1]}/${match[2]}`;
+  const pr = JSON.parse(github(['pr', 'view', match[0], '--json', 'state,files']));
+  return { ...classifyStageRoute({ repo, state: pr.state,
+    files: pr.files.map(({ path }) => path) }), repo, pr_url: match[0], pr_state: pr.state };
+}
 
 function uniqueFullSha(value) {
   const matches = [...String(value || '').matchAll(FULL_SHA_RE)]
@@ -705,15 +725,22 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
           }
         }
 
-        const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
+        const route = await buildCompletionRoute(client, row);
+        if (route && !route.toStage) {
+          logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=${route.reason}`);
+          continue;
+        }
+        const targetStage = route?.toStage || row.next_stage;
+        const payload = { issue_id: row.issue_id, to_stage: targetStage,
           agent_token: RELAY_AGENT_SECRET,
           relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
+          ...(route ? { routing_classification: route } : {}),
           ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
         const response = await postRelay(payload);
 
         if (response.ok) {
           const proof = qcAdvance.ok ? ` sha=${qcAdvance.boundSha} md5=${qcAdvance.workProductMd5}` : '';
-          logger.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${row.next_stage}' (task-correlated log ${row.log_id})${proof}`);
+          logger.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${targetStage}' route=${route?.kind || 'configured'} (task-correlated log ${row.log_id})${proof}`);
           await markRelayLogCompletedById(client, row.log_id);
         } else if (response.deferred) {
           // Preserve the task-correlated pending log. The same advance becomes

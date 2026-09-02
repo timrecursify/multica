@@ -1,0 +1,27 @@
+{
+  "risk_paths": [
+    "**/auth/**",
+    "**/*auth*",
+    "**/billing/**",
+    "**/*billing*",
+    "**/stripe/**",
+    "**/*stripe*",
+    "**/migrations/**",
+    "**/*secret*",
+    "**/feature-flags/**",
+    "**/*feature-flag*",
+    "**/*feature_flag*"
+  ],
+  "non_execution_paths": ["**/*.md", "**/*.test.*", "**/test/**", "**/tests/**", "docs/**"],
+  "repositories": {
+    "timrecursify/multica": {
+      "runtime_paths": ["server/**", "ops/belt/**", "ops/gsp-belt/**"]
+    },
+    "timrecursify/sk-cli": {
+      "runtime_paths": ["bin/**", ".systemd/**"]
+    },
+    "timrecursify/ppp": {
+      "runtime_paths": ["app/**", "apps/**", "src/**", "server/**", "workers/**", "scripts/**"]
+    }
+  }
+}
