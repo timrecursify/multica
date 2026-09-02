@@ -45,7 +45,14 @@ function marker(output) {
   if (matches.length !== 1) return null;
   try {
     const parsed = JSON.parse(matches[0][1]);
-    return parsed && (parsed.verdict === 'PASS' || parsed.verdict === 'FAIL') ? parsed : null;
+    const sha = /^[0-9a-f]{40}$/i;
+    const md5 = /^[0-9a-f]{32}$/i;
+    if (!parsed || !['PASS', 'FAIL'].includes(parsed.verdict) || !md5.test(parsed.work_product_md5 || '') ||
+        !sha.test(parsed.bound_sha || '') || !sha.test(parsed.observed_sha || '') ||
+        String(parsed.bound_sha).toLowerCase() !== String(parsed.observed_sha).toLowerCase() ||
+        !['none', 'implementation', 'evidence', 'tool', 'access'].includes(parsed.failure_class) ||
+        typeof parsed.qualifying !== 'boolean' || parsed.model !== 'gpt-5.6-sol' || parsed.effort !== 'low') return null;
+    return parsed;
   } catch { return null; }
 }
 

@@ -17,7 +17,10 @@ test('defect precedence, genuine classification, and exception preservation are 
   assert.equal(classify(base), 'genuine');
   assert.equal(classify({ ...base, attempt_verdict: 'PASS' }), 'exception');
   assert.equal(marker('QC_EVIDENCE_JSON={bad}'), null);
-  assert.equal(marker('QC_EVIDENCE_JSON={"verdict":"FAIL"}').verdict, 'FAIL');
+  const evidence = { verdict: 'FAIL', work_product_md5: 'a'.repeat(32), bound_sha: 'b'.repeat(40),
+    observed_sha: 'b'.repeat(40), failure_class: 'implementation', qualifying: true,
+    model: 'gpt-5.6-sol', effort: 'low' };
+  assert.equal(marker(`QC_EVIDENCE_JSON=${JSON.stringify(evidence)}`).verdict, 'FAIL');
 });
 
 test('markdown refuses a wrong population before producing a recommendation', () => {
