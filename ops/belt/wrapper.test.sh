@@ -14,6 +14,9 @@ if [ "$*" = 'daemon start --help' ]; then
   fi
   exit 0
 fi
+if [ -n "${DAEMON_LAUNCH_MARKER:-}" ]; then
+  : >"$DAEMON_LAUNCH_MARKER"
+fi
 printf '%s\n' "$*" >"${CAPTURE_FILE:?}"
 printf 'cap=%s root=%s daemon_root=%s workspaces=%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" "${MULTICA_DAEMON_WORKSPACES_ROOT:-}" "${MULTICA_WORKSPACES_ROOT:-}" "${DISCOVERED_WORKSPACES:-2}" >>"${CAPTURE_FILE}"
 printf 'go_path=%s\n' "${PATH%%:*}" >>"${CAPTURE_FILE}"
@@ -24,7 +27,9 @@ chmod +x "$fake/daemon"
 daemon_cwd="$fake/daemon-root"
 mkdir -p -- "$daemon_cwd"
 capture="$fake/capture"
-MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/ws" "$root_dir/multica-daemon-wrapper.sh"
+launch_marker="$fake/daemon-launch"
+DAEMON_LAUNCH_MARKER="$launch_marker" MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/ws" "$root_dir/multica-daemon-wrapper.sh"
+[[ -e "$launch_marker" ]]
 grep -q -- "--workspaces-root=$fake/ws" "$capture"
 grep -q -- "--max-concurrent-tasks=2" "$capture"
 grep -q 'cap=2 root=.* daemon_root=.* workspaces=2' "$capture"
@@ -47,7 +52,7 @@ wait "$pid"
 assert_wrapper_rejects() {
   local label="$1" expected="$2" stderr="$fake/$1.stderr" status
   shift 2
-  if env "$@" MULTICA_DAEMON_LOCK_FILE="$fake/$label.lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$stderr"; then
+  if env "$@" DAEMON_LAUNCH_MARKER="$launch_marker" MULTICA_DAEMON_LOCK_FILE="$fake/$label.lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$stderr"; then
     echo "$label unexpectedly succeeded" >&2
     return 1
   else
@@ -55,7 +60,9 @@ assert_wrapper_rejects() {
   fi
   [[ "$status" -eq 64 ]]
   [[ "$(<"$stderr")" == "$expected" ]]
+  [[ ! -e "$launch_marker" ]]
 }
+rm -f -- "$launch_marker"
 assert_wrapper_rejects cap-bad \
   'multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=bad
