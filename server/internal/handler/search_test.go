@@ -97,6 +97,20 @@ func TestBuildSearchQuery_MultiTermDoesNotRepeatPhrasePredicate(t *testing.T) {
 	}
 }
 
+func TestBuildSearchQuery_MultiTermPrecomputesCommentMatches(t *testing.T) {
+	query := buildSearchQueryForTest(t, "runner load ppp-prod", []string{"runner", "load", "ppp-prod"}, 0, false, false)
+	if !strings.Contains(query, "WITH comment_matches AS") || !strings.Contains(query, "LEFT JOIN comment_matches cm ON cm.issue_id = i.id") {
+		t.Fatalf("multi-term query does not aggregate workspace comment matches before joining issues: %s", query)
+	}
+	fromStart := strings.Index(query, "FROM issue i")
+	whereStart := strings.Index(query[fromStart:], "WHERE ")
+	orderStart := strings.LastIndex(query, "ORDER BY ")
+	whereClause := query[fromStart+whereStart : orderStart]
+	if strings.Contains(whereClause, "EXISTS (SELECT 1 FROM comment") {
+		t.Errorf("multi-term WHERE still has a correlated comment subquery per candidate issue: %s", whereClause)
+	}
+}
+
 func TestBuildSearchQuery_WithNumber(t *testing.T) {
 	query, args := buildSearchQuery(linearTestContract, "MUL-42", []string{"MUL-42"}, 42, true, false)
 

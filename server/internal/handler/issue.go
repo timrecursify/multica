@@ -492,10 +492,10 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	// workspace_id-in-subquery contract as above.
 	if len(termContainsParams) > 1 {
 		var termConditions []string
-		for _, tp := range termContainsParams {
+		for termIdx, tp := range termContainsParams {
 			termConditions = append(termConditions, fmt.Sprintf(
-				"(LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s OR EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s))",
-				tp, tp, wsParam, tp,
+				"(LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s OR COALESCE(cm.has_term_%d, false))",
+				tp, tp, termIdx,
 			))
 		}
 		whereParts = append(whereParts, "("+strings.Join(termConditions, " AND ")+")")
@@ -559,11 +559,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 
 	// Tier 8: Comment matches all words (multi-word only)
 	if len(termContainsParams) > 1 {
-		var commentTerms []string
-		for _, tp := range termContainsParams {
-			commentTerms = append(commentTerms, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
-		}
-		rankCases = append(rankCases, fmt.Sprintf("WHEN EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND (%s)) THEN 8", wsParam, strings.Join(commentTerms, " AND ")))
+		rankCases = append(rankCases, "WHEN COALESCE(cm.has_all_terms_in_one_comment, false) THEN 8")
 	}
 
 	rankExpr := "CASE " + strings.Join(rankCases, " ") + " ELSE 9 END"
@@ -657,7 +653,27 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	limitParam := nextArg(nil)  // placeholder
 	offsetParam := nextArg(nil) // placeholder
 
-	query := fmt.Sprintf(`SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
+	// Multi-word searches previously ran one correlated comment EXISTS per term
+	// and per candidate issue. Precompute each term's comment presence once for
+	// the workspace, then join it by issue. The filter keeps the aggregate on
+	// indexable LIKE matches rather than scanning unrelated comment bodies.
+	cte := ""
+	join := ""
+	if len(termContainsParams) > 1 {
+		commentMatches := []string{fmt.Sprintf("bool_or(LOWER(c.content) LIKE %s) AS has_phrase", phraseContainsParam)}
+		commentFilters := []string{fmt.Sprintf("LOWER(c.content) LIKE %s", phraseContainsParam)}
+		allTermsInOneComment := []string{}
+		for termIdx, tp := range termContainsParams {
+			commentMatches = append(commentMatches, fmt.Sprintf("bool_or(LOWER(c.content) LIKE %s) AS has_term_%d", tp, termIdx))
+			commentFilters = append(commentFilters, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
+			allTermsInOneComment = append(allTermsInOneComment, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
+		}
+		commentMatches = append(commentMatches, fmt.Sprintf("bool_or(%s) AS has_all_terms_in_one_comment", strings.Join(allTermsInOneComment, " AND ")))
+		cte = fmt.Sprintf("WITH comment_matches AS (SELECT c.issue_id, %s FROM comment c WHERE c.workspace_id = %s AND (%s) GROUP BY c.issue_id) ", strings.Join(commentMatches, ", "), wsParam, strings.Join(commentFilters, " OR "))
+		join = "LEFT JOIN comment_matches cm ON cm.issue_id = i.id"
+	}
+
+	query := fmt.Sprintf(`%sSELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 		i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
 		i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position,
 		i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id,
@@ -665,11 +681,14 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 		%s AS match_source,
 		%s AS matched_comment_content
 	FROM issue i
+	%s
 	WHERE i.workspace_id = %s AND %s
 	ORDER BY %s, %s, %s, i.updated_at DESC
 	LIMIT %s OFFSET %s`,
+		cte,
 		matchSourceExpr,
 		commentSubquery,
+		join,
 		wsParam,
 		whereClause,
 		cancelledRank,
