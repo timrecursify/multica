@@ -79,7 +79,7 @@ const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
 const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived"]);
-const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review"]);
+const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review", "Parked"]);
 
 function isTerminalStage(stage) {
   return TERMINAL_STAGES.has(stage);
@@ -1876,10 +1876,12 @@ async function relayAdvance(req, res, body) {
     }
 
     if (isNoDispatchArrivalStage(to_stage)) {
-      relayLogId = await ensureCompletedRelayLog(
+      // Parked has already written its completed, dedicated audit row above.
+      // Other no-dispatch arrivals need a regular completed relay log.
+      relayLogId = relayLogId || await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
-      // Terminal and human-gate arrivals have no stage owner, task, or
+      // Terminal, human-gate, and parked-disposition arrivals have no stage owner, task, or
       // successor relay. Keep this return before every dispatch path.
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });

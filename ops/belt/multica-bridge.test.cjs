@@ -1452,6 +1452,7 @@ test('terminal relay transitions are logged and Parked Done remains relay-only a
   assert.equal(isTerminalStage('Done'), true);
   assert.equal(isTerminalStage('Cancelled'), true);
   assert.equal(isTerminalStage('Archived'), true);
+  assert.equal(isNoDispatchArrivalStage('Parked'), true);
   assert.match(source, /const parkedDiagnosisDone = issue\.status === "Parked" && to_stage === "Done"/);
   assert.match(source, /to_stage === "Done"/);
   assert.match(source, /work_product_mismatch/);
@@ -1459,9 +1460,9 @@ test('terminal relay transitions are logged and Parked Done remains relay-only a
   assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
 });
 
-test('empty Human Review pool commits an audit row without a successor task', async () => {
+test('Parked disposition bypasses an incompatible pool and commits its audit without a successor task', async () => {
   const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
-    status: 'In Review', description: '', parent_issue_id: null, title: 'review me',
+    status: 'CI/CD & Deploy', description: '', parent_issue_id: null, title: 'park me',
     priority: 'medium', metadata: {} };
   const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
   const queries = [];
@@ -1469,14 +1470,20 @@ test('empty Human Review pool commits an audit row without a successor task', as
     queries.push({ sql, values });
     if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
     if (sql.includes('FROM agent_task_queue t') && sql.includes("t.context->>'to_stage' = 'In Review'")) return { rows: [] };
-    if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Human Review' }] };
-    if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Human Review', alt_next_stages: [] }] };
-    if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Human Review' }] };
+    if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Parked' }] };
+    if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Parked', alt_next_stages: [] }] };
+    if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Parked' }] };
     if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
       persisted.issue.status = values[0];
       return { rowCount: 1, rows: [{ id: persisted.issue.id, status: persisted.issue.status }] };
     }
     if (sql.includes('UPDATE relay_run_log') && sql.includes("SET status = 'completed'")) return { rows: [] };
+    if (sql.includes("to_stage, status, parked_audit")) {
+      const row = { id: 'parked-log-1', issue_id: values[0], from_stage: values[1], to_stage: 'Parked',
+        task_id: null, status: 'completed', parked_audit: JSON.parse(values[2]) };
+      persisted.relay_run_log.push(row);
+      return { rows: [{ id: row.id }] };
+    }
     if (sql.includes('INSERT INTO relay_run_log')) {
       const row = { id: 'relay-log-1', issue_id: values[0], from_stage: values[1], to_stage: values[2],
         task_id: null, status: 'completed' };
@@ -1488,17 +1495,19 @@ test('empty Human Review pool commits an audit row without a successor task', as
   const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
   setTestClientFactory(() => client);
   try {
-    await relayAdvance({ headers: {} }, res, { issue_id: issue.id, to_stage: 'Human Review',
-      agent_token: 'test-relay-secret' });
+    await relayAdvance({ headers: {} }, res, { issue_id: issue.id, to_stage: 'Parked',
+      parked_audit: { cicd_worker: { reason: 'no compatible owner' } }, agent_token: 'test-relay-secret' });
   } finally {
     setTestClientFactory(null);
   }
   assert.equal(res.status, 200);
   assert.equal(JSON.parse(res.body).task_id, null);
-  assert.deepEqual(persisted.relay_run_log, [{ id: 'relay-log-1', issue_id: issue.id,
-    from_stage: 'In Review', to_stage: 'Human Review', task_id: null, status: 'completed' }]);
+  assert.deepEqual(persisted.relay_run_log, [{ id: 'parked-log-1', issue_id: issue.id,
+    from_stage: 'CI/CD & Deploy', to_stage: 'Parked', task_id: null, status: 'completed',
+    parked_audit: { cicd_worker: { reason: 'no compatible owner' }, trigger: 'relay_advance',
+      intended_stage: null, attempts: 0, task_count: 0 } }]);
   assert.deepEqual(persisted.agent_task_queue, []);
-  assert.equal(persisted.issue.status, 'Human Review');
+  assert.equal(persisted.issue.status, 'Parked');
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
 });
 
