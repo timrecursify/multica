@@ -60,6 +60,52 @@ test('typed re-advance moves recorded work through relay without an agent dispat
   assert.equal(calls.some((sql) => sql.includes('INSERT INTO agent_task_queue')), false);
 });
 
+function typedReadvanceQcRow(overrides = {}) {
+  return {
+    issue_id: 'issue-1', to_stage: 'In Review', outcome: 'ADVANCED', task_id: 'task-1',
+    task_status: 'completed', task_result: { output: 'QC PASS' }, issue_title: 'work',
+    next_stage: 'CI/CD & Deploy', task_agent_id: 'qc-agent', qc_verdict_checker_id: 'qc-agent',
+    qc_verdict: 'PASS', qc_verdict_work_product_md5: '76becea4ab970644b7a21220665a1619',
+    qc_attempt_verdict: 'PASS', qc_attempt_work_product_md5: '76becea4ab970644b7a21220665a1619',
+    qc_attempt_bound_sha: 'c909401ef7a4a438348eb5ceda33839211721524',
+    qc_attempt_observed_sha: 'c909401ef7a4a438348eb5ceda33839211721524',
+    qc_attempt_qualifying: true, qc_attempt_evidence_task_id: 'qc-task',
+    qc_attempt_evidence_task_status: 'completed', qc_attempt_evidence_agent_id: 'qc-agent',
+    qc_attempt_evidence_agent_model: 'gpt-5.6-sol', qc_attempt_evidence_agent_effort: 'low',
+    ...overrides
+  };
+}
+
+test('typed In Review re-advance supplies strict QC pass evidence', async () => {
+  const client = { release() {}, query: async (sql) => sql.includes('FROM issue_stage_outcome')
+    ? { rows: [typedReadvanceQcRow()] } : { rows: [] } };
+  const payloads = [];
+  const advanced = await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async (payload) => { payloads.push(payload); return { ok: true }; },
+    logger: { log() {} }, typedOutcomes: true });
+  assert.deepEqual(advanced, ['issue-1']);
+  assert.deepEqual(payloads[0].evidence, {
+    qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: 'qc-task'
+  });
+});
+
+test('typed In Review re-advance holds failed QC without a relay denial', async () => {
+  const calls = [];
+  const client = { release() {}, query: async (sql, values) => {
+    calls.push({ sql, values });
+    return sql.includes('FROM issue_stage_outcome')
+      ? { rows: [typedReadvanceQcRow({ qc_verdict: 'FAIL' })] } : { rows: [] };
+  }};
+  let posts = 0;
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => { posts += 1; return { ok: true }; },
+    logger: { log() {} }, typedOutcomes: true });
+  assert.equal(posts, 0);
+  const blocked = calls.find(({ sql }) => sql.startsWith('UPDATE issue_stage_outcome SET blocked_on = $3::text'));
+  assert.deepEqual(blocked.values, ['issue-1', 'In Review', 'human']);
+  assert.equal(calls.some(({ sql }) => sql.includes('typed_readvance_denials')), false);
+});
+
 test('no linked PR completion routes directly to Done and never In Review', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const route = source.slice(source.indexOf('async function buildCompletionRoute'), source.indexOf('function uniqueFullSha'));
@@ -824,7 +870,7 @@ test('relay daemon scopes stage configuration to each issue workspace', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /rsc\.workspace_id = i\.workspace_id/);
   assert.match(source, /a\.workspace_id = rsc\.workspace_id/);
-  assert.match(source, /evidence_agent\.workspace_id = i\.workspace_id/);
+  assert.match(source, /evidence_agent\.workspace_id = \$\{issueAlias\}\.workspace_id/);
   assert.match(source, /evidence_agent\.model AS evidence_agent_model/);
   assert.match(source, /evidence_agent\.thinking_level AS evidence_agent_effort/);
 });
