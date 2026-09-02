@@ -224,7 +224,7 @@ async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () =
             SET runtime_config = (COALESCE(runtime_config, '{}'::jsonb) - 'quota_paused' - 'quota_paused_at')
                   || jsonb_build_object(
                     'quota_pause_cleared_at', to_jsonb(NOW()),
-                    'quota_pause_clear_reason', $2
+                    'quota_pause_clear_reason', $2::text
                   ),
                 updated_at = NOW()
           WHERE id = $1
