@@ -119,7 +119,8 @@ async function rescopeCompletedNoArtifactQc(client, { postRelay, logger = consol
       !isNoArtifactQcBlock(taskResultText(task.result))) continue;
     seenIssues.add(task.issue_id);
     const result = await postRelay({ issue_id: task.issue_id, to_stage: 'In Progress',
-      reason: 'QC-BLOCKED NO-SHA relay return' });
+      reason: 'QC-BLOCKED NO-SHA relay return',
+      evidence: { implementationFail: 'qc_blocked_no_artifact', retryRemaining: true } });
     if (result && result.status >= 200 && result.status < 300) {
       converted.add(task.id);
       logger.log(`${logPrefix} [qc-no-artifact-rescoped] task=${task.id}`);
