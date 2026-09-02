@@ -15,14 +15,20 @@ WITH parked AS (
                     AND l.status = 'completed'
                     AND l.parked_audit->>'reason' = 'escalation_loop')
 ), countable AS (
-  SELECT p.workspace_id, p.number, t.id AS task_id, t.status AS task_status,
+  SELECT p.workspace_id, p.number, t.id AS task_id,
          t.result->>'output' AS output,
          EXISTS (SELECT 1 FROM qc_verdict verdict
                   WHERE verdict.issue_id = t.issue_id
                     AND verdict.checker_id = t.agent_id
                     AND verdict.created_at >= t.started_at) AS budget_has_verdict,
-         a.verdict AS attempt_verdict, a.failure_class AS attempt_failure_class
+         a.verdict AS attempt_verdict, a.failure_class AS attempt_failure_class,
+         relay.status AS relay_status
     FROM parked p JOIN agent_task_queue t ON t.issue_id = p.id
+    LEFT JOIN LATERAL (
+      SELECT status FROM relay_run_log
+       WHERE task_id = t.id
+       ORDER BY created_at DESC, id DESC LIMIT 1
+    ) relay ON true
     LEFT JOIN LATERAL (
       SELECT verdict, failure_class FROM qc_attempt
        WHERE issue_id = p.id
@@ -36,7 +42,7 @@ WITH parked AS (
                          AND verdict.checker_id = t.agent_id
                          AND verdict.created_at >= t.started_at))
 )
-SELECT workspace_id, number, task_id, task_status, output, budget_has_verdict,
+SELECT workspace_id, number, task_id, relay_status, output, budget_has_verdict,
        attempt_verdict, attempt_failure_class
   FROM countable ORDER BY workspace_id, number, task_id`;
 
@@ -60,7 +66,7 @@ function classify(row) {
   const evidence = marker(row.output);
   // A failed relay or no historical judgement is a burned attempt regardless
   // of any marker left in output; this is the required defect precedence.
-  if (row.task_status === 'failed' || !row.attempt_verdict) return 'defect';
+  if (row.relay_status === 'failed' || !row.attempt_verdict) return 'defect';
   if (row.attempt_verdict === 'FAIL' || evidence?.failure_class === 'implementation') return 'genuine';
   return 'exception';
 }
@@ -91,10 +97,19 @@ function markdown(snapshot, tickets) {
   const exceptions = tickets.flatMap((x) => x.exceptions.map((task) => `${x.workspace}-${x.issue} task ${task}`));
   const invalid = tickets.filter((x) => x.defect + x.genuine !== x.countable);
   const total = tickets.reduce((sum, x) => sum + x.countable, 0);
+  const zeroGenuine = tickets.filter((x) => x.genuine === 0);
+  const defectMajorityMixed = tickets.filter((x) => x.genuine > 0 && x.defect > x.genuine);
+  const genuineMajorityOrEqualMixed = tickets.filter((x) => x.genuine > 0 && x.defect <= x.genuine);
+  const bucket = (items) => items.length ? items.map((x) => `${x.workspace}-${x.issue}`).join(', ') : 'none';
   const lines = [`Snapshot: ${snapshot}`, '', '| workspace | issue | countable attempts | defect-shaped | genuine | defect-shaped ratio |',
     '|---|---:|---:|---:|---:|---:|'];
   for (const x of tickets) lines.push(`| ${x.workspace} | ${x.issue} | ${x.countable} | ${x.defect} | ${x.genuine} | ${(x.defect / x.countable).toFixed(3)} |`);
-  lines.push('', `Aggregate countable attempts: ${total}.`, '', `Exceptions: ${exceptions.length ? exceptions.join('; ') : 'none'}.`);
+  lines.push('', `Aggregate countable attempts: ${total}.`, '',
+    '## Buckets',
+    `Zero genuine FAILs: ${bucket(zeroGenuine)}. Recommendation: keep the cap at 2/6; request a human ruling before any reset.`,
+    `Defect-majority mixed: ${bucket(defectMajorityMixed)}. Recommendation: keep the cap at 2/6; request a human ruling before any reset.`,
+    `Genuine-majority/equal mixed: ${bucket(genuineMajorityOrEqualMixed)}. Recommendation: keep the cap at 2/6; request a human ruling before any reset.`,
+    `Exceptions: ${exceptions.length ? exceptions.join('; ') : 'none'}. Recommendation: keep the cap at 2/6; request a human ruling before any reset.`);
   if (invalid.length) lines.push('Report incomplete: classification invariant failed; no cap recommendation.');
   else lines.push('Invariant: defect-shaped + genuine = countable for every ticket. Cap remains 2/6 pending human ruling.');
   return lines.join('\n');
