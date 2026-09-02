@@ -60,17 +60,51 @@ test('deploy admission accepts a correctly bound current QC artifact', async () 
   });
 });
 
-test('deploy admission refuses missing or invalid artifacts without treating PR text as evidence', async () => {
-  let sql = '';
-  const client = { query: async (query) => {
-    sql = query;
-    return { rows: [{ work_product_md5: 'not-an-md5', bound_sha: 'a'.repeat(40),
-      observed_head: 'b'.repeat(40), evidence_task_id: 'qc-task-1' }] };
+test('deploy admission parks a code ticket without bound evidence and never queues deploy work', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
+    status: 'In Review', description: '', parent_issue_id: null, title: 'code ticket',
+    priority: 'high', metadata: { artifact_admission: 'code', pr: 'https://github.com/owner/repo/pull/1' } };
+  const persisted = { issue: { ...issue }, relay_run_log: [], agent_task_queue: [] };
+  const queries = [];
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    queries.push({ sql, values });
+    if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
+    if (sql.includes('FROM qc_verdict qv')) return { rows: [] };
+    if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Parked' }] };
+    if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'CI/CD & Deploy', alt_next_stages: [] }] };
+    if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'CI/CD & Deploy' }] };
+    if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
+      persisted.issue.status = values[0];
+      return { rowCount: 1, rows: [{ id: issue.id, status: values[0] }] };
+    }
+    if (sql.includes("to_stage, status, parked_audit")) {
+      const row = { id: 'artifact-park-log', issue_id: values[0], from_stage: values[1],
+        to_stage: 'Parked', task_id: null, status: 'completed', parked_audit: JSON.parse(values[2]) };
+      persisted.relay_run_log.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+    return { rowCount: 0, rows: [] };
   } };
-  const result = await deployArtifactAdmission(client, { id: 'issue-1',
-    metadata: { artifact_admission: 'code', pr: 'https://github.com/owner/repo/pull/1' } });
-  assert.deepEqual(result, { admitted: false, reason: 'artifact_admission_required' });
-  assert.doesNotMatch(sql, /FROM comment|pull\/[0-9]/i);
+  const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayAdvance({ headers: {} }, res, { issue_id: issue.id, to_stage: 'CI/CD & Deploy',
+      agent_token: 'test-relay-secret' });
+  } finally {
+    setTestClientFactory(null);
+  }
+  const body = JSON.parse(res.body);
+  assert.equal(res.status, 200);
+  assert.deepEqual(persisted.issue.status, 'Parked');
+  assert.deepEqual(persisted.relay_run_log, [{ id: 'artifact-park-log', issue_id: issue.id,
+    from_stage: 'In Review', to_stage: 'Parked', task_id: null, status: 'completed',
+    parked_audit: { trigger: 'artifact_admission_required', reason: 'artifact_admission_required',
+      intendedStage: 'CI/CD & Deploy', intended_stage: 'CI/CD & Deploy', attempts: 0, task_count: 0 } }]);
+  assert.equal(body.admission_refused, true);
+  assert.equal(body.disposition, 'Parked');
+  assert.equal(body.relay_log_id, 'artifact-park-log');
+  assert.deepEqual(persisted.agent_task_queue, []);
+  assert.equal(queries.some(({ sql }) => /FROM comment|pull\/[0-9]/i.test(sql)), false);
 });
 
 test('deploy admission accepts only the explicit non_code classification without a QC artifact', async () => {
