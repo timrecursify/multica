@@ -87,6 +87,29 @@ func TestIssueMetadataSetGetDelete(t *testing.T) {
 	}
 }
 
+func TestSetImplementationEvidenceWritesCanonicalPair(t *testing.T) {
+	issueID := createMetadataTestIssue(t, "Implementation evidence")
+	w := httptest.NewRecorder()
+	req := newRequest("POST", "/api/issues/"+issueID+"/metadata/implementation-evidence", map[string]string{
+		"pr_url":    "https://github.com/acme/repo/pull/42",
+		"bound_sha": "0123456789012345678901234567890123456789",
+	})
+	req = withURLParam(req, "id", issueID)
+	testHandler.SetImplementationEvidence(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var response struct {
+		Metadata map[string]any `json:"metadata"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Metadata["pr_url"] != "https://github.com/acme/repo/pull/42" || response.Metadata["bound_sha"] != "0123456789012345678901234567890123456789" {
+		t.Fatalf("canonical pair missing: %#v", response.Metadata)
+	}
+}
+
 // Invalid keys / values / shapes are rejected with 400 — the regex, primitive,
 // and "no null" rules must all hold.
 func TestIssueMetadataValidation(t *testing.T) {

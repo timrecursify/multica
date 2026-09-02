@@ -393,8 +393,8 @@ test('zero-task Queue fixture creates attempt one without retry admission', asyn
 
 test('In Review requeue summary supplies the QC PR URL and full SHA', () => {
   const summary = requeueTriggerSummary(strandedFixture({ stage: 'In Review', number: 159,
-    build_task_result: { pr_url: 'https://github.com/timrecursify/multica/pull/1',
-      head_sha: 'c909401ef7a4a438348eb5ceda33839211721524' } }), false);
+    metadata: { pr_url: 'https://github.com/timrecursify/multica/pull/1',
+      bound_sha: 'c909401ef7a4a438348eb5ceda33839211721524' } }), false);
   assert.match(summary, /ticket 159/);
   assert.match(summary, /board prod/);
   assert.match(summary, /https:\/\/github.com\/timrecursify\/multica\/pull\/1/);
