@@ -84,6 +84,13 @@ const LIVE_TASK_STATUSES = [
 ];
 const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived", "Rejected"]);
 const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review", "Parked"]);
+const NONQUALIFYING_FAILURE_CLASSES = new Set(["evidence", "tool", "access"]);
+const PPP_23189_REPAIR_ATTEMPTS = Object.freeze([
+  { id: 10107, idemKey: "ppp-23189-5dff98e0-evidence-fail" },
+  { id: 10125, idemKey: "qc-23189-5dff98e0b5f4d048241d2f4fb17ae21adff56ac4-FAIL" },
+  { id: 10350, idemKey: "qc-23189-41aa105a9f58215c809da54976568d9bdbe654c6-FAIL" }
+]);
+const PPP_23189_ID = "023cd68d-a287-48e9-a056-ea0975afe615";
 
 function isTerminalStage(stage) {
   return TERMINAL_STAGES.has(stage);
@@ -251,6 +258,7 @@ function validateRelayVerdict(payload) {
   if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
   if (!FAILURE_CLASSES.has(payload.failure_class)) return "invalid_failure_class";
   if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
+  if (payload.qualifying && NONQUALIFYING_FAILURE_CLASSES.has(payload.failure_class)) return "nonqualifying_failure_class";
   if (payload.model !== "gpt-5.6-sol" || payload.effort !== "low") return "invalid_qc_lane";
   if (typeof payload.idem_key !== "string" || !IDEM_KEY_RE.test(payload.idem_key)) return "invalid_idem_key";
   return null;
@@ -2230,8 +2238,53 @@ async function assertRoutableStagesHaveOwners() {
   }
 }
 
+// This deliberately repairs only the three immutable records named in GSP-1508.
+// A missing or changed preimage is an operator-safety failure: do not let the
+// relay start with an ambiguous mutation target.
+async function repairPpp23189NonqualifyingAttempts(client) {
+  const receipt = [];
+  for (const target of PPP_23189_REPAIR_ATTEMPTS) {
+    const result = await client.query(
+      `SELECT id, issue_id, idem_key, verdict, failure_class, qualifying
+         FROM qc_attempt WHERE id = $1 AND idem_key = $2 FOR UPDATE`,
+      [target.id, target.idemKey]
+    );
+    if (result.rows.length !== 1) throw new Error(`PPP-23189 repair preimage missing: ${target.id}`);
+    const row = result.rows[0];
+    if (row.issue_id !== PPP_23189_ID || row.verdict !== "FAIL" || row.failure_class !== "evidence" ||
+        typeof row.qualifying !== "boolean") {
+      throw new Error(`PPP-23189 repair preimage mismatch: ${target.id}`);
+    }
+    if (row.qualifying) {
+      await client.query("UPDATE qc_attempt SET qualifying = false WHERE id = $1", [target.id]);
+      receipt.push({ id: target.id, repaired: true });
+    } else {
+      receipt.push({ id: target.id, repaired: false });
+    }
+  }
+  console.log(`[relay/startup] PPP-23189 qualifying repair ${JSON.stringify(receipt)}`);
+  return receipt;
+}
+
+async function repairPpp23189AtStartup() {
+  const client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
+  await client.connect();
+  try {
+    await client.query("BEGIN");
+    const receipt = await repairPpp23189NonqualifyingAttempts(client);
+    await client.query("COMMIT");
+    return receipt;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    await client.end();
+  }
+}
+
 async function start() {
   await assertRoutableStagesHaveOwners();
+  await repairPpp23189AtStartup();
   server.listen(PORT, "127.0.0.1", () => {
   console.log(`GSP Multica relay bridge listening on 127.0.0.1:${PORT}`);
   console.log(`SSO workspace: ${SSO_WORKSPACE_ID}`);
@@ -2256,6 +2309,8 @@ module.exports = {
   isBookkeepingTransition,
   recordBookkeepingHandoff,
   validateRelayVerdict,
+  repairPpp23189NonqualifyingAttempts,
+  repairPpp23189AtStartup,
   qcBounceDecision,
   hasCurrentPassWorkProduct,
   relayRedirect,

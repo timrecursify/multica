@@ -35,6 +35,8 @@ const {
   isBookkeepingTransition,
   recordBookkeepingHandoff,
   validateRelayVerdict,
+  repairPpp23189NonqualifyingAttempts,
+  repairPpp23189AtStartup,
   hasCurrentPassWorkProduct,
   relayRedirect,
   passVerdictRescopeForbidden,
@@ -525,6 +527,45 @@ test('verdict validation accepts the sanctioned CLI checker field and rejects fo
   assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
+  for (const failure_class of ['evidence', 'tool', 'access']) {
+    assert.equal(validateRelayVerdict({ ...validVerdict, verdict: 'FAIL', failure_class, qualifying: true }), 'nonqualifying_failure_class');
+    assert.equal(validateRelayVerdict({ ...validVerdict, verdict: 'FAIL', failure_class, qualifying: false }), null);
+  }
+});
+
+test('PPP-23189 startup repair mutates only exact qualifying preimages and is replay safe', async () => {
+  const rows = new Map([
+    [10107, { id: 10107, issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', idem_key: 'ppp-23189-5dff98e0-evidence-fail', verdict: 'FAIL', failure_class: 'evidence', qualifying: true, bound_sha: 'keep' }],
+    [10125, { id: 10125, issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', idem_key: 'qc-23189-5dff98e0b5f4d048241d2f4fb17ae21adff56ac4-FAIL', verdict: 'FAIL', failure_class: 'evidence', qualifying: true }],
+    [10350, { id: 10350, issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', idem_key: 'qc-23189-41aa105a9f58215c809da54976568d9bdbe654c6-FAIL', verdict: 'FAIL', failure_class: 'evidence', qualifying: true }],
+    [10000, { id: 10000, issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', idem_key: 'unrelated', verdict: 'FAIL', failure_class: 'implementation', qualifying: true }]
+  ]);
+  const client = { async query(sql, values) {
+    if (/SELECT id, issue_id/.test(sql)) return { rows: [rows.get(values[0])].filter(Boolean) };
+    if (/UPDATE qc_attempt/.test(sql)) { rows.get(values[0]).qualifying = false; return { rowCount: 1 }; }
+    throw new Error(`unexpected query: ${sql}`);
+  } };
+  assert.deepEqual(await repairPpp23189NonqualifyingAttempts(client), [
+    { id: 10107, repaired: true }, { id: 10125, repaired: true }, { id: 10350, repaired: true }
+  ]);
+  assert.equal(rows.get(10000).qualifying, true);
+  assert.equal(rows.get(10107).bound_sha, 'keep');
+  assert.deepEqual(await repairPpp23189NonqualifyingAttempts(client), [
+    { id: 10107, repaired: false }, { id: 10125, repaired: false }, { id: 10350, repaired: false }
+  ]);
+});
+
+test('PPP-23189 startup repair rolls back and refuses startup on a changed preimage', async () => {
+  const calls = [];
+  const client = { async connect() {}, async end() {}, async query(sql, values) {
+    calls.push(sql);
+    if (/SELECT id, issue_id/.test(sql)) return { rows: [{ id: values[0], issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', idem_key: values[1], verdict: 'FAIL', failure_class: values[0] === 10125 ? 'tool' : 'evidence', qualifying: true }] };
+    return { rows: [] };
+  } };
+  setTestClientFactory(() => client);
+  await assert.rejects(repairPpp23189AtStartup(), /preimage mismatch: 10125/);
+  setTestClientFactory(null);
+  assert.deepEqual(calls.filter((sql) => /^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)), ['BEGIN', 'ROLLBACK']);
 });
 
 test('routing rejections expose only bounded agent routing fields', () => {
