@@ -261,7 +261,8 @@ async function latestQcVerdict(client, issueId) {
 
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explicitTaskId = null) {
   const result = await client.query(
-    `SELECT t.id, t.agent_id, t.status, t.context, t.result, a.name AS agent_name
+      `SELECT t.id, t.agent_id, t.status, t.context, t.result, t.completed_at,
+              a.name AS agent_name
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
@@ -1076,7 +1077,8 @@ async function relayVerdict(req, res, payload) {
               observed_head, failure_class, qualifying, model, effort
          FROM qc_attempt WHERE idem_key = $1 FOR UPDATE`, [payload.idem_key]
     );
-    if (prior.rows.length > 0) {
+    const replay = prior.rows.length > 0;
+    if (replay) {
       const existing = prior.rows[0];
       const same = existing.issue_id === payload.issue_id && existing.verdict === payload.verdict &&
         String(existing.work_product_md5).toLowerCase() === payload.work_product_md5.toLowerCase() &&
@@ -1084,12 +1086,19 @@ async function relayVerdict(req, res, payload) {
         String(existing.observed_head).toLowerCase() === payload.observed_sha.toLowerCase() &&
         existing.failure_class === payload.failure_class && existing.qualifying === payload.qualifying &&
         existing.model === payload.model && existing.effort === payload.effort;
-      await client.query("COMMIT");
-      if (!same) return relayVerdictError(res, 409, "idempotency_conflict");
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, replay: true, issue_id: payload.issue_id,
-        work_product_md5: existing.work_product_md5 }));
-      return;
+      if (!same) {
+        await client.query("COMMIT");
+        return relayVerdictError(res, 409, "idempotency_conflict");
+      }
+      // FAIL replays are immutable acknowledgements. Only PASS replays repair
+      // a missing verdict row so they cannot alter FAIL behavior.
+      if (payload.verdict !== "PASS") {
+        await client.query("COMMIT");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, replay: true, issue_id: payload.issue_id,
+          work_product_md5: existing.work_product_md5 }));
+        return;
+      }
     }
 
     const issue = await client.query(
@@ -1117,37 +1126,51 @@ async function relayVerdict(req, res, payload) {
       typeof payload.notes === "string" && payload.notes.length <= 2000 ? payload.notes : null,
     ].filter(Boolean).join("\n");
     const current = await client.query(
-      `SELECT issue_id FROM qc_verdict WHERE issue_id = $1 FOR UPDATE`, [payload.issue_id]
+      `SELECT issue_id, checker_id, notes, created_at
+         FROM qc_verdict WHERE issue_id = $1 FOR UPDATE`, [payload.issue_id]
     );
-    await client.query(
-      `INSERT INTO qc_attempt
-         (issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head,
-          failure_class, qualifying, model, effort, idem_key, notes)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [payload.issue_id, qcTask.agent_name, payload.verdict, payload.work_product_md5,
-        payload.bound_sha, payload.observed_sha, payload.failure_class, payload.qualifying,
-        payload.model, payload.effort, payload.idem_key, notes]
-    );
-    if (current.rows.length > 0) {
+    const currentVerdict = current.rows[0];
+    const currentFromBoundTask = currentVerdict &&
+      currentVerdict.checker_id === qcTask.agent_id &&
+      String(currentVerdict.notes || "").includes(`relay_task_id=${qcTask.id}`);
+    if (replay && currentVerdict && !currentFromBoundTask &&
+        new Date(currentVerdict.created_at) > new Date(qcTask.completed_at)) {
+      await client.query("ROLLBACK");
+      return relayVerdictError(res, 409, "qc_verdict_newer_than_bound_qc_task");
+    }
+    if (!replay) {
       await client.query(
-        `UPDATE qc_verdict SET checker_id = $2, checker_name = $3, verdict = $4,
-                work_product_md5 = $5, notes = $6, created_at = NOW()
-          WHERE issue_id = $1`,
-        [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
-          payload.work_product_md5, notes]
-      );
-    } else {
-      await client.query(
-        `INSERT INTO qc_verdict
-           (issue_id, checker_id, checker_name, verdict, work_product_md5, notes)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
-          payload.work_product_md5, notes]
+        `INSERT INTO qc_attempt
+           (issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head,
+            failure_class, qualifying, model, effort, idem_key, notes)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+        [payload.issue_id, qcTask.agent_name, payload.verdict, payload.work_product_md5,
+          payload.bound_sha, payload.observed_sha, payload.failure_class, payload.qualifying,
+          payload.model, payload.effort, payload.idem_key, notes]
       );
     }
+    if (!currentFromBoundTask) {
+      if (currentVerdict) {
+        await client.query(
+          `UPDATE qc_verdict SET checker_id = $2, checker_name = $3, verdict = $4,
+                  work_product_md5 = $5, notes = $6, created_at = NOW()
+            WHERE issue_id = $1`,
+          [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
+            payload.work_product_md5, notes]
+        );
+      } else {
+        await client.query(
+          `INSERT INTO qc_verdict
+             (issue_id, checker_id, checker_name, verdict, work_product_md5, notes)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
+            payload.work_product_md5, notes]
+        );
+      }
+    }
     await client.query("COMMIT");
-    res.writeHead(201, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ success: true, issue_id: payload.issue_id,
+    res.writeHead(replay ? 200 : 201, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true, replay, issue_id: payload.issue_id,
       checker_id: qcTask.agent_id, work_product_md5: payload.work_product_md5 }));
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
