@@ -6,9 +6,26 @@ const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
-  readvanceRecordedOutcomes, buildCompletionRoute } = require('./multica-relay-advance-daemon.cjs');
+  readvanceRecordedOutcomes, buildCompletionRoute, scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
+
+test('scheduleEvery swallows rejected ticks and logs their label', async () => {
+  const originalSetInterval = global.setInterval;
+  const originalError = console.error;
+  let tick;
+  const errors = [];
+  global.setInterval = callback => { tick = callback; return { unref() {} }; };
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    scheduleEvery(() => Promise.reject(new Error('database unavailable')), 123, 'test-cycle');
+    await tick();
+    assert.equal(errors.some(line => line.includes('test-cycle error: database unavailable')), true);
+  } finally {
+    global.setInterval = originalSetInterval;
+    console.error = originalError;
+  }
+});
 
 test('completion evidence satisfies every automatic transition policy row', () => {
   const row = { task_id: 'task-1', task_result: { output: 'completed' }, issue_title: 'normal change' };
@@ -1151,5 +1168,5 @@ test('quota pause flips are timestamped and stale unbudgeted pauses self-clear',
   assert.match(source, /b\.spent_ticks \+ b\.reserved_ticks >= b\.limit_ticks/);
   assert.match(source, /committedFlips\.push\(\{ agent_name: agent\.agent_name, timestamp, paused: false \}\)/);
   assert.match(source, /await client\.query\('COMMIT'\);\s+for \(const flip of committedFlips\) onFlip\(flip\)/);
-  assert.match(source, /setInterval\(reconcileQuotaPauses, 60000\)/);
+  assert.match(source, /scheduleEvery\(reconcileQuotaPauses, 60000, 'reconcileQuotaPauses'\)/);
 });
