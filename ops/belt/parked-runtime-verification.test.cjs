@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
-const { processParkedRuntimeVerifications } = require('./parked-runtime-verification.cjs');
+const { processParkedRuntimeVerifications, firstDurableEvidence } = require('./parked-runtime-verification.cjs');
+const { verifyRuntimeEvidence } = require('./parked-diagnosis.cjs');
 const { run } = require('./backfill-parked-runtime-verification.cjs');
 
 function fixture(count = 1) {
@@ -48,6 +49,55 @@ test('unverified evidence fails closed without a relay release', async () => {
   const f = fixture(); const relays = [];
   const result = await processParkedRuntimeVerifications({ verificationPool: f.pool, workspaceId: 'workspace', relayPost: async p => { relays.push(p); return { ok: true }; }, ...dependencies({ verified: false }) });
   assert.equal(result.writes, 1); assert.equal(relays.length, 0); assert.equal(f.state.issueUpdates.length, 1);
+});
+
+test('cohort is workspace-scoped and excludes non-parked, non-exact blockers, and diagnosis evidence', async () => {
+  const f = fixture();
+  let candidateSql = '';
+  f.client.query = async (sql, values = []) => {
+    candidateSql = sql;
+    if (sql.includes('ORDER BY i.updated_at')) return { rows: [], rowCount: 0 };
+    throw new Error(`unexpected SQL: ${sql.slice(0, 80)}`);
+  };
+  const result = await processParkedRuntimeVerifications({
+    verificationPool: f.pool, workspaceId: 'workspace', relayPost: async () => ({ ok: true })
+  });
+  assert.equal(result.writes, 0);
+  assert.match(candidateSql, /i\.workspace_id = \$1::uuid/);
+  assert.match(candidateSql, /i\.status = 'Parked'/);
+  assert.match(candidateSql, /parked_blocker' = 'runtime_evidence_unverified'/);
+  assert.match(candidateSql, /context->>'kind' = \$4::text/);
+  const diagnosisQueries = [];
+  const evidenceClient = { query: async (sql) => {
+    diagnosisQueries.push(sql);
+    return { rows: [{ '?column?': 1 }], rowCount: 1 };
+  } };
+  assert.equal(await verifyRuntimeEvidence(evidenceClient, 'issue', 'task:00000000-0000-0000-0000-000000000001'), true);
+  assert.match(diagnosisQueries[0], /IS DISTINCT FROM 'parked_diagnosis'/);
+  assert.equal(await verifyRuntimeEvidence(evidenceClient, 'issue', 'task:not-a-uuid'), false);
+  assert.equal(await verifyRuntimeEvidence(evidenceClient, 'issue', 'prose claiming fixed'), false);
+});
+
+test('durable evidence selection never uses diagnosis or verification task rows', async () => {
+  let sql = '';
+  const client = { query: async (statement) => { sql = statement; return { rows: [], rowCount: 0 }; } };
+  assert.equal(await firstDurableEvidence(client, 'issue'), null);
+  assert.match(sql, /context->>'kind' IS DISTINCT FROM \$2::text/);
+  assert.match(sql, /context->>'kind' IS DISTINCT FROM \$3::text/);
+  assert.match(sql, /qc_verdict/);
+  assert.match(sql, /activity_log/);
+});
+
+test('malformed evidence remains parked and performs no release', async () => {
+  const f = fixture(); const relays = [];
+  const result = await processParkedRuntimeVerifications({
+    verificationPool: f.pool, workspaceId: 'workspace',
+    relayPost: async payload => { relays.push(payload); return { ok: true }; },
+    findEvidence: async () => 'not-runtime-proof'
+  });
+  assert.equal(result.writes, 1);
+  assert.equal(relays.length, 0);
+  assert.equal(f.state.issueUpdates.length, 1);
 });
 
 test('backfill dry run is write-free and apply processes 46 tickets in replay-safe 25/21 batches', async () => {
