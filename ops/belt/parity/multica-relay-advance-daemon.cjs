@@ -45,6 +45,7 @@ function strictQcAttempt(row, verdictMd5) {
   const md5 = String(row.qc_attempt_work_product_md5 || '').toLowerCase();
   const evidenceAgentId = row.qc_attempt_evidence_agent_id || row.task_agent_id;
   const ok = row.qc_attempt_verdict === 'PASS' && row.qc_attempt_qualifying === true &&
+    row.qc_attempt_evidence_task_status === 'completed' &&
     row.qc_attempt_evidence_agent_model === 'gpt-5.6-sol' &&
     row.qc_attempt_evidence_agent_effort === 'low' &&
     row.qc_verdict_checker_id === evidenceAgentId &&
@@ -560,6 +561,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
              attempt.observed_head AS qc_attempt_observed_sha,
              attempt.qualifying AS qc_attempt_qualifying,
              attempt.evidence_task_id AS qc_attempt_evidence_task_id,
+             attempt.evidence_task_status AS qc_attempt_evidence_task_status,
              attempt.evidence_agent_id AS qc_attempt_evidence_agent_id,
              attempt.evidence_agent_model AS qc_attempt_evidence_agent_model,
              attempt.evidence_agent_effort AS qc_attempt_evidence_agent_effort,
@@ -579,6 +581,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
                qa.qualifying,
                evidence_task.id AS evidence_task_id,
+               evidence_task.status AS evidence_task_status,
                evidence_task.agent_id AS evidence_agent_id,
                evidence_agent.model AS evidence_agent_model,
                evidence_agent.thinking_level AS evidence_agent_effort
@@ -621,14 +624,6 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
-        AND NOT (
-          rrl.to_stage = 'In Review'
-          AND NOT EXISTS (
-            SELECT 1 FROM qc_verdict missing_verdict
-             WHERE missing_verdict.issue_id = atq.issue_id
-               AND missing_verdict.created_at >= atq.created_at
-          )
-        )
       ORDER BY rrl.created_at ASC
       LIMIT 20`;
 
