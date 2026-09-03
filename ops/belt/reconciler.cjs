@@ -1,5 +1,6 @@
 "use strict";
 const { stageEligibility } = require("./stage-outcome.cjs");
+const { execFileSync } = require("child_process");
 const { resolveBuilderRoute } = require("./guardrails.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
@@ -108,7 +109,82 @@ const LINK_TABLE = { ci: "issue_pull_request", sha: "issue_pull_request", depend
 //   ci / sha   - need a linked PR to supply a head sha or a checks rollup.
 //   dependency - needs a linked issue_dependency row to supply a state.
 // quota is excluded: it clears on its own once the provider window resets.
-async function terminalBlocker(client, issue, prior) {
+const PR_URL_RE = /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i;
+
+function ghExec(args) {
+  return execFileSync("gh", args, { encoding: "utf8", timeout: 90000, maxBuffer: 8e6 }).trim();
+}
+
+// The same comment window the advance daemon already reads for a PR pointer
+// (parity/multica-relay-advance-daemon.cjs:198). A builder that opened a PR
+// records its URL here; that comment IS the machine-observable evidence, so a
+// missing link row is a gap in our own bookkeeping, not an unobservable stage.
+async function commentPullRequestUrl(client, issue) {
+  const comments = await client.query(
+    "SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40", [issue.id]);
+  const match = comments.rows
+    .map(({ content }) => String(content || "").match(PR_URL_RE))
+    .find(Boolean);
+  return match ? { url: match[0], owner: match[1], repo: match[2], number: Number(match[3]) } : null;
+}
+
+// Persist the observed PR so the stage input hash (stage-outcome.cjs:51-55) can
+// see a head sha and a checks rollup from here on. Every column is copied from
+// the GitHub API response; nothing is synthesised. installation_id carries the
+// belt's existing 0 sentinel because the relay reads GitHub through `gh`, not
+// through a GitHub App installation.
+async function linkObservedPullRequest(client, issue, options = {}) {
+  const githubCommand = options.githubCommand || ghExec;
+  const pointer = await commentPullRequestUrl(client, issue);
+  if (!pointer) return false;
+  let pr;
+  try {
+    pr = JSON.parse(githubCommand(["pr", "view", pointer.url, "--json",
+      "number,title,state,url,headRefOid,createdAt,updatedAt,mergedAt,closedAt," +
+      "author,headRefName,additions,deletions,changedFiles,mergeable,mergeStateStatus,statusCheckRollup"]));
+  } catch (error) {
+    // An unreadable PR stays unobservable: leave the park in place.
+    console.error(`[reconcile] pr view failed issue=${issue.id} pr=${pointer.url} ${error.message}`);
+    return false;
+  }
+  if (!pr || typeof pr.number !== "number" || !pr.state) return false;
+  const rollup = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const conclusions = rollup.map((check) =>
+    String(check.conclusion || check.state || "").toUpperCase()).filter(Boolean);
+  const rollupState = conclusions.length === 0 ? null
+    : conclusions.some((value) => ["FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED"].includes(value)) ? "FAILURE"
+    : conclusions.every((value) => ["SUCCESS", "SKIPPED", "NEUTRAL"].includes(value)) ? "SUCCESS"
+    : "PENDING";
+  const inserted = await client.query(
+    `INSERT INTO github_pull_request (workspace_id, installation_id, repo_owner, repo_name,
+        pr_number, title, state, html_url, branch, author_login, merged_at, closed_at,
+        pr_created_at, pr_updated_at, head_sha, additions, deletions, changed_files,
+        api_mergeable, api_merge_state_status, checks_rollup_state, snapshot_head_sha, snapshot_fetched_at)
+      VALUES ($1::uuid, 0, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+        $15, $16, $17, $18, $19, $20, $14, NOW())
+      ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
+        state = EXCLUDED.state, head_sha = EXCLUDED.head_sha, merged_at = EXCLUDED.merged_at,
+        closed_at = EXCLUDED.closed_at, pr_updated_at = EXCLUDED.pr_updated_at,
+        api_mergeable = EXCLUDED.api_mergeable, api_merge_state_status = EXCLUDED.api_merge_state_status,
+        checks_rollup_state = EXCLUDED.checks_rollup_state, snapshot_head_sha = EXCLUDED.snapshot_head_sha,
+        snapshot_fetched_at = NOW(), updated_at = NOW()
+      RETURNING id`,
+    [issue.workspace_id, pointer.owner, pointer.repo, pr.number, pr.title || pointer.url,
+      String(pr.state).toLowerCase(), pr.url || pointer.url, pr.headRefName || null,
+      pr.author?.login || null, pr.mergedAt || null, pr.closedAt || null,
+      pr.createdAt, pr.updatedAt, pr.headRefOid || "",
+      pr.additions ?? 0, pr.deletions ?? 0, pr.changedFiles ?? 0,
+      pr.mergeable || null, pr.mergeStateStatus || null, rollupState]);
+  await client.query(
+    `INSERT INTO issue_pull_request (issue_id, pull_request_id, linked_by_type, linked_at)
+      VALUES ($1::uuid, $2::uuid, 'reconciler', NOW())
+      ON CONFLICT (issue_id, pull_request_id) DO NOTHING`,
+    [issue.id, inserted.rows[0].id]);
+  console.log(`[reconcile] ${issue.id} linked observed PR ${pr.url || pointer.url} state=${pr.state} sha=${pr.headRefOid || "-"}`);
+  return true;
+}
+
+async function terminalBlocker(client, issue, prior, options = {}) {
   if (!prior || prior.outcome !== "BLOCKED") return null;
   const why = prior.blocked_on;
   if (why === "human") return "blocked_human";
@@ -117,14 +193,20 @@ async function terminalBlocker(client, issue, prior) {
   const linked = table === "issue_dependency"
     ? await client.query("SELECT 1 FROM issue_dependency WHERE issue_id = $1::uuid LIMIT 1", [issue.id])
     : await client.query("SELECT 1 FROM issue_pull_request WHERE issue_id = $1::uuid LIMIT 1", [issue.id]);
-  return linked.rows.length ? null : `blocked_${why}_unobservable`;
+  if (linked.rows.length) return null;
+  // A ci/sha blocker only needs a PR to become observable, and the issue's own
+  // comments may already name one. Derive the missing link from that evidence
+  // before calling the stage terminal. A dependency blocker is not answered by
+  // a PR, so it keeps the original terminal reading.
+  if (table === "issue_pull_request" && await linkObservedPullRequest(client, issue, options)) return null;
+  return `blocked_${why}_unobservable`;
 }
 
 // Returns a human_review result, or null to leave the issue skipped as before.
 async function routeTerminalBlocker(client, issue, prior, options) {
   if (!options.humanReviewRouting || !HUMAN_REVIEW_FROM.has(issue.status)) return null;
   if (options.budget.humanReview >= options.maxHumanReviewPerCycle) return null;
-  const reason = await terminalBlocker(client, issue, prior);
+  const reason = await terminalBlocker(client, issue, prior, options);
   if (!reason) return null;
   try {
     const result = await moveToHumanReview(client, issue, reason, options);
@@ -323,4 +405,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, reconcileIssue, reconcileCycle };
