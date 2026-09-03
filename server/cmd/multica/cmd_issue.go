@@ -379,7 +379,8 @@ var issueSearchCmd = &cobra.Command{
 // stops being needed.
 var validIssueStatuses = []string{
 	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
-	"Spec", "Queue", "In Progress", "In Review", "Human Review", "Done", "Cancelled", "Archived",
+	"Registered", "Spec", "Queue", "Building", "In Progress", "QC", "In Review", "Human Review",
+	"CI/CD & Deploy", "Done", "Blocked", "Cancelled", "Archived", "dead_letter",
 }
 
 var validIssuePriorities = []string{
@@ -409,6 +410,28 @@ var directionalIssueSortColumns = func() []string {
 
 func validateIssueStatus(status string) error {
 	return validateIssueEnum("status", status, validIssueStatuses)
+}
+
+// isTerminalIssueStatus reports status spellings that close an issue. The
+// terminal transition is owned by the relay, which records its gate decisions
+// and transition in relay_run_log. The generic CLI must not bypass that path.
+func isTerminalIssueStatus(status string) bool {
+	switch status {
+	case "done", "cancelled", "Done", "Cancelled", "Archived":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateDirectIssueStatusWrite(status string) error {
+	if err := validateIssueStatus(status); err != nil {
+		return err
+	}
+	if isTerminalIssueStatus(status) {
+		return fmt.Errorf("terminal status %q is relay-owned; use the relay transition path", status)
+	}
+	return nil
 }
 
 func validateIssuePriority(priority string) error {
@@ -1077,7 +1100,7 @@ func runIssueCreate(cmd *cobra.Command, _ []string) error {
 	}
 	statusFlag, _ := cmd.Flags().GetString("status")
 	if statusFlag != "" {
-		if err := validateIssueStatus(statusFlag); err != nil {
+		if err := validateDirectIssueStatusWrite(statusFlag); err != nil {
 			return err
 		}
 	}
@@ -1251,7 +1274,7 @@ func runIssueUpdate(cmd *cobra.Command, args []string) error {
 	statusChanged := cmd.Flags().Changed("status")
 	statusFlag, _ := cmd.Flags().GetString("status")
 	if statusChanged {
-		if err := validateIssueStatus(statusFlag); err != nil {
+		if err := validateDirectIssueStatusWrite(statusFlag); err != nil {
 			return err
 		}
 	}
@@ -1445,7 +1468,7 @@ func runIssueStatus(cmd *cobra.Command, args []string) error {
 	id := args[0]
 	status := args[1]
 
-	if err := validateIssueStatus(status); err != nil {
+	if err := validateDirectIssueStatusWrite(status); err != nil {
 		return err
 	}
 
@@ -2290,7 +2313,14 @@ func runIssueCancelTask(cmd *cobra.Command, args []string) error {
 	}
 
 	var result map[string]any
+	// Keep the bare task endpoint for a canonical UUID with no --issue: it
+	// avoids the task-runs listing race. When a caller supplied --issue,
+	// however, use the issue-scoped endpoint so the server atomically verifies
+	// that this exact task belongs to that issue before it is cancelled.
 	path := "/api/tasks/" + url.PathEscape(taskRef.ID) + "/cancel"
+	if issueScope != "" {
+		path = "/api/issues/" + url.PathEscape(issueScope) + "/tasks/" + url.PathEscape(taskRef.ID) + "/cancel"
+	}
 	if err := client.PostJSON(ctx, path, map[string]any{}, &result); err != nil {
 		return fmt.Errorf("cancel task: %w", err)
 	}

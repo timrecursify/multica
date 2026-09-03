@@ -320,7 +320,7 @@ func (s *AutopilotService) ensureWebhookCreateIssueTask(ctx context.Context, aut
 	if err != nil {
 		return fmt.Errorf("dispatch for webhook delivery: load linked issue: %w", err)
 	}
-	if issue.Status != "Spec" && issue.Status != "in_progress" {
+	if issue.Status != "Spec" && issue.Status != "In Progress" {
 		return nil
 	}
 	if autopilot.AssigneeType == "squad" {
@@ -447,6 +447,17 @@ func (s *AutopilotService) FireIssueStatusEventTriggers(ctx context.Context, iss
 	if err != nil {
 		return fmt.Errorf("list event triggers for status %q: %w", issue.Status, err)
 	}
+	legacyFilter := issueStatusEventFilterJSON(legacyIssueStatusAlias(issue.Status))
+	if string(legacyFilter) != string(issueStatusEventFilterJSON(issue.Status)) {
+		legacyRows, legacyErr := s.Queries.ListAutopilotEventTriggersForStatus(ctx, db.ListAutopilotEventTriggersForStatusParams{
+			WorkspaceID:  issue.WorkspaceID,
+			StatusFilter: legacyFilter,
+		})
+		if legacyErr != nil {
+			return fmt.Errorf("list legacy event triggers for status %q: %w", issue.Status, legacyErr)
+		}
+		rows = appendUniqueAutopilotEventTriggers(rows, legacyRows)
+	}
 	if len(rows) == 0 {
 		return nil
 	}
@@ -493,6 +504,41 @@ func (s *AutopilotService) FireIssueStatusEventTriggers(ctx context.Context, iss
 // [{"event":"issue_status","actions":["<status>"]}] to fire on this entry.
 func issueStatusEventFilterJSON(status string) []byte {
 	return []byte(fmt.Sprintf(`[{"event": %q, "actions": [%q]}]`, EventTriggerIssueStatusEvent, status))
+}
+
+func legacyIssueStatusAlias(status string) string {
+	switch status {
+	case "Spec":
+		return "todo"
+	case "Queue":
+		return "backlog"
+	case "In Progress":
+		return "in_progress"
+	case "In Review":
+		return "in_review"
+	case "Human Review":
+		return "blocked"
+	case "Done":
+		return "done"
+	case "Cancelled", "Archived":
+		return "cancelled"
+	default:
+		return status
+	}
+}
+
+func appendUniqueAutopilotEventTriggers(existing, additions []db.ListAutopilotEventTriggersForStatusRow) []db.ListAutopilotEventTriggersForStatusRow {
+	seen := make(map[pgtype.UUID]struct{}, len(existing)+len(additions))
+	for _, row := range existing {
+		seen[row.AutopilotTrigger.ID] = struct{}{}
+	}
+	for _, row := range additions {
+		if _, ok := seen[row.AutopilotTrigger.ID]; !ok {
+			existing = append(existing, row)
+			seen[row.AutopilotTrigger.ID] = struct{}{}
+		}
+	}
+	return existing
 }
 
 // issueStatusEventPayloadJSON is the trigger_payload written on an event-trigger
@@ -1062,7 +1108,7 @@ func (s *AutopilotService) SyncRunFromIssue(ctx context.Context, issue db.Issue)
 	wsID := util.UUIDToString(issue.WorkspaceID)
 
 	switch issue.Status {
-	case "Done", "in_review":
+	case "Done", "In Review":
 		updatedRun, err := s.Queries.UpdateAutopilotRunCompleted(ctx, db.UpdateAutopilotRunCompletedParams{
 			ID: run.ID,
 		})

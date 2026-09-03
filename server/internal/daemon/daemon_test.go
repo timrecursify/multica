@@ -58,6 +58,42 @@ func TestNormalizeServerBaseURL(t *testing.T) {
 	}
 }
 
+func TestSweepOrphanTaskTempDirsRemovesOnlyOldUntrackedDirectories(t *testing.T) {
+	root := t.TempDir()
+	now := time.Now()
+	makeDir := func(name string, age time.Duration) string {
+		t.Helper()
+		path := filepath.Join(root, name)
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "payload"), []byte("payload"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, now.Add(-age), now.Add(-age)); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+
+	fresh := makeDir("multica-task-fresh", time.Hour)
+	old := makeDir("multica-task-old", 3*time.Hour)
+	tracked := makeDir("multica-task-tracked", 3*time.Hour)
+	removed, bytesFreed := sweepOrphanTaskTempDirs(root, 2*time.Hour, map[string]struct{}{tracked: {}}, now)
+
+	if removed != 1 || bytesFreed == 0 {
+		t.Fatalf("sweep = (%d, %d), want (1, >0)", removed, bytesFreed)
+	}
+	if _, err := os.Stat(old); !os.IsNotExist(err) {
+		t.Fatalf("old untracked dir stat error = %v, want not exist", err)
+	}
+	for _, path := range []string{fresh, tracked} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("preserved dir %q stat error = %v", path, err)
+		}
+	}
+}
+
 func TestTriggerRestart_BrewLinuxCellarDeleted(t *testing.T) {
 	originalIsBrewInstall := isBrewInstall
 	originalGetBrewPrefix := getBrewPrefix
@@ -1583,6 +1619,73 @@ type fakeBackend struct {
 	results []agent.Result
 	errors  []error
 	idx     atomic.Int32
+}
+
+type messageBackend struct {
+	messages []agent.Message
+	result   agent.Result
+}
+
+func (b messageBackend) Execute(_ context.Context, _ string, _ agent.ExecOptions) (*agent.Session, error) {
+	msgCh := make(chan agent.Message, len(b.messages))
+	for _, message := range b.messages {
+		msgCh <- message
+	}
+	close(msgCh)
+	resultCh := make(chan agent.Result, 1)
+	resultCh <- b.result
+	return &agent.Session{Messages: msgCh, Result: resultCh}, nil
+}
+
+func TestExecuteAndDrain_PullRequestCreationProvenance(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		messages   []agent.Message
+		wantStatus string
+		wantURL    string
+	}{
+		{
+			name: "creation result propagates",
+			messages: []agent.Message{
+				{Type: agent.MessageToolUse, Tool: "exec_command", CallID: "create", Input: map[string]any{"cmd": "gh pr create --json url"}},
+				{Type: agent.MessageToolResult, CallID: "create", Output: `{"url":"https://github.com/acme/widget/pull/7"}`},
+			},
+			wantStatus: "completed",
+			wantURL:    "https://github.com/acme/widget/pull/7",
+		},
+		{
+			name: "read only url is ignored",
+			messages: []agent.Message{
+				{Type: agent.MessageToolUse, Tool: "exec_command", CallID: "view", Input: map[string]any{"cmd": "gh pr view 7 --json url"}},
+				{Type: agent.MessageToolResult, CallID: "view", Output: `{"url":"https://github.com/acme/widget/pull/7"}`},
+			},
+			wantStatus: "completed",
+		},
+		{
+			name: "creation without url fails closed",
+			messages: []agent.Message{
+				{Type: agent.MessageToolUse, Tool: "exec_command", CallID: "create", Input: map[string]any{"cmd": "gh pr create --json url"}},
+				{Type: agent.MessageToolResult, CallID: "create", Output: `{"url":""}`},
+			},
+			wantStatus: "failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newTestDaemon(t)
+			var seq atomic.Int32
+			result, _, err := d.executeAndDrain(context.Background(), messageBackend{messages: tt.messages, result: agent.Result{Status: "completed"}}, "prompt", agent.ExecOptions{}, slog.Default(), "task-1", "", &seq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.Status != tt.wantStatus || result.PRURL != tt.wantURL {
+				t.Fatalf("result = %+v; want status=%q pr_url=%q", result, tt.wantStatus, tt.wantURL)
+			}
+		})
+	}
 }
 
 func (b *fakeBackend) Execute(_ context.Context, _ string, opts agent.ExecOptions) (*agent.Session, error) {
@@ -3855,6 +3958,13 @@ func TestReportTaskResult_NonCompletedHitsFailEndpoint(t *testing.T) {
 			wantFailureReason: "cancelled",
 		},
 		{
+			name:              "cancelled under daemon shutdown retries as runtime recovery",
+			status:            "cancelled",
+			comment:           "task cancelled by daemon shutdown",
+			failureReasonIn:   "",
+			wantFailureReason: "runtime_recovery",
+		},
+		{
 			name:              "unknown status routes through classifier",
 			status:            "weird_new_status",
 			comment:           "rate limit reached",
@@ -3869,8 +3979,14 @@ func TestReportTaskResult_NonCompletedHitsFailEndpoint(t *testing.T) {
 			srv := httptest.NewServer(rec.handler(t))
 			t.Cleanup(srv.Close)
 
+			ctx := context.Background()
+			if tc.wantFailureReason == "runtime_recovery" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
 			d := &Daemon{client: NewClient(srv.URL), logger: slog.Default()}
-			d.reportTaskResult(context.Background(), "task-x", TaskResult{
+			d.reportTaskResult(ctx, "task-x", TaskResult{
 				Status:        tc.status,
 				Comment:       tc.comment,
 				SessionID:     "ses-x",

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/http"
@@ -83,7 +84,7 @@ func TestPrintDaemonStatusIncludesCLIVersion(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	printDaemonStatusReport(&out, "Daemon", health)
+	printDaemonStatusReport(&out, "Daemon", health, "/home/user/.multica/daemon.log")
 
 	got := out.String()
 	if !strings.Contains(got, "Version:     v9.9.9\n") {
@@ -149,14 +150,14 @@ func TestPrintDaemonStatusExplainsDeferredRestart(t *testing.T) {
 	}
 
 	var idle bytes.Buffer
-	printDaemonStatusReport(&idle, "Daemon", base)
+	printDaemonStatusReport(&idle, "Daemon", base, "/home/user/.multica/daemon.log")
 	if strings.Contains(idle.String(), "Restart pending") {
 		t.Errorf("status output = %q, want no restart row when nothing is pending", idle.String())
 	}
 
 	base["reload_pending_reason"] = "multica binary on disk reports 0.3.8, running 0.3.7"
 	var pending bytes.Buffer
-	printDaemonStatusReport(&pending, "Daemon", base)
+	printDaemonStatusReport(&pending, "Daemon", base, "/home/user/.multica/daemon.log")
 	if !strings.Contains(pending.String(), "0.3.8") {
 		t.Errorf("status output = %q, want the pending restart reason", pending.String())
 	}
@@ -190,7 +191,7 @@ func TestPrintDaemonStatusOmitsVersionWhenMissing(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			var out bytes.Buffer
-			printDaemonStatusReport(&out, "Daemon", health)
+			printDaemonStatusReport(&out, "Daemon", health, "/home/user/.multica/daemon.log")
 			if strings.Contains(out.String(), "Version:") {
 				t.Fatalf("daemon status output = %q, want no Version line", out.String())
 			}
@@ -589,7 +590,7 @@ func TestPrintDaemonStatusAlignsValuesWithProfileLabel(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	printDaemonStatusReport(&out, "Daemon [staging]", health)
+	printDaemonStatusReport(&out, "Daemon [staging]", health, "/home/user/.multica/profiles/staging/daemon.log")
 
 	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
 	if len(lines) < 2 {
@@ -604,6 +605,238 @@ func TestPrintDaemonStatusAlignsValuesWithProfileLabel(t *testing.T) {
 			t.Fatalf("value column drift: line %q starts at col %d, want %d (first line: %q)",
 				line, got, want, lines[0])
 		}
+	}
+}
+
+func TestDaemonStatusLogPathForProfiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("MULTICA_TASK_CONFIG_ROOT", "")
+
+	defaultPath := daemonLogPathForProfile("")
+	wantDefault := filepath.Join(home, ".multica", "daemon.log")
+	if defaultPath != wantDefault {
+		t.Fatalf("daemonLogPathForProfile(\"\") = %q, want default path %q", defaultPath, wantDefault)
+	}
+
+	namedPath := daemonLogPathForProfile("staging")
+	wantNamed := filepath.Join(home, ".multica", "profiles", "staging", "daemon.log")
+	if namedPath != wantNamed {
+		t.Fatalf("daemonLogPathForProfile(\"staging\") = %q, want named path %q", namedPath, wantNamed)
+	}
+}
+
+func TestDaemonStatusTableLabelsDefaultProfile(t *testing.T) {
+	t.Parallel()
+
+	health := map[string]any{
+		"status":      "running",
+		"pid":         float64(1234),
+		"uptime":      "1h2m3s",
+		"cli_version": "v9.9.9",
+	}
+
+	var out bytes.Buffer
+	printDaemonStatusReport(&out, "Daemon [default]", health, "/home/user/.multica/daemon.log")
+
+	got := out.String()
+	if !strings.Contains(got, "Daemon [default]") {
+		t.Fatalf("daemon status output = %q, want explicit default label", got)
+	}
+	if !strings.Contains(got, "/home/user/.multica/daemon.log") {
+		t.Fatalf("daemon status output = %q, want the resolved default log path", got)
+	}
+	if strings.Contains(got, "Daemon:") {
+		t.Fatalf("daemon status output = %q, must not use bare Daemon label", got)
+	}
+}
+
+func TestDaemonStatusTableIncludesLogPathForNamedProfile(t *testing.T) {
+	t.Parallel()
+
+	health := map[string]any{
+		"status": "running",
+		"pid":    float64(1234),
+		"uptime": "1h2m3s",
+	}
+
+	var out bytes.Buffer
+	printDaemonStatusReport(&out, "Daemon [staging]", health, "/home/user/.multica/profiles/staging/daemon.log")
+
+	got := out.String()
+	if !strings.Contains(got, "Daemon [staging]") {
+		t.Fatalf("daemon status output = %q, want named profile label", got)
+	}
+	if !strings.Contains(got, "/home/user/.multica/profiles/staging/daemon.log") {
+		t.Fatalf("daemon status output = %q, want the resolved named log path", got)
+	}
+}
+
+func runDaemonStatusCmd(t *testing.T, profile, output string) (out string, err error) {
+	t.Helper()
+	cmd := testCmd()
+	var buf bytes.Buffer
+	cmd.SetOut(&buf)
+	cmd.Flags().String("output", "table", "")
+	cmd.Flags().String("profile", "", "")
+	if err := cmd.Flags().Set("output", output); err != nil {
+		t.Fatalf("set output flag: %v", err)
+	}
+	if profile != "" {
+		if err := cmd.Flags().Set("profile", profile); err != nil {
+			t.Fatalf("set profile flag: %v", err)
+		}
+	}
+	err = runDaemonStatus(cmd, nil)
+	return buf.String(), err
+}
+
+func TestDaemonStatusNonRunningPrintsLogPath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("MULTICA_TASK_CONFIG_ROOT", "")
+	clearDaemonTaskEnv(t)
+
+	const profile = "stopped-test"
+	out, err := runDaemonStatusCmd(t, profile, "table")
+	if err != nil {
+		t.Fatalf("runDaemonStatus: %v", err)
+	}
+	wantPath := filepath.Join(home, ".multica", "profiles", profile, "daemon.log")
+	if !strings.Contains(out, wantPath) {
+		t.Fatalf("daemon status output = %q, want resolved path %q", out, wantPath)
+	}
+	if !strings.Contains(out, "Daemon ["+profile+"]: stopped") {
+		t.Fatalf("daemon status output = %q, want named profile stopped state", out)
+	}
+}
+
+func TestDaemonStatusStartingPrintsLogPath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("MULTICA_TASK_CONFIG_ROOT", "")
+	clearDaemonTaskEnv(t)
+
+	const profile = "starting-test"
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
+	if err != nil {
+		t.Skipf("health port for profile %s unavailable: %v", profile, err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"starting","pid":99}`))
+	})}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	out, err := runDaemonStatusCmd(t, profile, "table")
+	if err != nil {
+		t.Fatalf("runDaemonStatus: %v", err)
+	}
+	wantPath := filepath.Join(home, ".multica", "profiles", profile, "daemon.log")
+	if !strings.Contains(out, wantPath) {
+		t.Fatalf("daemon status output = %q, want resolved path %q", out, wantPath)
+	}
+	if !strings.Contains(out, "Daemon ["+profile+"]: starting") {
+		t.Fatalf("daemon status output = %q, want named profile starting label", out)
+	}
+}
+
+func TestDaemonStatusRunningPrintsLogPath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("MULTICA_TASK_CONFIG_ROOT", "")
+	clearDaemonTaskEnv(t)
+
+	const profile = "running-test"
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
+	if err != nil {
+		t.Skipf("health port for profile %s unavailable: %v", profile, err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"running","pid":1234,"uptime":"1h2m3s","cli_version":"v9.9.9","agents":["codex"],"workspaces":[{"id":"ws-1"}]}`))
+	})}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	out, err := runDaemonStatusCmd(t, profile, "table")
+	if err != nil {
+		t.Fatalf("runDaemonStatus: %v", err)
+	}
+	if !strings.Contains(out, "Daemon ["+profile+"]") {
+		t.Fatalf("daemon status output = %q, want named profile label", out)
+	}
+	if !strings.Contains(out, filepath.Join(home, ".multica", "profiles", profile, "daemon.log")) {
+		t.Fatalf("daemon status output = %q, want resolved named log path", out)
+	}
+}
+
+func TestDaemonStatusJSONIncludesProfileAndLogPath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("MULTICA_TASK_CONFIG_ROOT", "")
+	clearDaemonTaskEnv(t)
+
+	const profile = "json-test"
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", healthPortForProfile(profile)))
+	if err != nil {
+		t.Skipf("health port for profile %s unavailable: %v", profile, err)
+	}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"running","pid":1234,"uptime":"1h2m3s","cli_version":"v9.9.9","agents":["codex"],"workspaces":[{"id":"ws-1"}]}`))
+	})}
+	go srv.Serve(ln)
+	t.Cleanup(func() { srv.Close() })
+
+	out, err := runDaemonStatusCmd(t, profile, "json")
+	if err != nil {
+		t.Fatalf("runDaemonStatus: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(out), &decoded); err != nil {
+		t.Fatalf("json output not parseable: %v\noutput=%q", err, out)
+	}
+	if got := decoded["profile"]; got != profile {
+		t.Fatalf("JSON profile = %#v, want %q", got, profile)
+	}
+	wantPath := filepath.Join(home, ".multica", "profiles", profile, "daemon.log")
+	if got := decoded["log_path"]; got != wantPath {
+		t.Fatalf("JSON log_path = %#v, want %q", got, wantPath)
+	}
+	if got := decoded["status"]; got != "running" {
+		t.Fatalf("JSON status = %#v, want running", got)
+	}
+	if got := decoded["cli_version"]; got != "v9.9.9" {
+		t.Fatalf("JSON must preserve cli_version, got %#v", got)
+	}
+	if _, ok := decoded["pid"]; !ok {
+		t.Fatalf("JSON must preserve health fields, pid missing: %q", out)
+	}
+}
+
+func TestDaemonStatusJSONDefaultProfileIdentifiers(t *testing.T) {
+	t.Parallel()
+
+	got := daemonStatusJSON("", "/home/user/.multica/daemon.log", map[string]any{
+		"status":      "running",
+		"pid":         float64(1234),
+		"cli_version": "v9.9.9",
+	})
+	if got["profile"] != "" {
+		t.Fatalf("default profile JSON profile = %#v, want empty string", got["profile"])
+	}
+	if got["log_path"] != "/home/user/.multica/daemon.log" {
+		t.Fatalf("default profile JSON log_path = %#v, want default path", got["log_path"])
+	}
+	if got["status"] != "running" {
+		t.Fatalf("JSON status = %#v, want running", got["status"])
+	}
+	if got["cli_version"] != "v9.9.9" {
+		t.Fatalf("JSON must preserve cli_version, got %#v", got["cli_version"])
 	}
 }
 
@@ -931,5 +1164,21 @@ func clearDaemonTaskEnv(t *testing.T) {
 		daemon.TaskWorkspacesRootEnv,
 	} {
 		t.Setenv(key, "")
+	}
+}
+
+func TestDaemonStartGuardDistinguishesSupervisorPortFromTaskContext(t *testing.T) {
+	t.Chdir(t.TempDir())
+	clearDaemonTaskEnv(t)
+	t.Setenv("MULTICA_DAEMON_PORT", "20464")
+	if err := requireHumanLocalDaemonStart(); err != nil {
+		t.Fatalf("supervisor port rejected: %v", err)
+	}
+	t.Setenv("MULTICA_TASK_ID", "task-test")
+	if err := requireHumanLocalDaemonStart(); err == nil {
+		t.Fatal("managed child unexpectedly allowed daemon start")
+	}
+	if err := requireHumanLocalCommand("daemon stop"); err == nil {
+		t.Fatal("other daemon command guard weakened")
 	}
 }

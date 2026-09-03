@@ -1,0 +1,34 @@
+name: Daemon artifact
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+      - '!v*-dirty*'
+
+permissions:
+  contents: read
+
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Enforce release-tag grammar
+        run: '[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]'
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - name: Build immutable daemon artifact
+        run: ops/belt/build-daemon-artifact.sh dist/daemon-linux-amd64-${{ github.sha }}
+      - name: Verify workflow-relative artifact output
+        run: bash ops/belt/build-daemon-artifact.test.sh
+      - name: Verify operator deploy safety checks
+        run: bash ops/belt/daemon-artifact.test.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: multica-daemon-linux-amd64-${{ github.sha }}
+          path: dist/daemon-linux-amd64-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 14

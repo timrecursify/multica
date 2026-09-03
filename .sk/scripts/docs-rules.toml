@@ -1,0 +1,9 @@
+# Committed, hermetic documentation ruleset for `sk repo test --profile docs-lint`.
+# Rules run offline against the committed docs listing; nothing is downloaded
+# at test time. Enable a rule with `true`; keep it off to allow the current
+# tree's established style.
+[rules]
+trailing-whitespace = true
+tab = false
+crlf = true
+unclosed-fence = true

@@ -131,13 +131,13 @@ func TestIssueTableWorkingAgentsFacetFollowsSurfaceScopeAndFilters(t *testing.T)
 	}
 
 	if _, err := testPool.Exec(ctx, `
-		SELECT count(*) FROM issue WHERE id = $1::uuid AND status = 'in_progress'
+		SELECT count(*) FROM issue WHERE id = $1::uuid AND status = 'In Progress'
 	`, inProjectTodoID); err != nil {
 		t.Fatalf("verify facet fixture status: %v", err)
 	}
 
 	if _, err := testPool.Exec(ctx, `
-		UPDATE issue SET assignee_id = $2::uuid WHERE id = $1::uuid AND status = 'in_progress'
+		UPDATE issue SET assignee_id = $2::uuid WHERE id = $1::uuid AND status = 'In Progress'
 	`, inProjectTodoID, insideAgentID); err != nil {
 		t.Fatalf("reassign facet fixture: %v", err)
 	}

@@ -656,7 +656,7 @@ func TestStageLeaderPrepareTimeoutRetryCanAdvanceNextStage(t *testing.T) {
 	// identity. This is the operation the Stage handoff prompt asks the leader
 	// to perform, and proves the retry was not demoted to a generic worker.
 	w = httptest.NewRecorder()
-	req = newRequest("PUT", "/api/issues/"+stage2.ID, map[string]any{"status": "todo"})
+	req = newRequest("PUT", "/api/issues/"+stage2.ID, map[string]any{"status": "Queue"})
 	req.Header.Set("X-Agent-ID", sq.LeaderID)
 	req.Header.Set("X-Task-ID", retryID)
 	req = withURLParam(req, "id", stage2.ID)
@@ -668,8 +668,8 @@ func TestStageLeaderPrepareTimeoutRetryCanAdvanceNextStage(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `SELECT status FROM issue WHERE id = $1`, stage2.ID).Scan(&stage2Status); err != nil {
 		t.Fatalf("load promoted Stage 2: %v", err)
 	}
-	if stage2Status != "todo" {
-		t.Fatalf("Stage 2 status = %q, want todo", stage2Status)
+	if stage2Status != "Queue" {
+		t.Fatalf("Stage 2 status = %q, want Queue", stage2Status)
 	}
 	if got := countPendingTasksForAgent(t, stage2.ID, sq.LeaderID); got != 1 {
 		t.Fatalf("promoted Stage 2 queued %d leader tasks, want 1", got)

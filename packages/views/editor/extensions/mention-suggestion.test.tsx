@@ -161,7 +161,7 @@ describe("createMentionSuggestion", () => {
           id: "i-login",
           identifier: "MUL-1",
           title: "Login redirect bug",
-          status: "todo",
+          status: "Queue",
         },
       ],
     });
@@ -268,7 +268,7 @@ describe("createMentionSuggestion", () => {
           id: "i-1007",
           identifier: "MUL-1007",
           title: "多 Agent 协作探索",
-          status: "done",
+          status: "Done",
         },
       ],
       total: 1,
@@ -598,8 +598,8 @@ describe("createMentionSuggestion", () => {
   it("includes cached issues in the synchronous response", () => {
     const qc = fakeQc({
       issues: [
-        { id: "i1", identifier: "MUL-1", title: "Login bug", status: "todo" },
-        { id: "i2", identifier: "MUL-2", title: "Other", status: "done" },
+        { id: "i1", identifier: "MUL-1", title: "Login bug", status: "Queue" },
+        { id: "i2", identifier: "MUL-2", title: "Other", status: "Done" },
       ],
     });
     searchIssuesMock.mockReturnValue(new Promise(() => {}));
@@ -614,7 +614,7 @@ describe("createMentionSuggestion", () => {
   it("does not inject current/recent chat context into the normal @ results", () => {
     const qc = fakeQc({
       members: [{ user_id: "u1", name: "Alice", role: "member" }],
-      issues: [{ id: "i1", identifier: "MUL-1", title: "Login bug", status: "todo" }],
+      issues: [{ id: "i1", identifier: "MUL-1", title: "Login bug", status: "Queue" }],
     });
     searchIssuesMock.mockReturnValue(new Promise(() => {}));
 
@@ -631,14 +631,14 @@ describe("createMentionSuggestion", () => {
     const qc = fakeQc({
       members: [{ user_id: "u1", name: "Alice", role: "member" }],
       agents: [{ id: "a1", name: "Aegis", archived_at: null, visibility: "workspace", owner_id: null }],
-      issues: [{ id: "i-cache", identifier: "MUL-9", title: "Cached", status: "todo" }],
+      issues: [{ id: "i-cache", identifier: "MUL-9", title: "Cached", status: "Queue" }],
     });
     searchIssuesMock.mockReturnValue(new Promise(() => {}));
 
     const config = createMentionSuggestion(qc, {
       mode: "context",
       getContextItems: () => [
-        { id: "i1", label: "MUL-1", type: "issue", description: "Alpha issue", status: "todo", group: "current" },
+        { id: "i1", label: "MUL-1", type: "issue", description: "Alpha issue", status: "Queue", group: "current" },
         { id: "p1", label: "Roadmap", type: "project", description: "Q3", group: "recent" },
       ],
     });
@@ -652,14 +652,14 @@ describe("createMentionSuggestion", () => {
     const qc = fakeQc({
       members: [{ user_id: "u1", name: "Alice", role: "member" }],
       agents: [{ id: "a1", name: "Aegis", archived_at: null, visibility: "workspace", owner_id: null }],
-      issues: [{ id: "i-cache", identifier: "MUL-9", title: "Cached", status: "todo" }],
+      issues: [{ id: "i-cache", identifier: "MUL-9", title: "Cached", status: "Queue" }],
     });
     searchIssuesMock.mockReturnValue(new Promise(() => {}));
 
     const config = createMentionSuggestion(qc, {
       mode: "context",
       getContextItems: () => [
-        { id: "i1", label: "MUL-1", type: "issue", description: "Alpha issue", status: "todo", group: "current" },
+        { id: "i1", label: "MUL-1", type: "issue", description: "Alpha issue", status: "Queue", group: "current" },
         { id: "p1", label: "Roadmap", type: "project", description: "Q3", group: "recent" },
       ],
     });
@@ -906,10 +906,10 @@ describe("MentionList cancelled demotion", () => {
 
   it("sorts cancelled issues below live ones regardless of input order", () => {
     const items: MentionItem[] = [
-      { id: "i-1", label: "MUL-1", type: "issue", status: "cancelled" },
-      { id: "i-2", label: "MUL-2", type: "issue", status: "in_progress" },
-      { id: "i-3", label: "MUL-3", type: "issue", status: "cancelled" },
-      { id: "i-4", label: "MUL-4", type: "issue", status: "backlog" },
+      { id: "i-1", label: "MUL-1", type: "issue", status: "Cancelled" },
+      { id: "i-2", label: "MUL-2", type: "issue", status: "In Progress" },
+      { id: "i-3", label: "MUL-3", type: "issue", status: "Cancelled" },
+      { id: "i-4", label: "MUL-4", type: "issue", status: "Registered" },
     ];
 
     render(<I18nWrapper><MentionList items={items} query="" command={vi.fn()} /></I18nWrapper>);
@@ -926,9 +926,9 @@ describe("MentionList cancelled demotion", () => {
         id: `i-c${n}`,
         label: `MUL-${100 + n}`,
         type: "issue" as const,
-        status: "cancelled" as const,
+        status: "Cancelled" as const,
       })),
-      { id: "i-live", label: "MUL-9", type: "issue", status: "todo" },
+      { id: "i-live", label: "MUL-9", type: "issue", status: "Queue" },
     ];
 
     render(<I18nWrapper><MentionList items={items} query="" command={vi.fn()} /></I18nWrapper>);
@@ -944,8 +944,8 @@ describe("MentionList cancelled demotion", () => {
     // "Current" is explicit context, not a relevance hit — demoting it past the
     // truncation would make the issue on screen vanish from its own picker.
     const items: MentionItem[] = [
-      { id: "i-cur", label: "MUL-7", type: "issue", status: "cancelled", group: "current" },
-      { id: "i-live", label: "MUL-8", type: "issue", status: "in_progress" },
+      { id: "i-cur", label: "MUL-7", type: "issue", status: "Cancelled", group: "current" },
+      { id: "i-live", label: "MUL-8", type: "issue", status: "In Progress" },
     ];
 
     render(
@@ -961,8 +961,8 @@ describe("MentionList cancelled demotion", () => {
   it("does not reorder server results, which the API already ranked", async () => {
     searchIssuesMock.mockResolvedValue({
       issues: [
-        { id: "i-a", identifier: "MUL-11", title: "Live match", status: "todo" },
-        { id: "i-b", identifier: "MUL-12", title: "Cancelled match", status: "cancelled" },
+        { id: "i-a", identifier: "MUL-11", title: "Live match", status: "Queue" },
+        { id: "i-b", identifier: "MUL-12", title: "Cancelled match", status: "Cancelled" },
       ],
       total: 2,
     });
@@ -977,14 +977,14 @@ describe("MentionList cancelled demotion", () => {
 
   it("demotes a cached cancelled row below a server-ranked live one", async () => {
     searchIssuesMock.mockResolvedValue({
-      issues: [{ id: "i-live", identifier: "MUL-21", title: "Live match", status: "in_progress" }],
+      issues: [{ id: "i-live", identifier: "MUL-21", title: "Live match", status: "In Progress" }],
       total: 1,
     });
 
     // The cached row is merged first; without the demotion it would render on
     // top of the server's higher-ranked live match.
     const items: MentionItem[] = [
-      { id: "i-cached", label: "MUL-20", type: "issue", status: "cancelled", description: "Cancelled match" },
+      { id: "i-cached", label: "MUL-20", type: "issue", status: "Cancelled", description: "Cancelled match" },
     ];
 
     render(<I18nWrapper><MentionList items={items} query="match" command={vi.fn()} /></I18nWrapper>);
@@ -1015,7 +1015,7 @@ describe("MentionList cancelled demotion", () => {
     it("keeps a cancelled project below a live issue in the search results", async () => {
       searchIssuesMock.mockResolvedValue({
         issues: [
-          { id: "i-live", identifier: "MUL-31", title: "Live issue", status: "todo" },
+          { id: "i-live", identifier: "MUL-31", title: "Live issue", status: "Queue" },
         ],
         total: 1,
       });
@@ -1042,8 +1042,8 @@ describe("MentionList cancelled demotion", () => {
     it("demotes cancelled search results of both types below every live row", async () => {
       searchIssuesMock.mockResolvedValue({
         issues: [
-          { id: "i-dead", identifier: "MUL-41", title: "Dead issue", status: "cancelled" },
-          { id: "i-live", identifier: "MUL-42", title: "Live issue", status: "in_review" },
+          { id: "i-dead", identifier: "MUL-41", title: "Dead issue", status: "Cancelled" },
+          { id: "i-live", identifier: "MUL-42", title: "Live issue", status: "In Review" },
         ],
         total: 2,
       });
@@ -1085,7 +1085,7 @@ describe("MentionList cancelled demotion", () => {
           projectStatus: "cancelled",
           group: "current",
         },
-        { id: "i-live", label: "MUL-51", type: "issue", status: "todo" },
+        { id: "i-live", label: "MUL-51", type: "issue", status: "Queue" },
       ];
 
       render(
@@ -1112,7 +1112,7 @@ describe("MentionList cancelled demotion", () => {
           type: "project" as const,
           projectStatus: "cancelled" as const,
         })),
-        { id: "i-live", label: "MUL-61", type: "issue", status: "todo" },
+        { id: "i-live", label: "MUL-61", type: "issue", status: "Queue" },
       ];
 
       render(
@@ -1148,8 +1148,8 @@ describe("MentionList cancelled demotion", () => {
     it("keeps a cancelled issue matched by exact identifier out of the Cancelled group", async () => {
       searchIssuesMock.mockResolvedValue({
         issues: [
-          { id: "i-hit", identifier: "MUL-77", title: "Abandoned plan", status: "cancelled" },
-          { id: "i-other", identifier: "MUL-78", title: "MUL-77 follow-up", status: "todo" },
+          { id: "i-hit", identifier: "MUL-77", title: "Abandoned plan", status: "Cancelled" },
+          { id: "i-other", identifier: "MUL-78", title: "MUL-77 follow-up", status: "Queue" },
         ],
         total: 2,
       });
@@ -1167,8 +1167,8 @@ describe("MentionList cancelled demotion", () => {
     it("treats a bare number as targeting the issue with that number", async () => {
       searchIssuesMock.mockResolvedValue({
         issues: [
-          { id: "i-live", identifier: "MUL-800", title: "Mentions 77 in passing", status: "todo" },
-          { id: "i-hit", identifier: "MUL-77", title: "Abandoned plan", status: "cancelled" },
+          { id: "i-live", identifier: "MUL-800", title: "Mentions 77 in passing", status: "Queue" },
+          { id: "i-hit", identifier: "MUL-77", title: "Abandoned plan", status: "Cancelled" },
         ],
         total: 2,
       });
@@ -1183,7 +1183,7 @@ describe("MentionList cancelled demotion", () => {
 
     it("keeps a cancelled project matched by its full title with the live rows", async () => {
       searchIssuesMock.mockResolvedValue({
-        issues: [{ id: "i-live", identifier: "MUL-81", title: "Search revamp notes", status: "todo" }],
+        issues: [{ id: "i-live", identifier: "MUL-81", title: "Search revamp notes", status: "Queue" }],
         total: 1,
       });
       searchProjectsMock.mockResolvedValue({
@@ -1212,7 +1212,7 @@ describe("MentionList cancelled demotion", () => {
       // truncation would still delete it, so it has to be pinned to the front.
       searchIssuesMock.mockResolvedValue({
         issues: [
-          { id: "i-hit", identifier: "MUL-99", title: "Abandoned plan", status: "cancelled" },
+          { id: "i-hit", identifier: "MUL-99", title: "Abandoned plan", status: "Cancelled" },
         ],
         total: 1,
       });
@@ -1221,7 +1221,7 @@ describe("MentionList cancelled demotion", () => {
         id: `i-live${n}`,
         label: `MUL-${200 + n}`,
         type: "issue" as const,
-        status: "todo" as const,
+        status: "Queue" as const,
       }));
 
       render(<I18nWrapper><MentionList items={items} query="MUL-99" command={vi.fn()} /></I18nWrapper>);
@@ -1241,8 +1241,8 @@ describe("MentionList cancelled demotion", () => {
       // Guard against over-exempting: a partial match is not a direct hit.
       searchIssuesMock.mockResolvedValue({
         issues: [
-          { id: "i-dead", identifier: "MUL-91", title: "Abandoned plan", status: "cancelled" },
-          { id: "i-live", identifier: "MUL-92", title: "Active plan", status: "todo" },
+          { id: "i-dead", identifier: "MUL-91", title: "Abandoned plan", status: "Cancelled" },
+          { id: "i-live", identifier: "MUL-92", title: "Active plan", status: "Queue" },
         ],
         total: 2,
       });

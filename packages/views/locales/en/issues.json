@@ -13,7 +13,17 @@
     "in_review": "In Review",
     "done": "Done",
     "blocked": "Blocked",
-    "cancelled": "Cancelled"
+    "cancelled": "Cancelled",
+    "Registered": "Registered",
+    "Spec": "Spec",
+    "Queue": "Queue",
+    "In Progress": "In Progress",
+    "In Review": "In Review",
+    "Human Review": "Human Review",
+    "CI/CD & Deploy": "CI/CD & Deploy",
+    "Done": "Done",
+    "Archived": "Archived",
+    "Cancelled": "Cancelled"
   },
   "priority": {
     "urgent": "Urgent",

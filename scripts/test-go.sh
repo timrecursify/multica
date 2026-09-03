@@ -35,7 +35,9 @@ for package in $packages; do
   esac
 done
 
-"$GUARD_SCRIPT" -- go "${go_test_args[@]}" "${regular_packages[@]}"
+# Every package shares the CI database. Run package tests serially so each
+# package's TestMain cleanup cannot race another package's fixture setup.
+"$GUARD_SCRIPT" -- go "${go_test_args[@]}" -p 1 "${regular_packages[@]}"
 # Subprocess-backed agent tests have hard deadlines. Limit both package and
 # within-package parallelism so race builds do not starve their parent loops.
 "$GUARD_SCRIPT" -- go "${go_test_args[@]}" -p 2 -parallel 2 ./pkg/agent/...

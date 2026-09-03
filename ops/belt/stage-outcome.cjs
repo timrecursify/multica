@@ -1,0 +1,104 @@
+"use strict";
+// Typed stage outcomes (GSP-1826). One row per (issue, stage): what the last agent
+// run concluded and the hash of the inputs it saw. The reconciler re-dispatches a
+// stage only when no outcome exists or the input hash changed.
+
+const OUTCOMES = new Set(["ADVANCED", "BLOCKED", "NO_OP", "FAILED"]);
+const BLOCKED_ON = new Set(["ci", "human", "sha", "dependency", "quota"]);
+const LINE = /^\s*OUTCOME:\s*(ADVANCED|BLOCKED|NO_OP|FAILED)(?:\s+blocked_on=([a-z]+))?\s*$/i;
+
+// Contract: the last non-empty output line is `OUTCOME: <kind>[ blocked_on=<why>]`.
+// Legacy heuristics keep pre-contract output useful; anything else is FAILED.
+function parseOutcome(output) {
+  const text = String(output || "");
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines.slice(-5).reverse()) {
+    const m = LINE.exec(line);
+    if (m) {
+      const outcome = m[1].toUpperCase();
+      const blockedOn = m[2] ? m[2].toLowerCase() : null;
+      return { outcome, blockedOn: outcome === "BLOCKED" && BLOCKED_ON.has(blockedOn) ? blockedOn : null, typed: true };
+    }
+  }
+  return { ...legacyOutcome(text), typed: false };
+}
+
+function legacyOutcome(text) {
+  if (/"qualifying"\s*:\s*true/.test(text) || /"verdict"\s*:\s*"(PASS|FAIL)"/.test(text)) return { outcome: "ADVANCED", blockedOn: null };
+  if (/relay transition .* denied \(409 transition_denied\)|relay rejected .* evidence_missing|BUILD-READY posted|specification posted.*now in Queue/i.test(text)) return { outcome: "ADVANCED", blockedOn: null };
+  if (/QC-BLOCKED NO-SHA|no implementation (pull request|commit)/i.test(text)) return { outcome: "BLOCKED", blockedOn: "sha" };
+  if (/blocked by (queued|pending|running) CI|waiting (on|for) CI/i.test(text)) return { outcome: "BLOCKED", blockedOn: "ci" };
+  if (/usage limit|provider_quota_limit/i.test(text)) return { outcome: "BLOCKED", blockedOn: "quota" };
+  if (/already[- ]merged|already deployed|nothing to do/i.test(text)) return { outcome: "NO_OP", blockedOn: null };
+  if (/https:\/\/github\.com\/[^\s]+\/pull\/\d+/.test(text)) return { outcome: "ADVANCED", blockedOn: null };
+  if (/^\s*(Blocked|Unable|Cannot|Could not|Failed|Error)\b/i.test(text) || /\bblocked\b.*\b(fail-closed|checkout|session expired|filesystem)/i.test(text)) return { outcome: "FAILED", blockedOn: null };
+  if (/\b(BUILD-READY|QC PASS|verified|validated|implemented|posted|merged|tests? pass)\b/i.test(text)) return { outcome: "ADVANCED", blockedOn: null };
+  return { outcome: "FAILED", blockedOn: null };
+}
+
+// Inputs the agent could have acted on: PR head sha, CI rollup, newest comment,
+// dependency states, spec/description body. Any change re-opens the stage.
+function stageInputHashSql() {
+  return `
+    WITH pr AS (
+      SELECT p.id, p.head_sha, p.checks_rollup_state
+      FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
+      WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1)
+    SELECT md5(concat_ws('|',
+      (SELECT head_sha FROM pr), (SELECT checks_rollup_state FROM pr),
+      (SELECT string_agg(s.suite_id::text || ':' || s.status || ':' || coalesce(s.conclusion, ''), ',' ORDER BY s.suite_id)
+         FROM github_pull_request_check_suite s
+        WHERE s.pr_id = (SELECT id FROM pr) AND s.head_sha = (SELECT head_sha FROM pr)),
+      (SELECT c.id::text FROM comment c WHERE c.issue_id = i.id ORDER BY c.created_at DESC LIMIT 1),
+      (SELECT string_agg(d.depends_on_issue_id::text || ':' || di.status, ',' ORDER BY d.depends_on_issue_id)
+         FROM issue_dependency d JOIN issue di ON di.id = d.depends_on_issue_id WHERE d.issue_id = i.id),
+      md5(coalesce(i.description, '')))) AS input_hash
+    FROM issue i WHERE i.id = $1::uuid`;
+}
+
+function outcomeForStageSql() {
+  return "SELECT outcome, blocked_on, input_hash, task_id, outcome_at FROM issue_stage_outcome WHERE issue_id = $1::uuid AND stage = $2::text";
+}
+
+function upsertOutcomeSql() {
+  return `INSERT INTO issue_stage_outcome (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
+    VALUES ($1::uuid, $2::text, $3::text, $4::text, $5::uuid, $6::text, NOW())
+    ON CONFLICT (issue_id, stage) DO UPDATE SET outcome = EXCLUDED.outcome, blocked_on = EXCLUDED.blocked_on,
+      task_id = EXCLUDED.task_id, input_hash = EXCLUDED.input_hash, outcome_at = NOW()`;
+}
+
+// Completed stage tasks not yet recorded. Bounded window keeps the pass cheap.
+function unrecordedCompletionsSql() {
+  return `SELECT t.id, t.issue_id, t.context->>'to_stage' AS stage, t.result->>'output' AS output
+    FROM agent_task_queue t
+    WHERE t.status = 'completed' AND t.completed_at > NOW() - ($1::int * interval '1 minute')
+      AND t.context->>'to_stage' IS NOT NULL AND t.issue_id IS NOT NULL
+      AND NOT EXISTS (SELECT 1 FROM issue_stage_outcome o WHERE o.task_id = t.id)
+    ORDER BY t.completed_at ASC LIMIT 200`;
+}
+
+async function recordStageOutcomes(client, { windowMinutes = 180, logger = console } = {}) {
+  const rows = (await client.query(unrecordedCompletionsSql(), [windowMinutes])).rows;
+  let recorded = 0;
+  for (const row of rows) {
+    const parsed = parseOutcome(row.output);
+    const hash = (await client.query(stageInputHashSql(), [row.issue_id])).rows[0]?.input_hash || null;
+    await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, parsed.blockedOn, row.id, hash]);
+    recorded += 1;
+    if (!parsed.typed) logger.log(`[stage-outcome] legacy parse task=${row.id} stage=${row.stage} -> ${parsed.outcome}${parsed.blockedOn ? "/" + parsed.blockedOn : ""}`);
+  }
+  return { scanned: rows.length, recorded };
+}
+
+// Reconciler eligibility: dispatch only when nothing is recorded for this stage or
+// the inputs changed since. BLOCKED/human never re-opens without a hash change.
+async function stageEligibility(client, issueId, stage) {
+  const prior = (await client.query(outcomeForStageSql(), [issueId, stage])).rows[0];
+  if (!prior) return { eligible: true, reason: "no_outcome" };
+  const current = (await client.query(stageInputHashSql(), [issueId])).rows[0]?.input_hash || null;
+  if (current && prior.input_hash && current !== prior.input_hash) return { eligible: true, reason: "input_changed", prior };
+  return { eligible: false, reason: `outcome_unchanged:${prior.outcome}${prior.blocked_on ? "/" + prior.blocked_on : ""}`, prior };
+}
+
+module.exports = { OUTCOMES, BLOCKED_ON, parseOutcome, legacyOutcome, stageInputHashSql, outcomeForStageSql,
+  upsertOutcomeSql, unrecordedCompletionsSql, recordStageOutcomes, stageEligibility };

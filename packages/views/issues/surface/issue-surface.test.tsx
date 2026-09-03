@@ -112,7 +112,7 @@ function makeIssue(id: string, title: string, projectId: string): Issue {
     identifier: `MUL-${id}`,
     title,
     description: null,
-    status: "todo",
+    status: "Queue",
     priority: "none",
     assignee_type: null,
     assignee_id: null,
@@ -159,7 +159,7 @@ describe("IssueSurface — scope switch loading semantics", () => {
     const listIssues = vi.fn((params?: ListIssuesParams) => {
       if (params?.project_id === "p2") return never<ListIssuesResponse>();
       const issues =
-        params?.status === "todo" ? [makeIssue("i1", "P1 issue", "p1")] : [];
+        params?.status === "Queue" ? [makeIssue("i1", "P1 issue", "p1")] : [];
       return Promise.resolve({ issues, total: issues.length });
     });
     setApiInstance({
@@ -246,7 +246,7 @@ describe("IssueSurface — scope switch loading semantics", () => {
 
     const listIssues = vi.fn((params?: ListIssuesParams) => {
       const issues =
-        params?.status === "todo" ? [makeIssue("i1", "WS1 issue", "p1")] : [];
+        params?.status === "Queue" ? [makeIssue("i1", "WS1 issue", "p1")] : [];
       return Promise.resolve({ issues, total: issues.length });
     });
     setApiInstance({
@@ -321,7 +321,7 @@ describe("IssueSurface — table pagination ownership", () => {
 
     const runningIssues = Array.from({ length: 250 }, (_, index) => ({
       ...makeIssue(`run-${index}`, `Running ${index}`, "pt"),
-      status: "in_progress" as const,
+      status: "In Progress" as const,
     }));
     const listIssueTableRows = vi.fn(() => never());
     setApiInstance({
@@ -634,7 +634,7 @@ describe("IssueSurface — table pagination ownership", () => {
           groups: [
             {
               key: "status:todo",
-              value: { kind: "status", status: "todo" },
+              value: { kind: "status", status: "Queue" },
               count: 1,
             },
           ],

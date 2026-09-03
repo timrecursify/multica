@@ -1,0 +1,44 @@
+# Hermetic `sk repo test` profiles for the Multica repository.
+# Each profile executes a direct argv rooted at the checkout; commands never
+# reach the caller's shell, environment, or network. Discovery is bound to the
+# committed listings under .sk/. See CONTRIBUTING.md > Repo test profiles.
+[[profile]]
+name = "bash-syntax"
+command_argv = ["/usr/bin/bash", ".sk/scripts/check-bash-syntax.sh"]
+working_directory = "."
+env_allowlist = []
+timeout = 60
+hermetic = true
+
+[[profile]]
+name = "diff-whitespace"
+command_argv = ["/usr/bin/bash", ".sk/scripts/check-diff-whitespace.sh"]
+working_directory = "."
+env_allowlist = []
+timeout = 120
+hermetic = true
+
+[[profile]]
+name = "docs-lint"
+command_argv = ["/usr/bin/env", "python3", ".sk/scripts/docs-lint.py"]
+working_directory = "."
+env_allowlist = []
+timeout = 60
+hermetic = true
+
+[[profile]]
+name = "backend"
+command_argv = ["/usr/bin/bash", ".sk/scripts/check-backend.sh"]
+working_directory = "."
+# The runner supplies fixed loopback service values; caller environment is excluded.
+env_allowlist = []
+timeout = 600
+hermetic = true
+
+[[profile]]
+name = "parked-diagnosis-node-tests"
+command_argv = ["/usr/bin/node", "--test", "ops/belt/backfill-parked-diagnosis.test.cjs", "ops/belt/parked-diagnosis.test.cjs"]
+working_directory = "."
+env_allowlist = []
+timeout = 60
+hermetic = true

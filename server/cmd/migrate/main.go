@@ -23,10 +23,12 @@ import (
 // safely acquire other session-level locks (e.g. advisory lock 4246
 // for the task_usage hourly rollup).
 //
-// Returning an error aborts the migration run. The corresponding
-// migration is NOT recorded in schema_migrations, so the next run will
-// retry the hook + migration.
-type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) error
+// Returning an error aborts the migration run. A hook may skip only its own
+// SQL while still recording its version when the migration is inapplicable to
+// a clean schema; that outcome is explicit and audited by runMigrations.
+type preMigrationHook func(ctx context.Context, pool *pgxpool.Pool) (skipSQL bool, err error)
+
+const cleanSchemaSkipVersion = "286_build_budget_scope_workspace"
 
 // preMigrationHooks wires migration version → hook. The version key is
 // the file basename without the `.up.sql` suffix, matching what
@@ -64,6 +66,10 @@ var preMigrationHooks = map[string]preMigrationHook{
 	"198_agent_task_attribution_strict_constraint_validate": runAttributionStrictHook,
 	"257_agent_task_queue_channel_media_pending_unique_v2":  cleanupInvalidConcurrentIndexHook("idx_one_pending_task_per_issue_agent_v2"),
 	"261_agent_task_queue_terminal_completed_at_v2":         cleanupInvalidConcurrentIndexHook("idx_agent_task_queue_terminal_completed_at_v2"),
+	"286_build_budget_scope_workspace": buildBudgetWorkspaceIndexHook(
+		"uq_build_budget_scope_workspace",
+		"CREATE UNIQUE INDEX uq_build_budget_scope_workspace ON public.build_budget USING btree (workspace_id, scope, scope_ref)",
+	),
 }
 
 // cleanupInvalidConcurrentIndexHook removes an INVALID index left by an
@@ -72,7 +78,7 @@ var preMigrationHooks = map[string]preMigrationHook{
 // relation as success and allow a later migration to drop the still-valid old
 // index. Non-index relations fail closed instead of being dropped implicitly.
 func cleanupInvalidConcurrentIndexHook(indexRegclass string) preMigrationHook {
-	return func(ctx context.Context, pool *pgxpool.Pool) error {
+	return func(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 		var schemaName, relationName string
 		var isIndex, isValid bool
 		err := pool.QueryRow(ctx, `
@@ -83,60 +89,121 @@ func cleanupInvalidConcurrentIndexHook(indexRegclass string) preMigrationHook {
 			WHERE c.oid = to_regclass($1)
 		`, indexRegclass).Scan(&schemaName, &relationName, &isIndex, &isValid)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil
+			return false, nil
 		}
 		if err != nil {
-			return fmt.Errorf("inspect concurrent index %q: %w", indexRegclass, err)
+			return false, fmt.Errorf("inspect concurrent index %q: %w", indexRegclass, err)
 		}
 		if !isIndex {
-			return fmt.Errorf("relation %q exists but is not an index", indexRegclass)
+			return false, fmt.Errorf("relation %q exists but is not an index", indexRegclass)
 		}
 		if isValid {
-			return nil
+			return false, nil
 		}
 
 		qualifiedName := pgx.Identifier{schemaName, relationName}.Sanitize()
 		if _, err := pool.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+qualifiedName); err != nil {
-			return fmt.Errorf("drop invalid concurrent index %s: %w", qualifiedName, err)
+			return false, fmt.Errorf("drop invalid concurrent index %s: %w", qualifiedName, err)
 		}
 		slog.Warn("removed invalid index before migration retry", "index", qualifiedName)
-		return nil
+		return false, nil
 	}
 }
 
-func runTaskUsageHourlyHook(ctx context.Context, pool *pgxpool.Pool) error {
+// exactConcurrentIndexHook makes a concurrent-index retry safe. An absent
+// relation lets the migration create the index; an INVALID leftover is removed
+// concurrently; and a valid relation must be the exact expected index rather
+// than an unrelated object reusing the migration's name.
+func exactConcurrentIndexHook(indexRegclass, expectedDefinition string) preMigrationHook {
+	return func(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+		var schemaName, relationName, definition string
+		var isIndex, isValid bool
+		err := pool.QueryRow(ctx, `
+			SELECT n.nspname, c.relname, c.relkind = 'i', COALESCE(i.indisvalid, FALSE), pg_get_indexdef(c.oid)
+			FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			LEFT JOIN pg_index i ON i.indexrelid = c.oid
+			WHERE c.oid = to_regclass($1)
+		`, indexRegclass).Scan(&schemaName, &relationName, &isIndex, &isValid, &definition)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("inspect concurrent index %q: %w", indexRegclass, err)
+		}
+		if !isIndex {
+			return false, fmt.Errorf("relation %q exists but is not an index", indexRegclass)
+		}
+		if isValid {
+			if definition != expectedDefinition {
+				return false, fmt.Errorf("valid index %q has unexpected definition %q", indexRegclass, definition)
+			}
+			return false, nil
+		}
+
+		qualifiedName := pgx.Identifier{schemaName, relationName}.Sanitize()
+		if _, err := pool.Exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+qualifiedName); err != nil {
+			return false, fmt.Errorf("drop invalid concurrent index %s: %w", qualifiedName, err)
+		}
+		slog.Warn("removed invalid index before migration retry", "index", qualifiedName)
+		return false, nil
+	}
+}
+
+// buildBudgetWorkspaceIndexHook records 286 without executing its index SQL
+// only when a clean schema has no build_budget relation. Existing tables still
+// use the exact-definition validation and concurrent cleanup above.
+func buildBudgetWorkspaceIndexHook(indexRegclass, expectedDefinition string) preMigrationHook {
+	return buildBudgetWorkspaceIndexHookForRelation("public.build_budget", indexRegclass, expectedDefinition)
+}
+
+func buildBudgetWorkspaceIndexHookForRelation(relationRegclass, indexRegclass, expectedDefinition string) preMigrationHook {
+	exact := exactConcurrentIndexHook(indexRegclass, expectedDefinition)
+	return func(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+		var exists bool
+		if err := pool.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", relationRegclass).Scan(&exists); err != nil {
+			return false, fmt.Errorf("check build_budget relation before migration 286: %w", err)
+		}
+		if !exists {
+			return true, nil
+		}
+		return exact(ctx, pool)
+	}
+}
+
+func runTaskUsageHourlyHook(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 	res, err := taskusagebackfill.Hook(ctx, pool, taskusagebackfill.HookOptions{})
 	if err != nil {
-		return fmt.Errorf("task_usage_hourly pre-103 hook: %w", err)
+		return false, fmt.Errorf("task_usage_hourly pre-103 hook: %w", err)
 	}
 	if res.Skipped != "" {
 		slog.Info("task_usage hourly rollup hook: skipped",
 			"reason", res.Skipped,
 			"watermark_stamped", res.WatermarkStamped)
-		return nil
+		return false, nil
 	}
 	slog.Info("task_usage hourly rollup hook: backfill complete",
 		"slices", res.SlicesProcessed,
 		"rows_touched", res.RowsTouched,
 		"from", res.From.Format("2006-01-02T15:04:05Z07:00"),
 		"to", res.To.Format("2006-01-02T15:04:05Z07:00"))
-	return nil
+	return false, nil
 }
 
 // runAttributionStrictHook backfills accountable_user_id from
 // originator_user_id before migration 198 validates the strict attribution
 // constraint, so self-hosted upgrades that never ran the out-of-band
 // backfill recover automatically (GH #5544 / MUL-4897).
-func runAttributionStrictHook(ctx context.Context, pool *pgxpool.Pool) error {
+func runAttributionStrictHook(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 	res, err := attributionbackfill.Hook(ctx, pool, attributionbackfill.HookOptions{})
 	if err != nil {
-		return fmt.Errorf("attribution strict-constraint pre-198 hook: %w", err)
+		return false, fmt.Errorf("attribution strict-constraint pre-198 hook: %w", err)
 	}
 	slog.Info("attribution backfill hook: complete",
 		"rows_backfilled", res.RowsBackfilled,
 		"batches", res.Batches,
 		"mismatch_normalized", res.MismatchNormalized)
-	return nil
+	return false, nil
 }
 
 // migrationAdvisoryLockKey is the int64 identifier used with Postgres
@@ -341,17 +408,27 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool, opts runOptions) err
 		// colliding with migrationAdvisoryLockKey. Hook failures
 		// abort the run before schema_migrations is updated, so the
 		// same version retries cleanly on the next invocation.
+		skipSQL := false
 		if opts.Direction == "up" {
 			if hook, ok := opts.Hooks[version]; ok && hook != nil {
 				slog.Info("running pre-migration hook", "version", version)
-				if err := hook(ctx, pool); err != nil {
-					return fmt.Errorf("pre-migration hook for %q: %w", version, err)
+				var hookErr error
+				skipSQL, hookErr = hook(ctx, pool)
+				if hookErr != nil {
+					return fmt.Errorf("pre-migration hook for %q: %w", version, hookErr)
+				}
+				if skipSQL && version != cleanSchemaSkipVersion {
+					return fmt.Errorf("pre-migration hook for %q returned an unsupported skip-SQL outcome", version)
 				}
 			}
 		}
 
-		if _, err := conn.Exec(ctx, string(sql)); err != nil {
-			return fmt.Errorf("apply migration %q: %w", file, err)
+		if !skipSQL {
+			if _, err := conn.Exec(ctx, string(sql)); err != nil {
+				return fmt.Errorf("apply migration %q: %w", file, err)
+			}
+		} else {
+			slog.Warn("recording migration without SQL", "version", version, "reason", "build_budget relation absent on clean schema")
 		}
 
 		if opts.Direction == "up" {

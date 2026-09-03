@@ -317,6 +317,9 @@ export function useIssueSurfaceData({
   );
 
   const visibleStatuses = useMemo<IssueStatus[]>(() => {
+    if (serverStatusBranches.enabled) {
+      return Object.keys(serverStatusBranches.pagination) as IssueStatus[];
+    }
     // Default view shows every lifecycle status, `cancelled` last (its
     // canonical position in ALL_STATUSES). An active status filter narrows to
     // the selected subset while preserving that order.
@@ -324,7 +327,7 @@ export function useIssueSurfaceData({
       return ALL_STATUSES.filter((s) => statusFilters.includes(s));
     }
     return ALL_STATUSES;
-  }, [statusFilters]);
+  }, [serverStatusBranches.enabled, serverStatusBranches.pagination, statusFilters]);
 
   // Hidden columns are the lifecycle statuses not currently visible, so
   // `cancelled` participates in the board show/hide controls exactly like the

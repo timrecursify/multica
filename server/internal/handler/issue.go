@@ -88,9 +88,9 @@ var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
 // it — they canonicalize against h.IssueStatusContract so the configured
 // profile's vocabulary is authoritative. The CLI keeps its own union list.
 var validIssueStatuses = []string{
-	"Spec", "Queue", "in_progress", "in_review", "Human Review", "Done", "Cancelled", "Archived",
-	"Queue", "Spec", "Building", "QC", "In Review", "In Progress",
-	"Human Review", "Done", "Blocked", "Cancelled", "Archived", "dead_letter", "Registered",
+	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
+	"Registered", "Spec", "Queue", "Building", "In Progress", "QC", "In Review", "Human Review",
+	"CI/CD & Deploy", "Done", "Blocked", "Cancelled", "Archived", "dead_letter",
 }
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {
@@ -392,16 +392,21 @@ var identifierNumberRe = regexp.MustCompile(`(?i)^[a-z]+-(\d+)$`)
 func parseQueryNumber(q string) (int, bool) {
 	q = strings.TrimSpace(q)
 	// Check for identifier pattern like "MUL-123"
-	if m := identifierNumberRe.FindStringSubmatch(q); m != nil {
-		if n, err := strconv.Atoi(m[1]); err == nil && n > 0 {
-			return n, true
+	parsePositiveInt32 := func(s string) (int, bool) {
+		// PostgreSQL stores issue.number as integer (int32). Parsing with
+		// Atoi follows the host word size, which can accept values that the
+		// database cannot bind to this column.
+		n, err := strconv.ParseInt(s, 10, 32)
+		if err != nil || n <= 0 {
+			return 0, false
 		}
+		return int(n), true
 	}
-	// Check for bare number
-	if n, err := strconv.Atoi(q); err == nil && n > 0 {
-		return n, true
+	if m := identifierNumberRe.FindStringSubmatch(q); m != nil {
+		return parsePositiveInt32(m[1])
 	}
-	return 0, false
+	// Check for bare number.
+	return parsePositiveInt32(q)
 }
 
 // searchResult holds a raw row from the dynamic search query.
@@ -473,7 +478,15 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 		"(LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s OR EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s))",
 		phraseContainsParam, phraseContainsParam, wsParam, phraseContainsParam,
 	)
-	whereParts = append(whereParts, phraseMatch)
+	// For multi-word queries the all-terms predicate below logically includes
+	// a full-phrase match: a phrase containing every term necessarily satisfies
+	// every per-term condition. Keeping both predicates makes Postgres execute
+	// one additional correlated comment search across the workspace without
+	// changing the result set. Retain the phrase predicate only for the
+	// single-term path; phrase relevance is still preserved in ORDER BY.
+	if len(termContainsParams) <= 1 {
+		whereParts = append(whereParts, phraseMatch)
+	}
 
 	// Multi-word AND match (each term must appear somewhere). Same
 	// workspace_id-in-subquery contract as above.

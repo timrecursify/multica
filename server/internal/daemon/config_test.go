@@ -35,6 +35,12 @@ func TestDefaultGCIntervalIsTwoHours(t *testing.T) {
 	}
 }
 
+func TestDefaultTaskTempOrphanTTLIsTwoHours(t *testing.T) {
+	if DefaultTaskTempOrphanTTL != 2*time.Hour {
+		t.Fatalf("DefaultTaskTempOrphanTTL = %s, want 2h", DefaultTaskTempOrphanTTL)
+	}
+}
+
 func TestPatternsFromEnv_DropsSeparatorBearingEntries(t *testing.T) {
 	t.Setenv("MULTICA_GC_ARTIFACT_PATTERNS", "node_modules, .next ,foo/bar, ../etc, ,target")
 	got := patternsFromEnv("MULTICA_GC_ARTIFACT_PATTERNS", nil)

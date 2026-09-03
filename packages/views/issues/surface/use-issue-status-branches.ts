@@ -12,7 +12,6 @@ import {
   useQueryClient,
   type UseQueryResult,
 } from "@tanstack/react-query";
-import { ALL_STATUSES } from "@multica/core/issues/config";
 import {
   issueKeys,
   issueTableRowPageOptions,
@@ -36,14 +35,15 @@ export interface IssueStatusPageState {
   retry: () => void;
 }
 
-export type IssueStatusPagination = Record<
-  IssueStatus,
-  IssueStatusPageState
->;
+// Facet responses may contain workflow statuses unknown to this client's
+// static status vocabulary, so pagination must support arbitrary status keys.
+export type IssueStatusPagination = Record<IssueStatus, IssueStatusPageState> & {
+  [status: string]: IssueStatusPageState | undefined;
+};
 
 interface StatusCursorState {
   identity: string;
-  cursors: Record<IssueStatus, Array<string | null>>;
+  cursors: Record<string, Array<string | null>>;
 }
 
 interface StatusPageTarget {
@@ -74,10 +74,7 @@ function initialCursorState(
   statuses: readonly IssueStatus[],
 ): StatusCursorState {
   const cursors = Object.fromEntries(
-    ALL_STATUSES.map((status) => [
-      status,
-      statuses.includes(status) ? [null] : [],
-    ]),
+    statuses.map((status) => [status, [null]]),
   ) as StatusCursorState["cursors"];
   return { identity, cursors };
 }
@@ -91,7 +88,7 @@ function rebaseCursorState(
     state.identity === identity ? state : initialCursorState(identity, statuses);
   let cursors: StatusCursorState["cursors"] | null = null;
   for (const status of statuses) {
-    if (current.cursors[status].length > 0) continue;
+    if ((current.cursors[status] ?? []).length > 0) continue;
     cursors ??= { ...current.cursors };
     cursors[status] = [null];
   }
@@ -104,9 +101,7 @@ function statusCountsFromFacets(
   const counts = new Map<IssueStatus, number>();
   const statusFacet = facets?.facets.find((facet) => facet.kind === "status");
   for (const value of statusFacet?.values ?? []) {
-    if (ALL_STATUSES.includes(value.key as IssueStatus)) {
-      counts.set(value.key as IssueStatus, value.count);
-    }
+    counts.set(value.key as IssueStatus, value.count);
   }
   return counts;
 }
@@ -165,7 +160,7 @@ export function useIssueStatusBranches({
     () =>
       enabled
         ? statuses.flatMap((status) =>
-            activeCursorState.cursors[status].map((cursor) => ({
+            (activeCursorState.cursors[status] ?? []).map((cursor) => ({
               status,
               cursor,
             })),
@@ -243,7 +238,7 @@ export function useIssueStatusBranches({
       if (
         target?.cursor === null &&
         queryResult?.isFetching &&
-        activeCursorState.cursors[target.status].length > 1
+        (activeCursorState.cursors[target.status] ?? []).length > 1
       ) {
         headFetching.add(target.status);
       }
@@ -312,7 +307,7 @@ export function useIssueStatusBranches({
       next[status] = branch.headUpdatedAt;
       const seen = previous[status];
       if (
-        activeCursorState.cursors[status].length > 1 &&
+        (activeCursorState.cursors[status] ?? []).length > 1 &&
         (branch.headFetching ||
           (seen !== undefined && seen !== branch.headUpdatedAt))
       ) {
@@ -341,7 +336,7 @@ export function useIssueStatusBranches({
       if (!cursor) return;
       setCursorState((previous) => {
         if (previous.identity !== identity) return previous;
-        const current = previous.cursors[status];
+        const current = previous.cursors[status] ?? [];
         if (current.includes(cursor)) return previous;
         return {
           ...previous,
@@ -374,7 +369,7 @@ export function useIssueStatusBranches({
 
   const pagination = useMemo<IssueStatusPagination>(() => {
     return Object.fromEntries(
-      ALL_STATUSES.map((status) => {
+      statuses.map((status) => {
         const branch = branchData.get(status);
         const loaded = branch?.rows.length ?? 0;
         const total = counts.get(status) ?? loaded;
@@ -393,7 +388,7 @@ export function useIssueStatusBranches({
         ];
       }),
     ) as IssueStatusPagination;
-  }, [branchData, counts, enabled, loadMore, retry]);
+  }, [branchData, counts, enabled, loadMore, retry, statuses]);
 
   const issues = useMemo(
     () => statuses.flatMap((status) => branchData.get(status)?.rows ?? []),

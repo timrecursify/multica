@@ -189,6 +189,7 @@ type terminalTaskReport struct {
 	taskID        string
 	output        string
 	branchName    string
+	prURL         string
 	errorMessage  string
 	sessionID     string
 	workDir       string
@@ -477,6 +478,11 @@ type Daemon struct {
 	// It deliberately includes preparation and local-directory waiters because
 	// restart/update barriers must not kill any claimed task.
 	activeTasks atomic.Int64
+	// taskTempDirs records temp directories owned by live task handlers. It is
+	// consulted by the orphan sweep so a periodic sweep cannot remove a task's
+	// working directory.
+	taskTempDirsMu sync.Mutex
+	taskTempDirs   map[string]struct{}
 	// runningTasks counts live provider execution sessions, beginning only after
 	// backend.Execute returns. It can briefly lag the server-side running state,
 	// which starts during preparation before provider launch. resourceWaitTasks
@@ -574,6 +580,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		resolvedPaths:             make(map[string]healedAgent),
 		wsHBLastAck:               make(map[string]time.Time),
 		activeEnvRoots:            make(map[string]int),
+		taskTempDirs:              make(map[string]struct{}),
 		deletingEnvRoots:          make(map[string]bool),
 		activeStores:              make(map[string]int),
 		deletingStores:            make(map[string]bool),
@@ -1659,6 +1666,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancelFunc = cancel
 	d.rootCtx = ctx
+	if dir, err := cli.ProfileDir(d.cfg.Profile); err != nil {
+		return fmt.Errorf("resolve codex lease directory: %w", err)
+	} else {
+		agent.RecoverCodexProcessLeases(filepath.Join(dir, "codex-process-leases"), d.logger)
+	}
 
 	// Bind health port early to detect another running daemon.
 	healthLn, err := d.listenHealth()
@@ -1675,6 +1687,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		logFields = append(logFields, "profile", d.cfg.Profile)
 	}
 	d.logger.Info("starting daemon", logFields...)
+	d.sweepTaskTempDirs()
 	d.logger.Debug("daemon config resolved",
 		"daemon_id", d.cfg.DaemonID,
 		"device_name", d.cfg.DeviceName,
@@ -1726,6 +1739,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 
+	// A hard process death (including an OOM kill) cannot report terminal
+	// callbacks for work already claimed by this daemon.  Once startup has
+	// registered the replacement runtimes, ask the server to atomically mark
+	// that predecessor work as runtime_recovery and create its normal retry
+	// children.  This is deliberately after preflight: before registration the
+	// daemon has no runtime identity with which to authorize the recovery call.
+	//
+	// The request is best-effort per runtime.  A transient API failure must not
+	// make a healthy daemon exit; the runtime sweeper remains the backstop and
+	// the next restart retries this targeted recovery.
+	d.recoverOrphanedTasks(ctx)
+
 	// Deregister runtimes on shutdown (uses a fresh context since ctx will be cancelled).
 	defer d.deregisterRuntimes()
 
@@ -1743,6 +1768,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	go d.gcLoop(ctx)
 	go d.autoUpdateLoop(ctx)
 	go d.tokenRenewalLoop(ctx)
+	go d.codexLeaseSweepLoop(ctx)
 
 	// Preflight succeeded and the background loops are up: the daemon has
 	// registered its runtimes and can now claim and run tasks. Flip /health
@@ -1754,6 +1780,31 @@ func (d *Daemon) Run(ctx context.Context) error {
 	err = d.pollLoop(ctx, taskWakeups)
 	d.logger.Debug("daemon main loop returning", "error", err)
 	return err
+}
+
+func (d *Daemon) codexLeaseSweepLoop(ctx context.Context) {
+	dir, err := cli.ProfileDir(d.cfg.Profile)
+	if err != nil {
+		return
+	}
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			agent.RecoverCodexProcessLeases(filepath.Join(dir, "codex-process-leases"), d.logger)
+		}
+	}
+}
+
+func codexLeaseDir(profile string) string {
+	dir, err := cli.ProfileDir(profile)
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "codex-process-leases")
 }
 
 // RestartBinary returns the path to the new binary if the daemon needs to restart
@@ -1780,6 +1831,21 @@ func (d *Daemon) deregisterRuntimes() {
 		d.logger.Warn("failed to deregister runtimes on shutdown", "error", err)
 	} else {
 		d.logger.Info("deregistered runtimes", "count", len(runtimeIDs))
+	}
+}
+
+// recoverOrphanedTasks returns claimed work from a previous daemon process to
+// the server's runtime_recovery retry path.  It runs only after this process
+// has successfully registered its replacement runtimes, so it cannot reclaim
+// work owned by another live daemon.
+func (d *Daemon) recoverOrphanedTasks(ctx context.Context) {
+	for _, runtimeID := range d.allRuntimeIDs() {
+		recoveryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		err := d.client.RecoverOrphans(recoveryCtx, runtimeID)
+		cancel()
+		if err != nil {
+			d.logger.Warn("recover orphaned tasks at daemon startup failed", "runtime_id", runtimeID, "error", err)
+		}
 	}
 }
 
@@ -2411,6 +2477,14 @@ func (d *Daemon) appendProfileRuntimes(ctx context.Context, workspaceID string, 
 		return profileSetSignature(nil)
 	}
 	for _, profile := range resp.RuntimeProfiles {
+		if allowed := configuredAgentAllowlist(); len(allowed) > 0 {
+			if _, ok := allowed[strings.ToLower(strings.TrimSpace(profile.ProtocolFamily))]; !ok {
+				d.logger.Info("skip custom runtime profile: provider is not allowed",
+					"workspace_id", workspaceID, "profile_id", profile.ID,
+					"protocol_family", profile.ProtocolFamily)
+				continue
+			}
+		}
 		if profile.CommandName == "" || profile.ProtocolFamily == "" {
 			d.logger.Warn("skip custom runtime profile: missing command_name or protocol_family",
 				"workspace_id", workspaceID, "profile_id", profile.ID, "display_name", profile.DisplayName)
@@ -4995,6 +5069,7 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 			taskID:                taskID,
 			output:                result.Comment,
 			branchName:            result.BranchName,
+			prURL:                 result.PRURL,
 			sessionID:             result.SessionID,
 			workDir:               result.WorkDir,
 			sessionRolloutMissing: result.SessionRolloutMissing,
@@ -5044,11 +5119,20 @@ func (d *Daemon) reportTaskResult(ctx context.Context, taskID string, result Tas
 		failureReason := result.FailureReason
 		if failureReason == "" {
 			if result.Status == "cancelled" {
-				// "cancelled" is a deliberate non-failure terminal
-				// state masquerading as a failure_reason — preserved
-				// outside the canonical taxonomy so the UI can render
-				// it differently from a real failure.
-				failureReason = "cancelled"
+				if ctx.Err() != nil {
+					// A cancelled task under the daemon root context is a process
+					// shutdown, not an operator/user cancellation.  Classify it as
+					// runtime_recovery so FailTask creates the normal retry child.
+					// User/server cancellation leaves the root context live and keeps
+					// its terminal cancelled meaning.
+					failureReason = "runtime_recovery"
+				} else {
+					// "cancelled" is a deliberate non-failure terminal
+					// state masquerading as a failure_reason — preserved
+					// outside the canonical taxonomy so the UI can render
+					// it differently from a real failure.
+					failureReason = "cancelled"
+				}
 			} else {
 				// MUL-2946: classify the agent's comment text so the
 				// failure_reason lands in the refined taxonomy
@@ -5086,7 +5170,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 
 	switch report.kind {
 	case terminalTaskReportComplete:
-		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
+		return d.client.CompleteTask(ctx, report.taskID, report.output, report.branchName, report.prURL, report.sessionID, report.workDir, report.sessionRolloutMissing, report.retiredSessionID)
 	case terminalTaskReportFail:
 		return d.client.FailTask(ctx, report.taskID, report.errorMessage, report.sessionID, report.workDir, report.failureReason, report.sessionRolloutMissing, report.retiredSessionID)
 	default:
@@ -5103,7 +5187,7 @@ func (d *Daemon) reportTerminalTask(parentCtx context.Context, report terminalTa
 // internal task with no IDs at all). The caller skips writing a meta file
 // in that case so the directory falls back to mtime-based orphan cleanup.
 func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
-	meta := execenv.GCMeta{WorkspaceID: task.WorkspaceID}
+	meta := execenv.GCMeta{WorkspaceID: task.WorkspaceID, TaskID: task.ID}
 	switch {
 	case task.ChatSessionID != "":
 		meta.Kind = execenv.GCKindChat
@@ -5120,7 +5204,6 @@ func gcMetaForTask(task Task) (execenv.GCMeta, bool) {
 		// task ID instead and let the GC loop ask the server for terminal
 		// state via the task gc-check endpoint.
 		meta.Kind = execenv.GCKindQuickCreate
-		meta.TaskID = task.ID
 	default:
 		return execenv.GCMeta{}, false
 	}
@@ -5734,6 +5817,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		QuickCreatePrompt:                task.QuickCreatePrompt,
 		HandoffNote:                      task.HandoffNote,
 		IsSquadLeader:                    taskIsSquadLeader(task),
+		RelayManaged:                     task.RelayManaged,
 		RequestingUserName:               task.RequestingUserName,
 		RequestingUserProfileDescription: task.RequestingUserProfileDescription,
 		InitiatorType:                    task.InitiatorType,
@@ -5945,7 +6029,9 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	if err != nil {
 		return TaskResult{}, fmt.Errorf("prepare task temp dir: %w", err)
 	}
+	d.trackTaskTempDir(taskTempDir)
 	defer func() {
+		d.untrackTaskTempDir(taskTempDir)
 		if cerr := os.RemoveAll(taskTempDir); cerr != nil {
 			taskLog.Warn("task temp dir cleanup failed", "path", taskTempDir, "error", cerr)
 		}
@@ -6134,6 +6220,8 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		RuntimeID:      task.RuntimeID,
 		DaemonVersion:  d.cfg.CLIVersion,
 		CodexVersion:   codexVersion,
+		CodexLeaseDir:  codexLeaseDir(d.cfg.Profile),
+		DaemonID:       d.cfg.DaemonID,
 		BuiltinRuntime: !usesCustomProfileCommand,
 	})
 	if err != nil {
@@ -6467,6 +6555,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			return TaskResult{
 				Status:    "completed",
 				Comment:   "",
+				PRURL:     result.PRURL,
 				SessionID: result.SessionID,
 				WorkDir:   env.WorkDir,
 				EnvRoot:   env.RootDir,
@@ -6497,6 +6586,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		taskResult = TaskResult{
 			Status:    "completed",
 			Comment:   result.Output,
+			PRURL:     result.PRURL,
 			SessionID: result.SessionID,
 			WorkDir:   env.WorkDir,
 			EnvRoot:   env.RootDir,
@@ -6836,6 +6926,10 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	defer drainCancel()
 
 	var toolCount atomic.Int32
+	var prURLMu sync.Mutex
+	var prURL string
+	prCreationCalls := make(map[string]bool)
+	var prCreationMissingURL bool
 	// lastActivityAt records (as unix nanos) when the drain loop most
 	// recently received a message from the backend. The idle watchdog
 	// reads this to decide whether the agent has gone silent for too long.
@@ -6986,6 +7080,11 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 						mu.Lock()
 						callIDToTool[msg.CallID] = msg.Tool
 						mu.Unlock()
+						if isPullRequestCreationInvocation(msg) {
+							prURLMu.Lock()
+							prCreationCalls[msg.CallID] = true
+							prURLMu.Unlock()
+						}
 					}
 					s := msgSeq.Add(1)
 					mu.Lock()
@@ -7006,6 +7105,16 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 					})
 					mu.Unlock()
 				case agent.MessageToolResult:
+					prURLMu.Lock()
+					if prCreationCalls[msg.CallID] {
+						if candidate, ok := pullRequestURLFromCreationResult(msg.Output); ok {
+							prURL = candidate
+							prCreationMissingURL = false
+						} else {
+							prCreationMissingURL = true
+						}
+					}
+					prURLMu.Unlock()
 					// Decrement only when the count would stay >= 0. A stray
 					// tool_result with no matching tool_use (backend bug or
 					// reconnect mid-stream) shouldn't push the counter
@@ -7103,6 +7212,14 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 	select {
 	case result := <-session.Result:
 		waitForDrain()
+		prURLMu.Lock()
+		result.PRURL = prURL
+		missingPRURL := prCreationMissingURL
+		prURLMu.Unlock()
+		if missingPRURL {
+			result.Status = "failed"
+			result.Error = "pull request creation returned no URL"
+		}
 		if idleWatchdogFired.Load() {
 			// The backend's wait goroutine (e.g. claude.go) translates the
 			// SIGKILL we delivered via agentCancel into Status="aborted".
@@ -7147,6 +7264,51 @@ func (d *Daemon) executeAndDrain(ctx context.Context, backend agent.Backend, pro
 			Error:  "agent did not produce result within drain timeout",
 		}, toolCount.Load(), nil
 	}
+}
+
+// isPullRequestCreationInvocation identifies the actual creation call rather
+// than inferring it from a URL-shaped result. ACP command tools report the
+// command under either cmd or command; dedicated GitHub tools expose their
+// creation operation in the tool name.
+func isPullRequestCreationInvocation(msg agent.Message) bool {
+	tool := strings.ToLower(strings.ReplaceAll(msg.Tool, "-", "_"))
+	if strings.Contains(tool, "create_pull_request") || strings.Contains(tool, "createpullrequest") {
+		return true
+	}
+	for _, key := range []string{"cmd", "command"} {
+		command, _ := msg.Input[key].(string)
+		fields := strings.Fields(command)
+		for i := 0; i+2 < len(fields); i++ {
+			if fields[i] == "gh" && fields[i+1] == "pr" && fields[i+2] == "create" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// pullRequestURLFromCreationResult reads only the result paired with a
+// positively identified creation call. A GitHub CLI creation returns the URL
+// directly; API tools return it in url or html_url JSON fields.
+func pullRequestURLFromCreationResult(raw string) (string, bool) {
+	if url := strings.TrimSpace(raw); strings.HasPrefix(url, "https://") && strings.Contains(url, "/pull/") && !strings.ContainsAny(url, " \t\r\n") {
+		return url, true
+	}
+	var payload struct {
+		URL     string `json:"url"`
+		HTMLURL string `json:"html_url"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(raw)), &payload); err != nil {
+		return "", false
+	}
+	url := strings.TrimSpace(payload.URL)
+	if url == "" {
+		url = strings.TrimSpace(payload.HTMLURL)
+	}
+	if !strings.HasPrefix(url, "https://") || !strings.Contains(url, "/pull/") {
+		return "", false
+	}
+	return url, true
 }
 
 // idleWatchdogReason formats the human-facing explanation surfaced on
@@ -7541,6 +7703,63 @@ func socketSafeTempBaseDir() string {
 		}
 	}
 	return os.TempDir()
+}
+
+func (d *Daemon) trackTaskTempDir(path string) {
+	d.taskTempDirsMu.Lock()
+	if d.taskTempDirs == nil {
+		d.taskTempDirs = make(map[string]struct{})
+	}
+	d.taskTempDirs[path] = struct{}{}
+	d.taskTempDirsMu.Unlock()
+}
+
+func (d *Daemon) untrackTaskTempDir(path string) {
+	d.taskTempDirsMu.Lock()
+	delete(d.taskTempDirs, path)
+	d.taskTempDirsMu.Unlock()
+}
+
+func (d *Daemon) sweepTaskTempDirs() {
+	d.taskTempDirsMu.Lock()
+	tracked := make(map[string]struct{}, len(d.taskTempDirs))
+	for path := range d.taskTempDirs {
+		tracked[path] = struct{}{}
+	}
+	d.taskTempDirsMu.Unlock()
+
+	removed, bytesFreed := sweepOrphanTaskTempDirs(socketSafeTempBaseDir(), d.cfg.TaskTempOrphanTTL, tracked, time.Now())
+	d.logger.Info("task temp orphan sweep complete", "removed", removed, "bytes_freed", bytesFreed, "ttl", d.cfg.TaskTempOrphanTTL)
+}
+
+func sweepOrphanTaskTempDirs(root string, ttl time.Duration, tracked map[string]struct{}, now time.Time) (int, int64) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return 0, 0
+	}
+
+	removed := 0
+	var bytesFreed int64
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "multica-task-") {
+			continue
+		}
+		path := filepath.Join(root, entry.Name())
+		if _, ok := tracked[path]; ok {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < ttl {
+			continue
+		}
+		size := dirSize(path)
+		if err := os.RemoveAll(path); err != nil {
+			continue
+		}
+		removed++
+		bytesFreed += size
+	}
+	return removed, bytesFreed
 }
 
 // isBlockedEnvKey returns true if the key must not be overridden by user-

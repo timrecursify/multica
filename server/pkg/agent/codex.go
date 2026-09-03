@@ -1027,6 +1027,13 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 		cancel()
 		return nil, fmt.Errorf("start codex: %w", err)
 	}
+	leasePath, err := writeCodexProcessLease(b.cfg.CodexLeaseDir, b.cfg, cmd.Process.Pid)
+	if err != nil {
+		signalProcessGroup(cmd.Process, syscall.SIGKILL)
+		_ = cmd.Wait()
+		cancel()
+		return nil, fmt.Errorf("record codex process lease: %w", err)
+	}
 	activeLaunches := activeCodexLaunches.Add(1)
 	for {
 		maxSeen := maxActiveCodexLaunchesObserved.Load()
@@ -1257,6 +1264,9 @@ func (b *codexBackend) executeOnce(ctx context.Context, prompt string, opts Exec
 			// On Unix, ProcessState.Exited reports false for a process terminated
 			// by SIGKILL even though Wait successfully reaped it.
 			cleanupConfirmed = waitReturned && cmd.ProcessState != nil && waitProcessGroupGone(cmd.Process, grace)
+			if cleanupConfirmed {
+				removeCodexProcessLease(leasePath)
+			}
 			if codexCleanupConfirmationOverride.Load() < 0 {
 				cleanupConfirmed = false
 			}
@@ -2955,6 +2965,19 @@ func (c *codexClient) handleEvent(msg map[string]any) {
 			}
 		}
 		changes := codexNormalizeLegacyChanges(msg["changes"])
+		// Legacy patch_apply_end events can claim completion without any
+		// evidence that the requested patch reached the filesystem. Do not
+		// present that shape as a successful tool result: callers otherwise
+		// have no way to distinguish it from a patch that was actually applied.
+		if codexNormalizePatchStatus(status) == "completed" && len(changes) > 0 && strings.TrimSpace(stdout) == "" {
+			status = "failed"
+			const diagnostic = "patch_apply reported completion without application evidence"
+			if strings.TrimSpace(stderr) == "" {
+				stderr = diagnostic
+			} else {
+				stderr += "\n" + diagnostic
+			}
+		}
 		if c.onMessage != nil {
 			c.onMessage(Message{
 				Type:   MessageToolResult,

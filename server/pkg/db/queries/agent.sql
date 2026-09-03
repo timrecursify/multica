@@ -286,13 +286,13 @@ ORDER BY created_at DESC;
 -- parsing (parseQuickCreateContext short-circuits on IssueID.Valid), so this
 -- key rides harmlessly alongside.
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id, trigger_evidence_kind, trigger_evidence_ref_id
 )
 VALUES (
-    $1, $2, $3, 'queued', $4, sqlc.narg(trigger_comment_id),
+    $1, $2, $3, $4, 'queued', $5, sqlc.narg(trigger_comment_id),
     COALESCE(sqlc.narg(coalesced_comment_ids)::uuid[], '{}'),
     sqlc.narg(trigger_summary),
     COALESCE(sqlc.narg('force_fresh_session')::boolean, FALSE),
@@ -301,7 +301,11 @@ VALUES (
     sqlc.narg(squad_id),
     CASE
         WHEN COALESCE(sqlc.narg('head_sha')::text, '') <> ''
-        THEN jsonb_build_object('head_sha', sqlc.narg('head_sha')::text)
+          OR COALESCE(sqlc.narg('to_stage')::text, '') <> ''
+        THEN jsonb_strip_nulls(jsonb_build_object(
+            'head_sha', NULLIF(sqlc.narg('head_sha')::text, ''),
+            'to_stage', NULLIF(sqlc.narg('to_stage')::text, '')
+        ))
         ELSE NULL
     END,
     sqlc.narg(originator_user_id),
@@ -1748,7 +1752,7 @@ JOIN issue i ON
   i.assignee_type = 'agent'
   AND i.assignee_id = a.id
   AND i.workspace_id = a.workspace_id
-  AND lower(i.status) = 'in_progress'
+  AND i.status = 'In Progress'
 WHERE a.workspace_id = $1
   AND a.kind = 'user'
   AND a.archived_at IS NULL
@@ -1860,7 +1864,9 @@ SELECT
   relay_stage_config.stage_name,
   COUNT(issue.id)::int AS ticket_count
 FROM relay_stage_config
-LEFT JOIN issue ON issue.status = relay_stage_config.stage_name
+LEFT JOIN issue ON issue.workspace_id = relay_stage_config.workspace_id
+  AND issue.status = relay_stage_config.stage_name
+WHERE relay_stage_config.workspace_id = $1
 GROUP BY relay_stage_config.id, relay_stage_config.stage_name
 ORDER BY relay_stage_config.id;
 
@@ -1948,3 +1954,34 @@ WHERE agent_id = $1
   AND status = 'failed'
   AND failure_reason = 'agent_error.provider_capacity_or_rate_limit'
   AND completed_at >= $2;
+
+-- name: ListRelayStageConfig :many
+-- The full relay stage configuration in canonical id order. Backs the
+-- operator read surface (GSP-806): every configured source stage plus its
+-- primary successor and any alternate successors.
+SELECT * FROM relay_stage_config
+ORDER BY id ASC;
+
+-- name: GetRelayStageConfig :one
+-- One exact relay stage by name. Returns a single row or sql.ErrNoRows so an
+-- operator can never mutate a stage that is not configured.
+SELECT * FROM relay_stage_config
+WHERE stage_name = $1;
+
+-- name: SetRelayStageOwner :one
+-- Atomically set (or clear) the relay stage owner for ONE exact transition.
+-- The stage is looked up by source stage_name; agent_id/agent_name are caller
+-- validated. Returns the updated row so the caller echoes the effect.
+UPDATE relay_stage_config
+SET agent_id = $2,
+    agent_name = $3
+WHERE stage_name = $1
+RETURNING *;
+
+-- name: GetAgentInWorkspaceByName :one
+-- Resolve one user agent by its exact (case-sensitive) name inside a
+-- workspace. Backs the operator roster resolve-by-name path (GSP-806):
+-- agent names are unique per (workspace_id, name).
+SELECT * FROM agent
+WHERE workspace_id = $1 AND name = $2 AND kind = 'user'
+LIMIT 1;

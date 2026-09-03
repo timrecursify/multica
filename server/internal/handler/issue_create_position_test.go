@@ -31,7 +31,7 @@ func TestCreateIssuePositionTopOfColumn(t *testing.T) {
 		w := httptest.NewRecorder()
 		req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 			"title":    title,
-			"status":   "todo",
+			"status":   "Queue",
 			"priority": "low",
 		})
 		testHandler.CreateIssue(w, req)
@@ -71,7 +71,7 @@ func TestCreateIssuePositionBelowExplicitMinimum(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":    "position-seed issue",
-		"status":   "todo",
+		"status":   "Queue",
 		"priority": "low",
 	})
 	testHandler.CreateIssue(w, req)
@@ -96,7 +96,7 @@ func TestCreateIssuePositionBelowExplicitMinimum(t *testing.T) {
 	w2 := httptest.NewRecorder()
 	req2 := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":    "position-new issue",
-		"status":   "todo",
+		"status":   "Queue",
 		"priority": "low",
 	})
 	testHandler.CreateIssue(w2, req2)
@@ -126,7 +126,7 @@ func TestAutopilotCreateIssuePositionBelowCurrentMinimum(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":    seedTitle,
-		"status":   "todo",
+		"status":   "Spec",
 		"priority": "low",
 	})
 	testHandler.CreateIssue(w, req)
@@ -147,7 +147,7 @@ func TestAutopilotCreateIssuePositionBelowCurrentMinimum(t *testing.T) {
 
 	var minBefore float64
 	if err := testPool.QueryRow(ctx,
-		`SELECT MIN(position) FROM issue WHERE workspace_id = $1 AND status = 'todo'`,
+		`SELECT MIN(position) FROM issue WHERE workspace_id = $1 AND status = 'Spec'`,
 		testWorkspaceID,
 	).Scan(&minBefore); err != nil {
 		t.Fatalf("load min position: %v", err)

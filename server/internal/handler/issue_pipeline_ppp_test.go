@@ -33,18 +33,7 @@ func withPPPStatusContract(t *testing.T, fn func()) {
 		t.Fatalf("build ppp contract: %v", err)
 	}
 	testHandler.IssueStatusContract = ppp
-	ctx := context.Background()
-	// The normal handler test schema intentionally remains at the legacy
-	// baseline. Model migration 282's resulting storage constraint here so the
-	// HTTP tests prove a canonical response can be persisted and written back.
-	if _, err := testPool.Exec(ctx, `ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check; ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived'))`); err != nil {
-		t.Fatalf("install canonical issue status constraint: %v", err)
-	}
 	defer func() {
-		_, err := testPool.Exec(ctx, `ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check; ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN ('backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled'))`)
-		if err != nil {
-			t.Errorf("restore legacy issue status constraint: %v", err)
-		}
 		testHandler.IssueStatusContract = orig
 	}()
 	fn()

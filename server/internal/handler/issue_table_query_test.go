@@ -337,7 +337,7 @@ func TestIssueTableWorkingIssueProjectionMatchesTaskIssuesNotAssignees(t *testin
 	)
 	if _, err := testPool.Exec(ctx, `
 		UPDATE issue
-		SET status = 'in_progress',
+		SET status = 'In Progress',
 		    assignee_type = 'agent', assignee_id = $2::uuid
 		WHERE id = ANY($1::uuid[])
 	`, []string{assignedOnlyIssueID, editedIssueID, otherAgentIssueID}, workingAgentID); err != nil {
@@ -423,7 +423,7 @@ func TestIssueTableWorkingIssueProjectionMatchesTaskIssuesNotAssignees(t *testin
 }
 
 func TestIssueTableCursorRejectsAnotherQuery(t *testing.T) {
-	groupKey := "status:todo"
+	groupKey := "status:Spec"
 	cursor := issueTableCursor{
 		Version:          1,
 		QueryFingerprint: "sha256:old",
@@ -482,7 +482,7 @@ func TestIssueTableCompoundCellKeyResolvesPrimaryAndStatus(t *testing.T) {
 	compound := resolvedIssueTableGroup{kind: "compound", primary: &primary, statusContract: linearTestContract}
 	key := compoundCellGroupKey(
 		"parent:00000000-0000-4000-8000-000000000001",
-		"todo",
+		"Spec",
 	)
 	args := make([]any, 0, 2)
 	predicate, ok := compound.predicate(
@@ -498,7 +498,7 @@ func TestIssueTableCompoundCellKeyResolvesPrimaryAndStatus(t *testing.T) {
 	}
 	if !strings.Contains(predicate, "i.parent_issue_id = $1::uuid") ||
 		!strings.Contains(predicate, "i.status = $2::text") ||
-		len(args) != 2 || args[1] != "todo" {
+		len(args) != 2 || args[1] != "Spec" {
 		t.Fatalf("compound cell predicate lost a dimension: %s args=%#v", predicate, args)
 	}
 }
@@ -656,7 +656,7 @@ func TestIssueTableStatusGroupingOverOneThousandRows(t *testing.T) {
 	for _, group := range groups.Groups {
 		counts[group.Key] = group.Count
 	}
-	if counts["status:todo"] != 501 || counts["status:done"] != 500 {
+	if counts["status:Spec"] != 501 || counts["status:Done"] != 500 {
 		t.Fatalf("unexpected group counts: %#v", counts)
 	}
 	firstGroupPageRecorder := httptest.NewRecorder()
@@ -692,7 +692,7 @@ func TestIssueTableStatusGroupingOverOneThousandRows(t *testing.T) {
 		t.Fatalf("group keyset pagination mismatch: first=%#v second=%#v", firstGroupPage, secondGroupPage)
 	}
 
-	groupKey := "status:todo"
+	groupKey := "status:Spec"
 	labelCalls := 0
 	tableQueryCalls := 0
 	rowsHandler := *testHandler
@@ -841,7 +841,7 @@ func TestIssueTableStatusGroupingOverOneThousandRows(t *testing.T) {
 	}
 
 	filteredQuery := query
-	filteredQuery.Filters.Statuses = []string{"todo"}
+	filteredQuery.Filters.Statuses = []string{"Spec"}
 	facetsRecorder := httptest.NewRecorder()
 	testHandler.ListIssueTableFacets(facetsRecorder, newRequest("POST", "/api/issues/table/facets", issueTableFacetsRequest{
 		Query:  filteredQuery,
@@ -861,7 +861,7 @@ func TestIssueTableStatusGroupingOverOneThousandRows(t *testing.T) {
 	for _, value := range facets.Facets[0].Values {
 		facetCounts[value.Key] = value.Count
 	}
-	if facetCounts["todo"] != 501 || facetCounts["done"] != 500 {
+	if facetCounts["Spec"] != 501 || facetCounts["Done"] != 500 {
 		t.Fatalf("status facet must ignore its own active filter: %#v", facetCounts)
 	}
 
@@ -932,7 +932,7 @@ func TestIssueTableStatusGroupingOverOneThousandRows(t *testing.T) {
 		}
 		batchCounts[facet.Kind] = counts
 	}
-	if batchCounts["status"]["todo"] != 501 || batchCounts["status"]["done"] != 500 ||
+	if batchCounts["status"]["Spec"] != 501 || batchCounts["status"]["Done"] != 500 ||
 		batchCounts["priority"]["none"] != 1001 ||
 		batchCounts["assignee"]["__none__"] != 1001 ||
 		batchCounts["creator"]["member:"+testUserID] != 1001 ||
@@ -964,7 +964,7 @@ func TestIssueTableStatusGroupingOverOneThousandRows(t *testing.T) {
 		}
 		mixedCounts[facet.Kind] = counts
 	}
-	if mixedCounts["status"]["todo"] != 501 || mixedCounts["status"]["done"] != 500 ||
+	if mixedCounts["status"]["Spec"] != 501 || mixedCounts["status"]["Done"] != 500 ||
 		mixedCounts["priority"]["none"] != 501 {
 		t.Fatalf("mixed facets lost disjunctive semantics: %#v", mixedCounts)
 	}
@@ -1183,7 +1183,7 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 		Kind:            "compound",
 		Primary:         "parent",
 		Secondary:       "status",
-		SecondaryValues: []string{"todo"},
+		SecondaryValues: []string{"Spec"},
 	}
 	filteredRecorder := httptest.NewRecorder()
 	testHandler.ListIssueTableGroups(filteredRecorder, newRequest("POST", "/api/issues/table/groups", issueTableGroupsRequest{
@@ -1249,6 +1249,8 @@ func TestIssueTableCompoundParentGroupsReturnExactStatusCells(t *testing.T) {
 		}
 		return result
 	}
+	// The Linear-profile handler renders canonical Spec as the legacy `todo`
+	// response spelling, while request filters remain canonical.
 	noParentTodo := listCell(cellKey(filteredNoParent, "todo"))
 	if len(noParentTodo.Rows) != 2 {
 		t.Fatalf("unexpected visible no-parent rows: %#v", noParentTodo.Rows)
@@ -1347,11 +1349,11 @@ func TestIssueTableHierarchyDoesNotCrossGroups(t *testing.T) {
 		return response
 	}
 
-	doneRows := listGroup("status:done")
+	doneRows := listGroup("status:Done")
 	if len(doneRows.Rows) != 1 || doneRows.Rows[0].Issue.ID != childID {
 		t.Fatalf("done child must become a root in its own group: %#v", doneRows.Rows)
 	}
-	todoRows := listGroup("status:todo")
+	todoRows := listGroup("status:Spec")
 	if len(todoRows.Rows) != 1 || todoRows.Rows[0].Issue.ID != parentID {
 		t.Fatalf("todo group root mismatch: %#v", todoRows.Rows)
 	}

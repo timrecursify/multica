@@ -1,0 +1,16 @@
+docker/entrypoint.sh
+scripts/check.sh
+scripts/dev-compose-isolation.test.sh
+scripts/dev.sh
+scripts/ensure-postgres.sh
+scripts/go-test-with-agent-cli-guard.sh
+scripts/helm-config.test.sh
+scripts/init-worktree-env.sh
+scripts/install.sh
+scripts/install.test.sh
+scripts/local-env.sh
+scripts/selfhost-compose.sh
+scripts/selfhost-config.test.sh
+scripts/selfhost-wait.sh
+scripts/test-go.sh
+scripts/test-go.test.sh

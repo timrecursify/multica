@@ -37,6 +37,7 @@ func TestCreateIssueAssignedToSquadEnqueuesLeader(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":         "Squad-assigned at creation",
+		"status":        "Queue",
 		"assignee_type": "squad",
 		"assignee_id":   squadID,
 	})

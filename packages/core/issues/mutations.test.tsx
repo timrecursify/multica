@@ -39,7 +39,7 @@ function makeIssue(idx: number, overrides: Partial<Issue> = {}): Issue {
     identifier: `MUL-${idx}`,
     title: `Issue ${idx}`,
     description: null,
-    status: "todo",
+    status: "Queue",
     priority: "none",
     assignee_type: null,
     assignee_id: null,
@@ -77,7 +77,7 @@ function makeInboxItem(
     issue_id: issueId,
     title: `Inbox ${id}`,
     body: null,
-    issue_status: "todo",
+    issue_status: "Queue",
     read: false,
     archived: false,
     created_at: "2025-01-01T00:00:00Z",
@@ -112,15 +112,15 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
   function makeBucketed(): ListIssuesCache {
     return {
       byStatus: {
-        todo: { issues: [makeIssue(1)], total: 1 },
-        in_progress: { issues: [], total: 0 },
+        "Queue": { issues: [makeIssue(1)], total: 1 },
+        "In Progress": { issues: [], total: 0 },
       },
     };
   }
 
   function bucketIds(
     key: readonly unknown[],
-    status: "todo" | "in_progress",
+    status: "Queue" | "In Progress",
   ): string[] {
     const c = qc.getQueryData<ListIssuesCache>(key);
     return (c?.byStatus[status]?.issues ?? []).map((i) => i.id);
@@ -164,22 +164,22 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
     });
 
     act(() => {
-      result.current.mutate({ id: "issue-1", status: "in_progress", position: 5 });
+      result.current.mutate({ id: "issue-1", status: "In Progress", position: 5 });
     });
 
     // Optimistic state — the regression: myList must move too, not just ws.
     for (const key of [wsKey, myKey, projectKey]) {
-      expect(bucketIds(key, "todo")).toEqual([]);
-      expect(bucketIds(key, "in_progress")).toEqual(["issue-1"]);
+      expect(bucketIds(key, "Queue")).toEqual([]);
+      expect(bucketIds(key, "In Progress")).toEqual(["issue-1"]);
     }
 
     await act(async () => {
-      resolve(makeIssue(1, { status: "in_progress", position: 5 }));
+      resolve(makeIssue(1, { status: "In Progress", position: 5 }));
     });
 
     // Authoritative settle keeps the card in place in both caches.
     for (const key of [wsKey, myKey, projectKey]) {
-      expect(bucketIds(key, "in_progress")).toEqual(["issue-1"]);
+      expect(bucketIds(key, "In Progress")).toEqual(["issue-1"]);
     }
   });
 
@@ -222,7 +222,7 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
 
   it("uses server move intent while keeping provisional position optimistic-only", async () => {
     moveIssue.mockResolvedValue(
-      makeIssue(1, { status: "in_progress", position: 15 }),
+      makeIssue(1, { status: "In Progress", position: 15 }),
     );
     const { result } = renderHook(() => useUpdateIssue(), {
       wrapper: createWrapper(qc),
@@ -231,7 +231,7 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
     await act(async () => {
       await result.current.mutateAsync({
         id: "issue-1",
-        status: "in_progress",
+        status: "In Progress",
         position: 12,
         move_intent: {
           before_id: "issue-0",
@@ -241,7 +241,7 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
     });
 
     expect(moveIssue).toHaveBeenCalledWith("issue-1", {
-      status: "in_progress",
+      status: "In Progress",
       before_id: "issue-0",
       after_id: "issue-2",
     });
@@ -249,7 +249,7 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
     expect(
       qc
         .getQueryData<ListIssuesCache>(wsKey)
-        ?.byStatus.in_progress?.issues[0]?.position,
+        ?.byStatus["In Progress"]?.issues[0]?.position,
     ).toBe(15);
   });
 
@@ -266,18 +266,18 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
     });
 
     act(() => {
-      result.current.mutate({ id: "issue-1", status: "in_progress" });
+      result.current.mutate({ id: "issue-1", status: "In Progress" });
     });
 
-    expect(inboxStatus("issue-1")).toBe("in_progress");
-    expect(inboxStatus("issue-2")).toBe("todo");
+    expect(inboxStatus("issue-1")).toBe("In Progress");
+    expect(inboxStatus("issue-2")).toBe("Queue");
 
     await act(async () => {
-      resolve(makeIssue(1, { status: "done" }));
+      resolve(makeIssue(1, { status: "Done" }));
     });
 
-    expect(inboxStatus("issue-1")).toBe("done");
-    expect(inboxStatus("issue-2")).toBe("todo");
+    expect(inboxStatus("issue-1")).toBe("Done");
+    expect(inboxStatus("issue-2")).toBe("Queue");
   });
 
   it("rolls both caches back when the request fails", async () => {
@@ -289,13 +289,13 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
 
     await act(async () => {
       await result.current
-        .mutateAsync({ id: "issue-1", status: "in_progress", position: 5 })
+        .mutateAsync({ id: "issue-1", status: "In Progress", position: 5 })
         .catch(() => {});
     });
 
     for (const key of [wsKey, myKey, projectKey]) {
-      expect(bucketIds(key, "todo")).toEqual(["issue-1"]);
-      expect(bucketIds(key, "in_progress")).toEqual([]);
+      expect(bucketIds(key, "Queue")).toEqual(["issue-1"]);
+      expect(bucketIds(key, "In Progress")).toEqual([]);
     }
   });
 
@@ -308,16 +308,16 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
 
     await act(async () => {
       await result.current
-        .mutateAsync({ id: "issue-1", status: "in_progress" })
+        .mutateAsync({ id: "issue-1", status: "In Progress" })
         .catch(() => {});
     });
 
-    expect(inboxStatus("issue-1")).toBe("todo");
-    expect(inboxStatus("issue-2")).toBe("todo");
+    expect(inboxStatus("issue-1")).toBe("Queue");
+    expect(inboxStatus("issue-2")).toBe("Queue");
   });
 
   it("does not invalidate the board list on settle (no refetch flicker)", async () => {
-    updateIssue.mockResolvedValue(makeIssue(1, { status: "in_progress", position: 5 }));
+    updateIssue.mockResolvedValue(makeIssue(1, { status: "In Progress", position: 5 }));
     const invalidateSpy = vi.spyOn(qc, "invalidateQueries");
 
     const { result } = renderHook(() => useUpdateIssue(), {
@@ -325,7 +325,7 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
     });
 
     await act(async () => {
-      await result.current.mutateAsync({ id: "issue-1", status: "in_progress", position: 5 });
+      await result.current.mutateAsync({ id: "issue-1", status: "In Progress", position: 5 });
     });
 
     const invalidatedKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
@@ -358,15 +358,15 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
 
     // Optimistic: gone from the old project's list immediately; the
     // workspace board and the assignee-filtered list keep the card.
-    expect(bucketIds(projectKey, "todo")).toEqual([]);
-    expect(bucketIds(wsKey, "todo")).toEqual(["issue-1"]);
-    expect(bucketIds(myKey, "todo")).toEqual(["issue-1"]);
+    expect(bucketIds(projectKey, "Queue")).toEqual([]);
+    expect(bucketIds(wsKey, "Queue")).toEqual(["issue-1"]);
+    expect(bucketIds(myKey, "Queue")).toEqual(["issue-1"]);
 
     await act(async () => {
       resolve(makeIssue(1, { project_id: "project-9" }));
     });
 
-    expect(bucketIds(projectKey, "todo")).toEqual([]);
+    expect(bucketIds(projectKey, "Queue")).toEqual([]);
     const invalidatedKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
     expect(invalidatedKeys).not.toContainEqual(issueKeys.myAll(WS_ID));
   });
@@ -384,7 +384,7 @@ describe("useUpdateIssue — optimistic move keeps every bucketed board in sync"
         .catch(() => {});
     });
 
-    expect(bucketIds(projectKey, "todo")).toEqual(["issue-1"]);
+    expect(bucketIds(projectKey, "Queue")).toEqual(["issue-1"]);
   });
 });
 
@@ -463,7 +463,7 @@ describe("useUpdateIssue — detaching a sub-issue prunes the old parent's child
 
   it("keeps the issue under its parent for a non-reparenting update", async () => {
     updateIssue.mockResolvedValue(
-      makeIssue(1, { parent_issue_id: PARENT_ID, status: "done" }),
+      makeIssue(1, { parent_issue_id: PARENT_ID, status: "Done" }),
     );
 
     const { result } = renderHook(() => useUpdateIssue(), {
@@ -471,7 +471,7 @@ describe("useUpdateIssue — detaching a sub-issue prunes the old parent's child
     });
 
     act(() => {
-      result.current.mutate({ id: "issue-1", status: "done" });
+      result.current.mutate({ id: "issue-1", status: "Done" });
     });
 
     // A status-only change patches in place — never prunes the relationship.
@@ -494,13 +494,13 @@ describe("useBatchUpdateIssues — optimistic patch covers filtered boards too",
   function makeBucketed(): ListIssuesCache {
     return {
       byStatus: {
-        todo: { issues: [makeIssue(1)], total: 1 },
-        in_progress: { issues: [], total: 0 },
+        "Queue": { issues: [makeIssue(1)], total: 1 },
+        "In Progress": { issues: [], total: 0 },
       },
     };
   }
 
-  function bucketIds(key: readonly unknown[], status: "todo" | "in_progress"): string[] {
+  function bucketIds(key: readonly unknown[], status: "Queue" | "In Progress"): string[] {
     const c = qc.getQueryData<ListIssuesCache>(key);
     return (c?.byStatus[status]?.issues ?? []).map((i) => i.id);
   }
@@ -531,7 +531,7 @@ describe("useBatchUpdateIssues — optimistic patch covers filtered boards too",
     });
 
     act(() => {
-      result.current.mutate({ ids: ["issue-1"], updates: { status: "in_progress" } });
+      result.current.mutate({ ids: ["issue-1"], updates: { status: "In Progress" } });
     });
 
     // The regression Howard flagged: batch must move the card on the myList
@@ -539,8 +539,8 @@ describe("useBatchUpdateIssues — optimistic patch covers filtered boards too",
     // so the optimistic patch lands a microtask later — wait for it.
     await waitFor(() => {
       for (const key of [wsKey, myKey]) {
-        expect(bucketIds(key, "todo")).toEqual([]);
-        expect(bucketIds(key, "in_progress")).toEqual(["issue-1"]);
+        expect(bucketIds(key, "Queue")).toEqual([]);
+        expect(bucketIds(key, "In Progress")).toEqual(["issue-1"]);
       }
     });
 
@@ -549,7 +549,7 @@ describe("useBatchUpdateIssues — optimistic patch covers filtered boards too",
     });
 
     for (const key of [wsKey, myKey]) {
-      expect(bucketIds(key, "in_progress")).toEqual(["issue-1"]);
+      expect(bucketIds(key, "In Progress")).toEqual(["issue-1"]);
     }
   });
 
@@ -604,13 +604,13 @@ describe("useBatchUpdateIssues — optimistic patch covers filtered boards too",
 
     await act(async () => {
       await result.current
-        .mutateAsync({ ids: ["issue-1"], updates: { status: "in_progress" } })
+        .mutateAsync({ ids: ["issue-1"], updates: { status: "In Progress" } })
         .catch(() => {});
     });
 
     for (const key of [wsKey, myKey]) {
-      expect(bucketIds(key, "todo")).toEqual(["issue-1"]);
-      expect(bucketIds(key, "in_progress")).toEqual([]);
+      expect(bucketIds(key, "Queue")).toEqual(["issue-1"]);
+      expect(bucketIds(key, "In Progress")).toEqual([]);
     }
   });
 
@@ -623,7 +623,7 @@ describe("useBatchUpdateIssues — optimistic patch covers filtered boards too",
     });
 
     await act(async () => {
-      await result.current.mutateAsync({ ids: ["issue-1"], updates: { status: "in_progress" } });
+      await result.current.mutateAsync({ ids: ["issue-1"], updates: { status: "In Progress" } });
     });
 
     const invalidatedKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
@@ -652,9 +652,9 @@ describe("useBatchUpdateIssues — optimistic patch covers filtered boards too",
       });
     });
 
-    expect(bucketIds(projectKey, "todo")).toEqual([]);
+    expect(bucketIds(projectKey, "Queue")).toEqual([]);
     // The assignee-filtered list is untouched by a project move.
-    expect(bucketIds(myKey, "todo")).toEqual(["issue-1"]);
+    expect(bucketIds(myKey, "Queue")).toEqual(["issue-1"]);
     const invalidatedKeys = invalidateSpy.mock.calls.map((c) => c[0]?.queryKey);
     expect(invalidatedKeys).not.toContainEqual(issueKeys.myAll(WS_ID));
   });
