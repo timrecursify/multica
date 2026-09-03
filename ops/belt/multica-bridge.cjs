@@ -86,7 +86,7 @@ const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
 const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived", "Rejected"]);
-const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review", "Parked"]);
+const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review", "Parked", "CI/CD & Deploy"]);
 
 function isTerminalStage(stage) {
   return TERMINAL_STAGES.has(stage);

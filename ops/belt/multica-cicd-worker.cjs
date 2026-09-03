@@ -25,6 +25,7 @@ function initializeRuntime() {
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
 const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
+const SWEEP_LIMIT = Math.max(1, parseInt(process.env.CICD_SWEEP_LIMIT || '25', 10));
 // Retroactive CI (Tim 2026-09-02 16:16Z: admin merge + admin deploy with
 // retroactive CI/CD for speed; risk paths still wait). Repos listed here merge
 // a mergeable PR while its CI is still pending unless the diff touches a risk
@@ -424,11 +425,69 @@ async function sweep() {
   }
 }
 
+// Recover already-merged work stranded before the deploy stage. This is a
+// bounded, deterministic pass; the relay remains the authority for the
+// transition and performs its own locking/idempotency checks.
+async function sweepMergedBacklog() {
+  const { rows } = await pool.query(
+    `SELECT id, number, status, workspace_id FROM issue
+     WHERE status IN ('Spec', 'Queue', 'In Progress')
+     ORDER BY number LIMIT $1`, [SWEEP_LIMIT]);
+  for (const issue of rows) {
+    try {
+      const comments = await pool.query(
+        `SELECT content FROM comment WHERE issue_id=$1 ORDER BY created_at DESC LIMIT 40`, [issue.id]);
+      const candidates = [];
+      const seen = new Set();
+      let bare = false;
+      for (const row of comments.rows) {
+        const content = row.content || '';
+        bare ||= hasBarePRReference(content);
+        for (const pr of findAllPRs(content)) {
+          const key = `${pr.repo}#${pr.num}`;
+          if (!seen.has(key)) { seen.add(key); candidates.push(pr); }
+        }
+      }
+      if (!candidates.length) {
+        log(`MERGED-BACKLOG skip #${issue.number} reason=${bare ? 'bare_pr_reference' : 'no_pr_reference'}`);
+        continue;
+      }
+      const states = candidates.map(pr => ({
+        pr,
+        info: JSON.parse(gh(['pr', 'view', String(pr.num), '-R', pr.repo,
+          '--json', 'state,mergedAt,mergeCommit']))
+      }));
+      const merged = states.filter(s => s.info.state === 'MERGED' && s.info.mergedAt &&
+        /^[0-9a-f]{40}$/i.test(s.info.mergeCommit?.oid || ''))
+        .sort((a, b) => String(b.info.mergedAt).localeCompare(String(a.info.mergedAt)));
+      const open = states.filter(s => s.info.state !== 'MERGED');
+      if (!merged.length || open.length) {
+        const reason = open.length ? (open.length > 1 ? 'multiple_or_open_prs' : 'open_pr') : 'not_merged_or_missing_sha';
+        log(`MERGED-BACKLOG skip #${issue.number} reason=${reason}`);
+        continue;
+      }
+      const selected = merged[0];
+      const evidence = {
+        repository: selected.pr.repo, pullRequest: Number(selected.pr.num),
+        mergeSha: selected.info.mergeCommit.oid, mergedAt: selected.info.mergedAt,
+        sourceStage: issue.status
+      };
+      await relay(issue.id, 'CI/CD & Deploy', null,
+        `MERGED-PR-EVIDENCE: ${selected.pr.repo}#${selected.pr.num} ${selected.info.mergeCommit.oid}`,
+        null, evidence);
+      log(`MERGED-BACKLOG advanced #${issue.number} ${selected.pr.repo}#${selected.pr.num}`);
+    } catch (e) {
+      log(`MERGED-BACKLOG skip #${issue.number} reason=provider_failure:${String(e.message).split('\n')[0].slice(0, 120)}`);
+    }
+  }
+}
+
 async function main() {
   initializeRuntime();
   log(`[cicd-worker] started; poll=${POLL_MS}ms merge=${MERGE_ENABLED}`);
   for (;;) {
     await sweep().catch(e => log('[sweep] error:', e.message));
+    await sweepMergedBacklog().catch(e => log('[merged-backlog] error:', e.message));
     await new Promise(r => setTimeout(r, POLL_MS));
   }
 }
@@ -444,4 +503,4 @@ function setTestDependencies(dependencies) {
 }
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
-  routeFinishedPR, receiptFor, mergeDeployEvidence, setTestDependencies, sweep };
+  routeFinishedPR, receiptFor, mergeDeployEvidence, setTestDependencies, sweep, sweepMergedBacklog };

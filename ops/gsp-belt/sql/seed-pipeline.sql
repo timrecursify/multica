@@ -45,60 +45,70 @@ INSERT INTO public.relay_stage_config (
   stage_name,
   next_stage,
   agent_id,
-  agent_name
+  agent_name,
+  alt_next_stages
 )
 VALUES
   (
     'Registered',
     'Spec',
     '240cceba-1bc0-44b5-b7fd-c85a1492c33b',
-    'Codex Luna'
+    'Codex Luna',
+    NULL
   ),
   (
     'Spec',
     'Queue',
     '3d0561a4-dfbd-47cc-ae80-38557a5c746d',
-    'Codex Terra'
+    'Codex Terra',
+    ARRAY['CI/CD & Deploy']
   ),
   (
     'Queue',
     'In Progress',
     '3d0561a4-dfbd-47cc-ae80-38557a5c746d',
-    'Codex Terra'
+    'Codex Terra',
+    ARRAY['CI/CD & Deploy']
   ),
   (
     'In Progress',
     'In Review',
     '3d0561a4-dfbd-47cc-ae80-38557a5c746d',
-    'Codex Terra'
+    'Codex Terra',
+    ARRAY['CI/CD & Deploy']
   ),
   (
     'In Review',
     'Human Review',
     'a9f7b355-66fb-4c3d-97c8-a95fd0362591',
-    'Codex Sol'
+    'Codex Sol',
+    NULL
   ),
   (
     'Human Review',
     'CI/CD & Deploy',
     'a9f7b355-66fb-4c3d-97c8-a95fd0362591',
-    'Codex Sol'
+    'Codex Sol',
+    NULL
   ),
   (
     'CI/CD & Deploy',
     'Done',
     'a9f7b355-66fb-4c3d-97c8-a95fd0362591',
-    'Codex Sol'
+    'Codex Sol',
+    NULL
   ),
   (
     'Done',
     NULL,
     NULL,
-    'Terminal stage'
+    'Terminal stage',
+    NULL
   )
 ON CONFLICT (stage_name) DO UPDATE
 SET next_stage = EXCLUDED.next_stage,
     agent_id = EXCLUDED.agent_id,
-    agent_name = EXCLUDED.agent_name;
+    agent_name = EXCLUDED.agent_name,
+    alt_next_stages = EXCLUDED.alt_next_stages;
 
 COMMIT;
