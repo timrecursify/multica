@@ -3504,6 +3504,54 @@ func (q *Queries) GetAgentInWorkspace(ctx context.Context, arg GetAgentInWorkspa
 	return i, err
 }
 
+const getAgentInWorkspaceByName = `-- name: GetAgentInWorkspaceByName :one
+SELECT id, workspace_id, name, avatar_url, runtime_mode, runtime_config, visibility, status, max_concurrent_tasks, owner_id, created_at, updated_at, description, runtime_id, instructions, archived_at, archived_by, custom_env, custom_args, mcp_config, model, thinking_level, composio_toolkit_allowlist, permission_mode, kind, system_key, disabled_runtime_skills, service_tier FROM agent
+WHERE workspace_id = $1 AND name = $2 AND kind = 'user'
+LIMIT 1
+`
+
+type GetAgentInWorkspaceByNameParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	Name        string      `json:"name"`
+}
+
+// Resolve one user agent by its exact name inside a workspace.
+func (q *Queries) GetAgentInWorkspaceByName(ctx context.Context, arg GetAgentInWorkspaceByNameParams) (Agent, error) {
+	row := q.db.QueryRow(ctx, getAgentInWorkspaceByName, arg.WorkspaceID, arg.Name)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.RuntimeMode,
+		&i.RuntimeConfig,
+		&i.Visibility,
+		&i.Status,
+		&i.MaxConcurrentTasks,
+		&i.OwnerID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Description,
+		&i.RuntimeID,
+		&i.Instructions,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
+		&i.CustomEnv,
+		&i.CustomArgs,
+		&i.McpConfig,
+		&i.Model,
+		&i.ThinkingLevel,
+		&i.ComposioToolkitAllowlist,
+		&i.PermissionMode,
+		&i.Kind,
+		&i.SystemKey,
+		&i.DisabledRuntimeSkills,
+		&i.ServiceTier,
+	)
+	return i, err
+}
+
 const getAgentRecentRateLimitFailures = `-- name: GetAgentRecentRateLimitFailures :one
 SELECT
     count(*)::int AS failure_count,
@@ -5516,7 +5564,9 @@ SELECT
   relay_stage_config.stage_name,
   COUNT(issue.id)::int AS ticket_count
 FROM relay_stage_config
-LEFT JOIN issue ON issue.status = relay_stage_config.stage_name
+LEFT JOIN issue ON issue.workspace_id = relay_stage_config.workspace_id
+  AND issue.status = relay_stage_config.stage_name
+WHERE relay_stage_config.workspace_id = $1
 GROUP BY relay_stage_config.id, relay_stage_config.stage_name
 ORDER BY relay_stage_config.id
 `
@@ -5528,8 +5578,8 @@ type ListWorkspaceStageCountsRow struct {
 
 // Current ticket totals by configured relay stage. Configured stages with no
 // tickets are retained as zero rows.
-func (q *Queries) ListWorkspaceStageCounts(ctx context.Context) ([]ListWorkspaceStageCountsRow, error) {
-	rows, err := q.db.Query(ctx, listWorkspaceStageCounts)
+func (q *Queries) ListWorkspaceStageCounts(ctx context.Context, workspaceID pgtype.UUID) ([]ListWorkspaceStageCountsRow, error) {
+	rows, err := q.db.Query(ctx, listWorkspaceStageCounts, workspaceID)
 	if err != nil {
 		return nil, err
 	}
@@ -5563,7 +5613,7 @@ JOIN issue i ON
   i.assignee_type = 'agent'
   AND i.assignee_id = a.id
   AND i.workspace_id = a.workspace_id
-  AND lower(i.status) = 'in_progress'
+  AND i.status = 'In Progress'
 WHERE a.workspace_id = $1
   AND a.kind = 'user'
   AND a.archived_at IS NULL
