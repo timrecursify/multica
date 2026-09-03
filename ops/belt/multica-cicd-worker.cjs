@@ -393,6 +393,14 @@ async function sweep() {
         gh(['pr', 'merge', String(pr.num), '-R', pr.repo, '--squash', '--admin', '--delete-branch']);
         log(`MERGED #${issue.number} ${pr.repo}#${pr.num} squash by belt operator`);
       } catch (e) {
+        // GitHub reports mergeable=null for every open PR right after a base
+        // move and recomputes lazily; a PR read as UNKNOWN can still be dirty,
+        // and the merge call then answers 405 "merge conflicts". That is the
+        // same fact as CONFLICTING: return it now instead of retrying every poll.
+        if (/merge conflicts/i.test(String(e.message))) {
+          await returnToBuild(issue, pr, 'merge conflict; verify master..merge diff after rebase');
+          continue;
+        }
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
       }
     } catch (e) {
