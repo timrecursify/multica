@@ -253,6 +253,56 @@ test('bundled-child rejection rolls back only that ticket and returns a partial 
   assert.deepEqual(pool.state.events, ['BEGIN', 'COMMIT', 'BEGIN', 'ROLLBACK', 'BEGIN', 'COMMIT']);
 });
 
+test('apply rejection rolls back, reports a stable reason, and continues the batch', async () => {
+  const rows = [
+    { id: 'rejected', workspace_id: 'w1', status: 'Parked', priority: 'low', metadata: {} },
+    { id: 'eligible', workspace_id: 'w2', status: 'Parked', priority: 'low', metadata: {} }
+  ];
+  const transactions = new Map(rows.map((row) => [row.id, []]));
+  const pool = {
+    query: async () => ({ rows, rowCount: rows.length }),
+    connect: async () => {
+      let issueId;
+      const commands = [];
+      return {
+        query: async (sql, values) => {
+          if (sql === 'BEGIN' || sql === 'ROLLBACK' || sql === 'COMMIT') {
+            commands.push(sql);
+            return { rowCount: 0, rows: [] };
+          }
+          if (sql.includes('FROM issue')) {
+            issueId = values[0];
+            transactions.set(issueId, commands);
+            return { rowCount: 1, rows: [rows.find((row) => row.id === issueId)] };
+          }
+          if (sql.includes('agent_task_queue') && sql.includes('failure_reason')) {
+            if (issueId === 'rejected') {
+              throw Object.assign(new Error('bundled child no dispatch'), { code: 'bundled_child_no_dispatch' });
+            }
+            return { rowCount: 0, rows: [] };
+          }
+          if (sql.includes('qc_verdict')) return { rowCount: 0, rows: [] };
+          if (sql.includes('FROM agent a')) return { rowCount: 1, rows: [{
+            id: 'owner', runtime_id: 'runtime', name: 'gsp-parked-diagnosis-sol-low', model: 'gpt-5.6-sol',
+            runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low' },
+            instructions: 'parked diagnosis fixable already_fixed duplicate genuinely_blocked', is_original_scoper: false
+          }] };
+          if (sql.includes('INSERT INTO comment')) return { rowCount: 1, rows: [] };
+          if (sql.includes('INSERT INTO agent_task_queue')) return { rowCount: 1, rows: [{ id: 'task-eligible' }] };
+          return { rowCount: 0, rows: [] };
+        },
+        release() {}
+      };
+    }
+  };
+  const result = await run(pool, parseArgs(['--apply', '--batch-size', '2']));
+  assert.equal(result.counts.failed, 1);
+  assert.deepEqual(result.ids.failed, [{ issue_id: 'rejected', reason: 'bundled_child_no_dispatch' }]);
+  assert.deepEqual(result.ids.queued, ['eligible:task-eligible']);
+  assert.deepEqual(transactions.get('rejected'), ['BEGIN', 'ROLLBACK']);
+  assert.deepEqual(transactions.get('eligible'), ['BEGIN', 'COMMIT']);
+});
+
 test('default selection covers both workspaces and emits stable dry-run IDs', async () => {
   const calls = [];
   const pool = { query: async (sql, values) => {
