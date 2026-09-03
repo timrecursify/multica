@@ -89,7 +89,7 @@ done
 
 apply_log="$tmp_dir/apply.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$apply_log"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" >"$tmp_dir/verify.log"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" "$(git -C "$root_dir/../.." rev-parse HEAD)" >"$tmp_dir/verify.log"
 grep -q "Match: $tmp_dir/cicd-deploy-evidence.cjs" "$tmp_dir/verify.log"
 receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$apply_log")"
 [[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }

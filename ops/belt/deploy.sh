@@ -128,7 +128,7 @@ for index in "${!sources[@]}"; do
         if [[ -z "$dependency_index" ]]; then
           printf 'Missing manifest runtime dependency: %s requires %s\n' "$source_file" "$dependency_file" >&2
           invalid=1
-        elif ! selected "$dependency_index" && [[ ! -f "${targets[$dependency_index]}" ]]; then
+        elif [[ -z "$only_target" ]] && ! selected "$dependency_index" && [[ ! -f "${targets[$dependency_index]}" ]]; then
           printf 'Missing runtime dependency target: %s requires %s\n' "$source_file" "${targets[$dependency_index]}" >&2
           invalid=1
         fi
