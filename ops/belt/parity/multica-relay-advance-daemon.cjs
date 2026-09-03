@@ -1564,12 +1564,12 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
         });
         const task = await client.query(
           `INSERT INTO agent_task_queue (
-             agent_id, issue_id, status, runtime_id, context,
+             agent_id, issue_id, workspace_id, status, runtime_id, context,
              trigger_summary, force_fresh_session, originator_source,
              trigger_evidence_kind, attempt, max_attempts, retry_of_task_id
            )
-           SELECT $1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
-                  'unattributed', 'relay_stage_transition', $6, $7, $8
+           SELECT $1, $2, $3, 'queued', $4, $5::jsonb, $6, TRUE,
+                  'unattributed', 'relay_stage_transition', $7, $8, $9
             WHERE NOT EXISTS (
               SELECT 1 FROM agent_task_queue active
                WHERE active.issue_id = $2
@@ -1579,7 +1579,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
             )
            ON CONFLICT DO NOTHING
            RETURNING id`,
-          [row.agent_id, row.issue_id, row.runtime_id, context,
+          [row.agent_id, row.issue_id, row.workspace_id, row.runtime_id, context,
            requeueTriggerSummary(row, coldStart),
            attempt, maxAttempts, row.dead_task_id, row.stage]
         );
