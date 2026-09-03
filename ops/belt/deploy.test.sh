@@ -8,6 +8,12 @@ bash -n "$root_dir/deploy.sh"
 tmp_dir="$(mktemp -d)"; trap 'rm -rf -- "$tmp_dir"' EXIT
 main_sha="$(git -C "$repo_root" rev-parse origin/main)"
 old_sha="$(git -C "$repo_root" log -n 2 --format=%H origin/main -- ops/belt/multica-bridge.cjs | tail -1)"
+# Some CI checkouts expose only the current bridge revision in the path
+# history.  Its parent is still a valid older runtime snapshot for this
+# rollback fixture, so fall back to it instead of treating the test as stale.
+if [[ "$old_sha" == "$main_sha" || -z "$old_sha" ]]; then
+  old_sha="$(git -C "$repo_root" rev-parse "$main_sha^")"
+fi
 [[ "$old_sha" != "$main_sha" ]] || { echo 'test needs an older bridge revision' >&2; exit 1; }
 mkdir -p "$tmp_dir/gsp-multica/parity" "$tmp_dir/gsp-multica/fleet" "$tmp_dir/tools" "$tmp_dir/multica-doctrine"
 declare -a files=('gsp-multica/multica-bridge.cjs' 'gsp-multica/guardrails.cjs' 'gsp-multica/parked-diagnosis.cjs' 'gsp-multica/parked-entry-audit.cjs' 'gsp-multica/parity/multica-relay-advance-daemon.cjs' 'gsp-multica/parity/relay-dead-rows.cjs' 'multica-cicd-worker.cjs' 'cicd-deploy-evidence.cjs' 'multica-archiver.cjs' 'tools/belt-config-guard.sh' 'gsp-multica/fleet/multica-daemon-wrapper.sh' 'gsp-multica/fleet/ecosystem.gsp-belt.config.js' 'tools/multica-bundle.py' 'multica-doctrine/RUNBOOK_SPEC_WORKER.md' 'multica-doctrine/RUNBOOK_BUILD_WORKER.md' 'multica-doctrine/RUNBOOK_QC_WORKER.md' 'multica-doctrine/WORKER_COMMON.md' 'gsp-multica/relay-completion-admission.cjs' 'gsp-multica/qc-lane.cjs' 'gsp-multica/reconciler.cjs' 'gsp-multica/stage-outcome.cjs' 'gsp-multica/transition-policy.cjs' 'gsp-multica/stage-routing.cjs' 'gsp-multica/qc-strict-evidence.cjs' 'gsp-multica/stage-routing.json' 'gsp-multica/qc-verdict-policy.cjs')
