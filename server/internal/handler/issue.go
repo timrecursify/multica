@@ -488,17 +488,27 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 		whereParts = append(whereParts, phraseMatch)
 	}
 
-	// Multi-word AND match (each term must appear somewhere). Same
-	// workspace_id-in-subquery contract as above.
+	// Multi-word AND match (each term must appear somewhere). Do not express
+	// this as a correlated EXISTS for every issue row: a short/common word
+	// makes that form repeatedly scan the workspace's comments before the
+	// intersection can reject the row. The MATERIALIZED CTE below selects the
+	// (indexable) issue IDs for each term first, then intersects those small
+	// sets. Ranking subqueries consequently run only for real candidates.
+	ctePrefix := ""
 	if len(termContainsParams) > 1 {
-		var termConditions []string
+		var termCandidates []string
 		for _, tp := range termContainsParams {
-			termConditions = append(termConditions, fmt.Sprintf(
-				"(LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s OR EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s))",
-				tp, tp, wsParam, tp,
-			))
+			termCandidates = append(termCandidates, fmt.Sprintf(`SELECT id FROM (
+				SELECT i.id FROM issue i
+				WHERE i.workspace_id = %s
+				  AND (LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s)
+				UNION
+				SELECT c.issue_id FROM comment c
+				WHERE c.workspace_id = %s AND LOWER(c.content) LIKE %s
+			) AS term_candidates`, wsParam, tp, tp, wsParam, tp))
 		}
-		whereParts = append(whereParts, "("+strings.Join(termConditions, " AND ")+")")
+		ctePrefix = "WITH matching_issue_ids AS MATERIALIZED (" + strings.Join(termCandidates, " INTERSECT ") + ") "
+		whereParts = append(whereParts, "i.id IN (SELECT id FROM matching_issue_ids)")
 	}
 
 	// Number match
@@ -657,7 +667,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	limitParam := nextArg(nil)  // placeholder
 	offsetParam := nextArg(nil) // placeholder
 
-	query := fmt.Sprintf(`SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
+	query := fmt.Sprintf(`%sSELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 		i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
 		i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position,
 		i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id,
@@ -668,6 +678,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	WHERE i.workspace_id = %s AND %s
 	ORDER BY %s, %s, %s, i.updated_at DESC
 	LIMIT %s OFFSET %s`,
+		ctePrefix,
 		matchSourceExpr,
 		commentSubquery,
 		wsParam,
