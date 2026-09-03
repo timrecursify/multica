@@ -51,6 +51,36 @@ func TestMemberAllowedToViewAgent_Pure(t *testing.T) {
 	}
 }
 
+// TestCanInvokeAgent_RelayPoolWorkspaceGrant exercises the real invocation
+// authorization predicate against a persisted workspace target. A same-
+// workspace member is accepted while an otherwise identical cross-workspace
+// actor remains denied.
+func TestCanInvokeAgent_RelayPoolWorkspaceGrant(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID := util.MustParseUUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	ownerID := util.MustParseUUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	workspaceID := testWorkspaceID
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_invocation_target (agent_id, target_type, target_id, created_by)
+		VALUES ($1, 'workspace', $2, NULL)
+		ON CONFLICT (agent_id, target_type, target_id) DO NOTHING`, agentID, util.MustParseUUID(workspaceID)); err != nil {
+		t.Fatalf("seed workspace invocation target: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_invocation_target WHERE agent_id=$1`, agentID)
+	})
+	agent := db.Agent{ID: agentID, OwnerID: ownerID, PermissionMode: "public_to"}
+	if !testHandler.canInvokeAgent(ctx, agent, "member", testUserID, "", workspaceID) {
+		t.Fatal("same-workspace member was denied workspace invocation target")
+	}
+	if testHandler.canInvokeAgent(ctx, agent, "member", "cccccccc-cccc-cccc-cccc-cccccccccccc", "", workspaceID) {
+		t.Fatal("cross-workspace actor was granted workspace invocation target")
+	}
+}
+
 // privateAgentTestFixture sets up a private agent owned by a freshly created
 // user, plus a second non-admin member in the workspace. Returns the agent
 // id, the owner's user id, and the unrelated member's user id. The caller's
@@ -587,7 +617,7 @@ func TestShouldEnqueueOnComment_PrivateAgentGate(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-				got := testHandler.shouldEnqueueAssigneeFallback(ctx, issue, tc.actorType, tc.actorID, commentTriggerComputeOptions{})
+			got := testHandler.shouldEnqueueAssigneeFallback(ctx, issue, tc.actorType, tc.actorID, commentTriggerComputeOptions{})
 			if got != tc.want {
 				t.Fatalf("%s\n  actor=%s/%s got=%v want=%v",
 					tc.reason, tc.actorType, tc.actorID, got, tc.want)
