@@ -1106,13 +1106,18 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 	// gated task is refused here and never lands in the queue.
 	admissionClass := admissionClassForTrigger(triggerCommentID)
 	if err := s.admitWithGate(ctx, admissionClass); err != nil {
-		slog.Info("task enqueue admission-gated",
-			"issue_id", util.UUIDToString(issue.ID),
-			"agent_id", util.UUIDToString(issue.AssigneeID),
-			"class", admissionClass,
-			"reason", err.Error(),
-		)
-		return db.AgentTaskQueue{}, err
+		var deferred *dispatchDeferredError
+		if errors.As(err, &deferred) {
+			fireAt = pgtype.Timestamptz{Time: time.Now().Add(deferred.retryAfter), Valid: true}
+		} else {
+			slog.Info("task enqueue admission-gated",
+				"issue_id", util.UUIDToString(issue.ID),
+				"agent_id", util.UUIDToString(issue.AssigneeID),
+				"class", admissionClass,
+				"reason", err.Error(),
+			)
+			return db.AgentTaskQueue{}, err
+		}
 	}
 
 	// The issue assignee reacting to an agent-authored comment is a
@@ -1153,6 +1158,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		FireAt:               fireAt,
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1275,14 +1281,22 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	if isLeader {
 		mentionClass = dispatch.ClassCritical
 	}
+	var admissionDeferred bool
+	var admissionFireAt pgtype.Timestamptz
 	if err := s.admitWithGate(ctx, mentionClass); err != nil {
-		slog.Info("mention task enqueue admission-gated",
-			"issue_id", util.UUIDToString(issue.ID),
-			"agent_id", util.UUIDToString(agentID),
-			"class", mentionClass,
-			"reason", err.Error(),
-		)
-		return db.AgentTaskQueue{}, err
+		var deferred *dispatchDeferredError
+		if errors.As(err, &deferred) {
+			admissionDeferred = true
+			admissionFireAt = pgtype.Timestamptz{Time: time.Now().Add(deferred.retryAfter), Valid: true}
+		} else {
+			slog.Info("mention task enqueue admission-gated",
+				"issue_id", util.UUIDToString(issue.ID),
+				"agent_id", util.UUIDToString(agentID),
+				"class", mentionClass,
+				"reason", err.Error(),
+			)
+			return db.AgentTaskQueue{}, err
+		}
 	}
 
 	// An explicit mention / thread-parent / squad-leader hop from an
@@ -1324,6 +1338,7 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		DelegatedFromTaskID:  attrDelegatedFrom,
 		TriggerEvidenceKind:  attrEvidenceKind,
 		TriggerEvidenceRefID: attrEvidenceRef,
+		FireAt:               admissionFireAt,
 		// Stamp the reviewed head so dedup can distinguish this run's target
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
@@ -1344,8 +1359,10 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 
 	slog.Info("mention task enqueued", "task_id", util.UUIDToString(task.ID), "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID), "is_leader_task", isLeader)
 	// See EnqueueTaskForIssue for ordering rationale.
-	s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
-	s.NotifyTaskEnqueued(ctx, task)
+	if !admissionDeferred {
+		s.broadcastTaskEvent(ctx, protocol.EventTaskQueued, task)
+		s.NotifyTaskEnqueued(ctx, task)
+	}
 	return task, nil
 }
 
