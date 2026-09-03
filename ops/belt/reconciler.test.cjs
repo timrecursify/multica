@@ -233,3 +233,85 @@ test("a policy rejection leaves the issue skipped rather than erroring the cycle
     /actor_denied/
   );
 });
+
+// The issue's own comments are machine-observable evidence. A builder that
+// opened a PR records its URL there, so a missing issue_pull_request row is a
+// gap in our bookkeeping, not proof the stage can never re-open.
+function commentHarness(comment) {
+  const writes = [];
+  return { writes, query: async (sql, values = []) => {
+    if (sql.includes("FROM issue_pull_request WHERE issue_id")) return { rows: [] };
+    if (sql.includes("FROM issue_dependency WHERE issue_id")) return { rows: [] };
+    if (sql.includes("FROM comment WHERE issue_id")) return { rows: comment ? [{ content: comment }] : [] };
+    if (sql.includes("INSERT INTO github_pull_request")) {
+      writes.push({ sql, values });
+      return { rows: [{ id: "55555555-5555-4555-8555-555555555555" }] };
+    }
+    if (sql.includes("INSERT INTO issue_pull_request")) { writes.push({ sql, values }); return { rows: [] }; }
+    return { rows: [] };
+  }};
+}
+
+const PR_VIEW = JSON.stringify({
+  number: 412, title: "fix(queue): enforce workspace ownership", state: "OPEN",
+  url: "https://github.com/timrecursify/multica/pull/412",
+  headRefOid: "852828aec35bccd3fefd67538a222f18b29b9e24", headRefName: "fix/queue-ownership",
+  createdAt: "2026-09-01T00:00:00Z", updatedAt: "2026-09-02T00:00:00Z",
+  mergedAt: null, closedAt: null, author: { login: "octocat" },
+  additions: 12, deletions: 3, changedFiles: 2,
+  mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+  statusCheckRollup: [{ conclusion: "SUCCESS" }, { conclusion: "SKIPPED" }]
+});
+
+test("terminalBlocker derives a ci link from an observed PR comment", async () => {
+  const db = commentHarness("opened https://github.com/timrecursify/multica/pull/412 for this");
+  const githubCommand = (args) => { assert.equal(args[1], "view"); return PR_VIEW; };
+  assert.equal(await terminalBlocker(db, issue, { outcome: "BLOCKED", blocked_on: "ci" }, { githubCommand }), null);
+
+  const pr = db.writes.find((w) => w.sql.includes("INSERT INTO github_pull_request"));
+  // Every persisted field comes from the GitHub response; none is synthesised.
+  assert.equal(pr.values[0], issue.workspace_id);
+  assert.deepEqual(pr.values.slice(1, 8), ["timrecursify", "multica", 412,
+    "fix(queue): enforce workspace ownership", "open",
+    "https://github.com/timrecursify/multica/pull/412", "fix/queue-ownership"]);
+  assert.equal(pr.values[13], "852828aec35bccd3fefd67538a222f18b29b9e24");
+  assert.equal(pr.values[19], "SUCCESS");
+  const link = db.writes.find((w) => w.sql.includes("INSERT INTO issue_pull_request"));
+  assert.deepEqual(link.values, [issue.id, "55555555-5555-4555-8555-555555555555"]);
+});
+
+test("terminalBlocker rolls a failing or pending checks rollup up honestly", async () => {
+  for (const [checks, expected] of [
+    [[{ conclusion: "SUCCESS" }, { conclusion: "FAILURE" }], "FAILURE"],
+    [[{ conclusion: "SUCCESS" }, { state: "PENDING" }], "PENDING"],
+    [[], null]
+  ]) {
+    const db = commentHarness("https://github.com/timrecursify/multica/pull/412");
+    const githubCommand = () => JSON.stringify({ ...JSON.parse(PR_VIEW), statusCheckRollup: checks });
+    await terminalBlocker(db, issue, { outcome: "BLOCKED", blocked_on: "ci" }, { githubCommand });
+    assert.equal(db.writes.find((w) => w.sql.includes("INSERT INTO github_pull_request")).values[19], expected);
+  }
+});
+
+test("terminalBlocker never invents evidence it cannot observe", async () => {
+  // A dependency blocker is not answered by a PR: it needs a dependency state.
+  const dep = commentHarness("https://github.com/timrecursify/multica/pull/412");
+  assert.equal(await terminalBlocker(dep, issue, { outcome: "BLOCKED", blocked_on: "dependency" },
+    { githubCommand: () => { throw new Error("gh must not run for a dependency blocker"); } }),
+    "blocked_dependency_unobservable");
+  assert.deepEqual(dep.writes, []);
+
+  // No PR named anywhere: the park stands and gh is never called.
+  const none = commentHarness(null);
+  assert.equal(await terminalBlocker(none, issue, { outcome: "BLOCKED", blocked_on: "ci" },
+    { githubCommand: () => { throw new Error("gh must not run without a PR pointer"); } }),
+    "blocked_ci_unobservable");
+  assert.deepEqual(none.writes, []);
+
+  // An unreadable PR leaves the ticket parked rather than guessing at its state.
+  const broken = commentHarness("https://github.com/timrecursify/multica/pull/412");
+  assert.equal(await terminalBlocker(broken, issue, { outcome: "BLOCKED", blocked_on: "sha" },
+    { githubCommand: () => { throw new Error("gh: not found"); } }),
+    "blocked_sha_unobservable");
+  assert.deepEqual(broken.writes, []);
+});
