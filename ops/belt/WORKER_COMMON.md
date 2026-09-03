@@ -94,6 +94,7 @@ Delete a test you wrote that turned out to prove nothing.
 - Clone fresh or use a managed isolated worktree. Never trust a stale local
   checkout.
 - Use a branch and pull request. Never push to `main` or force-push.
+- Push first, then run `gh pr create` as its own separate command (never chained with `&&` or in a script). The daemon reads the pull request URL from that command's output alone; any other text in the same output marks the task failed even though the PR exists.
 - Never print secrets. Money, auth, migrations, secrets, and production flags
   require Sol-low QC before merge or deployment.
 

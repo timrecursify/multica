@@ -31,6 +31,8 @@ function legacyOutcome(text) {
   if (/usage limit|provider_quota_limit/i.test(text)) return { outcome: "BLOCKED", blockedOn: "quota" };
   if (/already[- ]merged|already deployed|nothing to do/i.test(text)) return { outcome: "NO_OP", blockedOn: null };
   if (/https:\/\/github\.com\/[^\s]+\/pull\/\d+/.test(text)) return { outcome: "ADVANCED", blockedOn: null };
+  if (/^\s*(Blocked|Unable|Cannot|Could not|Failed|Error)\b/i.test(text) || /\bblocked\b.*\b(fail-closed|checkout|session expired|filesystem)/i.test(text)) return { outcome: "FAILED", blockedOn: null };
+  if (/\b(BUILD-READY|QC PASS|verified|validated|implemented|posted|merged|tests? pass)\b/i.test(text)) return { outcome: "ADVANCED", blockedOn: null };
   return { outcome: "FAILED", blockedOn: null };
 }
 
