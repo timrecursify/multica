@@ -27,6 +27,12 @@ procedure once with `VERDICT=PASS` or `VERDICT=FAIL`. Use only `sk multica
 verdict` and `sk multica advance` for state changes: never curl, use a secret,
 or write SQL.
 
+Submit the verdict while the assigned `gpt-5.6-sol`/`low` QC task is still
+`running` and targets `In Review`; the authenticated checker must match that
+task's agent. The command payload is the evidence for the live write.
+`QC_EVIDENCE_JSON` is post-run audit evidence and must be printed exactly once
+in the final task output after submitting the verdict.
+
 Minimum sk-cli requirement: `sk multica verdict` must accept `--board gsp`; if its help says prod only, the checker aborts with `BLOCKED`.
 
 ```bash

@@ -90,6 +90,18 @@ function validateInternalVerdict({ actor, task, evidence }) {
     model: bound.binding.model, effort: bound.binding.effort } };
 }
 
+function validateLiveVerdict({ task, evidence }) {
+  if (!task || task.status !== "running" || task.context?.to_stage !== "In Review") {
+    return { ok: false, reason: "assigned_running_sol_low_in_review_qc_task_required" };
+  }
+  const lane = taskLane(task);
+  if (!isQcLane(lane.model, lane.effort)) return { ok: false, reason: "invalid_qc_lane" };
+  const invalid = validateEvidence(evidence);
+  if (invalid) return { ok: false, reason: invalid };
+  return { ok: true, binding: { task_id: task.id, issue_id: task.issue_id,
+    workspace_id: task.workspace_id, ...lane }, evidence };
+}
+
 function validateExternalVerdict({ actor, evidence }) {
   if (actor?.type !== "operator" || actor.authenticated !== true ||
       typeof actor.external_receipt !== "string" || actor.external_receipt.trim() === "") {
@@ -106,4 +118,4 @@ function validateQcVerdict(input) {
 }
 
 module.exports = { FAILURE_CLASSES, readTaskEvidence, validateEvidence, taskLane, internalBinding,
-  validateInternalVerdict, validateExternalVerdict, validateQcVerdict };
+  validateInternalVerdict, validateLiveVerdict, validateExternalVerdict, validateQcVerdict };

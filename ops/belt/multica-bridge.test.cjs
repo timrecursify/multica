@@ -39,6 +39,7 @@ const {
   relayRedirect,
   passVerdictRescopeForbidden,
   latestCompletedSolLowQcTask,
+  latestRunningSolLowQcTask,
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
@@ -540,6 +541,51 @@ test('QC evidence parser accepts exactly one structured output marker', () => {
   assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC_EVIDENCE_JSON={bad}' } }, validVerdict), 'qc_task_evidence_required');
   assert.equal(qcTaskEvidenceMismatch({ result: { output: `${qcResult().output}\nQC_EVIDENCE_JSON=${JSON.stringify(validVerdict)}` } }, validVerdict), 'qc_task_evidence_required');
   assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC VERDICT: PASS' } }, validVerdict), 'qc_task_evidence_required');
+});
+
+test('running Sol-low selector admits exactly one matching assigned task', async () => {
+  let rows = [{ id: 'task-1', agent_id: 'agent-1', status: 'running', agent_name: validVerdict.checker }];
+  const client = { query: async (sql, values) => {
+    assert.deepEqual(values, ['issue-1', 'workspace-1', validVerdict.checker, null, ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
+    assert.match(sql, /t\.status = 'running'/);
+    return { rows };
+  } };
+  assert.equal(await latestRunningSolLowQcTask(client, 'issue-1', 'workspace-1', validVerdict.checker), rows[0]);
+  rows = [rows[0], { id: 'task-2' }];
+  assert.equal(await latestRunningSolLowQcTask(client, 'issue-1', 'workspace-1', validVerdict.checker), null);
+});
+
+test('assigned running Sol-low task persists live PASS and FAIL without completion evidence', async () => {
+  const writes = [];
+  const running = { id: '33333333-3333-4333-8333-333333333333', issue_id: validVerdict.issue_id,
+    workspace_id: 'workspace-1', agent_id: 'live-agent', agent_name: validVerdict.checker,
+    status: 'running', context: { to_stage: 'In Review' }, model: 'gpt-5.6-sol', thinking_level: 'low' };
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql) || /FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    if (/FROM agent_task_queue t/.test(sql)) {
+      return { rows: sql.includes("t.status = 'running'") && values[2] === validVerdict.checker ? [running] : [] };
+    }
+    if (/INSERT INTO qc_attempt|INSERT INTO qc_verdict/.test(sql)) writes.push(values);
+    return { rows: [] };
+  } };
+  const post = async (payload) => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
+    return { ...res, json: JSON.parse(res.body) };
+  };
+  setTestClientFactory(() => client);
+  try {
+    assert.equal((await post({ ...validVerdict, idem_key: 'live-pass-0001' })).status, 201);
+    const fail = { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false, idem_key: 'live-fail-0001' };
+    assert.equal((await post(fail)).status, 201);
+    assert.deepEqual(writes.filter((values) => values.length === 12).map((values) => values[1]),
+      [validVerdict.checker, validVerdict.checker]);
+    assert.deepEqual(writes.filter((values) => values.length === 6).map((values) => values[2]),
+      [validVerdict.checker, validVerdict.checker]);
+    const refused = await post({ ...validVerdict, checker: 'different-checker', idem_key: 'live-wrong-checker-0001' });
+    assert.equal(refused.json.error, 'assigned_running_sol_low_in_review_qc_task_required');
+  } finally { setTestClientFactory(null); }
 });
 
 test('verdict checker identity is selected from the completed same-workspace Sol-low QC task', async () => {
