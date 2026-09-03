@@ -27,7 +27,12 @@ write_receipt() {
 }
 source_tree=""; cleanup() { [[ -z "$source_tree" ]] || rm -rf -- "$source_tree"; }; trap cleanup EXIT
 if [[ "$mode" != rollback ]]; then
-  git -C "$repo_root" fetch --quiet origin main || { echo 'Could not refresh origin/main' >&2; exit 1; }
+  # CI checkouts already fetch the complete base branch.  A transient fetch
+  # failure (for example GitHub rate limiting) must not make an otherwise
+  # usable origin/main ref undeployable; only fail when no usable ref exists.
+  if ! git -C "$repo_root" fetch --quiet origin main; then
+    git -C "$repo_root" rev-parse --verify --quiet 'origin/main^{commit}' >/dev/null || { echo 'Could not refresh origin/main' >&2; exit 1; }
+  fi
   resolved_commit="$(git -C "$repo_root" rev-parse --verify --quiet 'origin/main^{commit}')" || { echo 'origin/main is unavailable' >&2; exit 1; }
   source_tree="$(mktemp -d "${TMPDIR:-/tmp}/belt-source.XXXXXX")"
   git -C "$repo_root" archive --format=tar "$resolved_commit" | tar -x -C "$source_tree" || { echo "Could not materialize origin/main" >&2; exit 1; }
