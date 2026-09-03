@@ -721,6 +721,33 @@ guard_bundled_children() {
       AND c.status NOT IN ('Done','Archived','Cancelled');" 2>/dev/null)
 }
 
+# A child is dispatched only through its parent (reconciler.cjs:103). When the
+# parent is Cancelled (rollup dismantled) or a PPP parent is Done with its
+# closing note leaving the children as independent work (PPP-23706, 2026-09-03),
+# the children strand in Queue/Spec forever. Detach them so the reconciler
+# dispatches each on its own; a child the parent's PR already covered ends as a
+# NO_OP build, which is cheaper than a stranded ticket.
+guard_freed_children() {
+  local child_id number parent_number parent_status board
+  while IFS='|' read -r child_id number parent_number parent_status; do
+    [[ -z "$child_id" ]] && continue
+    board=gsp; [[ "$number" -gt 20000 ]] && board=prod
+    if "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
+         UPDATE issue SET parent_issue_id=NULL, updated_at=NOW() WHERE id='${child_id}'::uuid;" >/dev/null 2>&1; then
+      "$SK" multica comment --board "$board" --number "$number" --body \
+        "Detached from rollup #${parent_number} (${parent_status}) so the belt dispatches this ticket on its own; the reconciler never dispatches a child." \
+        >/dev/null 2>&1 </dev/null
+      fixed+=("#${number} detached from ${parent_status} rollup #${parent_number}")
+    else
+      unfixable+=("#${number} is a child of ${parent_status} rollup #${parent_number} and could not be detached")
+    fi
+  done < <("${PSQL[@]}" -F'|' -c "SELECT c.id, c.number, p.number, p.status
+     FROM issue c JOIN issue p ON p.id = c.parent_issue_id
+    WHERE c.status NOT IN ('Done','Archived','Cancelled')
+      AND (p.status = 'Cancelled'
+           OR (p.status IN ('Done','Archived') AND c.workspace_id='da3c5c5c-a123-4567-b999-c3ed1820da00'));" 2>/dev/null)
+}
+
 # The relay dispatches on transition out of a stage, so parking or cancelling a
 # flight queues a paid build on work that must not be built (GSP-808). Until that
 # is fixed the calls keep being spent, so cancel them here. Scoped to build
@@ -967,7 +994,7 @@ guard_unshipped_closures() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 for f in "${fixed[@]:-}";     do [[ -n "$f" ]] && echo "belt-config-guard: FIXED $f"; done
 for u in "${unfixable[@]:-}"; do [[ -n "$u" ]] && echo "belt-config-guard: UNFIXABLE $u" >&2; done
