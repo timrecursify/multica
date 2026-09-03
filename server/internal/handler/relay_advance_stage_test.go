@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 )
 
 // relayAdvanceStageFixture wires a workspace-scoped relay_stage_config edge set
@@ -261,6 +263,46 @@ func TestRelayAdvanceStageRejectsMissingRuntime(t *testing.T) {
 	}
 	if got := issueStatusOf(t, fx.IssueID); got != "Spec" {
 		t.Fatalf("issue status = %q, want unchanged Spec", got)
+	}
+	if got := queuedTaskCountForIssue(t, fx.IssueID); got != 0 {
+		t.Fatalf("queued task count = %d, want 0", got)
+	}
+}
+
+func TestRelayAdvanceStageRollsBackOnSuccessorEnqueueFailure(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newRelayAdvanceStageFixture(t)
+	ctx := context.Background()
+	suffix := time.Now().UnixNano()
+	fn, trigger := fmt.Sprintf("relay_enqueue_fail_fn_%d", suffix), fmt.Sprintf("relay_enqueue_fail_%d", suffix)
+	t.Cleanup(func() {
+		testPool.Exec(ctx, fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON agent_task_queue", trigger))
+		testPool.Exec(ctx, fmt.Sprintf("DROP FUNCTION IF EXISTS %s()", fn))
+	})
+	if _, err := testPool.Exec(ctx, fmt.Sprintf(`
+CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	IF NEW.issue_id = '%s' THEN
+		RAISE EXCEPTION 'forced relay successor enqueue failure';
+	END IF;
+	RETURN NEW;
+END;
+$$;`, fn, fx.IssueID)); err != nil {
+		t.Fatalf("install enqueue failure function: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, fmt.Sprintf(`
+CREATE TRIGGER %s BEFORE INSERT ON agent_task_queue
+FOR EACH ROW EXECUTE FUNCTION %s();`, trigger, fn)); err != nil {
+		t.Fatalf("install enqueue failure trigger: %v", err)
+	}
+	rr := relayAdvanceHTTP(t, fx.IssueID, "Queue")
+	if rr.Code != http.StatusInternalServerError {
+		t.Fatalf("advance with enqueue failure status = %d, want 500", rr.Code)
+	}
+	if got := issueStatusOf(t, fx.IssueID); got != "Spec" {
+		t.Fatalf("issue status = %q, want rollback to Spec", got)
 	}
 	if got := queuedTaskCountForIssue(t, fx.IssueID); got != 0 {
 		t.Fatalf("queued task count = %d, want 0", got)
