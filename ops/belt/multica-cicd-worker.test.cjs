@@ -100,3 +100,30 @@ test('worker retains no self-deploy or direct database writes', () => {
   assert.doesNotMatch(source, /UPDATE |INSERT INTO /);
   assert.match(source, /transition-policy\.cjs/);
 });
+
+test('merged backlog sweep relays each source stage and skips unqualified work', async () => {
+  const sha = 'c'.repeat(40);
+  const rows = [
+    { id: 'spec', number: 3, status: 'Spec', workspace_id: 'ws' },
+    { id: 'queue', number: 4, status: 'Queue', workspace_id: 'ws' },
+    { id: 'progress', number: 5, status: 'In Progress', workspace_id: 'ws' },
+    { id: 'open', number: 6, status: 'Spec', workspace_id: 'ws' }
+  ];
+  const comments = new Map([
+    ['spec', [{ content: 'https://github.com/acme/repo/pull/3' }]],
+    ['queue', [{ content: 'https://github.com/acme/repo/pull/4' }]],
+    ['progress', [{ content: 'https://github.com/acme/repo/pull/5' }]],
+    ['open', [{ content: 'https://github.com/acme/repo/pull/6' }]]
+  ]);
+  const calls = [];
+  worker.setTestDependencies({
+    pool: { query: async (sql, params) => sql.startsWith('SELECT id, number')
+      ? { rows } : { rows: comments.get(params[0]) || [] } },
+    gh: args => JSON.stringify({ state: args[2] === '6' ? 'OPEN' : 'MERGED', mergedAt: '2026-09-03T00:00:00Z', mergeCommit: { oid: sha } }),
+    relay: async (...args) => calls.push(args)
+  });
+  await worker.sweepMergedBacklog();
+  assert.deepEqual(calls.map(call => call[0]), ['spec', 'queue', 'progress']);
+  assert.deepEqual(calls.map(call => call[1]), ['CI/CD & Deploy', 'CI/CD & Deploy', 'CI/CD & Deploy']);
+  assert.deepEqual(calls.map(call => call[5].sourceStage), ['Spec', 'Queue', 'In Progress']);
+});
