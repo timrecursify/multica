@@ -65,6 +65,7 @@ const {
   retryEscalationLoop,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
+  diagnosisRerunErrorStatus,
   operatorRespec,
   relayDiagnosisRerun,
   isTerminalStage,
@@ -195,6 +196,21 @@ test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', asyn
   const result = await rerunParkedDiagnosis(client, { issue_id: '123e4567-e89b-42d3-a456-426614174000', idempotency_key: 'rerun-0001' });
   assert.deepEqual(result, { ok: true, replay: true, task_id: 'existing-task' });
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
+});
+
+test('bundled parked diagnosis rerun is a stable conflict without queue work', async () => {
+  const calls = [];
+  const result = await rerunParkedDiagnosis({ query: async (sql) => {
+    calls.push(sql);
+    if (sql.includes('FROM issue WHERE')) return { rowCount: 1, rows: [{
+      id: '2c2298c1-1a5a-42bd-ad21-6805be7a3f3e', workspace_id: '223e4567-e89b-42d3-a456-426614174000',
+      status: 'Parked', priority: 'high', metadata: { bundled_into_id: 'dd5b20a4-65fa-4a98-976e-6887d7cfa4fe' }
+    }] };
+    return { rowCount: 0, rows: [] };
+  } }, { issue_id: '2c2298c1-1a5a-42bd-ad21-6805be7a3f3e', idempotency_key: 'rerun-0001' });
+  assert.deepEqual(result, { ok: false, error: 'bundled_issue_requires_canonical_parent' });
+  assert.equal(diagnosisRerunErrorStatus(result.error), 409);
+  assert.equal(calls.some(sql => sql.includes('agent_task_queue')), false);
 });
 
 test('Parked diagnosis rerun logs classified and unexpected database exceptions', async (t) => {
