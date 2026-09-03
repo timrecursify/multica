@@ -73,6 +73,18 @@ test("insert conflict is already-live and budgets bound creation", async () => {
   assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
+test("zero cycle limit creates no task or relay log", async () => {
+  const db = harness();
+  const result = await reconcileIssue(db, issue.id, {
+    evaluate: ok,
+    maxCreatePerCycle: 0,
+    budget: { created: 0, byAgent: new Map() }
+  });
+  assert.deepEqual(result, { action: "skipped", reason: "creation_budget" });
+  assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
+  assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO relay_run_log")), false);
+});
+
 test("cycle returns per-issue results", async () => {
   const db = harness();
   const original = db.query;
