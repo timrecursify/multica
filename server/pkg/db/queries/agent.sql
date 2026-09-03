@@ -286,7 +286,7 @@ ORDER BY created_at DESC;
 -- parsing (parseQuickCreateContext short-circuits on IssueID.Valid), so this
 -- key rides harmlessly alongside.
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id, trigger_evidence_kind, trigger_evidence_ref_id, fire_at
@@ -301,7 +301,11 @@ VALUES (
     sqlc.narg(squad_id),
     CASE
         WHEN COALESCE(sqlc.narg('head_sha')::text, '') <> ''
-        THEN jsonb_build_object('head_sha', sqlc.narg('head_sha')::text)
+          OR COALESCE(sqlc.narg('to_stage')::text, '') <> ''
+        THEN jsonb_strip_nulls(jsonb_build_object(
+            'head_sha', NULLIF(sqlc.narg('head_sha')::text, ''),
+            'to_stage', NULLIF(sqlc.narg('to_stage')::text, '')
+        ))
         ELSE NULL
     END,
     sqlc.narg(originator_user_id),
