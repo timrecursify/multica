@@ -211,7 +211,7 @@ async function returnIssueToBuild(issue, reason) {
 const PPP_WORKSPACE = 'da3c5c5c-a123-4567-b999-c3ed1820da00';
 function noteReturn(issue, reason) {
   const board = issue.workspace_id === PPP_WORKSPACE ? 'prod' : 'gsp';
-  const body = [`CI/CD RETURN: ${reason}.`,
+  const body = [`/note CI/CD RETURN: ${reason}.`,
     'Required before this ticket can advance again:',
     '1. git fetch origin; rebase the PR branch onto the PR base branch (master for sk-cli, main elsewhere); resolve every conflict (git merge-tree --write-tree origin/<base> HEAD names the files).',
     '2. Push the rebased branch; confirm GitHub reports the PR mergeable and CI runs on the new head.',
