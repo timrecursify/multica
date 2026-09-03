@@ -12,15 +12,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Validate requested SHA
-        env: { SHA: ${{ inputs.commit_sha }} }
+        env: { SHA: "${{ inputs.commit_sha }}" }
         run: '[[ "$SHA" =~ ^[0-9a-f]{40}$ ]]'
       - uses: actions/checkout@v4
-        with: { ref: ${{ inputs.commit_sha }}, fetch-depth: 0 }
+        with: { ref: "${{ inputs.commit_sha }}", fetch-depth: 0 }
       - name: Fail closed on ref mismatch
-        env: { SHA: ${{ inputs.commit_sha }} }
+        env: { SHA: "${{ inputs.commit_sha }}" }
         run: '[[ "$(git rev-parse HEAD)" == "$SHA" ]]'
       - uses: docker/login-action@v3
-        with: { registry: ghcr.io, username: ${{ github.actor }}, password: ${{ secrets.GITHUB_TOKEN }} }
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
       - uses: docker/setup-buildx-action@v3
       - id: image
         uses: docker/build-push-action@v6
@@ -32,11 +32,11 @@ jobs:
             VERSION=${{ inputs.commit_sha }}
             COMMIT=${{ inputs.commit_sha }}
       - name: Build daemon and provenance
-        env: { SHA: ${{ inputs.commit_sha }} }
+        env: { SHA: "${{ inputs.commit_sha }}" }
         run: |
           mkdir -p dist
           (cd server && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X main.version=$SHA -X main.commit=$SHA" -o ../dist/multica ./cmd/multica)
           chmod +x dist/multica
           ops/noc2/publish-provenance.sh --sha "$SHA" --image '${{ steps.image.outputs.digest }}' --binary dist/multica --workflow-run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --output dist/noc2-provenance.json
       - uses: actions/upload-artifact@v4
-        with: { name: noc2-${{ inputs.commit_sha }}, path: dist/, if-no-files-found: error }
+        with: { name: "noc2-${{ inputs.commit_sha }}", path: dist/, if-no-files-found: error }
