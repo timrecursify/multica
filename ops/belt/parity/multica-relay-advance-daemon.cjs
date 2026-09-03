@@ -1847,6 +1847,49 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
   }
 }
 
+// A QC FAIL is a return to the builder, not a final stage outcome. The legacy
+// outcome parser records any verdict as ADVANCED and the readvance requires a
+// bound PASS, so a FAIL sat in In Review forever (2026-09-03 belt v3 finding).
+// Only a verdict newer than the ticket's latest arrival in In Review counts.
+async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
+  logger = console, typedOutcomes = TYPED_OUTCOMES } = {}) {
+  if (!typedOutcomes) return [];
+  const client = await dbPool.connect();
+  try {
+    const result = await client.query(
+      `SELECT o.issue_id, o.task_id, v.work_product_md5, v.created_at AS verdict_at
+         FROM issue_stage_outcome o
+         JOIN issue i ON i.id = o.issue_id AND i.status = 'In Review'
+         JOIN LATERAL (SELECT verdict, work_product_md5, created_at FROM qc_verdict
+                        WHERE issue_id = o.issue_id ORDER BY created_at DESC LIMIT 1) v ON TRUE
+        WHERE o.stage = 'In Review' AND o.outcome IN ('ADVANCED', 'FAILED') AND v.verdict = 'FAIL'
+          AND v.created_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
+                                        WHERE l.issue_id = o.issue_id AND l.to_stage = 'In Review'), '-infinity')
+          AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
+                           WHERE q.issue_id = o.issue_id AND q.status IN ('queued', 'running'))
+        ORDER BY o.outcome_at ASC LIMIT 40`);
+    const returned = [];
+    for (const row of result.rows) {
+      const cause = `QC FAIL ${row.work_product_md5 || 'no-md5'} at ${new Date(row.verdict_at).toISOString()}; rework required`;
+      const response = await postRelay({ issue_id: row.issue_id, to_stage: 'In Progress',
+        agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+        reason: `RETURN:In Progress — ${cause}`,
+        evidence: { implementationFail: cause, retryRemaining: true } });
+      if (response.ok) {
+        await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = NULL
+          WHERE issue_id = $1::uuid AND stage = 'In Review'`, [row.issue_id]);
+        returned.push(row.issue_id);
+        logger.log(`${LOG_PREFIX} [qc-fail-return] issue=${row.issue_id} In Review->In Progress`);
+        continue;
+      }
+      logger.log(`${LOG_PREFIX} [qc-fail-return] denied issue=${row.issue_id} status=${response.status}; error=${response.error || response.body || 'unknown'}`);
+    }
+    return returned;
+  } finally {
+    client.release();
+  }
+}
+
 function startDaemon() {
   if (!MULTICA_DB || !RELAY_AGENT_SECRET || !WORKSPACE_ID) {
     console.error('[relay-advance-daemon] FATAL: env vars missing');
@@ -1868,6 +1911,7 @@ function startDaemon() {
   setInterval(guarded('reconcileQuotaPauses', reconcileQuotaPauses), 60000);
   setInterval(() => recordOutcomesPass().catch(err => console.error(`${LOG_PREFIX} stage-outcome error: ${err.message}`)), 30000);
   setInterval(() => readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`)), 300000);
+  setInterval(guarded('returnFailedQcOutcomes', returnFailedQcOutcomes), 120000);
   advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
   runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
@@ -1875,11 +1919,12 @@ function startDaemon() {
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
   reconcileQuotaPauses().catch(err => console.error(`${LOG_PREFIX} Error in quota-pause reconciliation: ${err.message}`));
   readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`));
+  returnFailedQcOutcomes().catch(err => console.error(`${LOG_PREFIX} qc-fail-return error: ${err.message}`));
 }
 
 if (require.main === module) startDaemon();
 
-module.exports = { advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
+module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes };
