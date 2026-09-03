@@ -12,7 +12,8 @@ const {
   lifetimeTaskAdmission,
   isExecutionStage,
   assertRoutableStageOwners,
-  crossStageExecutionAdmission
+  crossStageExecutionAdmission,
+  resolveBuilderRoute
 } = require("./guardrails.cjs");
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvidenceReference } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
@@ -1774,7 +1775,20 @@ async function relayAdvance(req, res, body) {
     // by the owner's runbook and its concurrency/model configuration is valid.
     // Unknown instructions fail closed: a worker that would stop on this stage
     // has no useful outcome and still consumes vendor tokens.
+    let builderRoute = { ok: true, route: null };
     if (stage.agent_id && isExecutionStage(to_stage) && !parkedRelease && !bookkeepingTransition) {
+      builderRoute = resolveBuilderRoute(stage, {
+        provider: stage.selected_runtime_provider,
+        model: stage.runtime_config && stage.runtime_config.model
+      });
+      if (!builderRoute.ok) {
+        await client.query("ROLLBACK");
+        console.warn(JSON.stringify({ event: "relay_advance_rejected", reason: builderRoute.reason,
+          issue_id: issue.id, agent_id: stage.agent_id }));
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: builderRoute.reason, message: "builder route is unavailable or contradictory" }));
+        return;
+      }
       const compatibility = instructionCompatibility(stage.instructions, to_stage);
       if (!compatibility.ok) {
         // Persist rejected advances so the Registered recovery pass can apply
@@ -2078,6 +2092,7 @@ async function relayAdvance(req, res, body) {
         from_stage: issue.status,
         to_stage,
         agent_name: stage.agent_name,
+        ...(builderRoute && builderRoute.route ? { builder_route: builderRoute.route } : {}),
         pool_stage: stage.pool_stage || (stage.agent_id ? to_stage : null),
         ...(retryEscalation ? {
           kind: "retry_escalation",

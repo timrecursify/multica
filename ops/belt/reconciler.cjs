@@ -1,5 +1,6 @@
 "use strict";
 const { stageEligibility } = require("./stage-outcome.cjs");
+const { resolveBuilderRoute } = require("./guardrails.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
@@ -17,7 +18,8 @@ function liveTasksSql() {
 }
 
 function ownerSql() {
-  return `SELECT pool.agent_id,
+  return `SELECT pool.agent_id, a.name AS agent_name, a.model, a.runtime_config,
+                   COALESCE(own_runtime.provider, online_runtime.provider) AS selected_runtime_provider,
                    COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id
             FROM relay_stage_agent_pool pool
             JOIN relay_stage_pool policy ON policy.workspace_id = pool.workspace_id
@@ -26,7 +28,7 @@ function ownerSql() {
             LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
              AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
             LEFT JOIN LATERAL (
-              SELECT ar.id FROM agent_runtime ar
+              SELECT ar.id, ar.provider FROM agent_runtime ar
                WHERE ar.workspace_id = pool.workspace_id
                  AND ar.provider = 'codex' AND ar.status = 'online'
                ORDER BY ar.updated_at DESC LIMIT 1
@@ -246,7 +248,12 @@ async function reconcileIssue(client, issueId, options = {}) {
       await client.query("COMMIT");
       return { action: "skipped", reason: "creation_budget" };
     }
-    const context = taskContext(issue.status);
+    const route = resolveBuilderRoute(owner, { provider: owner.selected_runtime_provider });
+    if (!route.ok) {
+      await client.query("COMMIT");
+      return { action: "skipped", reason: route.reason };
+    }
+    const context = { ...taskContext(issue.status), ...(route.route ? { builder_route: route.route } : {}) };
     const created = await client.query(
       `INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, workspace_id, status, priority, context,
           trigger_summary, originator_source, attempt, max_attempts)
