@@ -56,7 +56,7 @@ type IssueStatusContract struct {
 func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, error) {
 	canonical := []string{
 		"Registered", "Spec", "Queue", "In Progress", "In Review",
-		"Human Review", "Parked", "Rejected", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
+		"Human Review", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
 	}
 	aliases := map[string]string{
 		"todo":        "Spec",
@@ -78,7 +78,6 @@ func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, e
 		display = map[string]string{
 			"Spec": "todo", "Queue": "backlog", "In Progress": "in_progress", "In Review": "in_review",
 			"Human Review": "blocked", "Done": "done", "Cancelled": "cancelled", "Archived": "cancelled",
-			"Parked": "Parked", "Rejected": "Rejected",
 		}
 	case IssueStatusProfilePPP:
 		for _, status := range canonical {
