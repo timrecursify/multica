@@ -8,6 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/multica-ai/multica/server/internal/middleware"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
@@ -55,6 +56,7 @@ func (e *RepairLiveSlotTakenError) Error() string {
 // filter". OlderThan is a server-side cutoff already parsed by the handler;
 // the comparison includes the cutoff (<=).
 type TaskRepairFilter struct {
+	WorkspaceID pgtype.UUID
 	Status    string
 	DaemonID  string
 	OlderThan pgtype.Timestamptz
@@ -69,11 +71,18 @@ func (s *TaskService) ListRepairableTasks(ctx context.Context, f TaskRepairFilte
 		f.MaxRows = 100
 	}
 	return s.Queries.ListRepairableAgentTasks(ctx, db.ListRepairableAgentTasksParams{
+		WorkspaceID: f.WorkspaceID,
 		Status:    pgtype.Text{String: f.Status, Valid: f.Status != ""},
 		DaemonID:  pgtype.Text{String: f.DaemonID, Valid: f.DaemonID != ""},
 		OlderThan: f.OlderThan,
 		MaxRows:   f.MaxRows,
 	})
+}
+
+func workspaceFromContext(ctx context.Context) pgtype.UUID {
+	var id pgtype.UUID
+	_ = id.Scan(middleware.WorkspaceIDFromContext(ctx))
+	return id
 }
 
 // FailOrphanedTask terminally fails ONE non-terminal task without the
@@ -90,6 +99,7 @@ func (s *TaskService) FailOrphanedTask(ctx context.Context, taskID pgtype.UUID, 
 	}
 	task, err := s.Queries.FailOrphanedAgentTask(ctx, db.FailOrphanedAgentTaskParams{
 		TaskID:        taskID,
+		WorkspaceID:   workspaceFromContext(ctx),
 		Error:         reason,
 		FailureReason: classification,
 	})
@@ -109,7 +119,7 @@ func (s *TaskService) FailOrphanedTask(ctx context.Context, taskID pgtype.UUID, 
 // RepairLiveSlotTakenError; a task no longer in an in-flight state yields a
 // conflict / not-found error.
 func (s *TaskService) RequeueOrphanedTask(ctx context.Context, taskID pgtype.UUID) (*db.RequeueOrphanedAgentTaskRow, error) {
-	task, err := s.Queries.RequeueOrphanedAgentTask(ctx, taskID)
+	task, err := s.Queries.RequeueOrphanedAgentTask(ctx, db.RequeueOrphanedAgentTaskParams{TaskID: taskID, WorkspaceID: workspaceFromContext(ctx)})
 	if err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
