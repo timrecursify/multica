@@ -1915,13 +1915,13 @@ func (q *Queries) CreateAgentTask(ctx context.Context, arg CreateAgentTaskParams
 
 const createDeferredAgentTask = `-- name: CreateDeferredAgentTask :one
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     trigger_summary, is_leader_task, squad_id, escalation_for_task_id, fire_at,
     originator_user_id, accountable_user_id, originator_source,
     delegated_from_task_id, trigger_evidence_kind, trigger_evidence_ref_id
 )
 VALUES (
-    $1, $2, $3, 'deferred', $4,
+    $1, $2, $3, (SELECT workspace_id FROM agent WHERE id = $1), 'deferred', $4,
     $5,
     $6,
     COALESCE($7::boolean, FALSE),
@@ -2044,14 +2044,14 @@ func (q *Queries) CreateDeferredAgentTask(ctx context.Context, arg CreateDeferre
 
 const createDeferredChannelIssueTask = `-- name: CreateDeferredChannelIssueTask :one
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id,
     trigger_evidence_kind, trigger_evidence_ref_id, fire_at
 )
 VALUES (
-    $1, $2, $3, 'deferred', $4, $5,
+    $1, $2, $3, (SELECT workspace_id FROM agent WHERE id = $1), 'deferred', $4, $5,
     COALESCE($6::uuid[], '{}'),
     $7,
     COALESCE($8::boolean, FALSE),
@@ -2193,12 +2193,12 @@ func (q *Queries) CreateDeferredChannelIssueTask(ctx context.Context, arg Create
 
 const createQuickCreateTask = `-- name: CreateQuickCreateTask :one
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, context, originator_user_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, context, originator_user_id,
     accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, trigger_evidence_kind, trigger_evidence_ref_id
 )
 VALUES (
-    $1, $2, NULL, 'queued', $3, $4,
+    $1, $2, NULL, (SELECT workspace_id FROM agent WHERE id = $1), 'queued', $3, $4,
     $5,
     $6,
     $7,
@@ -2305,7 +2305,7 @@ func (q *Queries) CreateQuickCreateTask(ctx context.Context, arg CreateQuickCrea
 
 const createRetryTask = `-- name: CreateRetryTask :one
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, chat_session_id, autopilot_run_id,
+    agent_id, runtime_id, issue_id, workspace_id, chat_session_id, autopilot_run_id,
     status, priority, trigger_comment_id, coalesced_comment_ids, trigger_summary, context,
     session_id, work_dir,
     attempt, max_attempts, parent_task_id, force_fresh_session, is_leader_task,
@@ -2315,7 +2315,7 @@ INSERT INTO agent_task_queue (
     chat_input_task_id, fire_at
 )
 SELECT
-    p.agent_id, p.runtime_id, p.issue_id, p.chat_session_id, p.autopilot_run_id,
+    p.agent_id, p.runtime_id, p.issue_id, p.workspace_id, p.chat_session_id, p.autopilot_run_id,
     CASE WHEN $2::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
     p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary, p.context,
@@ -3908,7 +3908,7 @@ func (q *Queries) GetLatestTaskRolloutMissing(ctx context.Context, arg GetLatest
 }
 
 const getRelayStageConfig = `-- name: GetRelayStageConfig :one
-SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages FROM relay_stage_config
+SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages, workspace_id FROM relay_stage_config
 WHERE stage_name = $1
 `
 
@@ -3925,6 +3925,7 @@ func (q *Queries) GetRelayStageConfig(ctx context.Context, stageName string) (Re
 		&i.AgentName,
 		&i.CreatedAt,
 		&i.AltNextStages,
+		&i.WorkspaceID,
 	)
 	return i, err
 }
@@ -4203,8 +4204,11 @@ func (q *Queries) HasPendingTaskForIssueAndAgentExcludingTriggerComment(ctx cont
 
 const linkTaskToIssue = `-- name: LinkTaskToIssue :exec
 UPDATE agent_task_queue
-SET issue_id = $2
-WHERE id = $1 AND issue_id IS NULL
+SET issue_id = $2,
+    workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+WHERE agent_task_queue.id = $1 AND agent_task_queue.issue_id IS NULL
+  AND EXISTS (SELECT 1 FROM issue i JOIN agent a ON a.id = agent_task_queue.agent_id
+              WHERE i.id = $2 AND i.workspace_id = a.workspace_id)
 `
 
 type LinkTaskToIssueParams struct {
@@ -5044,7 +5048,7 @@ func (q *Queries) ListQueuedClaimCandidatesByRuntimes(ctx context.Context, arg L
 }
 
 const listRelayStageConfig = `-- name: ListRelayStageConfig :many
-SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages FROM relay_stage_config
+SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages, workspace_id FROM relay_stage_config
 ORDER BY id ASC
 `
 
@@ -5068,6 +5072,7 @@ func (q *Queries) ListRelayStageConfig(ctx context.Context) ([]RelayStageConfig,
 			&i.AgentName,
 			&i.CreatedAt,
 			&i.AltNextStages,
+			&i.WorkspaceID,
 		); err != nil {
 			return nil, err
 		}
@@ -7026,7 +7031,7 @@ UPDATE relay_stage_config
 SET agent_id = $2,
     agent_name = $3
 WHERE stage_name = $1
-RETURNING id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages
+RETURNING id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages, workspace_id
 `
 
 type SetRelayStageOwnerParams struct {
@@ -7049,6 +7054,7 @@ func (q *Queries) SetRelayStageOwner(ctx context.Context, arg SetRelayStageOwner
 		&i.AgentName,
 		&i.CreatedAt,
 		&i.AltNextStages,
+		&i.WorkspaceID,
 	)
 	return i, err
 }
