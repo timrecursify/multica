@@ -33,6 +33,10 @@ const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
+const scheduleEvery = (fn, ms, label) => setInterval(
+  () => Promise.resolve().then(fn)
+    .catch(err => console.error(`${LOG_PREFIX} ${label} error: ${err && err.message ? err.message : err}`)),
+  ms);
 const RECONCILE_INTERVAL_MS = 30000;
 const RECONCILE_MAX_CREATE_PER_CYCLE = Number.parseInt(
   process.env.RECONCILE_MAX_CREATE_PER_CYCLE || '25', 10
@@ -1855,19 +1859,17 @@ function startDaemon() {
   console.log(`${LOG_PREFIX} Starting (reconcile every 30s, cleanup every 5m)`);
   // A pg-pool connect timeout inside a bare async interval is an unhandled
   // rejection and fatal under Node 22; every tick is guarded.
-  const guarded = (name, fn) => () => Promise.resolve().then(fn)
-    .catch(err => console.error(`${LOG_PREFIX} ${name} error: ${err.message}`));
   process.on('unhandledRejection', err =>
     console.error(`${LOG_PREFIX} unhandledRejection: ${err && err.message ? err.message : err}`));
-  setInterval(guarded('advanceTick', advanceTick), 15000);
-  setInterval(guarded('findAndAdvanceRegistered', findAndAdvanceRegistered), 20000);
-  setInterval(guarded('recoveryAdvanceTasks', recoveryAdvanceTasks), 120000);
-  setInterval(guarded('cleanupStalePendingRows', cleanupStalePendingRows), 300000);
-  setInterval(() => runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`)), RECONCILE_INTERVAL_MS);
-  setInterval(guarded('processParkedDiagnoses', processParkedDiagnoses), 30000);
-  setInterval(guarded('reconcileQuotaPauses', reconcileQuotaPauses), 60000);
-  setInterval(() => recordOutcomesPass().catch(err => console.error(`${LOG_PREFIX} stage-outcome error: ${err.message}`)), 30000);
-  setInterval(() => readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`)), 300000);
+  scheduleEvery(advanceTick, 15000, 'advanceTick');
+  scheduleEvery(findAndAdvanceRegistered, 20000, 'findAndAdvanceRegistered');
+  scheduleEvery(recoveryAdvanceTasks, 120000, 'recoveryAdvanceTasks');
+  scheduleEvery(cleanupStalePendingRows, 300000, 'cleanupStalePendingRows');
+  scheduleEvery(runReconcileCycle, RECONCILE_INTERVAL_MS, 'reconcile');
+  scheduleEvery(processParkedDiagnoses, 30000, 'processParkedDiagnoses');
+  scheduleEvery(reconcileQuotaPauses, 60000, 'reconcileQuotaPauses');
+  scheduleEvery(recordOutcomesPass, 30000, 'stage-outcome');
+  scheduleEvery(readvanceRecordedOutcomes, 300000, 'typed-readvance');
   advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
   runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
@@ -1879,7 +1881,7 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
+module.exports = { advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, scheduleEvery,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes };
