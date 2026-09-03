@@ -110,7 +110,7 @@ CREATE TABLE agent_invocation_target (id bigserial PRIMARY KEY, agent_id uuid NO
 	if _, err := conn.Exec(ctx, `INSERT INTO agent (id,workspace_id,archived_at) VALUES ($1::uuid,$2::uuid,NULL),($3::uuid,$2::uuid,NULL),($4::uuid,$2::uuid,now())`, member, workspace, nonMember, archived); err != nil {
 		t.Fatalf("seed agents: %v", err)
 	}
-	if _, err := conn.Exec(ctx, `INSERT INTO relay_stage_agent_pool VALUES ($1::uuid,'Queue',$2::uuid,true),($1::uuid,'Queue',$4::uuid,true)`, workspace, member, nonMember, archived); err != nil {
+	if _, err := conn.Exec(ctx, `INSERT INTO relay_stage_agent_pool VALUES ($1::uuid,'Queue',$2::uuid,true),($1::uuid,'Queue',$3::uuid,true)`, workspace, member, archived); err != nil {
 		t.Fatalf("seed pool: %v", err)
 	}
 	applyMigrationFile(t, ctx, conn.Conn(), "305_relay_stage_pool_invocation_grant.up.sql")
