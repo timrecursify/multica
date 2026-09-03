@@ -7,6 +7,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute } = require('./multica-relay-advance-daemon.cjs');
+const { createGuardedRunner } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
 
@@ -26,6 +27,35 @@ test('completion evidence satisfies every automatic transition policy row', () =
 });
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+
+test('guarded runner contains startup rejection and allows the next pass', async () => {
+  let calls = 0;
+  const errors = [];
+  const runner = createGuardedRunner('startup-test', async () => {
+    calls += 1;
+    if (calls === 1) throw new Error('injected startup rejection');
+    return 'ok';
+  }, { backoffBaseMs: 0, backoffMaxMs: 0, logger: { warn() {}, error: (...args) => errors.push(args.join(' ')) }, now: () => 1 });
+  await runner();
+  await runner();
+  assert.equal(calls, 2);
+  assert.match(errors[0], /startup-test.*injected startup rejection/);
+});
+
+test('guarded runner suppresses overlapping ticks', async () => {
+  let release;
+  let calls = 0;
+  const runner = createGuardedRunner('overlap-test', () => {
+    calls += 1;
+    return new Promise((resolve) => { release = resolve; });
+  }, { logger: { warn() {}, error() {} } });
+  const first = runner();
+  const skipped = await runner();
+  assert.deepEqual(skipped, { skipped: 'in_flight' });
+  release();
+  await first;
+  assert.equal(calls, 1);
+});
 
 test('reconciliation ramp defaults to 25 and passes the full candidate set to reconciler', async () => {
   assert.equal(reconcileCreateLimit(), 25);
