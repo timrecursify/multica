@@ -6,10 +6,18 @@ BEGIN
     JOIN agent a ON a.id=t.agent_id WHERE qa.issue_id=NEW.issue_id AND qa.work_product_md5=NEW.work_product_md5
     AND qa.verdict=NEW.verdict AND qa.qualifying=true AND qa.bound_sha ~* '^[0-9a-f]{40}$'
     AND lower(qa.bound_sha)=lower(qa.observed_head) AND t.agent_id=NEW.checker_id
-    AND a.model='gpt-5.6-sol' AND a.thinking_level='low') THEN
+    AND a.model IN ('gpt-5.6-sol','gpt-5.6-luna')) THEN
     RAISE EXCEPTION 'qc_attempt_binding_required' USING ERRCODE='23514';
   END IF; RETURN NEW;
 END $$;
-DROP TRIGGER IF EXISTS qc_verdict_attempt_binding ON qc_verdict;
-CREATE TRIGGER qc_verdict_attempt_binding BEFORE INSERT OR UPDATE OF verdict, checker_id, work_product_md5 ON qc_verdict
-FOR EACH ROW EXECUTE FUNCTION public.require_qc_attempt_binding();
+-- qc_verdict and qc_attempt are provisioned by the belt runtime, not by this
+-- migration chain; a fresh database (CI) has neither. Bind the trigger only
+-- when the table exists so the chain applies cleanly everywhere.
+DO $$
+BEGIN
+  IF to_regclass('public.qc_verdict') IS NOT NULL THEN
+    DROP TRIGGER IF EXISTS qc_verdict_attempt_binding ON qc_verdict;
+    CREATE TRIGGER qc_verdict_attempt_binding BEFORE INSERT OR UPDATE OF verdict, checker_id, work_product_md5 ON qc_verdict
+    FOR EACH ROW EXECUTE FUNCTION public.require_qc_attempt_binding();
+  END IF;
+END $$;
