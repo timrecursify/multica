@@ -1112,8 +1112,11 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 404, "issue_not_found");
     }
-    const liveQcTask = externalQc ? null : await latestRunningSolLowQcTask(client, payload.issue_id,
+    const liveQcTaskCandidate = externalQc ? null : await latestRunningSolLowQcTask(client, payload.issue_id,
       issue.rows[0].workspace_id, payload.checker, payload.qc_task_id || null);
+    // Keep the admission split explicit even under test doubles or legacy
+    // adapters that may return an incomplete row for the running-task query.
+    const liveQcTask = liveQcTaskCandidate?.status === "running" ? liveQcTaskCandidate : null;
     const completedQcTask = externalQc || liveQcTask ? null : await latestCompletedSolLowQcTask(client,
       payload.issue_id, issue.rows[0].workspace_id, payload.qc_task_id || null);
     const qcTask = externalQc ? { id: null, agent_id: null, agent_name: payload.checker,
