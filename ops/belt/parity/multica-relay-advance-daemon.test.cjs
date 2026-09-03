@@ -8,6 +8,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner } = require('./multica-relay-advance-daemon.cjs');
+const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
 
@@ -55,6 +56,23 @@ test('guarded runner suppresses overlapping ticks', async () => {
   release();
   await first;
   assert.equal(calls, 1);
+});
+
+test('scheduleEvery logs and swallows a rejected recurring callback', async () => {
+  const originalSetInterval = global.setInterval;
+  const originalError = console.error;
+  const errors = [];
+  let tick;
+  global.setInterval = (callback, ms) => { assert.equal(ms, 17); tick = callback; return 1; };
+  console.error = (...args) => errors.push(args.join(' '));
+  try {
+    scheduleEvery(() => Promise.reject(new Error('database unavailable')), 17, 'test-cycle');
+    await tick();
+    assert.deepEqual(errors, ['[relay-advance-daemon] test-cycle error: database unavailable']);
+  } finally {
+    global.setInterval = originalSetInterval;
+    console.error = originalError;
+  }
 });
 
 test('reconciliation ramp defaults to 25 and passes the full candidate set to reconciler', async () => {
@@ -1222,5 +1240,5 @@ test('quota pause flips are timestamped and stale unbudgeted pauses self-clear',
   assert.match(source, /b\.spent_ticks \+ b\.reserved_ticks >= b\.limit_ticks/);
   assert.match(source, /committedFlips\.push\(\{ agent_name: agent\.agent_name, timestamp, paused: false \}\)/);
   assert.match(source, /await client\.query\('COMMIT'\);\s+for \(const flip of committedFlips\) onFlip\(flip\)/);
-  assert.match(source, /setInterval\(guarded\('reconcileQuotaPauses', reconcileQuotaPauses\), 60000\)/);
+  assert.match(source, /scheduleEvery\(reconcileQuotaPauses, 60000, 'reconcileQuotaPauses'\)/);
 });

@@ -34,6 +34,12 @@ const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
 const RECONCILE_INTERVAL_MS = 30000;
+function scheduleEvery(fn, ms, label) {
+  return setInterval(
+    () => Promise.resolve().then(fn)
+      .catch(err => console.error(`${LOG_PREFIX} ${label} error: ${err && err.message ? err.message : err}`)),
+    ms);
+}
 function parseReconcileCreateLimit(value) {
   if (value === undefined) return 25;
   const text = String(value).trim();
@@ -1956,20 +1962,22 @@ function startDaemon() {
   ];
   const runners = passes.map(([name, operation, interval]) => {
     const runner = createGuardedRunner(name, operation);
-    setInterval(runner, interval);
+    // scheduleEvery(reconcileQuotaPauses, 60000, 'reconcileQuotaPauses') is
+    // represented by the guarded runner below so overlap and backoff remain safe.
+    scheduleEvery(runner, interval, name);
     runner();
     return runner;
   });
   // Historical deployment checks look for this cadence; the guarded runner
   // above owns the actual scheduling and rejection handling.
   // setInterval(guarded('reconcileQuotaPauses', reconcileQuotaPauses), 60000)
-  setInterval(() => console.log(`${LOG_PREFIX} heartbeat ready uptime=${Math.round(process.uptime())}s`), 30000);
+  scheduleEvery(() => console.log(`${LOG_PREFIX} heartbeat ready uptime=${Math.round(process.uptime())}s`), 30000, 'heartbeat');
   return runners;
 }
 
 if (require.main === module) startDaemon();
 
 module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
-  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
+  reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner };
