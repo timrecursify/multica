@@ -1666,6 +1666,17 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 		resp.ConnectedApps = parseRuntimeConnectedAppsForClaim(task.RuntimeConnectedApps, task.ID)
 	}
 	if agent, err := h.Queries.GetAgent(r.Context(), task.AgentID); err == nil {
+		if uuidToString(agent.WorkspaceID) != runtimeWorkspaceID {
+			slog.Error("task claim: agent workspace isolation check failed, cancelling task",
+				"task_id", uuidToString(task.ID), "agent_id", uuidToString(agent.ID),
+				"agent_workspace", uuidToString(agent.WorkspaceID), "runtime_workspace", runtimeWorkspaceID)
+			if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+				slog.Error("task claim: cancel after agent workspace check failed", "task_id", uuidToString(task.ID), "error", cerr)
+			}
+			return resp, deliveredCommentIDs, agentSkillCount, builtinSkillCount, &claimBuildFailure{
+				outcome: "error_workspace", status: http.StatusInternalServerError, message: "task workspace isolation check failed",
+			}
+		}
 		useSkillRefs := requestHasClientCapability(r, protocol.DaemonCapabilitySkillBundlesV1)
 		var customEnv map[string]string
 		if agent.CustomEnv != nil {
