@@ -126,6 +126,60 @@ const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
 const RERUN_IDEM_KEY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,255}$/;
 
+// Operator-authorized respec is deliberately a separate endpoint.  It is the
+// only sanctioned exception to automatic retry lineage: no agent task is
+// created or fabricated, and the mutation is recorded in the relay audit log.
+async function operatorRespec(client, payload) {
+  const issueId = String(payload.issue_id || "");
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  const idem = String(payload.idempotency_key || "");
+  if (!UUID_RE.test(issueId) || !reason || !IDEM_KEY_RE.test(idem)) {
+    return { ok: false, status: 400, error: "invalid_request" };
+  }
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 806))", [issueId]);
+  const issueResult = await client.query(
+    `SELECT id, workspace_id, status, metadata FROM issue WHERE id = $1::uuid FOR UPDATE`, [issueId]);
+  if (!issueResult.rows[0]) return { ok: false, status: 404, error: "issue_not_found" };
+  const issue = issueResult.rows[0];
+  const prior = await client.query(
+    `SELECT id, parked_audit FROM relay_run_log
+      WHERE issue_id = $1::uuid AND parked_audit->'operator_respec'->>'idempotency_key' = $2
+      ORDER BY id DESC LIMIT 1`, [issueId, idem]);
+  if (prior.rows[0]) {
+    const recorded = prior.rows[0].parked_audit.operator_respec;
+    if (recorded.reason !== reason) return { ok: false, status: 409, error: "idempotency_conflict" };
+    return { ok: true, replay: true, receipt: { issue_id: issueId, prior_stage: "Human Review",
+      new_stage: "Spec", reason, idempotency_key: idem, audit_row_id: prior.rows[0].id,
+      accounting_baseline: recorded.accounting_baseline } };
+  }
+  if (issue.status !== "Human Review") return { ok: false, status: 409, error: "human_review_stage_required" };
+  const [cycle, lifetime] = await Promise.all([
+    capEscalationVerified(client, issue, "stage_cycle_limit", "Human Review"),
+    capEscalationVerified(client, issue, "lifetime_task_limit", "Human Review")
+  ]);
+  if (!cycle && !lifetime) return { ok: false, status: 409, error: "cap_evidence_required" };
+  const baseline = new Date().toISOString();
+  const metadata = JSON.stringify({ ...(issue.metadata || {}),
+    retry_escalation_at: baseline, operator_respec_at: baseline,
+    operator_respec_reason: reason, operator_respec_idempotency_key: idem
+  });
+  // Remove stale release markers while retaining the fresh retry baseline.
+  await client.query(
+    `UPDATE issue SET status = 'Spec', metadata = (COALESCE($2::jsonb, '{}'::jsonb)
+       - 'parked_release_at' - 'human_review_release_at' - 'human_review_release_reason'
+       - 'retry_escalation'), updated_at = NOW() WHERE id = $1::uuid`, [issueId, metadata]);
+  const audit = { operator_respec: { operator_authorized: true, reason,
+    idempotency_key: idem, accounting_baseline: baseline, cap_evidence: { stage_cycle: cycle, lifetime } } };
+  const log = await client.query(
+    `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
+      VALUES ($1::uuid, 'Human Review', 'Spec', 'completed', $2::jsonb) RETURNING id`,
+    [issueId, JSON.stringify(audit)]);
+  const auditId = log.rows[0]?.id;
+  return { ok: true, replay: false, receipt: { issue_id: issueId, prior_stage: "Human Review",
+    new_stage: "Spec", reason, idempotency_key: idem, audit_row_id: auditId,
+    accounting_baseline: baseline } };
+}
+
 // This deliberately reads only the canonical link tables.  issue.pr_url and
 // comment text are presentation/provenance data, not authority to skip work.
 async function mergedPrEvidence(client, issue, evidence, dependencies = {}) {
@@ -2143,6 +2197,36 @@ async function relayAdvance(req, res, body) {
   }
 }
 
+async function relayOperatorRespec(req, res, body) {
+  if (!RELAY_OPERATOR_SECRET || OPERATOR_SECRET_DISABLED ||
+      (req.headers || {})["x-relay-operator-secret"] !== RELAY_OPERATOR_SECRET) {
+    res.writeHead(403, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "operator_secret_required" }));
+    return;
+  }
+  const client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
+  try {
+    await client.connect();
+    await client.query("BEGIN");
+    await authorizeRelayStatusWrites(client);
+    const result = await operatorRespec(client, body || {});
+    if (!result.ok) {
+      await client.query("ROLLBACK");
+      res.writeHead(result.status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: result.error }));
+      return;
+    }
+    await client.query("COMMIT");
+    res.writeHead(result.replay ? 200 : 201, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true, replay: Boolean(result.replay), ...result.receipt }));
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    console.error("[relay/operator-respec] ERROR:", err.message);
+    res.writeHead(500, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "internal_error" }));
+  } finally { await client.end().catch(() => {}); }
+}
+
 async function relayDiagnosisRerun(req, res, payload) {
   if (!RELAY_AGENT_SECRET || payload.agent_token !== RELAY_AGENT_SECRET) return relayVerdictError(res, 403, 'invalid_token');
   const client = new Client({ connectionString: MULTICA_DB });
@@ -2175,24 +2259,30 @@ const server = http.createServer(async (req, res) => {
         relayVerdictError(res, 400, "invalid_json");
       }
     });
-  } else if (req.method === "POST" && req.url === "/relay/advance") {
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", () => {
-      try {
-        const data = JSON.parse(body);
-        relayAdvance(req, res, data);
-      } catch (err) {
-        res.writeHead(400);
-        res.end("Invalid JSON");
-      }
-    });
-  } else if (req.method === "POST" && req.url === "/relay/parked-diagnosis-rerun") {
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", () => {
-      try { relayDiagnosisRerun(req, res, JSON.parse(body)); } catch { relayVerdictError(res, 400, 'invalid_json'); }
-    });
+      } else if (req.method === "POST" && req.url === "/relay/advance") {
+        let body = "";
+        req.on("data", chunk => body += chunk);
+        req.on("end", () => {
+          try {
+            const data = JSON.parse(body);
+            relayAdvance(req, res, data);
+          } catch (err) {
+            res.writeHead(400);
+            res.end("Invalid JSON");
+          }
+        });
+      } else if (req.method === "POST" && (req.url === "/relay/operator-respec" || req.url === "/relay/respec")) {
+        let body = "";
+        req.on("data", chunk => body += chunk);
+        req.on("end", () => {
+          try { relayOperatorRespec(req, res, JSON.parse(body)); } catch { relayVerdictError(res, 400, "invalid_json"); }
+        });
+      } else if (req.method === "POST" && req.url === "/relay/parked-diagnosis-rerun") {
+        let body = "";
+        req.on("data", chunk => body += chunk);
+        req.on("end", () => {
+          try { relayDiagnosisRerun(req, res, JSON.parse(body)); } catch { relayVerdictError(res, 400, 'invalid_json'); }
+        });
   } else if (req.method === "GET" && req.url === "/sso/bridge") {
     ssoBridge(req, res);
   } else if (req.url === "/health") {
@@ -2256,6 +2346,8 @@ module.exports = {
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
+  relayOperatorRespec,
+  operatorRespec,
   setTestClientFactory(factory) { testClientFactory = factory; },
   isCicdReturn,
   consumeCicdReturnAuthorization,
