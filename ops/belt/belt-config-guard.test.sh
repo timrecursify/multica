@@ -102,4 +102,11 @@ assert_eq '1' "${#unfixable[@]}" 'malformed receipt is non-successful'
 fixture_advance_output='{"success":true,"issue":{"status":"Spec"},"task_id":null}'
 run_spec_refly_fixture
 assert_eq '1' "${#unfixable[@]}" 'receipt without scoper task is non-successful'
+# Status recovery is protected by the relay-authority trigger in migration 297;
+# keep the pump's reset on that same transaction-local authority path.
+spec_refly_source=$(sed -n '/^spec_refly_reset()/,/^spec_refly_advance()/p' "$root_dir/belt-config-guard.sh")
+if [[ "$spec_refly_source" != *"set_config('multica.relay_authorized','on',true)"* ]]; then
+  echo 'stranded-Spec reset does not set relay authority' >&2
+  exit 1
+fi
 echo 'belt config guard launch regression passed'
