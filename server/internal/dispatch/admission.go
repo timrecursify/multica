@@ -131,24 +131,19 @@ func deferRetryAfter(base, cap time.Duration, n int) time.Duration {
 	return clampedRetry(b, c, n)
 }
 
-// nearLimit reports whether load sits at or above the AlertThreshold fraction
-// of the smaller configured cap. With no alert threshold it is never near-limit.
+// nearLimit reports whether either resource sits at or above the alert
+// threshold of its own configured cap. Queue depth and active concurrency are
+// different units and must not be compared to one another (or to the smaller
+// of the two caps).
 func nearLimit(cfg AdmissionPolicy, load Load) bool {
 	if cfg.AlertThreshold <= 0 {
 		return false
 	}
-	cap := float64(cfg.MaxConcurrent)
-	if cap <= 0 || (cfg.MaxQueueDepth > 0 && float64(cfg.MaxQueueDepth) < cap) {
-		cap = float64(cfg.MaxQueueDepth)
-	}
-	if cap <= 0 {
-		return false
-	}
-	used := float64(load.ActiveConcurrent)
-	if used < float64(load.QueueDepth) {
-		used = float64(load.QueueDepth)
-	}
-	return used >= cfg.AlertThreshold*cap
+	queueNear := cfg.MaxQueueDepth > 0 &&
+		float64(load.QueueDepth) >= cfg.AlertThreshold*float64(cfg.MaxQueueDepth)
+	activeNear := cfg.MaxConcurrent > 0 &&
+		float64(load.ActiveConcurrent) >= cfg.AlertThreshold*float64(cfg.MaxConcurrent)
+	return queueNear || activeNear
 }
 
 func normalizedBackoff(cfg AdmissionPolicy) (base, cap time.Duration) {
