@@ -259,6 +259,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # deploy.test.sh replays the previous bridge revision from history.
+          fetch-depth: 0
 
       - name: Test daemon wrapper launch contract
         run: bash ops/belt/wrapper.test.sh
