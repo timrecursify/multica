@@ -18,6 +18,9 @@ const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvide
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const { currentStrictPass } = require("./qc-strict-evidence.cjs");
+const { evaluate } = require("./transition-policy.cjs");
+const { validateQcVerdict } = require("./qc-verdict-policy.cjs");
+const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require("./qc-lane.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -251,7 +254,7 @@ function validateRelayVerdict(payload) {
   if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
   if (!FAILURE_CLASSES.has(payload.failure_class)) return "invalid_failure_class";
   if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
-  if (payload.model !== "gpt-5.6-sol" || payload.effort !== "low") return "invalid_qc_lane";
+  if (!isQcLane(payload.model, payload.effort)) return "invalid_qc_lane";
   if (typeof payload.idem_key !== "string" || !IDEM_KEY_RE.test(payload.idem_key)) return "invalid_idem_key";
   return null;
 }
@@ -299,19 +302,19 @@ async function hasCurrentPassWorkProduct(client, issueId, workProductMd5) {
 
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explicitTaskId = null) {
   const result = await client.query(
-      `SELECT t.id, t.agent_id, t.status, t.context, t.result, t.completed_at,
-              a.name AS agent_name
+      `SELECT t.id, t.issue_id, t.workspace_id, t.agent_id, t.status, t.context, t.result, t.completed_at,
+              a.name AS agent_name, a.model, a.thinking_level, a.runtime_config
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
       WHERE t.issue_id = $1 AND i.workspace_id = $2 AND t.status = 'completed'
         AND t.context->>'to_stage' = 'In Review'
-        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($4::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $5::text
         AND ($3::uuid IS NULL OR t.id = $3::uuid)
       ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
       LIMIT 1 FOR UPDATE`,
-    [issueId, workspaceId, explicitTaskId]
+    [issueId, workspaceId, explicitTaskId, qcLaneModelsSqlArray(), QC_LANE_EFFORT]
   );
   return result.rows[0] || null;
 }
@@ -399,9 +402,9 @@ async function latestQcNoArtifactSignal(client, issue) {
       WHERE t.issue_id = $1 AND t.workspace_id = $2
         AND t.context->>'to_stage' = 'In Review'
         AND t.status IN ('queued','dispatched','running','waiting_local_directory','deferred','completed')
-        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
-      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id]);
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($3::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $4::text
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id, qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
   const row = latest.rows[0];
   return Boolean(row && (isNoArtifactQcBlock(taskResultText(row.result)) ||
     isNoArtifactQcBlock(row.content)));
@@ -421,7 +424,7 @@ function qcTaskEvidence(task) {
       !SHA_RE.test(String(evidence.observed_sha || "")) ||
       String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase() ||
       !FAILURE_CLASSES.has(evidence.failure_class) || typeof evidence.qualifying !== "boolean" ||
-      evidence.model !== "gpt-5.6-sol" || evidence.effort !== "low") return null;
+      !isQcLane(evidence.model, evidence.effort)) return null;
   return evidence;
 }
 
@@ -433,7 +436,7 @@ function qcTaskEvidenceMismatch(task, payload) {
   if (String(evidence.bound_sha || "").toLowerCase() !== payload.bound_sha.toLowerCase() ||
       String(evidence.observed_sha || "").toLowerCase() !== payload.observed_sha.toLowerCase()) return "qc_task_sha_mismatch";
   if (evidence.failure_class !== payload.failure_class || evidence.qualifying !== payload.qualifying ||
-      evidence.model !== payload.model || evidence.effort !== payload.effort) return "qc_task_evidence_mismatch";
+      !isQcLane(payload.model, payload.effort)) return "qc_task_evidence_mismatch";
   return null;
 }
 
@@ -530,7 +533,7 @@ function escalationDeadline() {
 }
 
 async function recordRetryEscalation(client, issue, escalation) {
-  const details = { ...escalation, target_stage: "Spec", model: "gpt-5.6-sol", effort: "low" };
+  const details = { ...escalation, target_stage: "Spec", model: qcLaneModelsSqlArray()[0], effort: QC_LANE_EFFORT };
   await client.query(
     `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
           jsonb_build_object('retry_escalation', $2::jsonb, 'retry_escalation_at', to_jsonb(NOW())),
@@ -554,7 +557,7 @@ async function selectRetryEscalationOwner(client, issue) {
   if (!owner?.agent_id || !owner.owner_id || owner.archived_at || !owner.selected_runtime_id) {
     throw new Error(`No active Sol-low re-spec owner for workspace ${issue.workspace_id}`);
   }
-  if (owner.model !== "gpt-5.6-sol" || owner.thinking_level !== "low") {
+  if (!isQcLane(owner.model, owner.thinking_level)) {
     throw new Error(`Sol-low re-spec owner has invalid lane: ${owner.agent_name}`);
   }
   const compatibility = instructionCompatibility(owner.instructions, "Spec");
@@ -721,89 +724,34 @@ async function authorizeCicdReturnCapBypass(client, issueId, capBypass) {
 }
 
 async function replaceStageTask(client, task) {
-  // The issue row lock normally serializes relayAdvance callers. Keep the
-  // enqueue primitive safe for recovery/replay callers too: the predicate and
-  // insert must share a stage-specific transaction lock or simultaneous
-  // retries can both observe no active successor.
-  if (task.serialize) {
-    await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [
-      task.issueId, task.toStage
-    ]);
-  }
-  const context = typeof task.context === 'string' ? JSON.parse(task.context) : task.context;
-  if (!isBuilderDispatchAllowed(context)) {
-    throw new Error('builder dispatcher rejected a no_builder diagnosis task');
-  }
-  // The issue row is locked by relayAdvance. Cancel only unstarted relay work
-  // for another execution stage before making the successor visible. Running
-  // paid work and manual/disposition tasks are deliberately preserved.
-  await client.query(
-    `UPDATE agent_task_queue
-        SET status = 'cancelled', completed_at = NOW(),
-            prepare_lease_expires_at = NULL,
-            failure_reason = 'relay_stage_transition_superseded'
-      WHERE issue_id = $1
-        AND status::text = ANY($2::text[])
-        AND context ? 'to_stage'
-        AND COALESCE(context->>'source', '') NOT LIKE 'manual%'
-        AND context->>'to_stage' NOT IN
-            ('Human Review', 'Parked', 'Rejected', 'Done', 'Archived', 'Cancelled')
-        AND COALESCE(context->>'to_stage', '') IS DISTINCT FROM $3`,
-    [task.issueId, REPLACEABLE_TASK_STATUSES, task.toStage]
-  );
+  throw new Error('task creation is reconciler-owned');
+}
 
-  const inserted = await client.query(
-    `INSERT INTO agent_task_queue (
-       agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
-       trigger_summary, force_fresh_session, originator_source,
-       trigger_evidence_kind
-     )
-     SELECT $1, $2, $3, 'queued', $4, $5, $6::jsonb, $7, TRUE,
-            'unattributed', 'relay_stage_transition'
-      WHERE NOT EXISTS (
-        SELECT 1 FROM agent_task_queue active
-         WHERE active.issue_id = $2
-           AND active.status::text = ANY($8::text[])
-           AND active.context->>'to_stage' = $9
-      )
-       ON CONFLICT DO NOTHING
-       RETURNING id`,
-    [task.agentId, task.issueId, task.workspaceId, task.priority, task.runtimeId, task.context,
-      task.triggerSummary, LIVE_TASK_STATUSES, task.toStage]
-  );
+function relayActor(req, from, to) {
+  return !OPERATOR_SECRET_DISABLED && RELAY_OPERATOR_SECRET &&
+    req.headers['x-relay-operator-secret'] === RELAY_OPERATOR_SECRET ? 'operator' :
+    (from === 'Spec' && to === 'Queue' ? 'worker' : 'system');
+}
 
-  const taskId = inserted.rows[0]?.id || await existingStageTask(
-    client, task.issueId, task.toStage
-  );
-  if (!taskId) {
-    throw new Error(`relay successor task was not created for issue ${task.issueId} stage ${task.toStage}`);
+function transitionEvidence(body) {
+  const evidence = body && typeof body.evidence === 'object' && !Array.isArray(body.evidence)
+    ? { ...body.evidence } : {};
+  // The daemon's retry escalation carries its cause in `reason`; expose it as
+  // the retryEscalation evidence key the transition policy requires.
+  const escalation = retryEscalationReason(body && body.reason);
+  if (escalation && evidence.retry_escalation == null) evidence.retry_escalation = escalation;
+  // `sk multica return` posts `RETURN:<stage> — <reason>` with no evidence
+  // object; the stated reason is the retry/return evidence for the In Progress
+  // hops from In Review and CI/CD & Deploy.
+  const returned = String(body && body.reason || "").match(/^RETURN:[^—]+—\s*(.+)$/s);
+  if (returned) {
+    const cause = returned[1].trim();
+    if (evidence.implementationFail == null) evidence.implementationFail = cause;
+    if (evidence.retryRemaining == null) evidence.retryRemaining = true;
+    if (evidence.ciFailureOrAbsent == null) evidence.ciFailureOrAbsent = cause;
+    if (evidence.mergeConflictEvidence == null) evidence.mergeConflictEvidence = cause;
   }
-
-  const log = task.relayAudit
-    ? await client.query(
-      `INSERT INTO relay_run_log (
-         issue_id, from_stage, to_stage, agent_id, task_id, status, parked_audit
-       )
-       SELECT $1, $2, $3, $4, $5, 'pending', $6::jsonb
-        WHERE NOT EXISTS (
-          SELECT 1 FROM relay_run_log
-           WHERE issue_id = $1 AND task_id = $5
-        )
-       RETURNING id`,
-      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId, task.relayAudit]
-    ) : await client.query(
-      `INSERT INTO relay_run_log (
-         issue_id, from_stage, to_stage, agent_id, task_id, status
-       )
-       SELECT $1, $2, $3, $4, $5, 'pending'
-        WHERE NOT EXISTS (
-          SELECT 1 FROM relay_run_log
-           WHERE issue_id = $1 AND task_id = $5
-        )
-       RETURNING id`,
-      [task.issueId, task.fromStage, task.toStage, task.agentId, taskId]
-    );
-  return { taskId, relayLogId: log.rows[0]?.id || null };
+  return evidence;
 }
 
 // Link the Queue -> In Progress bookkeeping hop to the builder task that
@@ -1091,9 +1039,9 @@ async function relayVerdict(req, res, payload) {
     relayVerdictError(res, 403, "invalid_token");
     return;
   }
-  const invalid = validateRelayVerdict(payload);
-  if (invalid) {
-    relayVerdictError(res, 400, invalid);
+  if (!payload || typeof payload !== 'object' || !UUID_RE.test(String(payload.issue_id || '')) ||
+      typeof payload.idem_key !== 'string' || !IDEM_KEY_RE.test(payload.idem_key)) {
+    relayVerdictError(res, 400, 'invalid_payload');
     return;
   }
   const externalQc = payload.operator_external_qc === true;
@@ -1152,6 +1100,16 @@ async function relayVerdict(req, res, payload) {
     if (!qcTask) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "completed_sol_low_qc_required");
+    }
+    const verdict = validateQcVerdict(externalQc
+      ? { actor: { type: 'operator', authenticated: true, external_receipt: payload.reason }, evidence: payload }
+      : { actor: { type: 'worker', authenticated_task_id: qcTask.id }, task: {
+        ...qcTask, agent: { model: qcTask.model, thinking_level: qcTask.thinking_level,
+          runtime_config: qcTask.runtime_config }
+      }, evidence: payload });
+    if (!verdict.ok) {
+      await client.query("ROLLBACK");
+      return relayVerdictError(res, 409, verdict.reason);
     }
     const evidenceMismatch = externalQc ? null : qcTaskEvidenceMismatch(qcTask, payload);
     if (evidenceMismatch) {
@@ -1281,6 +1239,33 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    // The bridge owns only the atomic status change. Reconciliation observes
+    // this committed transition and creates the one current-stage task.
+    const policy = evaluate({ from: issue.status, to: requestedStage,
+      actor: relayActor(req, issue.status, requestedStage), evidence: transitionEvidence(body) });
+    if (!policy.ok) {
+      await client.query("ROLLBACK");
+      console.log(`[relay/advance] denied #${issue.number} ${issue.status} -> ${requestedStage} actor=${relayActor(req, issue.status, requestedStage)} code=${policy.code} evidence=${Object.keys(transitionEvidence(body)).join(",") || "-"} reason=${JSON.stringify(String(body.reason || "").slice(0, 80))}`);
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: policy.code }));
+      return;
+    }
+    const transitionUpdate = await client.query(
+      `UPDATE "issue" SET status = $1, updated_at = NOW()
+        WHERE id = $2 RETURNING id, status`, [requestedStage, issue_id]
+    );
+    // Entering a stage starts it fresh: a recorded outcome from an earlier
+    // visit (e.g. a build ADVANCED before a CI/CD RETURN) must not let the
+    // daemon re-advance the issue past the stage it was just returned to.
+    await client.query(
+      `DELETE FROM issue_stage_outcome WHERE issue_id = $1 AND stage = $2`,
+      [issue_id, requestedStage]
+    );
+    await client.query("COMMIT");
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ success: true, issue: transitionUpdate.rows[0], task_id: null,
+      relay_log_id: null }));
+    return;
     // Recovery has already counted the cap history, but status changes must
     // remain relay-owned.  This authenticated receipt uses the same atomic
     // disposition authority as synchronous admission and is replay-safe.

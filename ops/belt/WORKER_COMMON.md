@@ -94,5 +94,25 @@ Delete a test you wrote that turned out to prove nothing.
 - Clone fresh or use a managed isolated worktree. Never trust a stale local
   checkout.
 - Use a branch and pull request. Never push to `main` or force-push.
+- Push first, then run `gh pr create` as its own separate command (never chained with `&&` or in a script). The daemon reads the pull request URL from that command's output alone; any other text in the same output marks the task failed even though the PR exists.
 - Never print secrets. Money, auth, migrations, secrets, and production flags
   require Sol-low QC before merge or deployment.
+
+## Stage outcome contract (GSP-1826)
+
+The last non-empty line of your final output must be exactly one of:
+
+```
+OUTCOME: ADVANCED
+OUTCOME: BLOCKED blocked_on=<ci|human|sha|dependency|quota>
+OUTCOME: NO_OP
+OUTCOME: FAILED
+```
+
+- `ADVANCED`: you produced the stage's deliverable (spec, PR, verdict, deploy receipt).
+- `BLOCKED`: you could not, and name why. `human` means a person must decide or supply something; `sha` means no implementation commit or PR exists to act on; `ci` means checks are queued or red; `dependency` means another issue must reach Done first; `quota` means the provider refused.
+- A relay refusal (`409 evidence_missing`, `transition_denied`, `relay POST failed`) after you delivered the stage's work product is NOT a block. Do not call `sk multica advance`; the belt advances the stage from your task result. Report `OUTCOME: ADVANCED` and cite the work product (PR URL, comment id, SHA).
+- `NO_OP`: the deliverable already exists (already merged, already deployed). Say where.
+- `FAILED`: you stopped for any other reason.
+
+The relay records this line against the issue and stage. A stage with a recorded outcome is not re-dispatched until its inputs change (PR head SHA, CI state, newest comment, dependency state, spec body). Missing or malformed line is recorded as `FAILED`.

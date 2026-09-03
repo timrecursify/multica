@@ -1,5 +1,6 @@
 const { Pool } = require('pg');
 const { currentStrictPass } = require('./qc-strict-evidence.cjs');
+const { QC_LANE_EFFORT, qcLaneModelsSqlArray } = require('./qc-lane.cjs');
 
 function parseArgs(args) {
   let mode = 'dry-run';
@@ -44,7 +45,7 @@ const CANDIDATE_SQL = `SELECT DISTINCT ON (i.id)
      WHERE qa.issue_id=i.id AND qa.work_product_md5=verdict.work_product_md5
        AND qa.verdict='PASS' AND qa.qualifying=true AND qa.bound_sha ~* '^[0-9a-f]{40}$'
        AND lower(qa.bound_sha)=lower(qa.observed_head) AND t.agent_id=verdict.checker_id
-       AND a.model='gpt-5.6-sol' AND a.thinking_level='low'
+       AND a.model = ANY($1::text[]) AND a.thinking_level = $2::text
    )
    AND NOT EXISTS (
      SELECT 1 FROM relay_run_log pending
@@ -60,16 +61,16 @@ const CANDIDATE_SQL = `SELECT DISTINCT ON (i.id)
         AND evidence_task.agent_id = verdict.checker_id
         AND evidence_task.status = 'completed'
         AND COALESCE(evidence_agent.model,
-                     evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
+                     evidence_agent.runtime_config->>'model') = ANY($1::text[])
         AND COALESCE(evidence_agent.thinking_level,
-                     evidence_agent.runtime_config->>'reasoning_effort') = 'low'
+                     evidence_agent.runtime_config->>'reasoning_effort') = $2::text
    )
  ORDER BY i.id, rrl.created_at DESC, rrl.id DESC`;
 
 async function recover(client, { mode }) {
   await client.query('BEGIN');
   try {
-    const candidates = await client.query(CANDIDATE_SQL);
+    const candidates = await client.query(CANDIDATE_SQL, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
     // Keep recovery on the same exact-one-attempt contract as deploy/Done.
     const strictCandidates = [];
     for (const candidate of candidates.rows) {

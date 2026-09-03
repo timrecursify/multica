@@ -22,33 +22,138 @@ const { completionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
+const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
+const { reconcileCycle } = require('../reconciler.cjs');
+const { recordStageOutcomes } = require('../stage-outcome.cjs');
+const TYPED_OUTCOMES = process.env.RECONCILE_TYPED_OUTCOMES === '1';
+const QUOTA_BREAKER_MINUTES = Number.parseInt(process.env.RECONCILE_QUOTA_BREAKER_MINUTES || '30', 10);
 
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
 const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
+const RECONCILE_INTERVAL_MS = 30000;
+const RECONCILE_MAX_CREATE_PER_CYCLE = Number.parseInt(
+  process.env.RECONCILE_MAX_CREATE_PER_CYCLE || '25', 10
+);
 const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
 const QC_EVIDENCE_MISMATCH_LIMIT = 3;
 let advanceTickInFlight = false;
 
+function reconcileCreateLimit(value = RECONCILE_MAX_CREATE_PER_CYCLE) {
+  return Number.isInteger(value) && value > 0 ? value : 25;
+}
+
+async function recordOutcomesPass({ dbPool = pool, logger = console } = {}) {
+  if (!TYPED_OUTCOMES) return null;
+  const client = await dbPool.connect();
+  try {
+    const result = await recordStageOutcomes(client, { logger });
+    if (result.recorded) logger.log(`${LOG_PREFIX} [stage-outcome] recorded=${result.recorded}`);
+    return result;
+  } finally { client.release(); }
+}
+
+async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } = {}) {
+  if (process.env.RECONCILE_DISPATCH_HOLD === '1') {
+    logger.log('Reconcile cycle: held (RECONCILE_DISPATCH_HOLD=1)');
+    return null;
+  }
+  // GSP-1826 item 5: one provider quota failure holds all dispatch for the breaker window.
+  if (QUOTA_BREAKER_MINUTES > 0) {
+    const probe = await dbPool.query(
+      `SELECT completed_at FROM agent_task_queue WHERE failure_reason = 'agent_error.provider_quota_limit'
+         AND completed_at > NOW() - ($1::int * interval '1 minute') ORDER BY completed_at DESC LIMIT 1`, [QUOTA_BREAKER_MINUTES]);
+    if (probe.rows[0]) {
+      logger.log(`Reconcile cycle: held (provider quota failure at ${new Date(probe.rows[0].completed_at).toISOString()}, breaker ${QUOTA_BREAKER_MINUTES}m)`);
+      return null;
+    }
+  }
+  const client = await dbPool.connect();
+  try {
+    const results = await reconcileCycle(client, { maxCreatePerCycle: reconcileCreateLimit(maxCreate) });
+    logger.log(`${LOG_PREFIX} reconciled ${results.length} ticket(s)`);
+    return results;
+  } finally {
+    client.release();
+  }
+}
+
 function github(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
 }
 
-async function buildCompletionRoute(client, row) {
+function resultPointer(row) {
+  const text = JSON.stringify(row.task_result || {});
+  return text.match(/https?:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(?:pull|commit)\/[^\s"']+/i)?.[0] ||
+    `task:${row.task_id}:result`;
+}
+
+function riskClass(row) {
+  const text = String(row.issue_title || '');
+  return /auth|billing|money|migration|secret|prod flag/i.test(text) ? 'risk' : 'standard';
+}
+
+function completionEvidence(row, targetStage, route, qcAdvance) {
+  const pointer = resultPointer(row);
+  if (row.to_stage === 'Spec' && targetStage === 'Queue') {
+    return { bindingScope: pointer, acceptanceTests: pointer || 'per task result', riskClass: riskClass(row) };
+  }
+  if (row.to_stage === 'Queue' && targetStage === 'In Progress') {
+    return { completedCurrentTask: row.task_id, workProductPointer: pointer };
+  }
+  if (row.to_stage === 'In Progress' && targetStage === 'In Review') {
+    return { reviewRequiredRoute: route?.kind || 'review', pr: route?.pr_url || pointer,
+      boundSha: route?.boundSha || pointer };
+  }
+  if (row.to_stage === 'In Progress' && targetStage === 'CI/CD & Deploy') {
+    return { noReviewRoute: route?.kind || 'deploy', pr: route?.pr_url || pointer,
+      boundSha: route?.boundSha || pointer };
+  }
+  if (row.to_stage === 'In Progress' && targetStage === 'Done') {
+    return { noDeployRoute: route?.kind || 'no_pr', workProductEvidence: pointer };
+  }
+  if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
+    return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };
+  }
+  return {};
+}
+
+function greenChecks(checks) {
+  return Array.isArray(checks) && checks.length > 0 && checks.every((check) =>
+    ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(String(check.conclusion || check.state || '').toUpperCase()));
+}
+
+async function buildCompletionRoute(client, row, { githubCommand = github } = {}) {
   if (row.to_stage !== 'In Progress' || row.next_stage !== 'In Review') return null;
-  const comments = await client.query(
-    `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`,
-    [row.issue_id]);
-  const match = comments.rows.map(({ content }) => String(content || '').match(
-    /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i)).find(Boolean);
-  if (!match) return { kind: 'no_pr', toStage: 'Done' };
-  const repo = `${match[1]}/${match[2]}`;
-  const pr = JSON.parse(github(['pr', 'view', match[0], '--json', 'state,files']));
-  return { ...classifyStageRoute({ repo, state: pr.state,
-    files: pr.files.map(({ path }) => path) }), repo, pr_url: match[0], pr_state: pr.state };
+  const linked = await client.query(
+    `SELECT p.html_url, p.repo_owner, p.repo_name
+       FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
+      WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1`, [row.issue_id]);
+  const commentPr = linked.rows[0] ? null : await client.query(
+    `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`, [row.issue_id]);
+  const commentMatch = commentPr?.rows
+    .map(({ content }) => String(content || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i))
+    .find(Boolean);
+  // Coordination and parent issues without a linked PR close from their work product.
+  if (!linked.rows[0] && !commentMatch) return { kind: 'no_pr', toStage: 'Done' };
+  const issuePr = linked.rows[0];
+  const repo = issuePr
+    ? `${issuePr.repo_owner}/${issuePr.repo_name}`
+    : `${commentMatch[1]}/${commentMatch[2]}`;
+  const prUrl = issuePr?.html_url || commentMatch[0];
+  const pr = JSON.parse(githubCommand(['pr', 'view', prUrl, '--json',
+    'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
+  const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
+  if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
+      greenChecks(pr.statusCheckRollup)) {
+    githubCommand(['pr', 'merge', prUrl, '--squash', '--admin']);
+    return { ...route, toStage: 'Done', kind: 'merge_only_admin_merged', repo,
+      pr_url: prUrl, pr_state: 'MERGED', boundSha: pr.headRefOid };
+  }
+  return { ...route, repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
 }
 
 function uniqueFullSha(value) {
@@ -66,8 +171,7 @@ function strictQcAttempt(row, verdictMd5) {
   const evidenceAgentId = row.qc_attempt_evidence_agent_id || row.task_agent_id;
   const ok = row.qc_attempt_verdict === 'PASS' && row.qc_attempt_qualifying === true &&
     row.qc_attempt_evidence_task_status === 'completed' &&
-    row.qc_attempt_evidence_agent_model === 'gpt-5.6-sol' &&
-    row.qc_attempt_evidence_agent_effort === 'low' &&
+    isQcLane(row.qc_attempt_evidence_agent_model, row.qc_attempt_evidence_agent_effort) &&
     row.qc_verdict_checker_id === evidenceAgentId &&
     /^[0-9a-f]{40}$/.test(bound) && bound === observed && md5 === verdictMd5;
   return ok ? { ok: true, boundSha: bound,
@@ -87,6 +191,84 @@ function qcCompletionAdvance(row) {
   const strict = strictEvidenceFromRow(row, md5);
   return strict.ok ? { ok: true, workProductMd5: md5, boundSha: strict.boundSha,
     evidenceTaskId: strict.evidenceTaskId } : strict;
+}
+
+function completedTaskEvidenceSql({ taskAlias, issueAlias, modelParam, effortParam }) {
+  return {
+    columns: `${taskAlias}.status AS task_status,
+             ${taskAlias}.result AS task_result, ${taskAlias}.error AS task_error,
+             ${taskAlias}.agent_id AS task_agent_id, ${taskAlias}.started_at AS task_started_at,
+             ${taskAlias}.completed_at AS task_completed_at,
+             task_agent.model AS task_agent_model,
+             task_agent.thinking_level AS task_agent_effort,
+             verdict.checker_id AS qc_verdict_checker_id,
+             verdict.verdict AS qc_verdict,
+             verdict.work_product_md5 AS qc_verdict_work_product_md5,
+             verdict.notes AS qc_verdict_notes,
+             verdict.created_at AS qc_verdict_created_at,
+             attempt.verdict AS qc_attempt_verdict,
+             attempt.work_product_md5 AS qc_attempt_work_product_md5,
+             attempt.bound_sha AS qc_attempt_bound_sha,
+             attempt.observed_head AS qc_attempt_observed_sha,
+             attempt.qualifying AS qc_attempt_qualifying,
+             attempt.evidence_task_id AS qc_attempt_evidence_task_id,
+             attempt.evidence_task_status AS qc_attempt_evidence_task_status,
+             attempt.evidence_agent_id AS qc_attempt_evidence_agent_id,
+             attempt.evidence_agent_model AS qc_attempt_evidence_agent_model,
+             attempt.evidence_agent_effort AS qc_attempt_evidence_agent_effort,
+             evidence.tasks AS qc_evidence_tasks,
+             ${issueAlias}.workspace_id, ${issueAlias}.priority, ${issueAlias}.title AS issue_title`,
+    joins: `LEFT JOIN agent task_agent ON task_agent.id = ${taskAlias}.agent_id
+      LEFT JOIN LATERAL (
+        SELECT checker_id, verdict, work_product_md5, notes, created_at
+          FROM qc_verdict WHERE issue_id = ${taskAlias}.issue_id
+         ORDER BY created_at DESC LIMIT 1
+      ) verdict ON true
+      LEFT JOIN LATERAL (
+        SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
+               qa.qualifying,
+               evidence_task.id AS evidence_task_id,
+               evidence_task.status AS evidence_task_status,
+               evidence_task.agent_id AS evidence_agent_id,
+               evidence_agent.model AS evidence_agent_model,
+               evidence_agent.thinking_level AS evidence_agent_effort
+          FROM qc_attempt qa
+          INNER JOIN agent_task_queue evidence_task
+                  ON evidence_task.issue_id = qa.issue_id
+                 AND evidence_task.id::text = substring(
+                       qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+          INNER JOIN agent evidence_agent
+                  ON evidence_agent.id = evidence_task.agent_id
+                 AND evidence_agent.workspace_id = ${issueAlias}.workspace_id
+         WHERE qa.issue_id = ${taskAlias}.issue_id
+           AND evidence_task.agent_id = verdict.checker_id
+           AND qa.work_product_md5 = verdict.work_product_md5
+         ORDER BY qa.created_at DESC LIMIT 1
+      ) attempt ON true
+      LEFT JOIN LATERAL (
+        SELECT jsonb_agg(jsonb_build_object(
+                 'task_id', evidence_task.id,
+                 'task_status', evidence_task.status,
+                 'task_result', evidence_task.result,
+                 'task_agent_id', evidence_task.agent_id,
+                 'task_agent_model', evidence_agent.model,
+                 'task_agent_effort', evidence_agent.thinking_level,
+                 'task_started_at', evidence_task.started_at,
+                 'task_completed_at', evidence_task.completed_at
+               ) ORDER BY evidence_task.completed_at DESC) AS tasks
+          FROM agent_task_queue evidence_task
+          INNER JOIN agent evidence_agent
+                  ON evidence_agent.id = evidence_task.agent_id
+                 AND evidence_agent.workspace_id = ${issueAlias}.workspace_id
+         WHERE evidence_task.issue_id = ${taskAlias}.issue_id
+           AND evidence_task.agent_id = verdict.checker_id
+           AND evidence_task.status = 'completed'
+           AND COALESCE(evidence_agent.model,
+                        evidence_agent.runtime_config->>'model') = ANY($${modelParam}::text[])
+           AND COALESCE(evidence_agent.thinking_level,
+                        evidence_agent.runtime_config->>'reasoning_effort') = $${effortParam}::text
+      ) evidence ON true`
+  };
 }
 
 function requeueTriggerSummary(row, coldStart) {
@@ -109,9 +291,9 @@ function requeueTriggerSummary(row, coldStart) {
 // steady trickle rather than firing every stranded ticket at the vendor at once.
 const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10);
 
-// Only stages whose owning agent is safe to re-run. Deliberately NOT the gated
-// or terminal stages: a stranded task in 'Done' or 'CI/CD & Deploy' must not be
-// re-dispatched, because replaying that agent moves finished work backwards.
+// Only stages whose owning agent is safe to re-run. Deliberately NOT gated or
+// terminal stages. CI/CD & Deploy is an executable stage, so a missing deploy
+// task must receive the same recovery as a missing build or QC task.
 // 'Queue' is where the build lane strands its work. 'Spec' was added 2026-08-31
 // on evidence: 324 tickets (207 GSP + 117 PPP) sat in Spec having NEVER had a
 // task dispatched, so no failure existed for the requeue to find. Their owning
@@ -119,7 +301,7 @@ const REQUEUE_BATCH = Number.parseInt(process.env.RELAY_REQUEUE_BATCH || '3', 10
 // multica-qc-worker-2, the spec writer) -- the belt knew who owned them and
 // still dispatched nobody. Widen further only with the same kind of evidence.
 const NON_REQUEUE_STAGES = new Set(['Human Review', 'Done', 'Cancelled', 'Archived']);
-const configuredRequeueStages = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec,In Review')
+const configuredRequeueStages = (process.env.RELAY_REQUEUE_STAGES || 'Queue,In Progress,Spec,In Review,CI/CD & Deploy')
   .split(',').map(s => s.trim()).filter(Boolean);
 const excludedRequeueStages = configuredRequeueStages.filter((stage) => NON_REQUEUE_STAGES.has(stage));
 const REQUEUE_STAGES = configuredRequeueStages.filter((stage) => !NON_REQUEUE_STAGES.has(stage));
@@ -533,91 +715,21 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
     // genuinely completed tasks; a failed task must never move work forward.
     // No completed_at window: eligibility is the task's terminal state, so a
     // daemon outage delays an advance instead of stranding it forever.
+    const evidenceSql = completedTaskEvidenceSql({ taskAlias: 'atq', issueAlias: 'i', modelParam: 2, effortParam: 3 });
     const query = `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id,
-             atq.status AS task_status,
-             atq.result AS task_result, atq.error AS task_error,
-             atq.agent_id AS task_agent_id, atq.started_at AS task_started_at,
-             atq.completed_at AS task_completed_at,
-             task_agent.model AS task_agent_model,
-             task_agent.thinking_level AS task_agent_effort,
-             verdict.checker_id AS qc_verdict_checker_id,
-             verdict.verdict AS qc_verdict,
-             verdict.work_product_md5 AS qc_verdict_work_product_md5,
-             verdict.notes AS qc_verdict_notes,
-             verdict.created_at AS qc_verdict_created_at,
-             attempt.verdict AS qc_attempt_verdict,
-             attempt.work_product_md5 AS qc_attempt_work_product_md5,
-             attempt.bound_sha AS qc_attempt_bound_sha,
-             attempt.observed_head AS qc_attempt_observed_sha,
-             attempt.qualifying AS qc_attempt_qualifying,
-             attempt.evidence_task_id AS qc_attempt_evidence_task_id,
-             attempt.evidence_task_status AS qc_attempt_evidence_task_status,
-             attempt.evidence_agent_id AS qc_attempt_evidence_agent_id,
-             attempt.evidence_agent_model AS qc_attempt_evidence_agent_model,
-             attempt.evidence_agent_effort AS qc_attempt_evidence_agent_effort,
-             evidence.tasks AS qc_evidence_tasks,
-             i.workspace_id, i.priority, rrl.to_stage, rsc.next_stage
+             ${evidenceSql.columns}, rrl.to_stage, rsc.next_stage
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
       INNER JOIN issue i ON atq.issue_id = i.id
-      LEFT JOIN agent task_agent ON task_agent.id = atq.agent_id
       INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name AND rsc.workspace_id = i.workspace_id
-      LEFT JOIN LATERAL (
-        SELECT checker_id, verdict, work_product_md5, notes, created_at
-          FROM qc_verdict WHERE issue_id = atq.issue_id
-         ORDER BY created_at DESC LIMIT 1
-      ) verdict ON true
-      LEFT JOIN LATERAL (
-        SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
-               qa.qualifying,
-               evidence_task.id AS evidence_task_id,
-               evidence_task.status AS evidence_task_status,
-               evidence_task.agent_id AS evidence_agent_id,
-               evidence_agent.model AS evidence_agent_model,
-               evidence_agent.thinking_level AS evidence_agent_effort
-          FROM qc_attempt qa
-          INNER JOIN agent_task_queue evidence_task
-                  ON evidence_task.issue_id = qa.issue_id
-                 AND evidence_task.id::text = substring(
-                       qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
-          INNER JOIN agent evidence_agent
-                  ON evidence_agent.id = evidence_task.agent_id
-                 AND evidence_agent.workspace_id = i.workspace_id
-         WHERE qa.issue_id = atq.issue_id
-           AND evidence_task.agent_id = verdict.checker_id
-           AND qa.work_product_md5 = verdict.work_product_md5
-         ORDER BY qa.created_at DESC LIMIT 1
-      ) attempt ON true
-      LEFT JOIN LATERAL (
-        SELECT jsonb_agg(jsonb_build_object(
-                 'task_id', evidence_task.id,
-                 'task_status', evidence_task.status,
-                 'task_result', evidence_task.result,
-                 'task_agent_id', evidence_task.agent_id,
-                 'task_agent_model', evidence_agent.model,
-                 'task_agent_effort', evidence_agent.thinking_level,
-                 'task_started_at', evidence_task.started_at,
-                 'task_completed_at', evidence_task.completed_at
-               ) ORDER BY evidence_task.completed_at DESC) AS tasks
-          FROM agent_task_queue evidence_task
-          INNER JOIN agent evidence_agent
-                  ON evidence_agent.id = evidence_task.agent_id
-                 AND evidence_agent.workspace_id = i.workspace_id
-         WHERE evidence_task.issue_id = atq.issue_id
-           AND evidence_task.agent_id = verdict.checker_id
-           AND evidence_task.status = 'completed'
-           AND COALESCE(evidence_agent.model,
-                        evidence_agent.runtime_config->>'model') = 'gpt-5.6-sol'
-           AND COALESCE(evidence_agent.thinking_level,
-                        evidence_agent.runtime_config->>'reasoning_effort') = 'low'
-      ) evidence ON true
+      ${evidenceSql.joins}
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
       ORDER BY rrl.created_at ASC
-      LIMIT 20`;
+      LIMIT 100`;
 
-    const result = await client.query(query, ['pending']);
+    const result = await client.query(query, ['pending', qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
 
     // A failed or cancelled task must not advance, but its pending log must not
     // linger either -- otherwise the row is retried forever. Close it as failed
@@ -679,6 +791,15 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
               `relay=${row.log_id}, attempt=${state?.mismatch_count || 'unknown'}, ` +
               `status=${state?.status || 'unknown'}`);
           }
+          if (['completed_sol_low_pass_required', 'qc_attempt_binding_required'].includes(qcAdvance.reason)) {
+            // A finished QC task with no bound PASS cannot advance; close its ledger row.
+            // The reconciler dispatches the next QC attempt with its own row.
+            await markRelayLogFailedById(client, row.log_id);
+          }
+          if (qcAdvance.reason === 'manual_gated_stage') {
+            // The CI/CD worker owns this exit; a completed desk task here is a ledger entry, not a trigger.
+            await markRelayLogCompletedById(client, row.log_id);
+          }
           logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
           continue;
         }
@@ -704,6 +825,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         const payload = { issue_id: row.issue_id, to_stage: targetStage,
           agent_token: RELAY_AGENT_SECRET,
           relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
+          evidence: completionEvidence(row, targetStage, route, qcAdvance),
           ...(route ? { routing_classification: route } : {}),
           ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
         const response = await postRelay(payload);
@@ -788,7 +910,8 @@ async function recoveryAdvanceTasks() {
         }
 
         const payload = { issue_id: row.issue_id, to_stage: row.next_stage,
-          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id };
+          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+          evidence: { registeredIssue: row.issue_id, selectedWorkspace: row.workspace_id || true } };
         const response = await postToRelay(payload);
 
         if (response.ok) {
@@ -931,7 +1054,8 @@ async function findAndAdvanceRegistered() {
 
     for (const row of result.rows) {
       try {
-        const payload = { issue_id: row.id, to_stage: 'Spec', agent_token: RELAY_AGENT_SECRET };
+        const payload = { issue_id: row.id, to_stage: 'Spec', agent_token: RELAY_AGENT_SECRET,
+          evidence: { registeredIssue: row.id, selectedWorkspace: row.workspace_id || true } };
         const response = await postToRelay(payload);
 
         if (response.ok) {
@@ -986,6 +1110,10 @@ function selectReplayAttempt(row) {
 // stage contract is the authority on who owns a stage, so a re-owned stage heals
 // its own strays.
 async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } = {}) {
+  // v3 reconciliation is the only live recovery path. Keep this compatibility
+  // export temporarily because older unit consumers import it directly.
+  return runReconcileCycle({ dbPool });
+  /* v2 recovery retained below only for source-history bisectability. */
   const client = await dbPool.connect();
   try {
     const candidates = await client.query(
@@ -1149,6 +1277,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
               THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
           FROM budgeted
          WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int
+         ORDER BY issue_created_at ASC, issue_id ASC
+         LIMIT $1::int
       ) candidates
       ORDER BY issue_created_at ASC, issue_id ASC`,
       [REQUEUE_BATCH, REQUEUE_STAGES, QUEUED_TASK_TTL_MINUTES,
@@ -1655,28 +1785,148 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
   }
 }
 
+// Retry recorded successful work without creating another agent task.  A relay
+// denial is retried at most three times, then the durable outcome becomes human-owned.
+async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRelay,
+  logger = console, typedOutcomes = TYPED_OUTCOMES } = {}) {
+  if (!typedOutcomes) return [];
+  const client = await dbPool.connect();
+  try {
+    const evidenceSql = completedTaskEvidenceSql({ taskAlias: 't', issueAlias: 'i', modelParam: 1, effortParam: 2 });
+    const result = await client.query(
+      `SELECT o.issue_id, o.stage AS to_stage, o.outcome, o.task_id,
+              ${evidenceSql.columns}, rsc.next_stage
+         FROM issue_stage_outcome o
+         JOIN issue i ON i.id = o.issue_id AND i.status = o.stage
+         JOIN agent_task_queue t ON t.id = o.task_id AND t.status = 'completed'
+         LEFT JOIN relay_stage_config rsc
+           ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
+         ${evidenceSql.joins}
+        WHERE o.outcome IN ('ADVANCED', 'NO_OP') AND o.blocked_on IS DISTINCT FROM 'human'
+        ORDER BY o.outcome_at ASC LIMIT 100`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
+    const advanced = [];
+    for (const row of result.rows) {
+      const route = row.outcome === 'NO_OP' && row.to_stage === 'In Progress'
+        ? { kind: 'no_pr', toStage: 'Done' }
+        : await buildCompletionRoute(client, row);
+      const targetStage = route?.toStage || row.next_stage;
+      if (!targetStage) continue;
+      const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
+      if (row.to_stage === 'In Review' && !qcAdvance.ok) {
+        const blockedOn = /sha|md5/i.test(qcAdvance.reason) ? 'sha' : 'human';
+        await client.query(`UPDATE issue_stage_outcome SET blocked_on = $3::text
+          WHERE issue_id = $1::uuid AND stage = $2::text`,
+        [row.issue_id, row.to_stage, blockedOn]);
+        logger.log(`${LOG_PREFIX} [typed-readvance] skipped issue=${row.issue_id} reason=${qcAdvance.reason}`);
+        continue;
+      }
+      const response = await postRelay({ issue_id: row.issue_id, to_stage: targetStage,
+        agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+        evidence: completionEvidence(row, targetStage, route, qcAdvance),
+        ...(route ? { routing_classification: route } : {}) });
+      if (response.ok) {
+        advanced.push(row.issue_id);
+        logger.log(`${LOG_PREFIX} [typed-readvance] advanced issue=${row.issue_id} ${row.to_stage}->${targetStage}`);
+        continue;
+      }
+      const error = `status=${response.status}; error=${response.error || response.body || 'unknown'}`;
+      const denied = await client.query(
+        `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
+             jsonb_build_object('typed_readvance_denials',
+               COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) + 1,
+               'typed_readvance_error', $2::text)
+          WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)
+        RETURNING COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) AS denials`, [row.task_id, error]);
+      if (Number(denied.rows[0]?.denials || 0) >= 3) {
+        await client.query(`UPDATE issue_stage_outcome SET blocked_on = 'human'
+          WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
+      }
+      logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);
+    }
+    return advanced;
+  } finally {
+    client.release();
+  }
+}
+
+// A QC FAIL is a return to the builder, not a final stage outcome. The legacy
+// outcome parser records any verdict as ADVANCED and the readvance requires a
+// bound PASS, so a FAIL sat in In Review forever (2026-09-03 belt v3 finding).
+// Only a verdict newer than the ticket's latest arrival in In Review counts.
+async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
+  logger = console, typedOutcomes = TYPED_OUTCOMES } = {}) {
+  if (!typedOutcomes) return [];
+  const client = await dbPool.connect();
+  try {
+    const result = await client.query(
+      `SELECT o.issue_id, o.task_id, v.work_product_md5, v.created_at AS verdict_at
+         FROM issue_stage_outcome o
+         JOIN issue i ON i.id = o.issue_id AND i.status = 'In Review'
+         JOIN LATERAL (SELECT verdict, work_product_md5, created_at FROM qc_verdict
+                        WHERE issue_id = o.issue_id ORDER BY created_at DESC LIMIT 1) v ON TRUE
+        WHERE o.stage = 'In Review' AND o.outcome IN ('ADVANCED', 'FAILED') AND v.verdict = 'FAIL'
+          AND v.created_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
+                                        WHERE l.issue_id = o.issue_id AND l.to_stage = 'In Review'), '-infinity')
+          AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
+                           WHERE q.issue_id = o.issue_id AND q.status IN ('queued', 'running'))
+        ORDER BY o.outcome_at ASC LIMIT 40`);
+    const returned = [];
+    for (const row of result.rows) {
+      const cause = `QC FAIL ${row.work_product_md5 || 'no-md5'} at ${new Date(row.verdict_at).toISOString()}; rework required`;
+      const response = await postRelay({ issue_id: row.issue_id, to_stage: 'In Progress',
+        agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+        reason: `RETURN:In Progress — ${cause}`,
+        evidence: { implementationFail: cause, retryRemaining: true } });
+      if (response.ok) {
+        await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = NULL
+          WHERE issue_id = $1::uuid AND stage = 'In Review'`, [row.issue_id]);
+        returned.push(row.issue_id);
+        logger.log(`${LOG_PREFIX} [qc-fail-return] issue=${row.issue_id} In Review->In Progress`);
+        continue;
+      }
+      logger.log(`${LOG_PREFIX} [qc-fail-return] denied issue=${row.issue_id} status=${response.status}; error=${response.error || response.body || 'unknown'}`);
+    }
+    return returned;
+  } finally {
+    client.release();
+  }
+}
+
 function startDaemon() {
   if (!MULTICA_DB || !RELAY_AGENT_SECRET || !WORKSPACE_ID) {
     console.error('[relay-advance-daemon] FATAL: env vars missing');
     process.exit(1);
   }
-  console.log(`${LOG_PREFIX} Starting (15s interval, recovery every 2m, cleanup every 5m)`);
-  setInterval(advanceTick, 15000);
-  setInterval(findAndAdvanceRegistered, 20000);
-  setInterval(recoveryAdvanceTasks, 120000);
-  setInterval(cleanupStalePendingRows, 300000);
-  setInterval(requeueStrandedTasks, 60000);
-  setInterval(processParkedDiagnoses, 30000);
-  setInterval(reconcileQuotaPauses, 60000);
+  console.log(`${LOG_PREFIX} Starting (reconcile every 30s, cleanup every 5m)`);
+  // A pg-pool connect timeout inside a bare async interval is an unhandled
+  // rejection and fatal under Node 22; every tick is guarded.
+  const guarded = (name, fn) => () => Promise.resolve().then(fn)
+    .catch(err => console.error(`${LOG_PREFIX} ${name} error: ${err.message}`));
+  process.on('unhandledRejection', err =>
+    console.error(`${LOG_PREFIX} unhandledRejection: ${err && err.message ? err.message : err}`));
+  setInterval(guarded('advanceTick', advanceTick), 15000);
+  setInterval(guarded('findAndAdvanceRegistered', findAndAdvanceRegistered), 20000);
+  setInterval(guarded('recoveryAdvanceTasks', recoveryAdvanceTasks), 120000);
+  setInterval(guarded('cleanupStalePendingRows', cleanupStalePendingRows), 300000);
+  setInterval(() => runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`)), RECONCILE_INTERVAL_MS);
+  setInterval(guarded('processParkedDiagnoses', processParkedDiagnoses), 30000);
+  setInterval(guarded('reconcileQuotaPauses', reconcileQuotaPauses), 60000);
+  setInterval(() => recordOutcomesPass().catch(err => console.error(`${LOG_PREFIX} stage-outcome error: ${err.message}`)), 30000);
+  setInterval(() => readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`)), 300000);
+  setInterval(guarded('returnFailedQcOutcomes', returnFailedQcOutcomes), 120000);
   advanceTick().catch(err => console.error(`${LOG_PREFIX} Error: ${err.message}`));
+  runReconcileCycle().catch(err => console.error(`${LOG_PREFIX} Reconcile error: ${err.message}`));
   findAndAdvanceRegistered().catch(err => console.error(`${LOG_PREFIX} Error in Registered pass: ${err.message}`));
   cleanupStalePendingRows().catch(err => console.error(`${LOG_PREFIX} Error in cleanup: ${err.message}`));
   processParkedDiagnoses().catch(err => console.error(`${LOG_PREFIX} Error in parked diagnosis pass: ${err.message}`));
   reconcileQuotaPauses().catch(err => console.error(`${LOG_PREFIX} Error in quota-pause reconciliation: ${err.message}`));
+  readvanceRecordedOutcomes().catch(err => console.error(`${LOG_PREFIX} typed-readvance error: ${err.message}`));
+  returnFailedQcOutcomes().catch(err => console.error(`${LOG_PREFIX} qc-fail-return error: ${err.message}`));
 }
 
 if (require.main === module) startDaemon();
 
-module.exports = { advanceTick, adoptUnloggedInReviewTasks, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance,
+module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon,
-  INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt };
+  INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
+  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes };

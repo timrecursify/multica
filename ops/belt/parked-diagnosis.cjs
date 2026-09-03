@@ -10,6 +10,7 @@ const DIAGNOSIS_OUTCOMES = new Set([
 ]);
 const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
 const PRIORITY = { urgent: 4, high: 3, medium: 2, low: 1, none: 0 };
+const { QC_LANE_EFFORT, isQcLane } = require('./qc-lane.cjs');
 
 function formatParkReason({ reason, stage, attempts, ceiling, lastError, qcVerdict }) {
   const detail = lastError || qcVerdict || 'unrecoverable_after_bounded_lookup';
@@ -77,20 +78,21 @@ function isSolLowDiagnosisAgent(agent) {
   const instructions = String((agent && agent.instructions) || '').toLowerCase();
   const configuredModel = cfg.model == null ? model : String(cfg.model).toLowerCase();
   const configuredEffort = cfg.reasoning_effort == null
-    ? (/(?:^|-)sol-low(?:-|$)/.test(name) ? 'low' : '')
+    ? (new RegExp(`(?:^|-)\\w+-${QC_LANE_EFFORT}(?:-|$)`).test(name) ? QC_LANE_EFFORT : '')
     : String(cfg.reasoning_effort).toLowerCase();
   const role = [name, cfg.role, cfg.lane, cfg.agent_role]
     .filter(Boolean).join(' ').toLowerCase();
-  const solLowModel = model === 'gpt-5.6-sol' && configuredModel === 'gpt-5.6-sol' &&
-    configuredEffort === 'low';
+  const qcLaneModel = isQcLane(model, configuredEffort) &&
+    isQcLane(configuredModel, configuredEffort);
   // Parked diagnosis is deliberately a dedicated seat. Existing QC/spec seats
   // are scoped to In Review/Spec and reject Parked tasks, which silently burns
   // diagnosis calls without producing an actionable outcome.
-  const dedicatedParkedSeat = /^(?:gsp|ppp)-parked-diagnosis-sol-low(?:-|$)/.test(name);
+  const dedicatedParkedSeat = new RegExp(
+    `^(?:gsp|ppp)-parked-diagnosis-\\w+-${QC_LANE_EFFORT}(?:-|$)`).test(name);
   const permitsParked = /\bparked\b/.test(instructions) &&
     /diagnos/.test(instructions) &&
     /(?:fixable|already[_ ]fixed|duplicate|genuinely[_ ]blocked)/.test(instructions);
-  return dedicatedParkedSeat && solLowModel && /diagnos/.test(role) && permitsParked &&
+  return dedicatedParkedSeat && qcLaneModel && /diagnos/.test(role) && permitsParked &&
     cfg.parked_diagnosis !== false;
 }
 

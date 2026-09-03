@@ -12,7 +12,6 @@ import {
   useQueryClient,
   type UseQueryResult,
 } from "@tanstack/react-query";
-import { ALL_STATUSES } from "@multica/core/issues/config";
 import {
   issueKeys,
   issueTableRowPageOptions,
@@ -36,10 +35,11 @@ export interface IssueStatusPageState {
   retry: () => void;
 }
 
-export type IssueStatusPagination = Record<
-  IssueStatus,
-  IssueStatusPageState
->;
+// Facet responses may contain workflow statuses unknown to this client's
+// static status vocabulary, so pagination must support arbitrary status keys.
+export type IssueStatusPagination = Record<IssueStatus, IssueStatusPageState> & {
+  [status: string]: IssueStatusPageState | undefined;
+};
 
 interface StatusCursorState {
   identity: string;
@@ -238,7 +238,7 @@ export function useIssueStatusBranches({
       if (
         target?.cursor === null &&
         queryResult?.isFetching &&
-        activeCursorState.cursors[target.status].length > 1
+        (activeCursorState.cursors[target.status] ?? []).length > 1
       ) {
         headFetching.add(target.status);
       }
@@ -307,7 +307,7 @@ export function useIssueStatusBranches({
       next[status] = branch.headUpdatedAt;
       const seen = previous[status];
       if (
-        activeCursorState.cursors[status].length > 1 &&
+        (activeCursorState.cursors[status] ?? []).length > 1 &&
         (branch.headFetching ||
           (seen !== undefined && seen !== branch.headUpdatedAt))
       ) {
@@ -336,7 +336,7 @@ export function useIssueStatusBranches({
       if (!cursor) return;
       setCursorState((previous) => {
         if (previous.identity !== identity) return previous;
-        const current = previous.cursors[status];
+        const current = previous.cursors[status] ?? [];
         if (current.includes(cursor)) return previous;
         return {
           ...previous,
