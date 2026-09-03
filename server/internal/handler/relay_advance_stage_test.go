@@ -6,8 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
-
 )
 
 // relayAdvanceStageFixture wires a workspace-scoped relay_stage_config edge set
@@ -21,9 +21,9 @@ import (
 // fallback. cleanup removes config rows, tasks, issues, mirrors other tests.
 
 type relayAdvanceStageFixture struct {
-	IssueID    string
-	AgentID    string
-	RuntimeID  string
+	IssueID   string
+	AgentID   string
+	RuntimeID string
 }
 
 func newRelayAdvanceStageFixture(t *testing.T) relayAdvanceStageFixture {
@@ -120,7 +120,7 @@ func relayAdvanceHTTP(t *testing.T, issueID, toStage string) *httptest.ResponseR
 }
 
 // issueStatusOf reads an issue's status straight from the row so assertions see
-// committed state. 
+// committed state.
 
 func issueStatusOf(t *testing.T, id string) string {
 	t.Helper()
@@ -220,6 +220,53 @@ func TestRelayAdvanceStageRejectsArchivedOwner(t *testing.T) {
 	}
 }
 
+func TestRelayAdvanceStageRejectsMissingOwner(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newRelayAdvanceStageFixture(t)
+	// Remove the target-stage row while retaining the source edge. This models
+	// a configured successor whose owner has been deleted.
+	if _, err := testPool.Exec(context.Background(), `
+		DELETE FROM relay_stage_config
+		WHERE workspace_id = $1 AND stage_name = 'Queue'
+	`, testWorkspaceID); err != nil {
+		t.Fatalf("remove relay owner config: %v", err)
+	}
+	rr := relayAdvanceHTTP(t, fx.IssueID, "Queue")
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("advance with missing owner status = %d, want 400", rr.Code)
+	}
+	if got := issueStatusOf(t, fx.IssueID); got != "Spec" {
+		t.Fatalf("issue status = %q, want unchanged Spec", got)
+	}
+	if got := queuedTaskCountForIssue(t, fx.IssueID); got != 0 {
+		t.Fatalf("queued task count = %d, want 0", got)
+	}
+}
+
+func TestRelayAdvanceStageRejectsMissingRuntime(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newRelayAdvanceStageFixture(t)
+	if _, err := testPool.Exec(context.Background(), `
+		UPDATE agent SET runtime_id = NULL WHERE id = $1
+	`, fx.AgentID); err != nil {
+		t.Fatalf("clear agent runtime: %v", err)
+	}
+	rr := relayAdvanceHTTP(t, fx.IssueID, "Queue")
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("advance with missing runtime status = %d, want 409", rr.Code)
+	}
+	if got := issueStatusOf(t, fx.IssueID); got != "Spec" {
+		t.Fatalf("issue status = %q, want unchanged Spec", got)
+	}
+	if got := queuedTaskCountForIssue(t, fx.IssueID); got != 0 {
+		t.Fatalf("queued task count = %d, want 0", got)
+	}
+}
+
 func TestRelayAdvanceStageRepeatedDeliveryCreatesOneSuccessor(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
@@ -249,5 +296,34 @@ func TestRelayAdvanceStageRepeatedDeliveryCreatesOneSuccessor(t *testing.T) {
 
 	if logCount != 1 {
 		t.Fatalf("relay_run_log count = %d,r want 1", logCount)
+	}
+}
+
+func TestRelayAdvanceStageConcurrentDeliveryCreatesOneSuccessor(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newRelayAdvanceStageFixture(t)
+	results := make(chan int, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- relayAdvanceHTTP(t, fx.IssueID, "Queue").Code
+		}()
+	}
+	wg.Wait()
+	close(results)
+	for code := range results {
+		if code != http.StatusOK {
+			t.Fatalf("concurrent advance status = %d, want 200", code)
+		}
+	}
+	if got := issueStatusOf(t, fx.IssueID); got != "Queue" {
+		t.Fatalf("issue status = %q, want Queue", got)
+	}
+	if got := queuedTaskCountForIssue(t, fx.IssueID); got != 1 {
+		t.Fatalf("queued task count = %d, want exactly 1", got)
 	}
 }
