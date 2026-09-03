@@ -864,7 +864,7 @@ test('QC runbook emits bridge evidence and advances both verdict dispositions', 
   assert.match(runbook, /sk multica verdict "\$NUMBER" --board "\$BOARD" --verdict "\$VERDICT"/);
   assert.match(runbook, /--bound-sha "\$BOUND_SHA" --observed-sha "\$OBSERVED_SHA"/);
   assert.match(runbook, /--work-product-md5 "\$WORK_PRODUCT_MD5" --failure-class "\$FAILURE_CLASS"/);
-  assert.match(runbook, /--qualifying "\$QUALIFYING" --model gpt-5\.6-sol --effort low --idem-key "\$IDEM_KEY"/);
+  assert.match(runbook, /--qualifying "\$QUALIFYING" --model "\$QC_MODEL" --effort "\$QC_EFFORT" --idem-key "\$IDEM_KEY"/);
   assert.match(runbook, /--notes "\$VERDICT_NOTES"/);
   assert.match(runbook, /VERDICT_NOTES="\$\{REWORK_SUMMARY:\?set a concise rework summary\}"/);
   assert.match(runbook, /VERDICT_NOTES="BLOCKED: \$BLOCKED_REASON"/);
