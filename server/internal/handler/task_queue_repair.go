@@ -37,6 +37,9 @@ var repairStatusValues = map[string]bool{
 func (h *Handler) ListRepairableTasks(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	filter := service.TaskRepairFilter{MaxRows: 100}
+	if ws := ctxWorkspaceID(r.Context()); ws != "" {
+		_ = filter.WorkspaceID.Scan(ws)
+	}
 
 	if v := q.Get("status"); v != "" {
 		if !repairStatusValues[v] {
@@ -89,6 +92,7 @@ func repairableTaskJSON(row db.ListRepairableAgentTasksRow) map[string]any {
 		"status":         row.Status,
 		"agent_id":       uuidOrNull(row.AgentID),
 		"issue_id":       uuidOrNull(row.IssueID),
+		"workspace_id":   uuidOrNull(row.WorkspaceID),
 		"runtime_id":     uuidOrNull(row.RuntimeID),
 		"daemon_id":      textOrNull(row.DaemonID),
 		"attempt":        row.Attempt,

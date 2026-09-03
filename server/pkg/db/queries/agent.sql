@@ -1137,11 +1137,12 @@ RETURNING *;
 -- Ordered oldest activity first, then task id, so an operator sweep reads a
 -- stable, deterministic window. Values are bound parameters, never
 -- interpolated into the SQL text.
-SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at,
+SELECT id, agent_id, issue_id, workspace_id, status, priority, dispatched_at, started_at,
        completed_at, error, created_at, runtime_id, attempt, max_attempts,
        failure_reason, daemon_id
 FROM agent_task_queue
-WHERE (sqlc.narg('status')::text IS NULL OR status = sqlc.narg('status')::text)
+WHERE (sqlc.narg('workspace_id')::uuid IS NULL OR workspace_id = sqlc.narg('workspace_id')::uuid)
+  AND (sqlc.narg('status')::text IS NULL OR status = sqlc.narg('status')::text)
   AND (sqlc.narg('daemon_id')::text IS NULL OR daemon_id = sqlc.narg('daemon_id')::text)
   AND (sqlc.narg('older_than')::timestamptz IS NULL
        OR COALESCE(started_at, dispatched_at, created_at) <= sqlc.narg('older_than')::timestamptz)
@@ -1159,7 +1160,7 @@ LIMIT sqlc.arg('max_rows')::integer;
 -- or retryable reason. The active lease is cleared; runtime provenance is
 -- kept for audit.
 WITH prev AS (
-    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id')
+    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id') AND (sqlc.narg('workspace_id')::uuid IS NULL OR aq.workspace_id = sqlc.narg('workspace_id')::uuid)
 ),
 updated AS (
     UPDATE agent_task_queue
@@ -1171,6 +1172,7 @@ updated AS (
         wait_reason = NULL
     WHERE id = sqlc.arg('task_id')
       AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+      AND (sqlc.narg('workspace_id')::uuid IS NULL OR workspace_id = sqlc.narg('workspace_id')::uuid)
     RETURNING *
 )
 SELECT u.*, p.status AS previous_status
@@ -1189,7 +1191,7 @@ FROM updated u, prev p;
 -- intentionally preserved: agent_task_queue_active_requires_runtime requires
 -- an active row to carry one.
 WITH prev AS (
-    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id')
+    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id') AND (sqlc.narg('workspace_id')::uuid IS NULL OR aq.workspace_id = sqlc.narg('workspace_id')::uuid)
 ),
 updated AS (
     UPDATE agent_task_queue
@@ -1201,6 +1203,7 @@ updated AS (
         delivered_comment_ids = '{}'
     WHERE id = sqlc.arg('task_id')
       AND status IN ('dispatched', 'running', 'waiting_local_directory')
+      AND (sqlc.narg('workspace_id')::uuid IS NULL OR workspace_id = sqlc.narg('workspace_id')::uuid)
     RETURNING *
 )
 SELECT u.*, p.status AS previous_status
