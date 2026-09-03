@@ -251,7 +251,9 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
     const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=30`]));
     // A run whose name is its file path is GitHub's 'invalid workflow file'
     // marker: it has no jobs and says nothing about this SHA.
-    runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/'));
+    // Cancelled runs (superseded by a newer push, or operator queue trims)
+    // say nothing about the SHA either.
+    runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/') && r.conclusion !== 'cancelled');
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
     if (!(runs.workflow_runs || []).length) {
       const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
@@ -343,7 +345,7 @@ async function sweep() {
       const failures = countCiFailure(issue, pr, info.headRefOid, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
-        const retro = (ci === 'pending' || ci === 'no_checks') && info.mergeable === 'MERGEABLE' ? retroactiveEligible(pr.repo, pr.num) : null;
+        const retro = (ci === 'pending' || ci === 'no_checks') && info.mergeable !== 'CONFLICTING' ? retroactiveEligible(pr.repo, pr.num) : null;
         if (!retro || !retro.ok) {
           const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
           log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}${retro ? ` retro=${retro.why}` : ''}`);
