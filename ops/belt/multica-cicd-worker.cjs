@@ -311,7 +311,19 @@ async function sweep() {
         continue;
       }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
-      log(`HOLD #${issue.number} ${pr.repo}#${pr.num} CI is green; merge is operator-owned`);
+      // Operator-owned merge, delegated to the belt (Tim 2026-09-03 01:48Z:
+      // CI/CD & Deploy is owned end to end). Only a green, MERGEABLE PR merges;
+      // the next poll sees it merged and routes the ticket to Done.
+      if (info.mergeable !== 'MERGEABLE') {
+        log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but mergeable=${info.mergeable}`);
+        continue;
+      }
+      try {
+        gh(['pr', 'merge', String(pr.num), '-R', pr.repo, '--squash', '--admin', '--delete-branch']);
+        log(`MERGED #${issue.number} ${pr.repo}#${pr.num} squash by belt operator`);
+      } catch (e) {
+        log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
+      }
     } catch (e) {
       log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
     }
