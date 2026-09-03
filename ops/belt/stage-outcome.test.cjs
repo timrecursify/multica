@@ -53,3 +53,12 @@ test("recordStageOutcomes upserts one row per unrecorded completion", async () =
   assert.match(c.calls[2].sql, /INSERT INTO issue_stage_outcome/);
   assert.deepEqual(c.calls[2].params, ["i1", "In Review", "ADVANCED", null, "t1", "h"]);
 });
+
+test("input hash ignores belt output and keys operator comments by content", () => {
+  const sql = so.stageInputHashSql();
+  // A builder's own comment must never re-open the stage it just reported on.
+  assert.match(sql, /c\.source_task_id IS NULL/);
+  assert.doesNotMatch(sql, /c\.id::text/);
+  // Content, not identity, so an identical repeated operator note is not new input.
+  assert.match(sql, /md5\(string_agg\(DISTINCT md5\(c\.content\)/);
+});

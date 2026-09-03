@@ -2,7 +2,8 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql } = require("./reconciler.cjs");
+const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
+  moveToHumanReview, terminalBlocker } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
 const ok = () => ({ ok: true });
@@ -180,4 +181,55 @@ test("agent without a runtime is skipped for the next eligible pool agent", asyn
   const insert = db.calls.find((call) => call.sql.includes("INSERT INTO agent_task_queue"));
   assert.equal(insert.values[0], "55555555-5555-4555-8555-555555555555");
   assert.equal(insert.values[1], "66666666-6666-4666-8666-666666666666");
+});
+
+// A recorded BLOCKED outcome only leaves the belt when nothing observable remains.
+test("terminalBlocker routes only unobservable blockers", async () => {
+  const unlinked = { query: async () => ({ rows: [] }) };
+  const linked = { query: async () => ({ rows: [{ "?column?": 1 }] }) };
+  const b = (outcome, blocked_on) => ({ outcome, blocked_on });
+
+  assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "human")), "blocked_human");
+  assert.equal(await terminalBlocker(linked, issue, b("BLOCKED", "human")), "blocked_human");
+  assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "ci")), "blocked_ci_unobservable");
+  assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "sha")), "blocked_sha_unobservable");
+  assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "dependency")), "blocked_dependency_unobservable");
+  // A linked PR or dependency still supplies a hash term, so the belt keeps it.
+  assert.equal(await terminalBlocker(linked, issue, b("BLOCKED", "ci")), null);
+  assert.equal(await terminalBlocker(linked, issue, b("BLOCKED", "dependency")), null);
+  // quota clears itself; non-BLOCKED outcomes are not this function's business.
+  assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "quota")), null);
+  assert.equal(await terminalBlocker(unlinked, issue, b("FAILED", null)), null);
+  assert.equal(await terminalBlocker(unlinked, issue, null), null);
+});
+
+test("moveToHumanReview asks as the operator the belt acts for", async () => {
+  const seen = [];
+  const db = { query: async (sql, values) => { seen.push({ sql, values }); return { rows: [] }; } };
+  const result = await moveToHumanReview(db, issue, "blocked_human", {
+    evaluate: (input) => { seen.push({ evaluate: input }); return { ok: true }; }
+  });
+  assert.deepEqual(result, { action: "human_review", reason: "blocked_human" });
+  const call = seen.find((s) => s.evaluate).evaluate;
+  // Every `* -> Human Review` row in transition-policy lists actors ['operator'];
+  // 'system' was refused as actor_denied, which left the function unusable.
+  assert.equal(call.actor, "operator");
+  assert.equal(call.to, "Human Review");
+  assert.deepEqual(call.evidence, { blocker: "blocked_human" });
+  assert.ok(seen.some((s) => /multica.relay_authorized/.test(s.sql || "")));
+  assert.ok(seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
+  assert.ok(seen.some((s) => /INSERT INTO relay_run_log/.test(s.sql || "")));
+});
+
+test("a policy rejection leaves the issue skipped rather than erroring the cycle", async () => {
+  const db = harness();
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [issue] };
+    if (sql.includes("FROM agent_task_queue") && sql.includes("FOR UPDATE")) return { rows: [] };
+    return { rows: [] };
+  };
+  await assert.rejects(
+    () => moveToHumanReview(db, issue, "blocked_human", { evaluate: () => ({ ok: false, code: "actor_denied" }) }),
+    /actor_denied/
+  );
 });

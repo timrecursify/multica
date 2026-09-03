@@ -36,8 +36,16 @@ function legacyOutcome(text) {
   return { outcome: "FAILED", blockedOn: null };
 }
 
-// Inputs the agent could have acted on: PR head sha, CI rollup, newest comment,
-// dependency states, spec/description body. Any change re-opens the stage.
+// Inputs the agent could have acted on: PR head sha, CI rollup, operator comment
+// content, dependency states, spec/description body. Any change re-opens the stage.
+//
+// Comments contribute the md5 set of DISTINCT operator comment bodies
+// (source_task_id IS NULL), never a comment id. Hashing the newest id let a
+// builder's own blocker comment mutate the hash and re-dispatch the stage that
+// had just reported BLOCKED, so a permanently blocked ticket rebuilt every
+// cooldown window. Content excludes belt output; the DISTINCT set also makes a
+// repeated identical operator note (the CI/CD worker re-posts one each poll) a
+// no-op, while genuinely new operator text still re-opens the stage.
 function stageInputHashSql() {
   return `
     WITH pr AS (
@@ -49,7 +57,8 @@ function stageInputHashSql() {
       (SELECT string_agg(s.suite_id::text || ':' || s.status || ':' || coalesce(s.conclusion, ''), ',' ORDER BY s.suite_id)
          FROM github_pull_request_check_suite s
         WHERE s.pr_id = (SELECT id FROM pr) AND s.head_sha = (SELECT head_sha FROM pr)),
-      (SELECT c.id::text FROM comment c WHERE c.issue_id = i.id ORDER BY c.created_at DESC LIMIT 1),
+      (SELECT md5(string_agg(DISTINCT md5(c.content), ',' ORDER BY md5(c.content)))
+         FROM comment c WHERE c.issue_id = i.id AND c.source_task_id IS NULL),
       (SELECT string_agg(d.depends_on_issue_id::text || ':' || di.status, ',' ORDER BY d.depends_on_issue_id)
          FROM issue_dependency d JOIN issue di ON di.id = d.depends_on_issue_id WHERE d.issue_id = i.id),
       md5(coalesce(i.description, '')))) AS input_hash
