@@ -144,6 +144,7 @@ func (h *Handler) FailOrphanedTask(w http.ResponseWriter, r *http.Request) {
 	)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"task_id":         uuidToString(previous.ID),
+		"workspace_id":    uuidOrNull(previous.WorkspaceID),
 		"previous_status": previous.PreviousStatus,
 		"status":          "failed",
 		"completed_at":    previous.CompletedAt,
@@ -172,6 +173,7 @@ func (h *Handler) RequeueOrphanedTask(w http.ResponseWriter, r *http.Request) {
 	)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"task_id":                  uuidToString(previous.ID),
+		"workspace_id":             uuidOrNull(previous.WorkspaceID),
 		"previous_status":          previous.PreviousStatus,
 		"status":                   "queued",
 		"updated_at":               time.Now().UTC(),
