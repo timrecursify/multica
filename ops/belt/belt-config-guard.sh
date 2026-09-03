@@ -827,6 +827,14 @@ guard_human_review_release() {
      ORDER BY i.updated_at LIMIT 25;" 2>/dev/null)
 }
 
+spec_receipt_status() {
+  jq -e -r 'if type != "object" then error("not-object") else (.current_status // .status // .result // .to_stage // .stage // empty) end' 2>/dev/null
+}
+
+spec_receipt_task_id() {
+  jq -e -r '.task_id // .pending_task_id // .selected_task_id // .task.id // .task.task_id // .result.task_id // .result.pending_task_id // empty' 2>/dev/null
+}
+
 guard_stranded_spec() {
 
   if queue_backed_up; then
@@ -842,15 +850,49 @@ guard_stranded_spec() {
   local number
   while read -r number; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    "${PSQL[@]}" -c "UPDATE issue SET status='Registered',
+    local reset_out reset_rc receipt receipt_rc relay_rc status task_id diag reset_rows reset_count
+    reset_out=$("${PSQL[@]}" -c "UPDATE issue SET status='Registered',
          metadata = coalesce(metadata,'{}'::jsonb) ||
            jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
-       WHERE number=${number} AND workspace_id='${GSP_WS}' AND status='Spec';" >/dev/null 2>&1 </dev/null || continue
-    if "$SK" multica advance "$number" --to "Spec" --board gsp >/dev/null 2>&1 </dev/null; then
-      fixed+=("gsp#${number} had no live scoper task; re-flown through Registered so the scoper runs (GSP-836)")
-    else
-      unfixable+=("gsp#${number} is stranded in Spec with no scoper task and could not be re-flown (GSP-836)")
+       WHERE number=${number} AND workspace_id='${GSP_WS}' AND status='Spec'
+         AND parent_issue_id IS NULL
+         AND coalesce(metadata->>'spec_reflies','0')::int < 3
+         AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
+                         WHERE q.issue_id=issue.id AND q.status IN ('queued','running'))
+       RETURNING number;" 2>&1 </dev/null); reset_rc=$?
+    if (( reset_rc != 0 )); then
+      diag=$(printf '%s' "$reset_out" | tr '\n' ' ' | sed -E 's/(password|token|secret)=[^ ]+/\1=[REDACTED]/Ig')
+      unfixable+=("gsp#${number} phase=reset exit=${reset_rc} diagnostic=${diag:-no-output}")
+      continue
     fi
+    reset_rows=$(printf '%s\n' "$reset_out" | sed '/^[[:space:]]*$/d')
+    reset_count=$(printf '%s\n' "$reset_rows" | sed '/^[[:space:]]*$/d' | wc -l | tr -d ' ')
+    if [[ "$reset_count" != 1 || "$(printf '%s' "$reset_rows" | tr -d '[:space:]')" != "$number" ]]; then
+      unfixable+=("gsp#${number} phase=reset exit=0 diagnostic=expected exactly one eligible row, changed ${reset_count:-0}")
+      continue
+    fi
+    # `sk multica advance` emits its JSON receipt on stdout; it has no
+    # --output switch, so keep stderr in the captured diagnostic stream.
+    receipt=$("$SK" multica advance "$number" --to "Spec" --board gsp 2>&1); relay_rc=$?
+    if (( relay_rc != 0 )); then
+      diag=$(printf '%s' "$receipt" | tr '\n' ' ' | sed -E 's/(password|token|secret)=[^ ]+/\1=[REDACTED]/Ig')
+      unfixable+=("gsp#${number} phase=relay exit=${relay_rc} diagnostic=${diag:-no-output}")
+      continue
+    fi
+    if ! receipt_rc=$(printf '%s' "$receipt" | spec_receipt_status); then
+      unfixable+=("gsp#${number} phase=json exit=0 diagnostic=malformed relay receipt")
+      continue
+    fi
+    status="$receipt_rc"
+    if [[ "$status" != "Spec" ]]; then
+      unfixable+=("gsp#${number} phase=status exit=0 diagnostic=relay receipt status=${status:-missing}, want=Spec")
+      continue
+    fi
+    if ! task_id=$(printf '%s' "$receipt" | spec_receipt_task_id) || [[ -z "$task_id" || "$task_id" == "null" ]]; then
+      unfixable+=("gsp#${number} phase=missing-task exit=0 diagnostic=Spec relay receipt had no scoper task_id")
+      continue
+    fi
+    fixed+=("gsp#${number} had no live scoper task; re-flown through Registered with Spec scoper task ${task_id} (GSP-836)")
   done < <("${PSQL[@]}" -c "
     SELECT i.number FROM issue i
     WHERE i.status='Spec' AND i.workspace_id='${GSP_WS}'
