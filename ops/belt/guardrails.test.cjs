@@ -7,7 +7,18 @@ const {
   retryAdmission, spendPreflight, beltRoutingAdmission, budgetCountPredicate, stageCycleAdmission, lifetimeTaskAdmission,
   isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
   quotaCircuitAdmission, QUOTA_PAUSE_MAX_AGE_MS, quotaPauseClearance, quotaPauseFlipLogLine
+  , resolveBuilderRoute
 } = require('./guardrails.cjs');
+
+test('builder route resolver rejects contradictory configuration and admits immutable route', () => {
+  const agent = { name: 'gsp-build-deepseek-low', model: 'deepseek/deepseek-v4-flash-0731',
+    runtime_config: { model: 'deepseek/deepseek-v4-flash-0731' } };
+  assert.deepEqual(resolveBuilderRoute(agent, { provider: 'openrouter' }).route,
+    { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash-0731', resolver_version: 'builder-route-v1' });
+  assert.equal(resolveBuilderRoute({ ...agent, runtime_config: { model: 'gpt-5.6-terra' } }, { provider: 'openrouter' }).reason,
+    'builder_route_mismatch');
+  assert.equal(resolveBuilderRoute({ name: 'gsp-build' }, {}).reason, 'builder_route_unavailable');
+});
 
 test('any bundled child is withheld, regardless of parent state', () => {
   assert.equal(isBundledChild({ parent_issue_id: 'p', title: 'child' }), true);

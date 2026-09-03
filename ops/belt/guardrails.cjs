@@ -15,6 +15,31 @@ const EXTERNAL_TRANSITION_STAGES = new Set(['Done']);
 const QUOTA_PAUSE_MAX_AGE_MS = 15 * 60 * 1000;
 const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('./qc-lane.cjs');
 
+// The route admitted for a builder is immutable task input.  Keep this pure so
+// relay admission, daemon claim and tests all use the same contract.
+const BUILDER_ROUTE_RESOLVER_VERSION = 'builder-route-v1';
+function resolveBuilderRoute(agent = {}, runtime = {}) {
+  const name = String(agent.name || agent.agent_name || '').toLowerCase();
+  if (!name.includes('build')) return { ok: true, route: null, resolver_version: BUILDER_ROUTE_RESOLVER_VERSION };
+  const cfg = agent.runtime_config && typeof agent.runtime_config === 'object' ? agent.runtime_config : {};
+  const models = [agent.model, cfg.model, runtime.model].map(v => String(v || '').trim()).filter(Boolean);
+  const uniqueModels = [...new Set(models)];
+  if (!uniqueModels.length) return { ok: false, reason: 'builder_route_unavailable' };
+  if (uniqueModels.length > 1) return { ok: false, reason: 'builder_route_mismatch', models: uniqueModels };
+  const model = uniqueModels[0];
+  // agent_runtime.provider identifies the Codex transport; model_provider is
+  // the billable route and may intentionally be OpenRouter for a Codex runtime.
+  const providerValues = [cfg.model_provider, cfg.provider, runtime.model_provider].map(v => String(v || '').trim().toLowerCase()).filter(Boolean);
+  const uniqueProviders = [...new Set(providerValues)];
+  const provider = uniqueProviders[0] || (/^deepseek[/:]/i.test(model) ? 'openrouter' : 'codex');
+  if (uniqueProviders.length > 1 || (provider === 'openrouter' && !/^deepseek[/:]/i.test(model)) ||
+      (provider === 'codex' && /^deepseek[/:]/i.test(model))) {
+    return { ok: false, reason: 'builder_route_mismatch', providers: uniqueProviders, model };
+  }
+  return { ok: true, resolver_version: BUILDER_ROUTE_RESOLVER_VERSION,
+    route: { provider, model, resolver_version: BUILDER_ROUTE_RESOLVER_VERSION } };
+}
+
 function canonicalStage(stage) {
   return STAGE_ALIASES.get(stage) || stage;
 }
@@ -248,6 +273,8 @@ function quotaCircuitAdmission(failures, limit = 3, { now = Date.now(),
 }
 
 module.exports = {
+  resolveBuilderRoute,
+  BUILDER_ROUTE_RESOLVER_VERSION,
   NONTERMINAL_TASK_STATES,
   canonicalStage,
   isBundledChild,
