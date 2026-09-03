@@ -35,6 +35,7 @@ const {
   isBookkeepingTransition,
   recordBookkeepingHandoff,
   validateRelayVerdict,
+  repairPpp23189Qualifying,
   hasCurrentPassWorkProduct,
   relayRedirect,
   passVerdictRescopeForbidden,
@@ -526,6 +527,36 @@ test('verdict validation accepts the sanctioned CLI checker field and rejects fo
   assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
+});
+
+test('blocked QC failure classes cannot be qualifying', () => {
+  for (const failure_class of ['evidence', 'tool', 'access']) {
+    assert.equal(validateRelayVerdict({ ...validVerdict, verdict: 'FAIL', failure_class, qualifying: true }), 'nonqualifying_failure_class');
+    assert.equal(validateRelayVerdict({ ...validVerdict, verdict: 'FAIL', failure_class, qualifying: false }), null);
+  }
+});
+
+test('PPP-23189 qualifying repair is exact and replay-safe', async () => {
+  const rows = new Map([
+    [10107, { id: 10107, issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', verdict: 'FAIL', failure_class: 'evidence', qualifying: true, idem_key: 'ppp-23189-5dff98e0-evidence-fail' }],
+    [10125, { id: 10125, issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', verdict: 'FAIL', failure_class: 'evidence', qualifying: true, idem_key: 'qc-23189-5dff98e0b5f4d048241d2f4fb17ae21adff56ac4-FAIL' }],
+    [10350, { id: 10350, issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', verdict: 'FAIL', failure_class: 'evidence', qualifying: true, idem_key: 'qc-23189-41aa105a9f58215c809da54976568d9bdbe654c6-FAIL' }],
+    [10000, { id: 10000, issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', verdict: 'FAIL', failure_class: 'implementation', qualifying: true, idem_key: 'unrelated' }]
+  ]);
+  const updates = [];
+  const client = { query: async (sql, values) => {
+    if (sql.startsWith('SELECT')) return { rowCount: 1, rows: [rows.get(values[0])] };
+    updates.push({ sql, values }); rows.get(values[0]).qualifying = false; return { rowCount: 1, rows: [] };
+  }};
+  assert.deepEqual(await repairPpp23189Qualifying(client), ['10107:changed', '10125:changed', '10350:changed']);
+  assert.deepEqual(await repairPpp23189Qualifying(client), ['10107:already_repaired', '10125:already_repaired', '10350:already_repaired']);
+  assert.equal(updates.length, 3);
+  assert.equal(rows.get(10000).qualifying, true);
+});
+
+test('PPP-23189 repair fails closed on a preimage mismatch', async () => {
+  const client = { query: async (sql, values) => ({ rowCount: 1, rows: [{ id: values[0], issue_id: '023cd68d-a287-48e9-a056-ea0975afe615', verdict: 'PASS', failure_class: 'evidence', qualifying: true, idem_key: values[1] }] }) };
+  await assert.rejects(() => repairPpp23189Qualifying(client), /qc_repair_preimage_mismatch:10107/);
 });
 
 test('routing rejections expose only bounded agent routing fields', () => {
