@@ -96,7 +96,7 @@ test('worker retains no self-deploy or direct database writes', () => {
   // Merge is belt-owned since 2026-09-03 (CI/CD & Deploy owned end to end);
   // it must stay gated on a green, MERGEABLE PR. Comments and shell stay out.
   assert.doesNotMatch(source, /execFileSync\('bash'|gh\(\['pr', 'comment'/);
-  assert.match(source, /info\.mergeable !== 'MERGEABLE'/);
+  assert.match(source, /info\.mergeable === 'CONFLICTING'/);
   assert.doesNotMatch(source, /UPDATE |INSERT INTO /);
   assert.match(source, /transition-policy\.cjs/);
 });

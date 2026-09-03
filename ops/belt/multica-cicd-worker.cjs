@@ -194,7 +194,9 @@ async function returnToBuild(issue, pr, reason) {
 
 function countCiFailure(issue, pr, sha, ci) {
   const key = `${issue.id}:${pr.repo}#${pr.num}:${sha}`;
-  if (!['red', 'unknown', 'mixed', 'pending'].includes(ci)) {
+  // Pending and unknown are not failures: a queued run on a saturated runner
+  // pool (ppp: 5 runners, ~20 jobs per PR) must wait, not return the ticket.
+  if (!['red', 'mixed'].includes(ci)) {
     ciFailureCounts.delete(key);
     return 0;
   }
@@ -334,7 +336,10 @@ async function sweep() {
       // Operator-owned merge, delegated to the belt (Tim 2026-09-03 01:48Z:
       // CI/CD & Deploy is owned end to end). Only a green, MERGEABLE PR merges;
       // the next poll sees it merged and routes the ticket to Done.
-      if (info.mergeable !== 'MERGEABLE') {
+      // UNKNOWN means GitHub has not recomputed yet (every merge on the repo
+      // resets it). Only CONFLICTING holds; the merge call itself refuses
+      // (405) if the PR is not mergeable.
+      if (info.mergeable === 'CONFLICTING') {
         log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but mergeable=${info.mergeable}`);
         continue;
       }
