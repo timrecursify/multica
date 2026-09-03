@@ -39,10 +39,11 @@ async function recordCursor(db, cursor) {
 }
 async function sweep(db = pool) {
   await db.query('BEGIN');
+  let candidates;
   try {
   await db.query("SELECT pg_advisory_xact_lock(hashtext('merged_pr_recovery_cursor'))");
   const cursor = await durableCursor(db);
-  const candidates = await db.query(
+  candidates = await db.query(
     `WITH linked AS (
        SELECT link.issue_id, pr.head_sha
          FROM issue_pull_request link JOIN github_pull_request pr ON pr.id=link.pull_request_id
@@ -63,12 +64,18 @@ async function sweep(db = pool) {
         AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=i.id
           AND q.status IN ('queued','dispatched','running','waiting_local_directory','deferred'))
       ORDER BY i.id LIMIT $1`, [LIMIT, cursor]);
+  // Release the database transaction before calling the relay.  The relay
+  // takes its own issue lock and transaction; keeping this read transaction
+  // open would allow the sweep to deadlock itself on the same issue rows.
+  await db.query('COMMIT');
   for (const issue of candidates.rows) {
     const result = await advance(issue, issue.head_sha);
     console.log(JSON.stringify({ event: 'merged_pr_recovery', issue_id: issue.id, number: issue.number,
       sha: issue.head_sha, status: result.status, outcome: result.body.slice(0, 240) }));
   }
   const nextCursor = candidates.rows.length < LIMIT ? '' : candidates.rows.at(-1).id;
+  await db.query('BEGIN');
+  await db.query("SELECT pg_advisory_xact_lock(hashtext('merged_pr_recovery_cursor'))");
   await recordCursor(db, nextCursor);
   await db.query('COMMIT');
   console.log(JSON.stringify({ event: 'merged_pr_recovery_cursor', next_cursor: nextCursor,
