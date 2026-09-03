@@ -22,6 +22,7 @@ const { deploymentCompletionAdmission } = require('../relay-completion-admission
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { processParkedRuntimeVerifications } = require('../parked-runtime-verification.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
+const { processParkedRuntimeVerifications } = require('../parked-runtime-verification.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
 const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
 const { reconcileCycle } = require('../reconciler.cjs');
