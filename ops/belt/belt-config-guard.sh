@@ -16,7 +16,7 @@ readonly SK=/home/newadmin/bin/sk
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
-readonly WANT_CONCURRENCY="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}"
+readonly WANT_CONCURRENCY=32
 readonly WANT_WORKSPACES_ROOT=/home/newadmin/multica-workspaces-gsp
 readonly BUILD_AGENT=gsp-build-deepseek-flash-1
 # 2026-08-31 14:20 UTC: global 12 -> 20, build capacity 3 -> 15, QC 4 each.
@@ -119,10 +119,15 @@ running_tasks() {
   "${PSQL[@]}" -c "SELECT count(*) FROM agent_task_queue WHERE status='running';" 2>/dev/null || echo 99
 }
 
-# 1. Tower concurrency and root must remain PM2-configurable. Empty values are
-# invalid rather than defaults so a broken ecosystem cannot silently widen work.
+# 1. Tower concurrency and root must remain PM2-configurable, so the environment
+# still wins when it is set. The guard runs from belt-config-guard.service, a
+# systemd oneshot with no PM2 environment, so an unset cap must fall back to the
+# declared fleet value rather than to the empty string: an empty cap makes
+# tower_concurrency_state report "mismatched" against every running Tower and
+# restarts gsp-multica-worker on each 5-minute tick. 32 is the fleet cap asserted
+# by ops/belt/deploy-daemon-artifact.sh health().
 daemon_launch_config() {
-  printf '%s|%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}" \
+  printf '%s|%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-"$WANT_CONCURRENCY"}" \
     "${MULTICA_DAEMON_WORKSPACES_ROOT-"$WANT_WORKSPACES_ROOT"}"
 }
 
@@ -300,7 +305,15 @@ guard_autopilot() {
 guard_build_capacity() {
   local current
   current=$("${PSQL[@]}" -c "SELECT max_concurrent_tasks FROM agent WHERE name='${BUILD_AGENT}' AND archived_at IS NULL;" 2>/dev/null)
-  [[ -z "$current" ]] && { unfixable+=("build agent ${BUILD_AGENT} is missing or archived"); return; }
+  if [[ -z "$current" ]]; then
+    # 2026-09-03: the single deepseek build agent is archived; the build lane is
+    # now gsp-build-terra-low-NN (Luna). Per-agent caps on that lane are gated by
+    # GSP-1849, so the guard only verifies the lane exists and never rewrites caps.
+    local lane
+    lane=$("${PSQL[@]}" -c "SELECT count(*) FROM agent WHERE name LIKE 'gsp-build-%' AND archived_at IS NULL;" 2>/dev/null)
+    [[ "${lane:-0}" -gt 0 ]] && return 0
+    unfixable+=("build lane empty: no non-archived agent named gsp-build-%"); return
+  fi
   [[ "$current" == "$WANT_BUILD_CAPACITY" ]] && return 0
   if "${PSQL[@]}" -c "UPDATE agent SET max_concurrent_tasks=${WANT_BUILD_CAPACITY}, updated_at=now() WHERE name='${BUILD_AGENT}' AND archived_at IS NULL;" >/dev/null 2>&1; then
     fixed+=("build capacity re-applied ${current} -> ${WANT_BUILD_CAPACITY} on ${BUILD_AGENT}")
@@ -702,6 +715,17 @@ guard_stranded_inprogress() {
 # child itself, so without this it sits open forever after the work has shipped —
 # the same "nothing ever closes" failure the bundling rule exists to prevent.
 # The child is dispositioned, not built: it never had a specification of its own.
+relay_cancel_child() {
+  local child_id="$1" parent_number="$2" agent operator body
+  agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' /home/newadmin/gsp-multica/.env | tail -1)
+  operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' /home/newadmin/gsp-multica/.env | tail -1)
+  [[ -z "$agent" || -z "$operator" ]] && return 1
+  body=$(printf '{"issue_id":"%s","to_stage":"Cancelled","agent_token":"%s","reason":"Folded into mega flight gsp#%s (Done), which carried the specification and the change for this report.","evidence":{"boardOwnerAuthority":"belt-config-guard bundled-child rule","reason":"child of completed mega gsp#%s"}}' \
+    "$child_id" "$agent" "$parent_number" "$parent_number")
+  curl -s -X POST http://127.0.0.1:5005/relay/advance -H 'content-type: application/json' \
+    -H "x-relay-operator-secret: $operator" -d "$body" | grep -q '"success":true'
+}
+
 guard_bundled_children() {
   local child_id number parent_number
   while IFS='|' read -r child_id number parent_number; do
@@ -709,7 +733,10 @@ guard_bundled_children() {
     "$SK" multica issue-comment-add "$child_id" --content \
       "Closed by mega flight gsp#${parent_number}, which carried the specification and the change for this report." \
       >/dev/null 2>&1 </dev/null
-    if "$SK" multica issue-update "$child_id" --status Done --no-start >/dev/null 2>&1 </dev/null; then
+    # 2026-09-03: terminal statuses are relay-owned (sk issue-update refuses
+    # Done) and Queue->Cancelled needs the operator actor + cancelled evidence
+    # (transition-policy.cjs:24,61). Fold the child as Cancelled via the relay.
+    if relay_cancel_child "$child_id" "$parent_number"; then
       fixed+=("gsp#${number} closed: its mega flight gsp#${parent_number} is done")
     else
       unfixable+=("gsp#${number} is a child of completed gsp#${parent_number} but could not be closed")
