@@ -942,7 +942,7 @@ test('relay advancement admits task results before creating a successor', () => 
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /require\('\.\.\/relay-completion-admission\.cjs'\)/);
   assert.match(source, /atq\.result AS task_result/);
-  assert.match(source, /completionAdmission\(row\.task_result/);
+  assert.match(source, /deploymentCompletionAdmission\(row\.task_status, row\.task_result/);
   assert.match(source, /requestRetryEscalation\(row, completion\.reason\)/);
   assert.match(source, /retry_escalation_task_id: taskId/);
   assert.match(source, /retry_escalation_stage: triggerStage/);

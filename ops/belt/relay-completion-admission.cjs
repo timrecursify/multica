@@ -91,4 +91,13 @@ function completionAdmission(result) {
   return { ok: true };
 }
 
-module.exports = { completionAdmission };
+// Deployment relay rows must be backed by a task that actually completed.
+// Terminal task state alone is not a successful work-product result.
+function deploymentCompletionAdmission(taskStatus, result) {
+  if (taskStatus !== 'completed') {
+    return { ok: false, reason: `task_${taskStatus || 'missing'}_not_completed`, disposition: 'Spec', escalation: 'sol_low_respec' };
+  }
+  return completionAdmission(result);
+}
+
+module.exports = { completionAdmission, deploymentCompletionAdmission };
