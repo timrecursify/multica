@@ -129,8 +129,61 @@ async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } 
   }
 }
 
-function github(args) {
+// GraphQL (gh pr view / gh pr merge) shares one per-user quota with every
+// operator session on this box. It was exhausted overnight on 2026-09-03 and
+// every completion route failed with
+// "GraphQL: API rate limit already exceeded for user ID 93534907" (168 times in
+// multica-relay-advance-error.log) while REST callers kept working. Both calls
+// are routed through REST here, the same way multica-cicd-worker.cjs does.
+const PR_URL_RE = /github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i;
+
+function ghExec(args) {
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
+}
+
+// gh returns statusCheckRollup as one flat list of check contexts. REST splits
+// the same facts across check-runs and the combined commit status, so both are
+// read and renamed to the GraphQL field names greenChecks() consumes. A commit
+// with no checks stays null, which is what GraphQL returns for that case.
+function restStatusCheckRollup(repo, sha, run = ghExec) {
+  const runs = JSON.parse(run(['api', `repos/${repo}/commits/${sha}/check-runs?per_page=100`])).check_runs || [];
+  const statuses = JSON.parse(run(['api', `repos/${repo}/commits/${sha}/status`])).statuses || [];
+  const rollup = [
+    ...runs.map((r) => ({ __typename: 'CheckRun', name: r.name,
+      status: String(r.status || '').toUpperCase(), conclusion: String(r.conclusion || '').toUpperCase() })),
+    ...statuses.map((s) => ({ __typename: 'StatusContext', context: s.context,
+      state: String(s.state || '').toUpperCase() }))
+  ];
+  return rollup.length ? rollup : null;
+}
+
+// The REST rebuild of `gh pr view --json
+// state,files,headRefOid,mergeStateStatus,statusCheckRollup`. GraphQL selects
+// files(first: 100); per_page=100 is the same window. REST reports a merged PR
+// as state=closed plus merged=true, so MERGED is restored here.
+function restPrView(repo, num, run = ghExec) {
+  const pr = JSON.parse(run(['api', `repos/${repo}/pulls/${num}`]));
+  const files = JSON.parse(run(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]));
+  const sha = pr.head && pr.head.sha;
+  return JSON.stringify({
+    state: pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase(),
+    files: files.map((f) => ({ path: f.filename })),
+    headRefOid: sha,
+    mergeStateStatus: String(pr.mergeable_state || 'unknown').toUpperCase(),
+    statusCheckRollup: restStatusCheckRollup(repo, sha, run)
+  });
+}
+
+function github(args, run = ghExec) {
+  const target = args[0] === 'pr' ? PR_URL_RE.exec(String(args[2] || '')) : null;
+  if (target) {
+    const repo = `${target[1]}/${target[2]}`;
+    if (args[1] === 'view') return restPrView(repo, target[3], run);
+    if (args[1] === 'merge') {
+      return run(['api', '-X', 'PUT', `repos/${repo}/pulls/${target[3]}/merge`, '-f', 'merge_method=squash']);
+    }
+  }
+  return run(args);
 }
 
 function resultPointer(row) {
@@ -1980,4 +2033,5 @@ if (require.main === module) startDaemon();
 module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
-  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner };
+  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
+  github, restPrView, restStatusCheckRollup };

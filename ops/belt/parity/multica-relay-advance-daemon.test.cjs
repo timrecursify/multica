@@ -1242,3 +1242,61 @@ test('quota pause flips are timestamped and stale unbudgeted pauses self-clear',
   assert.match(source, /await client\.query\('COMMIT'\);\s+for \(const flip of committedFlips\) onFlip\(flip\)/);
   assert.match(source, /scheduleEvery\(reconcileQuotaPauses, 60000, 'reconcileQuotaPauses'\)/);
 });
+
+// --- GitHub reads run on REST, not GraphQL (relay rate-limit migration) -----
+
+const { github: githubRest, restPrView } = require('./multica-relay-advance-daemon.cjs');
+
+function stubGh(responses) {
+  const calls = [];
+  const run = (args) => {
+    calls.push(args.join(' '));
+    const key = Object.keys(responses).find((k) => args.join(' ').includes(k));
+    if (!key) throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    return responses[key];
+  };
+  return { run, calls };
+}
+
+const OPEN_PR_RESPONSES = {
+  'pulls/42/files': JSON.stringify([{ filename: 'server/main.go' }, { filename: 'docs/x.md' }]),
+  'pulls/42': JSON.stringify({ state: 'open', merged: false, mergeable_state: 'clean',
+    head: { sha: 'a'.repeat(40) } }),
+  'check-runs': JSON.stringify({ check_runs: [{ name: 'ci', status: 'completed', conclusion: 'success' }] }),
+  '/status': JSON.stringify({ statuses: [{ context: 'legacy', state: 'success' }] })
+};
+
+test('pr view is rebuilt from REST with the GraphQL field names', () => {
+  const { run, calls } = stubGh(OPEN_PR_RESPONSES);
+  const pr = JSON.parse(restPrView('acme/widget', '42', run));
+  assert.equal(pr.state, 'OPEN');
+  assert.equal(pr.headRefOid, 'a'.repeat(40));
+  assert.equal(pr.mergeStateStatus, 'CLEAN');
+  assert.deepEqual(pr.files.map(({ path }) => path), ['server/main.go', 'docs/x.md']);
+  assert.deepEqual(pr.statusCheckRollup, [
+    { __typename: 'CheckRun', name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    { __typename: 'StatusContext', context: 'legacy', state: 'SUCCESS' }
+  ]);
+  assert.equal(calls.every((c) => c.startsWith('api ')), true);
+  assert.equal(calls.some((c) => c.includes('graphql')), false);
+});
+
+test('a merged PR reads as MERGED and an unchecked commit rolls up to null', () => {
+  const { run } = stubGh({ ...OPEN_PR_RESPONSES,
+    'pulls/42': JSON.stringify({ state: 'closed', merged: true, mergeable_state: 'unknown',
+      head: { sha: 'b'.repeat(40) } }),
+    'check-runs': JSON.stringify({ check_runs: [] }),
+    '/status': JSON.stringify({ statuses: [] }) });
+  const pr = JSON.parse(restPrView('acme/widget', '42', run));
+  assert.equal(pr.state, 'MERGED');
+  assert.equal(pr.mergeStateStatus, 'UNKNOWN');
+  assert.equal(pr.statusCheckRollup, null);
+});
+
+test('pr merge becomes a REST squash merge and other gh verbs pass through', () => {
+  const { run, calls } = stubGh({ 'pulls/42/merge': '{"merged":true}', 'repo view': 'acme/widget' });
+  githubRest(['pr', 'merge', 'https://github.com/acme/widget/pull/42', '--squash', '--admin'], run);
+  assert.deepEqual(calls, ['api -X PUT repos/acme/widget/pulls/42/merge -f merge_method=squash']);
+  githubRest(['repo', 'view'], run);
+  assert.equal(calls[1], 'repo view');
+});
