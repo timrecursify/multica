@@ -13,7 +13,7 @@ ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
 -- Multica installs. Reconcile it only where it exists.
 DO $$
 BEGIN
-    IF to_regclass('public.relay_run_log') IS NOT NULL THEN
+    IF to_regclass('relay_run_log') IS NOT NULL THEN
         EXECUTE 'ALTER TABLE relay_run_log DROP CONSTRAINT IF EXISTS relay_run_log_status_check';
         EXECUTE 'ALTER TABLE relay_run_log ADD CONSTRAINT relay_run_log_status_check '
              || 'CHECK (status IN (''pending'', ''completed'', ''failed'', ''rejected''))';
