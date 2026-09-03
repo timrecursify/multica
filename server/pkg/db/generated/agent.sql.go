@@ -3908,7 +3908,7 @@ func (q *Queries) GetLatestTaskRolloutMissing(ctx context.Context, arg GetLatest
 }
 
 const getRelayStageConfig = `-- name: GetRelayStageConfig :one
-SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages FROM relay_stage_config
+SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages, workspace_id FROM relay_stage_config
 WHERE stage_name = $1
 `
 
@@ -3925,6 +3925,7 @@ func (q *Queries) GetRelayStageConfig(ctx context.Context, stageName string) (Re
 		&i.AgentName,
 		&i.CreatedAt,
 		&i.AltNextStages,
+		&i.WorkspaceID,
 	)
 	return i, err
 }
@@ -5044,7 +5045,7 @@ func (q *Queries) ListQueuedClaimCandidatesByRuntimes(ctx context.Context, arg L
 }
 
 const listRelayStageConfig = `-- name: ListRelayStageConfig :many
-SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages FROM relay_stage_config
+SELECT id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages, workspace_id FROM relay_stage_config
 ORDER BY id ASC
 `
 
@@ -5068,6 +5069,7 @@ func (q *Queries) ListRelayStageConfig(ctx context.Context) ([]RelayStageConfig,
 			&i.AgentName,
 			&i.CreatedAt,
 			&i.AltNextStages,
+			&i.WorkspaceID,
 		); err != nil {
 			return nil, err
 		}
@@ -7026,7 +7028,7 @@ UPDATE relay_stage_config
 SET agent_id = $2,
     agent_name = $3
 WHERE stage_name = $1
-RETURNING id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages
+RETURNING id, stage_name, next_stage, agent_id, agent_name, created_at, alt_next_stages, workspace_id
 `
 
 type SetRelayStageOwnerParams struct {
@@ -7049,6 +7051,7 @@ func (q *Queries) SetRelayStageOwner(ctx context.Context, arg SetRelayStageOwner
 		&i.AgentName,
 		&i.CreatedAt,
 		&i.AltNextStages,
+		&i.WorkspaceID,
 	)
 	return i, err
 }
