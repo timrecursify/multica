@@ -10,7 +10,7 @@ UPDATE agent a
    AND a.archived_at IS NULL;
 
 INSERT INTO agent_invocation_target (agent_id, target_type, target_id, created_by)
-SELECT DISTINCT a.id, 'workspace', a.workspace_id, NULL
+SELECT DISTINCT a.id, 'workspace', a.workspace_id, NULL::uuid
   FROM agent a
   JOIN relay_stage_agent_pool p
     ON p.agent_id = a.id
