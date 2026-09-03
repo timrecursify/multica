@@ -113,7 +113,9 @@ async function humanReview(issue, reason) {
 
 async function watchdogFailure(issue, error, sha = '') {
   const row = watchdog.observe(issue.id, { sha, outcome: 'retrying', error });
-  if (!watchdog.retryAllowed(row) && watchdog.stalled(row)) {
+  // The sentinel is a wall-clock bound independent of poll count. Sparse or
+  // failed polls must still produce an auditable human-review hold on time.
+  if (watchdog.stalled(row)) {
     const stalled = watchdog.markAlerted(row);
     const detail = `deploy_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
     await humanReview(issue, detail);
