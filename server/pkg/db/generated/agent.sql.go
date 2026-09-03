@@ -1918,13 +1918,13 @@ func (q *Queries) CreateAgentTask(ctx context.Context, arg CreateAgentTaskParams
 
 const createDeferredAgentTask = `-- name: CreateDeferredAgentTask :one
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     trigger_summary, is_leader_task, squad_id, escalation_for_task_id, fire_at,
     originator_user_id, accountable_user_id, originator_source,
     delegated_from_task_id, trigger_evidence_kind, trigger_evidence_ref_id
 )
 VALUES (
-    $1, $2, $3, 'deferred', $4,
+    $1, $2, $3, (SELECT workspace_id FROM agent WHERE id = $1), 'deferred', $4,
     $5,
     $6,
     COALESCE($7::boolean, FALSE),
@@ -2047,14 +2047,14 @@ func (q *Queries) CreateDeferredAgentTask(ctx context.Context, arg CreateDeferre
 
 const createDeferredChannelIssueTask = `-- name: CreateDeferredChannelIssueTask :one
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id,
     trigger_evidence_kind, trigger_evidence_ref_id, fire_at
 )
 VALUES (
-    $1, $2, $3, 'deferred', $4, $5,
+    $1, $2, $3, (SELECT workspace_id FROM agent WHERE id = $1), 'deferred', $4, $5,
     COALESCE($6::uuid[], '{}'),
     $7,
     COALESCE($8::boolean, FALSE),
@@ -2196,12 +2196,12 @@ func (q *Queries) CreateDeferredChannelIssueTask(ctx context.Context, arg Create
 
 const createQuickCreateTask = `-- name: CreateQuickCreateTask :one
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, context, originator_user_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, context, originator_user_id,
     accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, trigger_evidence_kind, trigger_evidence_ref_id
 )
 VALUES (
-    $1, $2, NULL, 'queued', $3, $4,
+    $1, $2, NULL, (SELECT workspace_id FROM agent WHERE id = $1), 'queued', $3, $4,
     $5,
     $6,
     $7,
@@ -2411,7 +2411,7 @@ func (q *Queries) CreateRelayStageTask(ctx context.Context, arg CreateRelayStage
 
 const createRetryTask = `-- name: CreateRetryTask :one
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, chat_session_id, autopilot_run_id,
+    agent_id, runtime_id, issue_id, workspace_id, chat_session_id, autopilot_run_id,
     status, priority, trigger_comment_id, coalesced_comment_ids, trigger_summary, context,
     session_id, work_dir,
     attempt, max_attempts, parent_task_id, force_fresh_session, is_leader_task,
@@ -2421,7 +2421,7 @@ INSERT INTO agent_task_queue (
     chat_input_task_id, fire_at
 )
 SELECT
-    p.agent_id, p.runtime_id, p.issue_id, p.chat_session_id, p.autopilot_run_id,
+    p.agent_id, p.runtime_id, p.issue_id, p.workspace_id, p.chat_session_id, p.autopilot_run_id,
     CASE WHEN $2::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
     p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary, p.context,
@@ -2988,18 +2988,19 @@ func (q *Queries) FailAgentTask(ctx context.Context, arg FailAgentTaskParams) (A
 
 const failOrphanedAgentTask = `-- name: FailOrphanedAgentTask :one
 WITH prev AS (
-    SELECT status FROM agent_task_queue aq WHERE aq.id = $1
+    SELECT status FROM agent_task_queue aq WHERE aq.id = $1 AND ($2::uuid IS NULL OR aq.workspace_id = $2::uuid)
 ),
 updated AS (
     UPDATE agent_task_queue
     SET status = 'failed',
         completed_at = now(),
-        error = $2::text,
-        failure_reason = $3::text,
+        error = $3::text,
+        failure_reason = $4::text,
         prepare_lease_expires_at = NULL,
         wait_reason = NULL
     WHERE id = $1
       AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+      AND ($2::uuid IS NULL OR workspace_id = $2::uuid)
     RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, daemon_id, workspace_id
 )
 SELECT u.id, u.agent_id, u.issue_id, u.status, u.priority, u.dispatched_at, u.started_at, u.completed_at, u.result, u.error, u.created_at, u.context, u.runtime_id, u.session_id, u.work_dir, u.trigger_comment_id, u.chat_session_id, u.autopilot_run_id, u.attempt, u.max_attempts, u.parent_task_id, u.failure_reason, u.trigger_summary, u.force_fresh_session, u.is_leader_task, u.wait_reason, u.initiator_user_id, u.handoff_note, u.prepare_lease_expires_at, u.squad_id, u.runtime_mcp_overlay, u.escalation_for_task_id, u.fire_at, u.originator_user_id, u.runtime_connected_apps, u.coalesced_comment_ids, u.delivered_comment_ids, u.chat_input_task_id, u.chat_finalize_deferred_at, u.originator_source, u.delegated_from_task_id, u.retry_of_task_id, u.rerun_of_task_id, u.rule_version_id, u.trigger_evidence_kind, u.trigger_evidence_ref_id, u.accountable_user_id, u.session_rollout_missing, u.retired_session_id, u.quick_actions_disabled, u.regenerate_quick_actions_for, u.daemon_id, u.workspace_id, p.status AS previous_status
@@ -3008,6 +3009,7 @@ FROM updated u, prev p
 
 type FailOrphanedAgentTaskParams struct {
 	TaskID        pgtype.UUID `json:"task_id"`
+	WorkspaceID   pgtype.UUID `json:"workspace_id"`
 	Error         string      `json:"error"`
 	FailureReason string      `json:"failure_reason"`
 }
@@ -3079,7 +3081,12 @@ type FailOrphanedAgentTaskRow struct {
 // or retryable reason. The active lease is cleared; runtime provenance is
 // kept for audit.
 func (q *Queries) FailOrphanedAgentTask(ctx context.Context, arg FailOrphanedAgentTaskParams) (FailOrphanedAgentTaskRow, error) {
-	row := q.db.QueryRow(ctx, failOrphanedAgentTask, arg.TaskID, arg.Error, arg.FailureReason)
+	row := q.db.QueryRow(ctx, failOrphanedAgentTask,
+		arg.TaskID,
+		arg.WorkspaceID,
+		arg.Error,
+		arg.FailureReason,
+	)
 	var i FailOrphanedAgentTaskRow
 	err := row.Scan(
 		&i.ID,
@@ -4368,8 +4375,11 @@ func (q *Queries) HasPendingTaskForIssueAndAgentExcludingTriggerComment(ctx cont
 
 const linkTaskToIssue = `-- name: LinkTaskToIssue :exec
 UPDATE agent_task_queue
-SET issue_id = $2
-WHERE id = $1 AND issue_id IS NULL
+SET issue_id = $2,
+    workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+WHERE agent_task_queue.id = $1 AND agent_task_queue.issue_id IS NULL
+  AND EXISTS (SELECT 1 FROM issue i JOIN agent a ON a.id = agent_task_queue.agent_id
+              WHERE i.id = $2 AND i.workspace_id = a.workspace_id)
 `
 
 type LinkTaskToIssueParams struct {
@@ -5209,29 +5219,32 @@ func (q *Queries) ListQueuedClaimCandidatesByRuntimes(ctx context.Context, arg L
 }
 
 const listRepairableAgentTasks = `-- name: ListRepairableAgentTasks :many
-SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at,
+SELECT id, agent_id, issue_id, workspace_id, status, priority, dispatched_at, started_at,
        completed_at, error, created_at, runtime_id, attempt, max_attempts,
        failure_reason, daemon_id
 FROM agent_task_queue
-WHERE ($1::text IS NULL OR status = $1::text)
-  AND ($2::text IS NULL OR daemon_id = $2::text)
-  AND ($3::timestamptz IS NULL
-       OR COALESCE(started_at, dispatched_at, created_at) <= $3::timestamptz)
+WHERE ($1::uuid IS NULL OR workspace_id = $1::uuid)
+  AND ($2::text IS NULL OR status = $2::text)
+  AND ($3::text IS NULL OR daemon_id = $3::text)
+  AND ($4::timestamptz IS NULL
+       OR COALESCE(started_at, dispatched_at, created_at) <= $4::timestamptz)
 ORDER BY COALESCE(started_at, dispatched_at, created_at) ASC, id ASC
-LIMIT $4::integer
+LIMIT $5::integer
 `
 
 type ListRepairableAgentTasksParams struct {
-	Status    pgtype.Text        `json:"status"`
-	DaemonID  pgtype.Text        `json:"daemon_id"`
-	OlderThan pgtype.Timestamptz `json:"older_than"`
-	MaxRows   int32              `json:"max_rows"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	Status      pgtype.Text        `json:"status"`
+	DaemonID    pgtype.Text        `json:"daemon_id"`
+	OlderThan   pgtype.Timestamptz `json:"older_than"`
+	MaxRows     int32              `json:"max_rows"`
 }
 
 type ListRepairableAgentTasksRow struct {
 	ID            pgtype.UUID        `json:"id"`
 	AgentID       pgtype.UUID        `json:"agent_id"`
 	IssueID       pgtype.UUID        `json:"issue_id"`
+	WorkspaceID   pgtype.UUID        `json:"workspace_id"`
 	Status        string             `json:"status"`
 	Priority      int32              `json:"priority"`
 	DispatchedAt  pgtype.Timestamptz `json:"dispatched_at"`
@@ -5260,6 +5273,7 @@ type ListRepairableAgentTasksRow struct {
 // interpolated into the SQL text.
 func (q *Queries) ListRepairableAgentTasks(ctx context.Context, arg ListRepairableAgentTasksParams) ([]ListRepairableAgentTasksRow, error) {
 	rows, err := q.db.Query(ctx, listRepairableAgentTasks,
+		arg.WorkspaceID,
 		arg.Status,
 		arg.DaemonID,
 		arg.OlderThan,
@@ -5276,6 +5290,7 @@ func (q *Queries) ListRepairableAgentTasks(ctx context.Context, arg ListRepairab
 			&i.ID,
 			&i.AgentID,
 			&i.IssueID,
+			&i.WorkspaceID,
 			&i.Status,
 			&i.Priority,
 			&i.DispatchedAt,
@@ -6938,7 +6953,7 @@ func (q *Queries) RequeueAgentTaskAfterClaimFailure(ctx context.Context, arg Req
 
 const requeueOrphanedAgentTask = `-- name: RequeueOrphanedAgentTask :one
 WITH prev AS (
-    SELECT status FROM agent_task_queue aq WHERE aq.id = $1
+    SELECT status FROM agent_task_queue aq WHERE aq.id = $1 AND ($2::uuid IS NULL OR aq.workspace_id = $2::uuid)
 ),
 updated AS (
     UPDATE agent_task_queue
@@ -6950,11 +6965,17 @@ updated AS (
         delivered_comment_ids = '{}'
     WHERE id = $1
       AND status IN ('dispatched', 'running', 'waiting_local_directory')
+      AND ($2::uuid IS NULL OR workspace_id = $2::uuid)
     RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, daemon_id, workspace_id
 )
 SELECT u.id, u.agent_id, u.issue_id, u.status, u.priority, u.dispatched_at, u.started_at, u.completed_at, u.result, u.error, u.created_at, u.context, u.runtime_id, u.session_id, u.work_dir, u.trigger_comment_id, u.chat_session_id, u.autopilot_run_id, u.attempt, u.max_attempts, u.parent_task_id, u.failure_reason, u.trigger_summary, u.force_fresh_session, u.is_leader_task, u.wait_reason, u.initiator_user_id, u.handoff_note, u.prepare_lease_expires_at, u.squad_id, u.runtime_mcp_overlay, u.escalation_for_task_id, u.fire_at, u.originator_user_id, u.runtime_connected_apps, u.coalesced_comment_ids, u.delivered_comment_ids, u.chat_input_task_id, u.chat_finalize_deferred_at, u.originator_source, u.delegated_from_task_id, u.retry_of_task_id, u.rerun_of_task_id, u.rule_version_id, u.trigger_evidence_kind, u.trigger_evidence_ref_id, u.accountable_user_id, u.session_rollout_missing, u.retired_session_id, u.quick_actions_disabled, u.regenerate_quick_actions_for, u.daemon_id, u.workspace_id, p.status AS previous_status
 FROM updated u, prev p
 `
+
+type RequeueOrphanedAgentTaskParams struct {
+	TaskID      pgtype.UUID `json:"task_id"`
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+}
 
 type RequeueOrphanedAgentTaskRow struct {
 	ID                        pgtype.UUID        `json:"id"`
@@ -7024,8 +7045,8 @@ type RequeueOrphanedAgentTaskRow struct {
 // reports 409 instead of cancelling or replacing the other row. runtime_id is
 // intentionally preserved: agent_task_queue_active_requires_runtime requires
 // an active row to carry one.
-func (q *Queries) RequeueOrphanedAgentTask(ctx context.Context, taskID pgtype.UUID) (RequeueOrphanedAgentTaskRow, error) {
-	row := q.db.QueryRow(ctx, requeueOrphanedAgentTask, taskID)
+func (q *Queries) RequeueOrphanedAgentTask(ctx context.Context, arg RequeueOrphanedAgentTaskParams) (RequeueOrphanedAgentTaskRow, error) {
+	row := q.db.QueryRow(ctx, requeueOrphanedAgentTask, arg.TaskID, arg.WorkspaceID)
 	var i RequeueOrphanedAgentTaskRow
 	err := row.Scan(
 		&i.ID,
