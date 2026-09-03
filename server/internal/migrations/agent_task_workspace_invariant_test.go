@@ -62,21 +62,29 @@ VALUES ('dddddddd-dddd-dddd-dddd-dddddddddddd', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaa
 	if err != nil {
 		t.Fatalf("seed schema: %v", err)
 	}
-	applyMigrationFile(t, ctx, conn.Conn(), "304_agent_task_workspace_invariant.up.sql")
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin migration transaction: %v", err)
+	}
+	defer tx.Rollback(ctx)
+	applyMigrationFile(t, ctx, tx, "304_agent_task_workspace_invariant.up.sql")
 
 	var ws string
-	if err := conn.QueryRow(ctx, `SELECT workspace_id::text FROM agent_task_queue WHERE id='dddddddd-dddd-dddd-dddd-dddddddddddd'`).Scan(&ws); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT workspace_id::text FROM agent_task_queue WHERE id='dddddddd-dddd-dddd-dddd-dddddddddddd'`).Scan(&ws); err != nil {
 		t.Fatalf("read backfilled workspace: %v", err)
 	}
 	if ws != "11111111-1111-1111-1111-111111111111" {
 		t.Fatalf("workspace backfill = %s", ws)
 	}
-	if _, err := conn.Exec(ctx, `INSERT INTO agent_task_queue (id, agent_id, runtime_id, status, workspace_id)
+	if _, err := tx.Exec(ctx, `INSERT INTO agent_task_queue (id, agent_id, runtime_id, status, workspace_id)
 VALUES ('eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'queued', '22222222-2222-2222-2222-222222222222')`); err == nil {
 		t.Fatal("foreign task workspace was accepted")
 	}
-	if _, err := conn.Exec(ctx, `INSERT INTO agent_task_queue (id, agent_id, runtime_id, status)
+	if _, err := tx.Exec(ctx, `INSERT INTO agent_task_queue (id, agent_id, runtime_id, status)
 VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'cccccccc-cccc-cccc-cccc-cccccccccccc', 'queued')`); err == nil {
 		t.Fatal("foreign runtime workspace was accepted")
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback migration transaction: %v", err)
 	}
 }
