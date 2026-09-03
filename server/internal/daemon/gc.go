@@ -342,12 +342,8 @@ func gitWorktreeIsClean(workDir string) bool {
 	if err != nil || status != "" {
 		return false
 	}
-	branch, err := runGitGCCommand(workDir, "branch", "--show-current")
-	if err != nil || branch == "" {
-		return false
-	}
-	out, err := runGitGCCommand(workDir, "rev-list", "origin/"+branch+"..HEAD")
-	return err == nil && strings.TrimSpace(out) == ""
+	_, err = verifyGitPublication(workDir)
+	return err == nil
 }
 
 func recordArtifactCleanup(stats *gcStats, removed int, bytes int64, perPattern map[string]int) {
