@@ -30,7 +30,9 @@ const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?ss
 test('reconciliation ramp defaults to 25 and passes the full candidate set to reconciler', async () => {
   assert.equal(reconcileCreateLimit(), 25);
   assert.equal(reconcileCreateLimit(3), 3);
-  assert.equal(reconcileCreateLimit(0), 25);
+  assert.equal(reconcileCreateLimit(0), 0);
+  assert.equal(reconcileCreateLimit(-1), 25);
+  assert.equal(reconcileCreateLimit(1.5), 25);
   const candidates = [{ id: '1' }, { id: '2' }, { id: '3' }];
   const client = { release() {}, query: async (sql) => {
     if (sql === require('../reconciler.cjs').issueCandidatesSql()) return { rows: candidates };
@@ -39,6 +41,21 @@ test('reconciliation ramp defaults to 25 and passes the full candidate set to re
   }};
   const result = await runReconcileCycle({ dbPool: { connect: async () => client, query: async () => ({ rows: [] }) }, maxCreate: 2, logger: { log() {} } });
   assert.equal(result.length, candidates.length);
+});
+
+test('dispatch hold returns before database access', async () => {
+  const previous = process.env.RECONCILE_DISPATCH_HOLD;
+  process.env.RECONCILE_DISPATCH_HOLD = '1';
+  try {
+    const result = await runReconcileCycle({
+      dbPool: { connect: async () => { throw new Error('database must not be touched'); } },
+      logger: { log() {} }
+    });
+    assert.equal(result, null);
+  } finally {
+    if (previous === undefined) delete process.env.RECONCILE_DISPATCH_HOLD;
+    else process.env.RECONCILE_DISPATCH_HOLD = previous;
+  }
 });
 
 test('typed re-advance moves recorded work through relay without an agent dispatch', async () => {

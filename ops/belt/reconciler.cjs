@@ -63,12 +63,12 @@ function settingsFor(options = {}) {
   const positive = (value, fallback) => Number.isInteger(Number(value)) && Number(value) > 0 ? Number(value) : fallback;
   return {
     ...options,
-    maxCreatePerCycle: positive(options.maxCreatePerCycle || process.env.RECONCILE_MAX_CREATE_PER_CYCLE, 25),
-    maxCreatePerAgent: positive(options.maxCreatePerAgent || process.env.RECONCILE_MAX_CREATE_PER_AGENT, 3),
-    lifetimeTaskLimit: positive(options.lifetimeTaskLimit || process.env.RECONCILE_LIFETIME_TASK_LIMIT, 6),
-    defaultMaxAttempts: positive(options.defaultMaxAttempts || process.env.RECONCILE_DEFAULT_MAX_ATTEMPTS, 2),
-    issueCooldownMinutes: positive(options.issueCooldownMinutes || process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
-    completedStageCooldownMinutes: positive(options.completedStageCooldownMinutes || process.env.RECONCILE_COMPLETED_STAGE_COOLDOWN_MINUTES, 720),
+    maxCreatePerCycle: (() => { const value = options.maxCreatePerCycle ?? process.env.RECONCILE_MAX_CREATE_PER_CYCLE; return Number.isInteger(Number(value)) && Number(value) >= 0 ? Number(value) : 25; })(),
+    maxCreatePerAgent: positive(options.maxCreatePerAgent ?? process.env.RECONCILE_MAX_CREATE_PER_AGENT, 3),
+    lifetimeTaskLimit: positive(options.lifetimeTaskLimit ?? process.env.RECONCILE_LIFETIME_TASK_LIMIT, 6),
+    defaultMaxAttempts: positive(options.defaultMaxAttempts ?? process.env.RECONCILE_DEFAULT_MAX_ATTEMPTS, 2),
+    issueCooldownMinutes: positive(options.issueCooldownMinutes ?? process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
+    completedStageCooldownMinutes: positive(options.completedStageCooldownMinutes ?? process.env.RECONCILE_COMPLETED_STAGE_COOLDOWN_MINUTES, 720),
     typedOutcomes: options.typedOutcomes ?? process.env.RECONCILE_TYPED_OUTCOMES === "1",
     skipStages: new Set(String(options.skipStages ?? process.env.RECONCILE_SKIP_STAGES ?? "").split(",").map((v) => v.trim()).filter(Boolean)),
     budget: options.budget || { created: 0, byAgent: new Map() }

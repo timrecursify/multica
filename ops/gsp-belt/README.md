@@ -114,6 +114,10 @@ bash <release-dir>/ops/gsp-belt/scripts/belt-status.sh --release <release-dir>
 It exits non-zero if an app is offline or resolves outside that immutable
 release.
 
+## Dispatch controls
+
+`RECONCILE_MAX_CREATE_PER_CYCLE` limits tasks created per cycle; set it to `0` to halt task creation. `RECONCILE_DISPATCH_HOLD=1` is the supported way to stop dispatch, holding the reconcile cycle before any database access.
+
 ## Tests
 
 ```bash

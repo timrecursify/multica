@@ -34,8 +34,17 @@ const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
 const RECONCILE_INTERVAL_MS = 30000;
-const RECONCILE_MAX_CREATE_PER_CYCLE = Number.parseInt(
-  process.env.RECONCILE_MAX_CREATE_PER_CYCLE || '25', 10
+function parseReconcileCreateLimit(value) {
+  if (value === undefined) return 25;
+  const text = String(value).trim();
+  const parsed = Number(text);
+  if (/^\d+$/.test(text) && Number.isSafeInteger(parsed)) return parsed;
+  console.warn(`RECONCILE_MAX_CREATE_PER_CYCLE rejected value ${JSON.stringify(value)}; using 25`);
+  return 25;
+}
+
+const RECONCILE_MAX_CREATE_PER_CYCLE = parseReconcileCreateLimit(
+  process.env.RECONCILE_MAX_CREATE_PER_CYCLE
 );
 const TERMINAL_STAGES = new Set(['Done', 'Cancelled', 'Archived']);
 const MD5_RE = /^[0-9a-f]{32}$/i;
@@ -43,7 +52,7 @@ const QC_EVIDENCE_MISMATCH_LIMIT = 3;
 let advanceTickInFlight = false;
 
 function reconcileCreateLimit(value = RECONCILE_MAX_CREATE_PER_CYCLE) {
-  return Number.isInteger(value) && value > 0 ? value : 25;
+  return Number.isInteger(value) && value >= 0 ? value : 25;
 }
 
 async function recordOutcomesPass({ dbPool = pool, logger = console } = {}) {
