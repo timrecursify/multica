@@ -20,7 +20,9 @@ const { recordParkAndQueueDiagnosis, parseDiagnosisOutcome, diagnosisEvidence,
   diagnosisOutcomeAction, PARK_DIAGNOSIS_KIND } = require('../parked-diagnosis.cjs');
 const { deploymentCompletionAdmission } = require('../relay-completion-admission.cjs');
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
+const { processParkedRuntimeVerifications } = require('../parked-runtime-verification.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
+const { processParkedRuntimeVerifications } = require('../parked-runtime-verification.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
 const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
 const { reconcileCycle } = require('../reconciler.cjs');
@@ -1955,6 +1957,7 @@ function startDaemon() {
     ['cleanup', cleanupStalePendingRows, 300000],
     ['reconcile', runReconcileCycle, RECONCILE_INTERVAL_MS],
     ['parked-diagnosis', processParkedDiagnoses, 30000],
+    ['parked-runtime-verification', () => processParkedRuntimeVerifications({ verificationPool: pool, relayPost: postToRelay, workspaceId: WORKSPACE_ID }), 30000],
     ['quota-pause', reconcileQuotaPauses, 60000],
     ['stage-outcome', recordOutcomesPass, 30000],
     ['typed-readvance', readvanceRecordedOutcomes, 300000],
