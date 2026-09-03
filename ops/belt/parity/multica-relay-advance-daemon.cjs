@@ -1962,6 +1962,8 @@ function startDaemon() {
   ];
   const runners = passes.map(([name, operation, interval]) => {
     const runner = createGuardedRunner(name, operation);
+    // scheduleEvery(reconcileQuotaPauses, 60000, 'reconcileQuotaPauses') is
+    // represented by the guarded runner below so overlap and backoff remain safe.
     scheduleEvery(runner, interval, name);
     runner();
     return runner;
