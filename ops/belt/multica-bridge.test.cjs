@@ -39,6 +39,7 @@ const {
   relayRedirect,
   passVerdictRescopeForbidden,
   latestCompletedSolLowQcTask,
+  latestRunningSolLowQcTask,
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
@@ -540,6 +541,18 @@ test('QC evidence parser accepts exactly one structured output marker', () => {
   assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC_EVIDENCE_JSON={bad}' } }, validVerdict), 'qc_task_evidence_required');
   assert.equal(qcTaskEvidenceMismatch({ result: { output: `${qcResult().output}\nQC_EVIDENCE_JSON=${JSON.stringify(validVerdict)}` } }, validVerdict), 'qc_task_evidence_required');
   assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC VERDICT: PASS' } }, validVerdict), 'qc_task_evidence_required');
+});
+
+test('running Sol-low selector admits exactly one matching assigned task', async () => {
+  let rows = [{ id: 'task-1', agent_id: 'agent-1', status: 'running', agent_name: validVerdict.checker }];
+  const client = { query: async (sql, values) => {
+    assert.deepEqual(values, ['issue-1', 'workspace-1', validVerdict.checker, null, ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
+    assert.match(sql, /t\.status = 'running'/);
+    return { rows };
+  } };
+  assert.equal(await latestRunningSolLowQcTask(client, 'issue-1', 'workspace-1', validVerdict.checker), rows[0]);
+  rows = [rows[0], { id: 'task-2' }];
+  assert.equal(await latestRunningSolLowQcTask(client, 'issue-1', 'workspace-1', validVerdict.checker), null);
 });
 
 test('verdict checker identity is selected from the completed same-workspace Sol-low QC task', async () => {
