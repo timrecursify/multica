@@ -256,9 +256,15 @@ async function reconcileCycle(client, options = {}) {
     else if (result.action === "already_live") counts.alreadyLive += 1;
     else if (result.action === "handoff") counts.handoff = (counts.handoff || 0) + 1;
     else if (result.action === "error") counts.error += 1;
-    else counts.skipped += 1;
+    else {
+      counts.skipped += 1;
+      const reason = result.reason || result.action || "unknown";
+      counts.skipReasons = counts.skipReasons || {};
+      counts.skipReasons[reason] = (counts.skipReasons[reason] || 0) + 1;
+    }
   }
-  console.log(`Reconcile cycle: created=${counts.created} alreadyLive=${counts.alreadyLive} skipped=${counts.skipped} humanReview=${counts.humanReview} handoff=${counts.handoff || 0} error=${counts.error}`);
+  const skipDetail = Object.entries(counts.skipReasons || {}).sort((a, b) => b[1] - a[1]).map(([k, v]) => `${k}=${v}`).join(",");
+  console.log(`Reconcile cycle: created=${counts.created} alreadyLive=${counts.alreadyLive} skipped=${counts.skipped} humanReview=${counts.humanReview} handoff=${counts.handoff || 0} error=${counts.error}${skipDetail ? ` skipReasons=${skipDetail}` : ""}`);
   return results;
 }
 

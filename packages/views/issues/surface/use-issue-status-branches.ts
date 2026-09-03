@@ -12,7 +12,6 @@ import {
   useQueryClient,
   type UseQueryResult,
 } from "@tanstack/react-query";
-import { ALL_STATUSES } from "@multica/core/issues/config";
 import {
   issueKeys,
   issueTableRowPageOptions,
@@ -36,10 +35,11 @@ export interface IssueStatusPageState {
   retry: () => void;
 }
 
-export type IssueStatusPagination = Record<
-  IssueStatus,
-  IssueStatusPageState
->;
+// Facet responses may contain workflow statuses unknown to this client's
+// static status vocabulary, so pagination must support arbitrary status keys.
+export type IssueStatusPagination = Record<IssueStatus, IssueStatusPageState> & {
+  [status: string]: IssueStatusPageState | undefined;
+};
 
 interface StatusCursorState {
   identity: string;

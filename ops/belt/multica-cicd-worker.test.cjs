@@ -93,7 +93,10 @@ test('receipt mismatch is the only Human Review receipt path', async () => {
 
 test('worker retains no self-deploy or direct database writes', () => {
   const source = require('fs').readFileSync(require.resolve('./multica-cicd-worker.cjs'), 'utf8');
-  assert.doesNotMatch(source, /execFileSync\('bash'|gh\(\['pr', 'merge'|gh\(\['pr', 'comment'/);
+  // Merge is belt-owned since 2026-09-03 (CI/CD & Deploy owned end to end);
+  // it must stay gated on a green, MERGEABLE PR. Comments and shell stay out.
+  assert.doesNotMatch(source, /execFileSync\('bash'|gh\(\['pr', 'comment'/);
+  assert.match(source, /info\.mergeable !== 'MERGEABLE'/);
   assert.doesNotMatch(source, /UPDATE |INSERT INTO /);
   assert.match(source, /transition-policy\.cjs/);
 });

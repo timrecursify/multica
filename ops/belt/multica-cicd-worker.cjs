@@ -33,6 +33,23 @@ const ciFailureCounts = new Map();
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 let gh = function github(args) {
+  // GraphQL (gh pr view/merge) shares one per-user quota with every operator
+  // session and was exhausted at 02:19Z on 2026-09-03; route both through REST.
+  if (args[0] === 'pr' && args[1] === 'view' && args[3] === '-R') {
+    const raw = execFileSync('gh', ['api', `repos/${args[4]}/pulls/${args[2]}`],
+      { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 });
+    const pr = JSON.parse(raw);
+    return JSON.stringify({
+      state: pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase(),
+      mergeable: pr.mergeable === true ? 'MERGEABLE' : pr.mergeable === false ? 'CONFLICTING' : 'UNKNOWN',
+      headRefOid: pr.head && pr.head.sha, createdAt: pr.created_at, mergedAt: pr.merged_at,
+      mergeCommit: pr.merge_commit_sha && pr.merged ? { oid: pr.merge_commit_sha } : null
+    });
+  }
+  if (args[0] === 'pr' && args[1] === 'merge' && args[3] === '-R') {
+    return execFileSync('gh', ['api', '-X', 'PUT', `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'],
+      { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
+  }
   return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
 };
 
@@ -215,6 +232,9 @@ function hasBarePRReference(work) {
 function ciState(repo, sha, createdAt, now = Date.now()) {
   try {
     const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=30`]));
+    // A run whose name is its file path is GitHub's 'invalid workflow file'
+    // marker: it has no jobs and says nothing about this SHA.
+    runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/'));
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
     if (!(runs.workflow_runs || []).length) {
       const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
@@ -311,7 +331,19 @@ async function sweep() {
         continue;
       }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
-      log(`HOLD #${issue.number} ${pr.repo}#${pr.num} CI is green; merge is operator-owned`);
+      // Operator-owned merge, delegated to the belt (Tim 2026-09-03 01:48Z:
+      // CI/CD & Deploy is owned end to end). Only a green, MERGEABLE PR merges;
+      // the next poll sees it merged and routes the ticket to Done.
+      if (info.mergeable !== 'MERGEABLE') {
+        log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but mergeable=${info.mergeable}`);
+        continue;
+      }
+      try {
+        gh(['pr', 'merge', String(pr.num), '-R', pr.repo, '--squash', '--admin', '--delete-branch']);
+        log(`MERGED #${issue.number} ${pr.repo}#${pr.num} squash by belt operator`);
+      } catch (e) {
+        log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
+      }
     } catch (e) {
       log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
     }

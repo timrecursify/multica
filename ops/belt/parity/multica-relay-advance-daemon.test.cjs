@@ -406,11 +406,14 @@ function strandedHarness(fixtures, state = {
       const eligible = fixtures.filter((row) => row.eligible !== false &&
         (row.forceContender || !state.tasks.some((task) => task.issue_id === row.issue_id && task.status === 'queued')) &&
         (row.allow_repeat || !dispatchedIssueIds.has(row.issue_id)));
-      const exhausted = eligible.filter((row) => (row.stage_history_count ?? row.history_count ?? 1) >= values[3] ||
+      const exhaustedRows = eligible.filter((row) => (row.stage_history_count ?? row.history_count ?? 1) >= values[3] ||
         (row.lifetime_history_count ?? row.history_count ?? 1) >= values[4])
         .map((row) => ({ ...row, exhaustion_reason: (row.stage_history_count ?? row.history_count ?? 1) >= values[3]
           ? 'stage_cycle_limit' : 'lifetime_task_limit' }));
-      const admitted = eligible.filter((row) => !exhausted.some((exhaustedRow) => exhaustedRow.issue_id === row.issue_id))
+      const exhausted = exhaustedRows
+        .sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at) || a.issue_id.localeCompare(b.issue_id))
+        .slice(0, values[0]);
+      const admitted = eligible.filter((row) => !exhaustedRows.some((exhaustedRow) => exhaustedRow.issue_id === row.issue_id))
         .sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at) ||
           a.issue_id.localeCompare(b.issue_id))
         .filter((row, _, rows) => rows.filter((candidate) => candidate.agent_id === row.agent_id)
@@ -533,6 +536,27 @@ test('In Review requeue summary supplies the QC PR URL and full SHA', () => {
 test('In Review requeue summary directs a FAIL verdict when PR or SHA is absent', () => {
   assert.match(requeueTriggerSummary(strandedFixture({ stage: 'In Review' }), true),
     /PR\/SHA unknown: issue FAIL verdict per runbook/);
+});
+
+test('only the oldest exhausted batch escalates while a full admissible batch dispatches', async () => {
+  const overLimit = [1, 2, 3, 4].map((number) => strandedFixture({
+    number, issue_id: `223e4567-e89b-42d3-a456-42661417430${number}`,
+    agent_id: `423e4567-e89b-42d3-a456-42661417430${number}`,
+    issue_created_at: `2026-09-01T00:0${number}:00Z`, lifetime_history_count: 6
+  }));
+  const admissible = [5, 6, 7].map((number) => strandedFixture({
+    number, issue_id: `223e4567-e89b-42d3-a456-42661417430${number}`,
+    agent_id: `423e4567-e89b-42d3-a456-42661417430${number}`,
+    issue_created_at: `2026-09-01T00:0${number}:00Z`
+  }));
+  const exhausted = overLimit.slice().sort((a, b) => a.issue_created_at.localeCompare(b.issue_created_at) || a.issue_id.localeCompare(b.issue_id)).slice(0, 3);
+  const dispatched = admissible.slice(0, 3);
+  assert.deepEqual(dispatched.map(({ issue_id }) => issue_id), admissible.map(({ issue_id }) => issue_id));
+  assert.deepEqual(exhausted.map(({ issue_id }) => issue_id), overLimit.slice(0, 3).map(({ issue_id }) => issue_id));
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const candidateSql = source.slice(source.indexOf('WITH stranded AS'), source.indexOf('async function processParkedDiagnoses'));
+  assert.match(candidateSql, /WHERE rn <= \$1::int/);
+  assert.equal((candidateSql.match(/ORDER BY issue_created_at ASC, issue_id ASC\s+LIMIT \$1/g) || []).length, 1);
 });
 
 test.skip('stranded-task fixtures leave running tasks and bundled children untouched', async () => {
@@ -1151,5 +1175,5 @@ test('quota pause flips are timestamped and stale unbudgeted pauses self-clear',
   assert.match(source, /b\.spent_ticks \+ b\.reserved_ticks >= b\.limit_ticks/);
   assert.match(source, /committedFlips\.push\(\{ agent_name: agent\.agent_name, timestamp, paused: false \}\)/);
   assert.match(source, /await client\.query\('COMMIT'\);\s+for \(const flip of committedFlips\) onFlip\(flip\)/);
-  assert.match(source, /setInterval\(reconcileQuotaPauses, 60000\)/);
+  assert.match(source, /setInterval\(guarded\('reconcileQuotaPauses', reconcileQuotaPauses\), 60000\)/);
 });
