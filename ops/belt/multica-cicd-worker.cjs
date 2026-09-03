@@ -199,7 +199,29 @@ async function returnIssueToBuild(issue, reason) {
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'In Progress', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected In Progress: ${verdict.code}`);
   await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${reason}`, null, evidence);
+  noteReturn(issue, reason);
   log(`RETURN #${issue.number} ${reason}`);
+}
+
+// The reconciled build task carries no return reason (context is only
+// {kind, source, to_stage}), so a builder re-read the ticket, saw its own PR,
+// and reported ADVANCED again in under a minute (GSP-1097, 2026-09-03 05:30Z:
+// 70 of 97 rework tasks finished in <3 min with the PR still dirty). The
+// reason has to live on the ticket, where the brief is assembled from.
+const PPP_WORKSPACE = 'da3c5c5c-a123-4567-b999-c3ed1820da00';
+function noteReturn(issue, reason) {
+  const board = issue.workspace_id === PPP_WORKSPACE ? 'prod' : 'gsp';
+  const body = [`CI/CD RETURN: ${reason}.`,
+    'Required before this ticket can advance again:',
+    '1. git fetch origin; rebase the PR branch onto the PR base branch (master for sk-cli, main elsewhere); resolve every conflict (git merge-tree --write-tree origin/<base> HEAD names the files).',
+    '2. Push the rebased branch; confirm GitHub reports the PR mergeable and CI runs on the new head.',
+    '3. Report the new head SHA. Reporting ADVANCED with the PR still conflicting or without a fresh CI run returns it here again.'].join('\n');
+  try {
+    execFileSync('sk', ['multica', 'comment', '--board', board, '--number', String(issue.number), '--body', body],
+      { encoding: 'utf8', timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (e) {
+    log(`NOTE-FAIL #${issue.number} ${String(e.message).split('\n')[0].slice(0, 160)}`);
+  }
 }
 
 async function returnToBuild(issue, pr, reason) {
