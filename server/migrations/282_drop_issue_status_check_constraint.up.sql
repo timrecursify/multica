@@ -17,11 +17,10 @@ UPDATE issue
 SET status = CASE status
     WHEN 'backlog' THEN 'Spec'
     WHEN 'todo' THEN 'Spec'
-    WHEN 'Registered' THEN 'Spec'
     WHEN 'Building' THEN 'In Progress'
-    WHEN 'In Progress' THEN 'In Progress'
+    WHEN 'in_progress' THEN 'In Progress'
     WHEN 'QC' THEN 'In Review'
-    WHEN 'In Review' THEN 'In Review'
+    WHEN 'in_review' THEN 'In Review'
     WHEN 'blocked' THEN 'Human Review'
     WHEN 'Blocked' THEN 'Human Review'
     WHEN 'done' THEN 'Done'

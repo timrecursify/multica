@@ -61,7 +61,10 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 			('00000000-0000-0000-0000-000000000010', 'Building'),
 			('00000000-0000-0000-0000-000000000011', 'done'),
 			('00000000-0000-0000-0000-000000000012', 'CI/CD & Deploy'),
-			('00000000-0000-0000-0000-000000000013', 'unknown legacy value');
+			('00000000-0000-0000-0000-000000000013', 'unknown legacy value'),
+			('00000000-0000-0000-0000-000000000014', 'Registered'),
+			('00000000-0000-0000-0000-000000000015', 'Parked'),
+			('00000000-0000-0000-0000-000000000016', 'Rejected');
 		ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (
 			status IN ('backlog', 'todo', 'in_progress', 'in_review', 'done', 'blocked', 'cancelled', 'Spec', 'Queue', 'In Progress', 'In Review', 'Human Review', 'CI/CD & Deploy', 'Done', 'Archived', 'Cancelled')
 		) NOT VALID;
@@ -83,8 +86,11 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 		"00000000-0000-0000-0000-000000000009": "Spec",
 		"00000000-0000-0000-0000-000000000010": "In Progress",
 		"00000000-0000-0000-0000-000000000011": "Done",
-		"00000000-0000-0000-0000-000000000012": "Spec",
+		"00000000-0000-0000-0000-000000000012": "CI/CD & Deploy",
 		"00000000-0000-0000-0000-000000000013": "Spec",
+		"00000000-0000-0000-0000-000000000014": "Registered",
+		"00000000-0000-0000-0000-000000000015": "Spec",
+		"00000000-0000-0000-0000-000000000016": "Spec",
 	})
 
 	if _, err := conn.Exec(ctx, `
@@ -92,7 +98,8 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 			('00000000-0000-0000-0000-000000000014', 'Queue'),
 			('00000000-0000-0000-0000-000000000015', 'Human Review'),
 			('00000000-0000-0000-0000-000000000016', 'Archived'),
-			('00000000-0000-0000-0000-000000000017', 'In Review')
+			('00000000-0000-0000-0000-000000000017', 'In Review'),
+			('00000000-0000-0000-0000-000000000018', 'CI/CD & Deploy')
 	`); err != nil {
 		t.Fatalf("write canonical rows after up: %v", err)
 	}
@@ -117,6 +124,7 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 		"00000000-0000-0000-0000-000000000015": "blocked",
 		"00000000-0000-0000-0000-000000000016": "cancelled",
 		"00000000-0000-0000-0000-000000000017": "In Review",
+		"00000000-0000-0000-0000-000000000018": "CI/CD & Deploy",
 	})
 
 	var sidecarExists bool
@@ -129,19 +137,20 @@ func TestDropIssueStatusCheckMigrationRoundTrip(t *testing.T) {
 
 	if _, err := conn.Exec(ctx, `
 		INSERT INTO issue (id, status)
-		VALUES ('00000000-0000-0000-0000-000000000018', 'new unrecorded value')
+		VALUES ('00000000-0000-0000-0000-000000000019', 'new unrecorded value')
 	`); !isCheckViolation(err) {
 		t.Fatalf("restored legacy constraint: got %v, want check violation", err)
 	}
 
 	applyMigrationFile(t, ctx, conn.Conn(), "282_drop_issue_status_check_constraint.up.sql")
 	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
-		"00000000-0000-0000-0000-000000000012": "Spec",
+		"00000000-0000-0000-0000-000000000012": "CI/CD & Deploy",
 		"00000000-0000-0000-0000-000000000013": "Spec",
 		"00000000-0000-0000-0000-000000000014": "Spec",
-		"00000000-0000-0000-0000-000000000015": "Human Review",
-		"00000000-0000-0000-0000-000000000016": "Cancelled",
+		"00000000-0000-0000-0000-000000000015": "Spec",
+		"00000000-0000-0000-0000-000000000016": "Spec",
 		"00000000-0000-0000-0000-000000000017": "In Review",
+		"00000000-0000-0000-0000-000000000018": "CI/CD & Deploy",
 	})
 }
 
