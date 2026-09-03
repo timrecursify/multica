@@ -65,10 +65,56 @@ const {
   retryEscalationLoop,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
+  operatorRespec,
   relayDiagnosisRerun,
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
+
+test('operator respec validates requests and replays the same receipt', async () => {
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+  const payload = { issue_id: issueId, reason: 'lifetime cap exhausted', idempotency_key: 'respec-0001' };
+  let calls = 0;
+  const invalid = await operatorRespec({ query: async () => { calls += 1; } }, { ...payload, reason: ' ' });
+  assert.deepEqual(invalid, { ok: false, status: 400, error: 'invalid_request' });
+  assert.equal(calls, 0);
+
+  const replayClient = { query: async (sql) => {
+    if (sql.includes('FROM issue WHERE')) return { rows: [{ id: issueId, status: 'Spec', metadata: {} }] };
+    if (sql.includes('FROM relay_run_log')) return { rows: [{ id: 77,
+      parked_audit: { operator_respec: { reason: payload.reason, accounting_baseline: '2026-09-03T00:00:00.000Z' } } }] };
+    return { rows: [] };
+  } };
+  const replay = await operatorRespec(replayClient, payload);
+  assert.equal(replay.ok, true);
+  assert.equal(replay.replay, true);
+  assert.equal(replay.receipt.audit_row_id, 77);
+  const conflict = await operatorRespec(replayClient, { ...payload, reason: 'different reason' });
+  assert.deepEqual(conflict, { ok: false, status: 409, error: 'idempotency_conflict' });
+});
+
+test('operator respec atomically resets a capped Human Review issue and audits authorization', async () => {
+  const issueId = '223e4567-e89b-42d3-a456-426614174000';
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue WHERE')) return { rows: [{ id: issueId, status: 'Human Review',
+      metadata: { parked_release_at: '2026-01-01T00:00:00Z' } }] };
+    if (sql.includes('FROM relay_run_log')) return { rows: [] };
+    if (sql.includes('SELECT count(*)')) return { rows: [{ n: 6 }] };
+    if (sql.includes('INSERT INTO relay_run_log')) return { rows: [{ id: 88 }] };
+    return { rows: [] };
+  } };
+  const result = await operatorRespec(client, { issue_id: issueId,
+    reason: 'operator approved fresh review', idempotency_key: 'respec-0002' });
+  assert.equal(result.ok, true);
+  assert.equal(result.receipt.prior_stage, 'Human Review');
+  assert.equal(result.receipt.new_stage, 'Spec');
+  assert.equal(result.receipt.audit_row_id, 88);
+  assert.match(calls.find(c => c.sql.includes('UPDATE issue')).sql, /- 'retry_escalation'/);
+  const auditCall = calls.find(c => c.sql.includes('INSERT INTO relay_run_log'));
+  assert.match(auditCall.values[1], /operator_respec/);
+});
 
 test('relay receipts identify a changed destination and preserve its cause', () => {
   assert.equal(relayRedirect('CI/CD & Deploy', 'CI/CD & Deploy', null), null);
