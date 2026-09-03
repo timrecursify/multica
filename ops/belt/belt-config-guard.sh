@@ -735,7 +735,7 @@ guard_freed_children() {
     if "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
          UPDATE issue SET parent_issue_id=NULL, updated_at=NOW() WHERE id='${child_id}'::uuid;" >/dev/null 2>&1; then
       "$SK" multica comment --board "$board" --number "$number" --body \
-        "Detached from rollup #${parent_number} (${parent_status}) so the belt dispatches this ticket on its own; the reconciler never dispatches a child." \
+        "/note Detached from rollup #${parent_number} (${parent_status}) so the belt dispatches this ticket on its own; the reconciler never dispatches a child." \
         >/dev/null 2>&1 </dev/null
       fixed+=("#${number} detached from ${parent_status} rollup #${parent_number}")
     else
