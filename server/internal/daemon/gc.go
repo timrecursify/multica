@@ -194,7 +194,7 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 // Keep expensive process and Git inspection bounded.  The remote lookup may
 // have a larger batch, but at most this many issue environments are inspected
 // in one workspace pass.
-const issueGCBatchSize = 100
+const issueGCBatchSize = 100 // legacy default for callers/tests with zero-value Config
 
 type issueGCCandidate struct {
 	taskDir string
@@ -222,11 +222,15 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 	}
 
 	results := make(map[string]IssueGCCheckResult, len(issueIDs))
-	for start := 0; start < len(issueIDs); start += issueGCBatchSize {
+	batchSize := d.cfg.GCCandidateBatch
+	if batchSize < 1 {
+		batchSize = issueGCBatchSize
+	}
+	for start := 0; start < len(issueIDs); start += batchSize {
 		if ctx.Err() != nil {
 			break
 		}
-		end := min(start+issueGCBatchSize, len(issueIDs))
+		end := min(start+batchSize, len(issueIDs))
 		chunkResults, err := d.client.GetIssueGCChecks(ctx, workspaceID, issueIDs[start:end])
 		if err != nil {
 			d.logger.Warn("gc: batch issue check failed",
@@ -263,11 +267,23 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 			action = d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
 		}
 		action = d.applyLocalDirectoryGCOverride(candidate.meta, action)
-		if action == gcActionClean {
-			if reason := d.safeIssueRemoval(candidate.taskDir); reason != "" {
-				d.recordGCQuarantine(candidate.taskDir, candidate.meta.TaskID, reason, stats)
+		if action == gcActionClean && strings.TrimSpace(candidate.meta.TaskID) != "" {
+			// Reserve before probing /proc and Git, and retain the reservation
+			// through deletion. This closes the race where a task starts after
+			// the safety snapshot but before RemoveAll.
+			release, ok := d.reserveEnvRootForGC(candidate.taskDir)
+			if !ok {
+				stats.skipped++
 				continue
 			}
+			if reason := d.safeIssueRemoval(candidate.taskDir); reason != "" {
+				d.recordGCQuarantine(candidate.taskDir, candidate.meta.TaskID, reason, stats)
+				release()
+				continue
+			}
+			cleaned += d.applyGCActionReserved(candidate.taskDir, action, stats)
+			release()
+			continue
 		}
 		cleaned += d.applyGCAction(candidate.taskDir, action, stats)
 	}
@@ -286,6 +302,12 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		}
 		defer release()
 	}
+	return d.applyGCActionReserved(taskDir, action, stats)
+}
+
+// applyGCActionReserved applies a mutation while the caller holds the env
+// root reservation. It must not reserve again.
+func (d *Daemon) applyGCActionReserved(taskDir string, action gcAction, stats *gcStats) int {
 	switch action {
 	case gcActionClean:
 		bytes := dirSize(taskDir)
@@ -406,19 +428,34 @@ func processReferencesPath(root string) bool {
 			base := filepath.Join("/proc", p.Name(), name)
 			if name == "cwd" {
 				target, err := os.Readlink(base)
-				if err != nil || target == root || strings.HasPrefix(target, root+string(os.PathSeparator)) {
+				// A process can exit between the directory snapshot and the
+				// link read. That is not an active reference; other failures
+				// remain fail-closed.
+				if err != nil {
+					if os.IsNotExist(err) {
+						continue
+					}
+					return true
+				}
+				if target == root || strings.HasPrefix(target, root+string(os.PathSeparator)) {
 					return true
 				}
 				continue
 			}
 			entries, err := os.ReadDir(base)
 			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
 				return true
 			}
 			for _, entry := range entries {
 				link := filepath.Join(base, entry.Name())
 				target, err := os.Readlink(link)
 				if err != nil {
+					if os.IsNotExist(err) {
+						continue
+					}
 					return true
 				}
 				if target == root || strings.HasPrefix(target, root+string(os.PathSeparator)) {
@@ -626,7 +663,7 @@ func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, res
 		return d.orphanByMTime(taskDir, "issue not accessible")
 	}
 
-	if (result.Status == "done" || result.Status == "cancelled") &&
+	if (strings.EqualFold(strings.TrimSpace(result.Status), "done") || strings.EqualFold(strings.TrimSpace(result.Status), "cancelled")) &&
 		time.Since(result.UpdatedAt) > d.cfg.GCTTL {
 		d.logger.Info("gc: eligible for cleanup",
 			"dir", filepath.Base(taskDir),
