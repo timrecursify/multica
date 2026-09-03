@@ -40,6 +40,7 @@ declare -a sources=(
   "$root_dir/parity/relay-dead-rows.cjs"
   "$root_dir/multica-cicd-worker.cjs"
   "$root_dir/cicd-deploy-evidence.cjs"
+  "$root_dir/cicd-watchdog.cjs"
   "$root_dir/multica-archiver.cjs"
   "$root_dir/merged-pr-recovery-sweep.cjs"
   "$root_dir/belt-config-guard.sh"
@@ -51,6 +52,14 @@ declare -a sources=(
   "$root_dir/RUNBOOK_QC_WORKER.md"
   "$root_dir/WORKER_COMMON.md"
   "$root_dir/relay-completion-admission.cjs"
+  "$root_dir/qc-lane.cjs"
+  "$root_dir/reconciler.cjs"
+  "$root_dir/stage-outcome.cjs"
+  "$root_dir/transition-policy.cjs"
+  "$root_dir/stage-routing.cjs"
+  "$root_dir/qc-strict-evidence.cjs"
+  "$root_dir/stage-routing.json"
+  "$root_dir/qc-verdict-policy.cjs"
 )
 
 declare -a targets=(
@@ -62,6 +71,7 @@ declare -a targets=(
   "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs"
   "$runtime_root/multica-cicd-worker.cjs"
   "$runtime_root/cicd-deploy-evidence.cjs"
+  "$runtime_root/cicd-watchdog.cjs"
   "$runtime_root/multica-archiver.cjs"
   "$runtime_root/merged-pr-recovery-sweep.cjs"
   "$runtime_root/tools/belt-config-guard.sh"
@@ -73,6 +83,14 @@ declare -a targets=(
   "$runtime_root/multica-doctrine/RUNBOOK_QC_WORKER.md"
   "$runtime_root/multica-doctrine/WORKER_COMMON.md"
   "$runtime_root/gsp-multica/relay-completion-admission.cjs"
+  "$runtime_root/gsp-multica/qc-lane.cjs"
+  "$runtime_root/gsp-multica/reconciler.cjs"
+  "$runtime_root/gsp-multica/stage-outcome.cjs"
+  "$runtime_root/gsp-multica/transition-policy.cjs"
+  "$runtime_root/gsp-multica/stage-routing.cjs"
+  "$runtime_root/gsp-multica/qc-strict-evidence.cjs"
+  "$runtime_root/gsp-multica/stage-routing.json"
+  "$runtime_root/gsp-multica/qc-verdict-policy.cjs"
 )
 
 selected() {
@@ -128,7 +146,11 @@ for index in "${!sources[@]}"; do
       "${targets[$index]}" == "$runtime_root/gsp-multica/parked-entry-audit.cjs" ||
       "${targets[$index]}" == "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs" ||
       "${targets[$index]}" == "$runtime_root/cicd-deploy-evidence.cjs" ||
+      "${targets[$index]}" == "$runtime_root/cicd-watchdog.cjs" ||
+      "${targets[$index]}" == "$runtime_root/merged-pr-recovery-sweep.cjs" ||
       "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
+  [[ "${targets[$index]}" =~ /(qc-lane|reconciler|stage-outcome|transition-policy|stage-routing|qc-strict-evidence|qc-verdict-policy)\.cjs$ ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/stage-routing.json" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
     invalid=1
