@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -175,11 +176,11 @@ func TestUpdateWorkspaceOperatorAgentValidationIsAtomic(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 (body %s)", rr.Code, rr.Body.String())
 	}
-	var model string
+	var model sql.NullString
 	if err := testPool.QueryRow(context.Background(), `SELECT model FROM agent WHERE id = $1`, agentID).Scan(&model); err != nil {
 		t.Fatalf("read agent model: %v", err)
 	}
-	if model == "would-not-persist" {
+	if model.Valid && model.String == "would-not-persist" {
 		t.Fatal("valid field was persisted despite later validation failure")
 	}
 }
