@@ -48,6 +48,13 @@ declare -a backups=() absence_markers=() touched=()
 restore_on_failure() { local rc=$? i; if [[ "$mode" == apply && ${#touched[@]} -gt 0 ]]; then for i in "${touched[@]}"; do [[ -f "${absence_markers[$i]}" ]] && rm -f -- "${targets[$i]}" || cp --preserve=mode -- "${backups[$i]}" "${targets[$i]}" || echo "ROLLBACK FAILED: ${targets[$i]}" >&2; done; echo "Deployment failed; restored ${#touched[@]} target(s)." >&2; fi; exit "$rc"; }; trap restore_on_failure ERR
 for i in "${!targets[@]}"; do selected "$i" && [[ "${decisions[$i]}" == deploy ]] || continue; backups[$i]="${targets[$i]}.bak-${timestamp}"; absence_markers[$i]="${backups[$i]}.absent"; if [[ "$mode" == dry-run ]]; then echo "Would back up ${targets[$i]} to ${backups[$i]}"; elif [[ -f "${targets[$i]}" ]]; then cp --preserve=mode -- "${targets[$i]}" "${backups[$i]}"; echo "Backed up ${targets[$i]} to ${backups[$i]}"; else : > "${absence_markers[$i]}"; echo "Backed up absence of new target ${targets[$i]}"; fi; done
 for i in "${!targets[@]}"; do selected "$i" && [[ "${decisions[$i]}" == deploy ]] || continue; if [[ "$mode" == dry-run ]]; then echo "Would copy ${source_rels[$i]}@$resolved_commit to ${targets[$i]}"; continue; fi; touched+=("$i"); [[ "${BELT_DEPLOY_FAIL_INDEX:-}" != "$i" ]] || { echo "Injected deployment failure at index $i" >&2; false; }; cp --preserve=mode -- "${staged_sources[$i]}" "${targets[$i]}"; [[ "${BELT_DEPLOY_CORRUPT_INDEX:-}" != "$i" ]] || printf '\ncorrupted-after-copy\n' >> "${targets[$i]}"; cmp -s -- "${staged_sources[$i]}" "${targets[$i]}" || { echo "Post-copy mismatch: ${targets[$i]}" >&2; false; }; echo "Copied ${source_rels[$i]}@$resolved_commit to ${targets[$i]}"; done
+if [[ "$mode" == apply ]]; then
+  daemon_target="$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
+  if [[ -f "$daemon_target" ]]; then
+    node --check "$daemon_target" || { echo "Daemon syntax validation failed: $daemon_target" >&2; false; }
+    node -e 'const Module=require("module"); const load=Module._load; Module._load=(request,parent,isMain)=>request==="pg"?{Pool:class { constructor() {} on() {} connect() { return Promise.reject(new Error("validation stub")); } query() { return Promise.resolve({rows:[]}); } end() {} }}:load(request,parent,isMain); require(process.argv[1])' "$daemon_target" || { echo "Daemon dependency validation failed: $daemon_target" >&2; false; }
+  fi
+fi
 trap - ERR
 if [[ "$mode" == apply ]]; then write_receipt deployed; echo "Rollback receipt: $0 --rollback $timestamp${only_target:+ --only $only_target}"; fi
 echo 'No processes were restarted.'
