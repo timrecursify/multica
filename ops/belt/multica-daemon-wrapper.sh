@@ -14,9 +14,13 @@ export CODEX_BIN="$requested_codex_bin"
 # system Go toolchain ahead of inherited user paths for every task.
 export PATH="/usr/local/go/bin:${PATH}"
 
-cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-20}"
+cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}"
 root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
 help_timeout="${MULTICA_DAEMON_HELP_TIMEOUT_SECONDS:-5}"
+if [[ -z "$cap_raw" ]]; then
+  echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be set (no default is assumed)" >&2
+  exit 64
+fi
 if [[ ! "$cap_raw" =~ ^[1-9][0-9]*$ ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer" >&2
   exit 64

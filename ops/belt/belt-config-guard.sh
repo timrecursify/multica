@@ -16,7 +16,7 @@ readonly SK=/home/newadmin/bin/sk
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
-readonly WANT_CONCURRENCY=20
+readonly WANT_CONCURRENCY="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}"
 readonly WANT_WORKSPACES_ROOT=/home/newadmin/multica-workspaces-gsp
 readonly BUILD_AGENT=gsp-build-deepseek-flash-1
 # 2026-08-31 14:20 UTC: global 12 -> 20, build capacity 3 -> 15, QC 4 each.
@@ -122,7 +122,7 @@ running_tasks() {
 # 1. Tower concurrency and root must remain PM2-configurable. Empty values are
 # invalid rather than defaults so a broken ecosystem cannot silently widen work.
 daemon_launch_config() {
-  printf '%s|%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-"$WANT_CONCURRENCY"}" \
+  printf '%s|%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}" \
     "${MULTICA_DAEMON_WORKSPACES_ROOT-"$WANT_WORKSPACES_ROOT"}"
 }
 
@@ -144,7 +144,7 @@ guard_wrapper() {
   if ! validate_daemon_launch_config; then
     unfixable+=("invalid PM2 daemon launch config: cap must be a positive integer and workspaces root an absolute path")
   elif [[ ! -x "$WRAPPER" ]] ||
-       ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS-20' "$WRAPPER" ||
+       ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS-' "$WRAPPER" ||
        ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp' "$WRAPPER" ||
        ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS' "$ECOSYSTEM" ||
        ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT' "$ECOSYSTEM" ||
