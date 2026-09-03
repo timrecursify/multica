@@ -20,7 +20,10 @@ declare -a sources=('ops/belt/multica-bridge.cjs' 'ops/belt/guardrails.cjs' 'ops
 for i in "${!files[@]}"; do git -C "$repo_root" show "$old_sha:${sources[$i]}" > "$tmp_dir/${files[$i]}" 2>/dev/null || rm -f -- "$tmp_dir/${files[$i]}"; done
 mkdir -p "$tmp_dir/gsp-multica/deploy-receipts"
 printf '{"repo":"timrecursify/multica","source_sha":"%s","outcome":"deployed"}\n' "$old_sha" > "$tmp_dir/gsp-multica/deploy-receipts/belt-old.json"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --source-commit 0000000000000000000000000000000000000000 > "$tmp_dir/deploy.log"
+if ! BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --source-commit 0000000000000000000000000000000000000000 > "$tmp_dir/deploy.log" 2>&1; then
+  cat "$tmp_dir/deploy.log" >&2
+  exit 1
+fi
 git -C "$repo_root" show "$main_sha:ops/belt/multica-bridge.cjs" | cmp -s - "$tmp_dir/gsp-multica/multica-bridge.cjs"
 grep -Fq "Copied ops/belt/multica-bridge.cjs@$main_sha" "$tmp_dir/deploy.log"
 grep -Fq "\"source_sha\":\"$main_sha\"" "$(sed -n 's/^Receipt: //p' "$tmp_dir/deploy.log")"
