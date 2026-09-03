@@ -3,18 +3,19 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
-  moveToHumanReview, terminalBlocker } = require("./reconciler.cjs");
+  moveToHumanReview, terminalBlocker, isLeafSql } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
 const ok = () => ({ ok: true });
 
-function harness({ live = [], owner = {
+function harness({ live = [], isLeaf = true, owner = {
   agent_id: "33333333-3333-4333-8333-333333333333",
   selected_runtime_id: "44444444-4444-4444-8444-444444444444"
 } } = {}) {
   const calls = []; let inserted = 0;
   return { calls, query: async (sql, values = []) => {
     calls.push({ sql, values });
+    if (sql.includes("AS is_leaf")) return { rows: [{ is_leaf: isLeaf }] };
     if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [issue] };
     if (sql.includes("FROM agent_task_queue") && sql.includes("FOR UPDATE")) return { rows: live };
     if (sql.includes("FROM relay_stage_agent_pool")) return { rows: owner ? [owner] : [] };
@@ -25,7 +26,9 @@ function harness({ live = [], owner = {
 
 test("query builders hold the live status invariant", () => {
   assert.match(issueCandidatesSql(), /status = ANY/);
-  assert.match(issueCandidatesSql(), /parent_issue_id IS NULL/);
+  assert.match(issueCandidatesSql(), /NOT EXISTS \(SELECT 1 FROM issue c/);
+  assert.doesNotMatch(issueCandidatesSql(), /parent_issue_id IS NULL/);
+  assert.match(isLeafSql(), /AS is_leaf/);
   assert.match(liveTasksSql(), /FOR UPDATE/);
   assert.match(ownerSql(), /COALESCE\(own_runtime.id, online_runtime.id\) AS selected_runtime_id/);
   assert.match(ownerSql(), /a.archived_at IS NULL/);
@@ -52,13 +55,17 @@ test("restart is idempotent when the current-stage task is live", async () => {
   assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
-test("bundled children and running old-stage tasks are skipped", async () => {
-  const child = harness();
-  child.query = async (sql, values = []) => {
-    if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [{ ...issue, parent_issue_id: "parent" }] };
-    return { rows: [] };
-  };
-  assert.deepEqual(await reconcileIssue(child, issue.id, { evaluate: ok }), { action: "skipped" });
+test("rollups with open children and running old-stage tasks are skipped", async () => {
+  const rollup = harness({ isLeaf: false });
+  assert.deepEqual(await reconcileIssue(rollup, issue.id, { evaluate: ok }),
+    { action: "skipped", reason: "rollup_has_open_children" });
+  assert.equal(rollup.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
+  const leafChild = harness();
+  const childOriginal = leafChild.query;
+  leafChild.query = async (sql, values = []) =>
+    sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count, parent_issue_id")
+      ? { rows: [{ ...issue, parent_issue_id: "parent" }] } : childOriginal(sql, values);
+  assert.deepEqual(await reconcileIssue(leafChild, issue.id, { evaluate: ok }), { action: "created", taskId: "task-1" });
   const stale = harness({ live: [{ id: "old", status: "running", context: taskContext("Spec") }] });
   assert.deepEqual(await reconcileIssue(stale, issue.id, { evaluate: ok }), { action: "skipped", reason: "stale_stage_running" });
 });
@@ -89,7 +96,7 @@ test("zero cycle limit creates no task or relay log", async () => {
 test("cycle returns per-issue results", async () => {
   const db = harness();
   const original = db.query;
-  db.query = async (sql, values) => sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count\n            FROM issue WHERE")
+  db.query = async (sql, values) => sql.startsWith("SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata, i.qc_fail_count\n            FROM issue i WHERE")
     ? { rows: [issue] } : original(sql, values);
   assert.deepEqual(await reconcileCycle(db, { evaluate: ok }), [{ action: "created", taskId: "task-1" }]);
 });
@@ -99,7 +106,7 @@ test("cycle rolls back a throwing issue and reconciles the next issue", async ()
   const db = harness();
   const original = db.query;
   db.query = async (sql, values = []) => {
-    if (sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count\n            FROM issue WHERE")) {
+    if (sql.startsWith("SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata, i.qc_fail_count\n            FROM issue i WHERE")) {
       return { rows: [issue, second] };
     }
     if (sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count, parent_issue_id") &&
@@ -138,6 +145,7 @@ test("two reconciler sessions converge on one task", async () => {
         return { rows: [] };
       }
       if (sql === "COMMIT") { unlock?.(); return { rows: [] }; }
+      if (sql.includes("AS is_leaf")) return { rows: [{ is_leaf: true }] };
       if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [issue] };
       if (sql.includes("FROM agent_task_queue") && sql.includes("FOR UPDATE")) return { rows: shared.live };
       if (sql.includes("FROM relay_stage_agent_pool")) return { rows: [{
