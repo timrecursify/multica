@@ -265,9 +265,10 @@ test('Parked diagnosis rerun logs classified and unexpected database exceptions'
       assert.equal(response.status, scenario.status);
       assert.deepEqual(response.body, scenario.body);
       assert.deepEqual(calls.slice(-2), ['ROLLBACK', 'end']);
-      assert.deepEqual(logs, [{ event: 'relay_parked_diagnosis_rerun_failed', issue_id: issueId,
-        message: scenario.error.message, stack: scenario.error.stack, code: scenario.error.code,
-        constraint: scenario.error.constraint }]);
+      assert.deepEqual(logs, [{ event: 'parked_diagnosis_rerun_error', issue_id: issueId,
+        workspace_id: null, error_name: scenario.error.name, error_message: scenario.error.message,
+        error_code: scenario.error.code, error_constraint: scenario.error.constraint,
+        stack: scenario.error.stack }]);
     });
   }
 });
