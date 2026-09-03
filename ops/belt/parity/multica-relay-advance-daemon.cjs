@@ -1277,6 +1277,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
               THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
           FROM budgeted
          WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int
+         ORDER BY issue_created_at ASC, issue_id ASC
+         LIMIT $1::int
       ) candidates
       ORDER BY issue_created_at ASC, issue_id ASC`,
       [REQUEUE_BATCH, REQUEUE_STAGES, QUEUED_TASK_TTL_MINUTES,
