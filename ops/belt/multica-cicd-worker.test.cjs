@@ -100,3 +100,47 @@ test('worker retains no self-deploy or direct database writes', () => {
   assert.doesNotMatch(source, /UPDATE |INSERT INTO /);
   assert.match(source, /transition-policy\.cjs/);
 });
+
+test('a merge that triggered no deploy workflow ships as merge_is_deploy', async () => {
+  const noDeployRunGh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs')) {
+      return JSON.stringify({ workflow_runs: [
+        { status: 'completed', conclusion: 'success', name: 'CI', path: '.github/workflows/ci.yml' }
+      ] });
+    }
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (args[0] === 'run') return JSON.stringify([]);
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: null, gh: noDeployRunGh });
+  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2020-01-01T00:00:00Z' });
+  assert.equal(calls[0][1], 'Done');
+  assert.deepStrictEqual(calls[0][5].mergeDeployReceipt,
+    { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true });
+});
+
+test('a deploy run on the merge sha keeps the ticket pending until it succeeds', async () => {
+  const deployQueuedGh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs')) {
+      return JSON.stringify({ workflow_runs: [
+        { status: 'completed', conclusion: 'success', name: 'CI', path: '.github/workflows/ci.yml' },
+        { status: 'queued', conclusion: null, name: 'Deploy / billing-server',
+          path: '.github/workflows/deploy-billing-server.yml' }
+      ] });
+    }
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (args[0] === 'run') return JSON.stringify([]);
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: null, gh: deployQueuedGh });
+  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2020-01-01T00:00:00Z' });
+  assert.equal(calls.length, 0);
+});
+
+test('a just-merged sha stays pending inside the deploy trigger grace window', () => {
+  worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [] }) });
+  assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, new Date().toISOString()), false);
+  assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, undefined), false);
+});

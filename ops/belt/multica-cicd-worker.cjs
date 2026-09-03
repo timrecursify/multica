@@ -163,7 +163,27 @@ function successfulDeployRun(repo, sha, workflow) {
   } catch (_) { return null; }
 }
 
-function mergeDeployEvidence(repo, sha) {
+// GitHub creates a workflow run within seconds of a push, so a merge whose
+// deploy workflows produced no run at all matched none of their `on.push.paths`
+// filters: it deploys nothing and is already finished. That is the same
+// conclusion this function draws for a repository with no deploy workflows.
+// Demanding a successful deploy run regardless held 11 tickets in CI/CD & Deploy
+// indefinitely (2026-09-03; gsp#1149 merged timrecursify/ppp@0df2727ec36c, which
+// touched only docs/ and tests/, so none of ppp's 18 deploy-*.yml ever ran).
+// The grace window keeps a just-merged sha pending until GitHub has created its
+// runs, so a real deploy is never mistaken for an absent one.
+const DEPLOY_TRIGGER_GRACE_MINUTES = parseInt(process.env.CICD_DEPLOY_TRIGGER_GRACE_MINUTES || '10', 10);
+
+function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
+  const ageMinutes = (now - Date.parse(mergedAt || '')) / 60000;
+  if (!Number.isFinite(ageMinutes) || ageMinutes < DEPLOY_TRIGGER_GRACE_MINUTES) return false;
+  try {
+    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]));
+    return !(runs.workflow_runs || []).some(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || ''));
+  } catch (_) { return false; }
+}
+
+function mergeDeployEvidence(repo, sha, mergedAt) {
   const receipt = receiptEvidence(sha);
   if (receipt.mismatch) return { mismatch: true };
   if (receipt.receipt) return { evidence: receipt.receipt };
@@ -172,6 +192,9 @@ function mergeDeployEvidence(repo, sha) {
   for (const workflow of workflows) {
     const run = successfulDeployRun(repo, sha, workflow);
     if (run) return { evidence: run };
+  }
+  if (noDeployRunTriggered(repo, sha, mergedAt)) {
+    return { evidence: { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true } };
   }
   return { pending: true };
 }
@@ -193,7 +216,7 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     await returnIssueToBuild(issue, `${note}; latest QC PASS evidence is absent`);
     return;
   }
-  const deploy = mergeDeployEvidence(pr.repo, mergedSha);
+  const deploy = mergeDeployEvidence(pr.repo, mergedSha, pr.mergedAt);
   if (deploy.mismatch) {
     await humanReview(issue, `${note}; release receipt exists but does not match ${mergedSha}`);
     return;
@@ -381,7 +404,8 @@ async function sweep() {
         }
         const last = merged[0];
         await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
-          repo: last.pr.repo, headSha: last.info.headRefOid, createdAt: last.info.createdAt
+          repo: last.pr.repo, headSha: last.info.headRefOid, createdAt: last.info.createdAt,
+          mergedAt: last.info.mergedAt
         });
         watchdog.clear(issue.id);
         continue;
@@ -468,4 +492,5 @@ function setTestDependencies(dependencies) {
 }
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
-  routeFinishedPR, receiptFor, mergeDeployEvidence, setTestDependencies, sweep, watchdogFailure };
+  routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered,
+  setTestDependencies, sweep, watchdogFailure };
