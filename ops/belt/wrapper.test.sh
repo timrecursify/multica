@@ -35,9 +35,10 @@ grep -q -- "--max-concurrent-tasks=2" "$capture"
 grep -q 'cap=2 root=.* daemon_root=.* workspaces=2' "$capture"
 grep -qx 'go_path=/usr/local/go/bin' "$capture"
 grep -q "cwd=$daemon_cwd" "$capture"
-env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh"
-grep -q "cap=20 root=/home/newadmin/multica-workspaces-gsp" "$capture"
-grep -q -- "--max-concurrent-tasks=20" "$capture"
+if env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$fake/empty.stderr"; then
+  echo 'unset daemon cap unexpectedly succeeded' >&2; exit 1
+fi
+grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be set (no default is assumed)' "$fake/empty.stderr"
 DAEMON_SUPPORTS_WORKSPACES_FLAG=0 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/new.lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=32 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/new-workspaces" "$root_dir/multica-daemon-wrapper.sh"
 grep -q '^daemon start --foreground --daemon-id=gsp-multica-worker --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks=32$' "$capture"
 grep -q "cap=32 root=$fake/new-workspaces daemon_root=$fake/new-workspaces workspaces=2" "$capture"
@@ -45,16 +46,15 @@ if grep -q -- '--workspaces-root' "$capture"; then
   echo 'flagless daemon unexpectedly received --workspaces-root' >&2
   exit 1
 fi
-HOLD_DAEMON=1 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh" &
+HOLD_DAEMON=1 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh" &
 pid=$!; sleep 0.1
-if MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh"; then exit 1; fi
+if MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh"; then exit 1; fi
 wait "$pid"
 assert_wrapper_rejects() {
   local label="$1" expected="$2" stderr="$fake/$1.stderr" status
   shift 2
-  # Each rejection must happen before the fake daemon can receive argv.
   rm -f -- "$capture"
-  if env "$@" DAEMON_LAUNCH_MARKER="$launch_marker" MULTICA_DAEMON_LOCK_FILE="$fake/$label.lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$stderr"; then
+  if env MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 "$@" DAEMON_LAUNCH_MARKER="$launch_marker" MULTICA_DAEMON_LOCK_FILE="$fake/$label.lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$stderr"; then
     echo "$label unexpectedly succeeded" >&2
     return 1
   else
@@ -70,7 +70,7 @@ assert_wrapper_rejects cap-bad \
   'multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=bad
 assert_wrapper_rejects cap-empty \
-  'multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer' \
+  'multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be set (no default is assumed)' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=
 assert_wrapper_rejects root-relative \
   'multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path' \
