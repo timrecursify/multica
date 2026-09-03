@@ -4,7 +4,11 @@ const test = require('node:test');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { createWatchdog, correlationKey } = require('./cicd-watchdog.cjs');
+const { createWatchdog, correlationKey, SENTINEL_MS } = require('./cicd-watchdog.cjs');
+
+test('default sentinel threshold matches the 20-minute alert contract', () => {
+  assert.equal(SENTINEL_MS, 20 * 60 * 1000);
+});
 
 test('watchdog persists first-seen and correlation state across restart', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cicd-watchdog-'));
@@ -22,9 +26,9 @@ test('watchdog persists first-seen and correlation state across restart', () => 
 test('stalled alert is emitted once after threshold and backoff is capped', () => {
   let now = 0; const w = createWatchdog({ now: () => now });
   const row = w.observe('issue-2', { error: 'provider unavailable' });
-  now = 2700001;
+  now = SENTINEL_MS + 1;
   assert.equal(w.stalled(row), true);
   w.markAlerted(row);
   assert.equal(w.stalled(row), false);
-  assert.ok(w.backoffMs({ attempts: 99 }) <= 2700000);
+  assert.ok(w.backoffMs({ attempts: 99 }) <= SENTINEL_MS);
 });
