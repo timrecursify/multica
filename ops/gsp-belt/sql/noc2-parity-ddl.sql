@@ -432,3 +432,10 @@ ALTER TABLE ONLY public.workflow_state
 
 \unrestrict i1ZB9Rl9BjMeoVYgdJSBjCoH8E8OSvrpekY2q1jemhVyA22n8olQ3yndbrFesZi
 
+CREATE TABLE IF NOT EXISTS public.cicd_deploy_attempt (
+    issue_id uuid PRIMARY KEY REFERENCES public.issue(id) ON DELETE CASCADE,
+    status text NOT NULL CHECK (status IN ('running','advanced','held','failed')),
+    reason text,
+    lease_until timestamp with time zone,
+    updated_at timestamp with time zone NOT NULL DEFAULT now()
+);
