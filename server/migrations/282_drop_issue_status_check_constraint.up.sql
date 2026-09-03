@@ -26,20 +26,20 @@ SET status = CASE status
     WHEN 'done' THEN 'Done'
     WHEN 'cancelled' THEN 'Cancelled'
     WHEN 'dead_letter' THEN 'Cancelled'
-    -- Existing canonical relay statuses (including Registered, Parked,
-    -- Rejected, and CI/CD & Deploy) fall through unchanged. Unknown pre-up
+    -- Existing canonical relay statuses (including Registered and
+    -- CI/CD & Deploy) fall through unchanged. Unknown pre-up
     -- values are intentionally canonicalized to Spec. Their
     -- exact original value is retained in issue_status_282_rollback for down.
     ELSE 'Spec'
 END
 WHERE status NOT IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
-     'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
+     'Human Review', 'CI/CD & Deploy', 'Done',
      'Archived', 'Cancelled');
 
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
-     'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
+     'Human Review', 'CI/CD & Deploy', 'Done',
      'Archived', 'Cancelled'));
 
 -- New rows that omit status must also enter the canonical vocabulary.
