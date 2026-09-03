@@ -30,14 +30,15 @@ FROM agent a
 WHERE a.id = t.agent_id
   AND t.status IN ('queued','deferred','dispatched','running','waiting_local_directory')
   AND (t.workspace_id IS DISTINCT FROM a.workspace_id
-       OR EXISTS (SELECT 1 FROM agent_runtime r
-                  WHERE r.id = t.runtime_id AND r.workspace_id IS DISTINCT FROM a.workspace_id)
-       OR EXISTS (SELECT 1 FROM issue i
-                  WHERE i.id = t.issue_id AND i.workspace_id IS DISTINCT FROM a.workspace_id)
-       OR EXISTS (SELECT 1 FROM chat_session c
-                  WHERE c.id = t.chat_session_id AND c.workspace_id IS DISTINCT FROM a.workspace_id)
-       OR EXISTS (SELECT 1 FROM autopilot_run ar JOIN autopilot ap ON ap.id = ar.autopilot_id
-                  WHERE ar.id = t.autopilot_run_id AND ap.workspace_id IS DISTINCT FROM a.workspace_id));
+       OR (t.runtime_id IS NOT NULL AND NOT EXISTS
+           (SELECT 1 FROM agent_runtime r WHERE r.id = t.runtime_id AND r.workspace_id = a.workspace_id))
+       OR (t.issue_id IS NOT NULL AND NOT EXISTS
+           (SELECT 1 FROM issue i WHERE i.id = t.issue_id AND i.workspace_id = a.workspace_id))
+       OR (t.chat_session_id IS NOT NULL AND NOT EXISTS
+           (SELECT 1 FROM chat_session c WHERE c.id = t.chat_session_id AND c.workspace_id = a.workspace_id))
+       OR (t.autopilot_run_id IS NOT NULL AND NOT EXISTS
+           (SELECT 1 FROM autopilot_run ar JOIN autopilot ap ON ap.id = ar.autopilot_id
+            WHERE ar.id = t.autopilot_run_id AND ap.workspace_id = a.workspace_id)));
 
 CREATE OR REPLACE FUNCTION agent_task_queue_enforce_workspace()
 RETURNS trigger LANGUAGE plpgsql AS $$
