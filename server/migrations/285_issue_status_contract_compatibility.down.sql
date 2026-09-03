@@ -1,0 +1,4 @@
+-- Narrowing the status vocabulary is unsafe after this migration has served
+-- writes: canonical lower-case values may already exist.  Keep the additive
+-- constraint and trigger when rolling back the application image; the prior
+-- image can read and write every value in this superset.
