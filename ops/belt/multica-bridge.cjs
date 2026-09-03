@@ -19,7 +19,7 @@ const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const { currentStrictPass } = require("./qc-strict-evidence.cjs");
 const { evaluate } = require("./transition-policy.cjs");
-const { validateQcVerdict } = require("./qc-verdict-policy.cjs");
+const { validateQcVerdict, validateLiveVerdict } = require("./qc-verdict-policy.cjs");
 const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require("./qc-lane.cjs");
 
 // Relay configuration is supplied by the host environment.
@@ -317,6 +317,24 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explici
     [issueId, workspaceId, explicitTaskId, qcLaneModelsSqlArray(), QC_LANE_EFFORT]
   );
   return result.rows[0] || null;
+}
+
+async function latestRunningSolLowQcTask(client, issueId, workspaceId, checker, explicitTaskId = null) {
+  const result = await client.query(
+    `SELECT t.id, t.issue_id, t.workspace_id, t.agent_id, t.status, t.context, t.result, t.completed_at,
+            a.name AS agent_name, a.model, a.thinking_level, a.runtime_config
+       FROM agent_task_queue t
+       JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
+       JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
+      WHERE t.issue_id = $1 AND i.workspace_id = $2 AND t.status = 'running'
+        AND t.context->>'to_stage' = 'In Review' AND a.name = $3
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($5::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $6::text
+        AND ($4::uuid IS NULL OR t.id = $4::uuid)
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 2 FOR UPDATE`,
+    [issueId, workspaceId, checker, explicitTaskId, qcLaneModelsSqlArray(), QC_LANE_EFFORT]
+  );
+  return result.rows.length === 1 ? result.rows[0] : null;
 }
 
 function taskResultText(result) {
@@ -1094,16 +1112,21 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 404, "issue_not_found");
     }
+    const liveQcTask = externalQc ? null : await latestRunningSolLowQcTask(client, payload.issue_id,
+      issue.rows[0].workspace_id, payload.checker, payload.qc_task_id || null);
+    const completedQcTask = externalQc || liveQcTask ? null : await latestCompletedSolLowQcTask(client,
+      payload.issue_id, issue.rows[0].workspace_id, payload.qc_task_id || null);
     const qcTask = externalQc ? { id: null, agent_id: null, agent_name: payload.checker,
-      completed_at: new Date(0) } : await latestCompletedSolLowQcTask(client, payload.issue_id,
-      issue.rows[0].workspace_id, payload.qc_task_id || null);
+      completed_at: new Date(0) } : (liveQcTask || completedQcTask);
     if (!qcTask) {
       await client.query("ROLLBACK");
-      return relayVerdictError(res, 409, "completed_sol_low_qc_required");
+      return relayVerdictError(res, 409, "assigned_running_sol_low_in_review_qc_task_required");
     }
-    const verdict = validateQcVerdict(externalQc
-      ? { actor: { type: 'operator', authenticated: true, external_receipt: payload.reason }, evidence: payload }
-      : { actor: { type: 'worker', authenticated_task_id: qcTask.id }, task: {
+    const verdict = externalQc ? validateQcVerdict(
+      { actor: { type: 'operator', authenticated: true, external_receipt: payload.reason }, evidence: payload })
+      : liveQcTask ? validateLiveVerdict({ task: liveQcTask, evidence: payload })
+      : validateQcVerdict(
+      { actor: { type: 'worker', authenticated_task_id: qcTask.id }, task: {
         ...qcTask, agent: { model: qcTask.model, thinking_level: qcTask.thinking_level,
           runtime_config: qcTask.runtime_config }
       }, evidence: payload });
@@ -1111,7 +1134,7 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, verdict.reason);
     }
-    const evidenceMismatch = externalQc ? null : qcTaskEvidenceMismatch(qcTask, payload);
+    const evidenceMismatch = externalQc || liveQcTask ? null : qcTaskEvidenceMismatch(qcTask, payload);
     if (evidenceMismatch) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, evidenceMismatch);
@@ -1131,7 +1154,7 @@ async function relayVerdict(req, res, payload) {
     const currentFromBoundTask = !externalQc && currentVerdict &&
       currentVerdict.checker_id === qcTask.agent_id &&
       String(currentVerdict.notes || "").includes(`relay_task_id=${qcTask.id}`);
-    if (replay && currentVerdict && !currentFromBoundTask &&
+    if (replay && !liveQcTask && currentVerdict && !currentFromBoundTask &&
         new Date(currentVerdict.created_at) > new Date(qcTask.completed_at)) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "qc_verdict_newer_than_bound_qc_task");
@@ -2246,6 +2269,7 @@ module.exports = {
   relayRedirect,
   passVerdictRescopeForbidden,
   latestCompletedSolLowQcTask,
+  latestRunningSolLowQcTask,
   qcTaskEvidence,
   qcTaskEvidenceMismatch,
   relayVerdict,
