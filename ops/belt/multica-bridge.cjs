@@ -217,11 +217,16 @@ async function rerunParkedDiagnosis(client, payload) {
   }
   await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 805))", [payload.issue_id]);
   const issue = await client.query(
-    `SELECT id, workspace_id, status, priority, metadata FROM issue WHERE id = $1::uuid FOR UPDATE`,
+    `SELECT id, workspace_id, status, priority, metadata, parent_issue_id
+       FROM issue WHERE id = $1::uuid FOR UPDATE`,
     [payload.issue_id]);
   if (issue.rowCount === 0) return { ok: false, error: 'issue_not_found' };
   if (issue.rows[0].status !== 'Parked') return { ok: false, error: 'parked_issue_required' };
-  if (issue.rows[0].metadata?.bundled_into_id || issue.rows[0].metadata?.bundled_into) {
+  // parent_issue_id is the durable bundle marker. Older rows may not have the
+  // copied metadata fields, so checking metadata alone let legacy bundled
+  // children reach the diagnosis INSERT and fail with a silent 500.
+  if (isBundledChild(issue.rows[0]) || issue.rows[0].metadata?.bundled_into_id ||
+      issue.rows[0].metadata?.bundled_into) {
     return { ok: false, error: 'bundled_issue_requires_canonical_parent' };
   }
   const prior = await client.query(
