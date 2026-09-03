@@ -1760,26 +1760,25 @@ INSERT INTO agent_task_queue (
     agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
-    originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id, trigger_evidence_kind, trigger_evidence_ref_id
+    originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id, trigger_evidence_kind, trigger_evidence_ref_id, fire_at
 )
 VALUES (
-    $1, $2, $3, $4, 'queued', $5, $6,
-    COALESCE($7::uuid[], '{}'),
-    $8,
-    COALESCE($9::boolean, FALSE),
+    $1, $2, $3, $4, CASE WHEN $6::timestamptz IS NULL THEN 'queued' ELSE 'deferred' END, $5, $7,
+    COALESCE($8::uuid[], '{}'),
+    $9,
     COALESCE($10::boolean, FALSE),
-    $11,
+    COALESCE($11::boolean, FALSE),
     $12,
+    $13,
     CASE
-        WHEN COALESCE($13::text, '') <> ''
-          OR COALESCE($14::text, '') <> ''
+        WHEN COALESCE($14::text, '') <> ''
+          OR COALESCE($15::text, '') <> ''
         THEN jsonb_strip_nulls(jsonb_build_object(
-            'head_sha', NULLIF($13::text, ''),
-            'to_stage', NULLIF($14::text, '')
+            'head_sha', NULLIF($14::text, ''),
+            'to_stage', NULLIF($15::text, '')
         ))
         ELSE NULL
     END,
-    $15,
     $16,
     $17,
     $18,
@@ -1788,36 +1787,39 @@ VALUES (
     $21,
     $22,
     $23,
-    $24
+    $24,
+    $25,
+    $6
 )
 RETURNING id, agent_id, issue_id, status, priority, dispatched_at, started_at, completed_at, result, error, created_at, context, runtime_id, session_id, work_dir, trigger_comment_id, chat_session_id, autopilot_run_id, attempt, max_attempts, parent_task_id, failure_reason, trigger_summary, force_fresh_session, is_leader_task, wait_reason, initiator_user_id, handoff_note, prepare_lease_expires_at, squad_id, runtime_mcp_overlay, escalation_for_task_id, fire_at, originator_user_id, runtime_connected_apps, coalesced_comment_ids, delivered_comment_ids, chat_input_task_id, chat_finalize_deferred_at, originator_source, delegated_from_task_id, retry_of_task_id, rerun_of_task_id, rule_version_id, trigger_evidence_kind, trigger_evidence_ref_id, accountable_user_id, session_rollout_missing, retired_session_id, quick_actions_disabled, regenerate_quick_actions_for, daemon_id, workspace_id
 `
 
 type CreateAgentTaskParams struct {
-	AgentID              pgtype.UUID   `json:"agent_id"`
-	RuntimeID            pgtype.UUID   `json:"runtime_id"`
-	IssueID              pgtype.UUID   `json:"issue_id"`
-	WorkspaceID          pgtype.UUID   `json:"workspace_id"`
-	Priority             int32         `json:"priority"`
-	TriggerCommentID     pgtype.UUID   `json:"trigger_comment_id"`
-	CoalescedCommentIds  []pgtype.UUID `json:"coalesced_comment_ids"`
-	TriggerSummary       pgtype.Text   `json:"trigger_summary"`
-	ForceFreshSession    pgtype.Bool   `json:"force_fresh_session"`
-	IsLeaderTask         pgtype.Bool   `json:"is_leader_task"`
-	HandoffNote          pgtype.Text   `json:"handoff_note"`
-	SquadID              pgtype.UUID   `json:"squad_id"`
-	HeadSha              pgtype.Text   `json:"head_sha"`
-	ToStage              pgtype.Text   `json:"to_stage"`
-	OriginatorUserID     pgtype.UUID   `json:"originator_user_id"`
-	AccountableUserID    pgtype.UUID   `json:"accountable_user_id"`
-	RuntimeMcpOverlay    []byte        `json:"runtime_mcp_overlay"`
-	RuntimeConnectedApps []byte        `json:"runtime_connected_apps"`
-	OriginatorSource     pgtype.Text   `json:"originator_source"`
-	DelegatedFromTaskID  pgtype.UUID   `json:"delegated_from_task_id"`
-	RuleVersionID        pgtype.UUID   `json:"rule_version_id"`
-	RerunOfTaskID        pgtype.UUID   `json:"rerun_of_task_id"`
-	TriggerEvidenceKind  pgtype.Text   `json:"trigger_evidence_kind"`
-	TriggerEvidenceRefID pgtype.UUID   `json:"trigger_evidence_ref_id"`
+	AgentID              pgtype.UUID        `json:"agent_id"`
+	RuntimeID            pgtype.UUID        `json:"runtime_id"`
+	IssueID              pgtype.UUID        `json:"issue_id"`
+	WorkspaceID          pgtype.UUID        `json:"workspace_id"`
+	Priority             int32              `json:"priority"`
+	FireAt               pgtype.Timestamptz `json:"fire_at"`
+	TriggerCommentID     pgtype.UUID        `json:"trigger_comment_id"`
+	CoalescedCommentIds  []pgtype.UUID      `json:"coalesced_comment_ids"`
+	TriggerSummary       pgtype.Text        `json:"trigger_summary"`
+	ForceFreshSession    pgtype.Bool        `json:"force_fresh_session"`
+	IsLeaderTask         pgtype.Bool        `json:"is_leader_task"`
+	HandoffNote          pgtype.Text        `json:"handoff_note"`
+	SquadID              pgtype.UUID        `json:"squad_id"`
+	HeadSha              pgtype.Text        `json:"head_sha"`
+	ToStage              pgtype.Text        `json:"to_stage"`
+	OriginatorUserID     pgtype.UUID        `json:"originator_user_id"`
+	AccountableUserID    pgtype.UUID        `json:"accountable_user_id"`
+	RuntimeMcpOverlay    []byte             `json:"runtime_mcp_overlay"`
+	RuntimeConnectedApps []byte             `json:"runtime_connected_apps"`
+	OriginatorSource     pgtype.Text        `json:"originator_source"`
+	DelegatedFromTaskID  pgtype.UUID        `json:"delegated_from_task_id"`
+	RuleVersionID        pgtype.UUID        `json:"rule_version_id"`
+	RerunOfTaskID        pgtype.UUID        `json:"rerun_of_task_id"`
+	TriggerEvidenceKind  pgtype.Text        `json:"trigger_evidence_kind"`
+	TriggerEvidenceRefID pgtype.UUID        `json:"trigger_evidence_ref_id"`
 }
 
 // head_sha stamps the commit under review into the task's context JSONB so the
@@ -1834,6 +1836,7 @@ func (q *Queries) CreateAgentTask(ctx context.Context, arg CreateAgentTaskParams
 		arg.IssueID,
 		arg.WorkspaceID,
 		arg.Priority,
+		arg.FireAt,
 		arg.TriggerCommentID,
 		arg.CoalescedCommentIds,
 		arg.TriggerSummary,
