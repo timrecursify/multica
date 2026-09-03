@@ -331,6 +331,67 @@ func TestEnvNonNegativeDuration(t *testing.T) {
 	}
 }
 
+func TestDispatchAdmissionPolicyFromEnv_DisabledByDefault(t *testing.T) {
+	keys := []string{
+		"MULTICA_DISPATCH_MAX_QUEUE_DEPTH",
+		"MULTICA_DISPATCH_MAX_CONCURRENT",
+		"MULTICA_DISPATCH_ALERT_THRESHOLD",
+		"MULTICA_DISPATCH_BACKOFF_BASE",
+		"MULTICA_DISPATCH_BACKOFF_CAP",
+	}
+	for _, k := range keys {
+		os.Unsetenv(k)
+	}
+	if got := dispatchAdmissionPolicyFromEnv(); got != nil {
+		t.Fatalf("gate must be disabled with no caps, got %+v", got)
+	}
+}
+
+func TestDispatchAdmissionPolicyFromEnv_EnabledWithCaps(t *testing.T) {
+	os.Unsetenv("MULTICA_DISPATCH_MAX_QUEUE_DEPTH")
+	os.Unsetenv("MULTICA_DISPATCH_ALERT_THRESHOLD")
+	os.Unsetenv("MULTICA_DISPATCH_BACKOFF_BASE")
+	os.Unsetenv("MULTICA_DISPATCH_BACKOFF_CAP")
+	t.Setenv("MULTICA_DISPATCH_MAX_CONCURRENT", "50")
+
+	p := dispatchAdmissionPolicyFromEnv()
+	if p == nil {
+		t.Fatal("gate must be enabled when a cap is set")
+	}
+	if p.MaxConcurrent != 50 || p.MaxQueueDepth != 0 {
+		t.Fatalf("unexpected policy: %+v", p)
+	}
+	if p.AlertThreshold != 0.8 {
+		t.Fatalf("default alert threshold = %v, want 0.8", p.AlertThreshold)
+	}
+	if p.BackoffBase != time.Second || p.BackoffCap != 30*time.Second {
+		t.Fatalf("default backoff mismatch: %+v", p)
+	}
+}
+
+func TestEnvFloatClamped(t *testing.T) {
+	t.Setenv("TEST_FLOAT_1", "0.5")
+	if got := envFloatClamped("TEST_FLOAT_1", 0.8, 0, 1); got != 0.5 {
+		t.Fatalf("got %v, want 0.5", got)
+	}
+	os.Unsetenv("TEST_FLOAT_2")
+	if got := envFloatClamped("TEST_FLOAT_2", 0.8, 0, 1); got != 0.8 {
+		t.Fatalf("unset got %v, want default 0.8", got)
+	}
+	t.Setenv("TEST_FLOAT_3", "1.5")
+	if got := envFloatClamped("TEST_FLOAT_3", 0.8, 0, 1); got != 1.0 {
+		t.Fatalf("upper clamp got %v, want 1.0", got)
+	}
+	t.Setenv("TEST_FLOAT_4", "-2")
+	if got := envFloatClamped("TEST_FLOAT_4", 0.8, 0, 1); got != 0.0 {
+		t.Fatalf("lower clamp got %v, want 0.0", got)
+	}
+	t.Setenv("TEST_FLOAT_5", "oops")
+	if got := envFloatClamped("TEST_FLOAT_5", 0.8, 0, 1); got != 0.8 {
+		t.Fatalf("invalid got %v, want default 0.8", got)
+	}
+}
+
 func TestHoldBeforeShutdown(t *testing.T) {
 	const hold = 10 * time.Millisecond
 	started := time.Now()

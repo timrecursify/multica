@@ -7103,6 +7103,29 @@ func (q *Queries) SetTaskDeliveredCommentIDs(ctx context.Context, arg SetTaskDel
 	return delivered_comment_ids, err
 }
 
+const snapshotDispatchLoad = `-- name: SnapshotDispatchLoad :one
+SELECT
+  (SELECT count(*) FROM agent_task_queue WHERE status = 'queued')::bigint AS queued_depth,
+  (SELECT count(*) FROM agent_task_queue WHERE status IN ('dispatched', 'running', 'waiting_local_directory'))::bigint AS active_concurrent
+`
+
+type SnapshotDispatchLoadRow struct {
+	QueuedDepth      int64 `json:"queued_depth"`
+	ActiveConcurrent int64 `json:"active_concurrent"`
+}
+
+// Captures a point-in-time dispatch admission snapshot for the MINT-5 gate:
+// the number of tasks currently queued (waiting to be claimed) plus the number
+// being actively worked (dispatched / running / waiting on a local directory).
+// Runs in a single short read so the gate can size an incoming wave and decide
+// reject/defer against the operator's max queue depth and concurrency policy.
+func (q *Queries) SnapshotDispatchLoad(ctx context.Context) (SnapshotDispatchLoadRow, error) {
+	row := q.db.QueryRow(ctx, snapshotDispatchLoad)
+	var i SnapshotDispatchLoadRow
+	err := row.Scan(&i.QueuedDepth, &i.ActiveConcurrent)
+	return i, err
+}
+
 const startAgentTask = `-- name: StartAgentTask :one
 UPDATE agent_task_queue
 SET status = 'running',

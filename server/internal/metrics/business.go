@@ -34,6 +34,11 @@ type BusinessMetrics struct {
 	taskQueuedExpired *prometheus.CounterVec
 	taskLeaseExpired  *prometheus.CounterVec
 
+	admissionAdmitted  *prometheus.CounterVec
+	admissionDeferred  *prometheus.CounterVec
+	admissionRejected  *prometheus.CounterVec
+	admissionNearLimit *prometheus.CounterVec
+
 	activeMu    sync.Mutex
 	activeTasks map[string]activeTaskLabels
 
@@ -145,6 +150,30 @@ func NewBusinessMetrics() *BusinessMetrics {
 			Name:      "lease_expired_total",
 			Help:      "Total dispatched or running task leases expired by the scheduler.",
 		}, metricLabels("multica_task_lease_expired_total")),
+		admissionAdmitted: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica",
+			Subsystem: "dispatch",
+			Name:      "admission_admitted_total",
+			Help:      "Total tasks admitted by the dispatch admission gate.",
+		}, metricLabels("multica_dispatch_admission_admitted_total")),
+		admissionDeferred: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica",
+			Subsystem: "dispatch",
+			Name:      "admission_deferred_total",
+			Help:      "Total tasks deferred (Retry-After backoff) by the dispatch admission gate.",
+		}, metricLabels("multica_dispatch_admission_deferred_total")),
+		admissionRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica",
+			Subsystem: "dispatch",
+			Name:      "admission_rejected_total",
+			Help:      "Total tasks rejected at the hard cap by the dispatch admission gate.",
+		}, metricLabels("multica_dispatch_admission_rejected_total")),
+		admissionNearLimit: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "multica",
+			Subsystem: "dispatch",
+			Name:      "admission_near_limit_total",
+			Help:      "Total gate evaluations at or above the near-limit alert threshold.",
+		}, metricLabels("multica_dispatch_admission_near_limit_total")),
 		activeTasks: map[string]activeTaskLabels{},
 		events:      newBusinessEventMetrics(),
 	}
@@ -170,6 +199,10 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.llmRequests,
 		m.taskQueuedExpired,
 		m.taskLeaseExpired,
+		m.admissionAdmitted,
+		m.admissionDeferred,
+		m.admissionRejected,
+		m.admissionNearLimit,
 	}, m.events.collectors()...)
 }
 
@@ -248,6 +281,42 @@ func (m *BusinessMetrics) RecordTaskLeaseExpired(source string) {
 		return
 	}
 	m.taskLeaseExpired.WithLabelValues(NormalizeTaskSource(source)).Inc()
+}
+
+// RecordAdmissionAdmitted increments the dispatch admission-gate admitted
+// counter for the given admission class.
+func (m *BusinessMetrics) RecordAdmissionAdmitted(class string) {
+	if m == nil {
+		return
+	}
+	m.admissionAdmitted.WithLabelValues(class).Inc()
+}
+
+// RecordAdmissionDeferred increments the dispatch admission-gate deferred
+// counter for the given admission class.
+func (m *BusinessMetrics) RecordAdmissionDeferred(class string) {
+	if m == nil {
+		return
+	}
+	m.admissionDeferred.WithLabelValues(class).Inc()
+}
+
+// RecordAdmissionRejected increments the dispatch admission-gate rejected
+// counter for the given admission class.
+func (m *BusinessMetrics) RecordAdmissionRejected(class string) {
+	if m == nil {
+		return
+	}
+	m.admissionRejected.WithLabelValues(class).Inc()
+}
+
+// RecordAdmissionNearLimit increments the dispatch admission-gate near-limit
+// alert counter for the given admission class.
+func (m *BusinessMetrics) RecordAdmissionNearLimit(class string) {
+	if m == nil {
+		return
+	}
+	m.admissionNearLimit.WithLabelValues(class).Inc()
 }
 
 // costUSDTicks is the provider's own price for this usage in 1e-10 USD, or 0

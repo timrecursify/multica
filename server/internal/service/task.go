@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/internal/attribution"
+	"github.com/multica-ai/multica/server/internal/dispatch"
 	"github.com/multica-ai/multica/server/internal/events"
 	"github.com/multica-ai/multica/server/internal/featureflags"
 	obsmetrics "github.com/multica-ai/multica/server/internal/metrics"
@@ -63,6 +64,12 @@ type TaskService struct {
 	// state for a self-hosted deployment with no MULTICA_LLM_* configuration.
 	// Wired in router.go from the same *llm.Client that backs chat auto-titling.
 	QuickActions ChatQuickActionsLLM
+	// DispatchAdmission configures the MINT-5 dispatch/load admission gate.
+	// When nil (or a zero-valued policy) the gate is disabled and every enqueue
+	// proceeds exactly as before. When configured, issue-minted enqueue paths
+	// snapshot global dispatch load and defer/reject new work beyond the
+	// configured caps, emitting a near-limit alert as load approaches capacity.
+	DispatchAdmission *DispatchAdmissionPolicy
 	// quickActionsInFlight (chat session id -> struct{}{}) and
 	// quickActionsRunning admit suggestion passes: one per session, and a
 	// process-wide ceiling. Both zero values are usable, so a TaskService built
@@ -70,6 +77,10 @@ type TaskService struct {
 	// shedding everything.
 	quickActionsInFlight sync.Map
 	quickActionsRunning  atomic.Int64
+
+	// admissionDeferrals counts consecutive gate deferrals so the exponential
+	// backoff escalates across a sustained wave. Zero value is safe.
+	admissionDeferrals atomic.Int64
 
 	analyticsContextMu    sync.Mutex
 	analyticsContextCache map[string]analytics.TaskContext
@@ -1087,6 +1098,23 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		return db.AgentTaskQueue{}, fmt.Errorf("agent has no runtime")
 	}
 
+	// MINT-5 dispatch admission gate: enforce the operator's queue-depth /
+	// concurrency admission policy before persisting a new task, so an
+	// overloaded dispatcher stops feeding a wave instead of accepting it and
+	// then stalling. Assign the class from the trigger: a member-authored
+	// trigger is critical; an agent-authored delegation is standard. Any
+	// gated task is refused here and never lands in the queue.
+	admissionClass := admissionClassForTrigger(triggerCommentID)
+	if err := s.admitWithGate(ctx, admissionClass); err != nil {
+		slog.Info("task enqueue admission-gated",
+			"issue_id", util.UUIDToString(issue.ID),
+			"agent_id", util.UUIDToString(issue.AssigneeID),
+			"class", admissionClass,
+			"reason", err.Error(),
+		)
+		return db.AgentTaskQueue{}, err
+	}
+
 	// The issue assignee reacting to an agent-authored comment is a
 	// comment_source attribution (a special case of delegation); a member
 	// comment or direct member assignment is direct_human. attr.UserID is the
@@ -1238,6 +1266,23 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	if !agent.RuntimeID.Valid {
 		slog.Error("mention task enqueue failed: agent has no runtime", "issue_id", util.UUIDToString(issue.ID), "agent_id", util.UUIDToString(agentID))
 		return db.AgentTaskQueue{}, fmt.Errorf("agent has no runtime")
+	}
+
+	// MINT-5 dispatch admission gate (see enqueueIssueTaskWithCommentPlan for
+	// the rationale). A leader or direct mention is escalated work and treated
+	// as critical; an ordinary mention is standard.
+	mentionClass := admissionClassForTrigger(triggerCommentID)
+	if isLeader {
+		mentionClass = dispatch.ClassCritical
+	}
+	if err := s.admitWithGate(ctx, mentionClass); err != nil {
+		slog.Info("mention task enqueue admission-gated",
+			"issue_id", util.UUIDToString(issue.ID),
+			"agent_id", util.UUIDToString(agentID),
+			"class", mentionClass,
+			"reason", err.Error(),
+		)
+		return db.AgentTaskQueue{}, err
 	}
 
 	// An explicit mention / thread-parent / squad-leader hop from an

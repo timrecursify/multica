@@ -1325,6 +1325,16 @@ LIMIT @max_per_tick::int;
 SELECT count(*) FROM agent_task_queue
 WHERE agent_id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory');
 
+-- name: SnapshotDispatchLoad :one
+-- Captures a point-in-time dispatch admission snapshot for the MINT-5 gate:
+-- the number of tasks currently queued (waiting to be claimed) plus the number
+-- being actively worked (dispatched / running / waiting on a local directory).
+-- Runs in a single short read so the gate can size an incoming wave and decide
+-- reject/defer against the operator's max queue depth and concurrency policy.
+SELECT
+  (SELECT count(*) FROM agent_task_queue WHERE status = 'queued')::bigint AS queued_depth,
+  (SELECT count(*) FROM agent_task_queue WHERE status IN ('dispatched', 'running', 'waiting_local_directory'))::bigint AS active_concurrent;
+
 -- name: GetAgentForClaimUpdate :one
 SELECT * FROM agent
 WHERE id = $1
