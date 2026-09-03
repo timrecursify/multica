@@ -364,8 +364,10 @@ async function sweep() {
         continue;
       }
       if (openStates.length > 1) {
-        log(`HOLD #${issue.number} ${openStates.length} PRs still open: ` +
-            openStates.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', '));
+        const list = openStates.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', ');
+        await returnToBuild(issue, openStates[0].pr,
+          `${openStates.length} open PRs (${list}); keep exactly one: close the superseded PRs with gh pr close, then rebase the survivor`);
+        continue;
       }
       const pr = openStates[0].pr;
       const info = openStates[0].info;
