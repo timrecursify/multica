@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // relayAdvanceStageFixture wires a workspace-scoped relay_stage_config edge set
@@ -32,13 +34,17 @@ func newRelayAdvanceStageFixture(t *testing.T) relayAdvanceStageFixture {
 	t.Helper()
 	ctx := context.Background()
 
-	var agentID, runtimeID string
+	var agentID string
+	var runtimeID pgtype.Text
 	if err := testPool.QueryRow(ctx, `
 		SELECT a.id, a.runtime_id FROM agent a
-		WHERE a.workspace_id = $1
+		WHERE a.workspace_id = $1 AND a.runtime_id IS NOT NULL
 		ORDER BY a.created_at ASC LIMIT 1
 	`, testWorkspaceID).Scan(&agentID, &runtimeID); err != nil {
-		t.Fatalf("load seeded agent: %v", err)
+		t.Fatalf("load seeded routable agent: %v", err)
+	}
+	if !runtimeID.Valid {
+		t.Fatalf("load seeded routable agent: runtime_id is NULL")
 	}
 
 	recreateStageConfig := func() {
@@ -105,7 +111,7 @@ func newRelayAdvanceStageFixture(t *testing.T) relayAdvanceStageFixture {
 		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
 		testPool.Exec(context.Background(), `DELETE FROM relay_stage_config WHERE workspace_id = $1`, testWorkspaceID)
 	})
-	return relayAdvanceStageFixture{IssueID: issueID, AgentID: agentID, RuntimeID: runtimeID}
+	return relayAdvanceStageFixture{IssueID: issueID, AgentID: agentID, RuntimeID: runtimeID.String}
 }
 
 func relayAdvanceHTTP(t *testing.T, issueID, toStage string) *httptest.ResponseRecorder {
@@ -252,6 +258,13 @@ func TestRelayAdvanceStageRejectsMissingRuntime(t *testing.T) {
 		t.Skip("database not available")
 	}
 	fx := newRelayAdvanceStageFixture(t)
+	t.Cleanup(func() {
+		if _, err := testPool.Exec(context.Background(), `
+			UPDATE agent SET runtime_id = $1 WHERE id = $2
+		`, fx.RuntimeID, fx.AgentID); err != nil {
+			t.Errorf("restore agent runtime: %v", err)
+		}
+	})
 	if _, err := testPool.Exec(context.Background(), `
 		UPDATE agent SET runtime_id = NULL WHERE id = $1
 	`, fx.AgentID); err != nil {
