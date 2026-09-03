@@ -213,6 +213,20 @@ test('bundled parked diagnosis rerun is a stable conflict without queue work', a
   assert.equal(calls.some(sql => sql.includes('agent_task_queue')), false);
 });
 
+test('legacy bundled child marker is rejected before diagnosis queue work', async () => {
+  const calls = [];
+  const result = await rerunParkedDiagnosis({ query: async (sql) => {
+    calls.push(sql);
+    if (sql.includes('FROM issue WHERE')) return { rowCount: 1, rows: [{
+      id: '3c2298c1-1a5a-42bd-ad21-6805be7a3f3e', workspace_id: '323e4567-e89b-42d3-a456-426614174000',
+      status: 'Parked', priority: 'low', parent_issue_id: '4d2298c1-1a5a-42bd-ad21-6805be7a3f3e', metadata: {}
+    }] };
+    return { rowCount: 0, rows: [] };
+  } }, { issue_id: '3c2298c1-1a5a-42bd-ad21-6805be7a3f3e', idempotency_key: 'rerun-0002' });
+  assert.deepEqual(result, { ok: false, error: 'bundled_issue_requires_canonical_parent' });
+  assert.equal(calls.some(sql => sql.includes('agent_task_queue')), false);
+});
+
 test('Parked diagnosis rerun logs classified and unexpected database exceptions', async (t) => {
   const issueId = '123e4567-e89b-42d3-a456-426614174000';
   const payload = { agent_token: 'test-relay-secret', issue_id: issueId, idempotency_key: 'rerun-0001' };
