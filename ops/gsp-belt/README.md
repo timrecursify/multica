@@ -114,6 +114,16 @@ bash <release-dir>/ops/gsp-belt/scripts/belt-status.sh --release <release-dir>
 It exits non-zero if an app is offline or resolves outside that immutable
 release.
 
+To compare restart counters after a cutover (the bridge form remains supported):
+
+```bash
+bash <release-dir>/ops/gsp-belt/scripts/belt-status.sh --release <release-dir> \
+  --baseline-relay-unstable-restarts <count>
+```
+
+If the relay counter increases, inspect the emitted PM2 error-log path and exit
+code/signal, correct the operator environment or deployment, then rerun status.
+
 ## Dispatch controls
 
 `RECONCILE_MAX_CREATE_PER_CYCLE` limits tasks created per cycle; set it to `0` to halt task creation. `RECONCILE_DISPATCH_HOLD=1` is the supported way to stop dispatch, holding the reconcile cycle before any database access.
@@ -124,6 +134,7 @@ release.
 bash ops/gsp-belt/test/deploy-tool.test.sh   # dry-run, preflight, missing-input, rollback
 bash ops/gsp-belt/test/guard-check.test.sh   # secret + unmanaged-script guards
 bash ops/gsp-belt/test/relay-advance.integration.test.cjs  # unchanged relay coverage
+bash ops/gsp-belt/test/relay-launcher-status.test.cjs      # launcher + restart baseline coverage
 ```
 
 From a clean checkout the acceptance criterion is that these pass without any
