@@ -9,6 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/multica-ai/multica/server/internal/dispatch"
+	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
 // DispatchAdmissionPolicy configures the MINT-5 dispatch/load admission gate.
@@ -87,6 +88,13 @@ var ErrDispatchDeferred = &dispatchDeferredError{}
 // on a near-limit defer it returns a *dispatchDeferredError carrying the
 // exponential RetryAfter. Nil or zero policy admits everything.
 func (s *TaskService) admitWithGate(ctx context.Context, class dispatch.AdmissionClass) error {
+	if s == nil {
+		return nil
+	}
+	return s.admitWithGateOn(ctx, s.Queries, class)
+}
+
+func (s *TaskService) admitWithGateOn(ctx context.Context, q *db.Queries, class dispatch.AdmissionClass) error {
 	if s == nil || s.DispatchAdmission == nil {
 		return nil
 	}
@@ -96,13 +104,20 @@ func (s *TaskService) admitWithGate(ctx context.Context, class dispatch.Admissio
 	if s.DispatchAdmission.MaxQueueDepth <= 0 && s.DispatchAdmission.MaxConcurrent <= 0 {
 		return nil
 	}
-	load, err := s.snapshotDispatchLoad(ctx)
+	if q == nil {
+		q = s.Queries
+		if q == nil {
+			return nil
+		}
+	}
+	row, err := q.SnapshotDispatchLoad(ctx)
 	if err != nil {
 		// Fail open on a load-snapshot read error: an infra hiccup must not
 		// block work that the queue would otherwise accept. Logged for Ops.
 		slog.Warn("dispatch admission: load snapshot failed, admitting", "error", err)
 		return nil
 	}
+	load := dispatch.Load{QueueDepth: int(row.QueuedDepth), ActiveConcurrent: int(row.ActiveConcurrent)}
 
 	deferralCount := int(s.admissionDeferrals.Load())
 	dec := dispatch.Evaluate(s.DispatchAdmission.policy(), class, load, deferralCount)
