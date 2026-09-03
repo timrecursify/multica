@@ -10,6 +10,7 @@ const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
 const { evaluate } = require('./transition-policy.cjs');
+const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
 const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/home/newadmin/gsp-multica-runtime/receipts';
 let pool;
 let relayToken;
@@ -44,6 +45,7 @@ function retroactiveEligible(repo, num) {
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
 const ciFailureCounts = new Map();
+const watchdog = createWatchdog({ file: process.env.CICD_WATCHDOG_STATE || `${RECEIPT_ROOT}/cicd-watchdog.json` });
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -107,6 +109,22 @@ async function humanReview(issue, reason) {
   if (!verdict.ok) throw new Error(`transition policy rejected Human Review: ${verdict.code}`);
   await relay(issue.id, 'Human Review', null, reason, null, evidence);
   log(`HUMAN REVIEW #${issue.number} — ${reason}`);
+}
+
+async function watchdogFailure(issue, error, sha = '') {
+  const row = watchdog.observe(issue.id, { sha, outcome: 'retrying', error });
+  if (!watchdog.retryAllowed(row) && watchdog.stalled(row)) {
+    const stalled = watchdog.markAlerted(row);
+    const detail = `deploy_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
+    await humanReview(issue, detail);
+    return { stalled: true, audit: stalled };
+  }
+  if (!watchdog.retryAllowed(row)) {
+    log(`HOLD #${issue.number} retry limit reached; awaiting sentinel threshold correlation_key=${row.correlation_key}`);
+    return { stalled: false, audit: row };
+  }
+  log(`RETRY #${issue.number} attempt=${row.attempts}/${RETRY_LIMIT} backoff_ms=${watchdog.backoffMs(row)} correlation_key=${row.correlation_key}`);
+  return { stalled: false, audit: row };
 }
 
 function receiptEvidence(sha) {
@@ -300,6 +318,7 @@ async function sweep() {
   log(`[poll] ${rows.length} ticket(s) in CI/CD & Deploy`);
   for (const issue of rows) {
     try {
+      watchdog.observe(issue.id);
       // Read the thread, not just its last line. The pull request is announced by
       // whichever comment the builder wrote, and a later note pushes it out of a
       // one-row lookup. Reading one comment closed flights whose pull request was
@@ -324,6 +343,7 @@ async function sweep() {
       }
       if (!prs.length) {
         await returnIssueToBuild(issue, hasBarePR ? 'ambiguous PR reference, no repository' : 'no PR referenced');
+        watchdog.clear(issue.id);
         continue;
       }
 
@@ -361,6 +381,7 @@ async function sweep() {
         await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
           repo: last.pr.repo, headSha: last.info.headRefOid, createdAt: last.info.createdAt
         });
+        watchdog.clear(issue.id);
         continue;
       }
       if (openStates.length > 1) {
@@ -419,14 +440,15 @@ async function sweep() {
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
       }
     } catch (e) {
-      log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
+      const failure = await watchdogFailure(issue, e.message);
+      log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}${failure.stalled ? ' (Human Review)' : ''}`);
     }
   }
 }
 
 async function main() {
   initializeRuntime();
-  log(`[cicd-worker] started; poll=${POLL_MS}ms merge=${MERGE_ENABLED}`);
+  log(`[cicd-worker] started; poll=${POLL_MS}ms merge=${MERGE_ENABLED} sentinel_ms=${SENTINEL_MS} retry_limit=${RETRY_LIMIT}`);
   for (;;) {
     await sweep().catch(e => log('[sweep] error:', e.message));
     await new Promise(r => setTimeout(r, POLL_MS));
@@ -444,4 +466,4 @@ function setTestDependencies(dependencies) {
 }
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
-  routeFinishedPR, receiptFor, mergeDeployEvidence, setTestDependencies, sweep };
+  routeFinishedPR, receiptFor, mergeDeployEvidence, setTestDependencies, sweep, watchdogFailure };
