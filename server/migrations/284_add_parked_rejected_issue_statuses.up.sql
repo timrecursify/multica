@@ -4,8 +4,7 @@ ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
-     'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
-     'Archived', 'Cancelled'));
+     'Human Review', 'CI/CD & Deploy', 'Done', 'Archived', 'Cancelled'));
 
 -- relay_run_log is an operator-side belt table and is not present in every
 -- canonical Multica installation. Extend it where installed without making a

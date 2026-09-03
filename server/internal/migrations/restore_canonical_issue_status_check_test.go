@@ -74,8 +74,8 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 		"00000000-0000-0000-0000-000000000008": "Done",
 		"00000000-0000-0000-0000-000000000009": "Archived",
 		"00000000-0000-0000-0000-000000000010": "Cancelled",
-		"00000000-0000-0000-0000-000000000011": "Parked",
-		"00000000-0000-0000-0000-000000000012": "Rejected",
+		"00000000-0000-0000-0000-000000000011": "Spec",
+		"00000000-0000-0000-0000-000000000012": "Spec",
 	})
 
 	if _, err := conn.Exec(ctx, `INSERT INTO issue (id, status) VALUES ('00000000-0000-0000-0000-000000000013', 'in_progress')`); err != nil {

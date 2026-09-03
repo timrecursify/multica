@@ -4,6 +4,8 @@
 -- compatible through the write trigger.
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
+UPDATE issue SET status = 'Spec' WHERE status IN ('Parked', 'Rejected');
+
 CREATE OR REPLACE FUNCTION normalize_issue_status_before_write()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -32,7 +34,6 @@ FOR EACH ROW EXECUTE FUNCTION normalize_issue_status_before_write();
 
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
-     'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
-     'Archived', 'Cancelled'));
+     'Human Review', 'CI/CD & Deploy', 'Done', 'Archived', 'Cancelled'));
 
 ALTER TABLE issue ALTER COLUMN status SET DEFAULT 'Spec';
