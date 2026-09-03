@@ -1254,6 +1254,13 @@ async function relayAdvance(req, res, body) {
       `UPDATE "issue" SET status = $1, updated_at = NOW()
         WHERE id = $2 RETURNING id, status`, [requestedStage, issue_id]
     );
+    // Entering a stage starts it fresh: a recorded outcome from an earlier
+    // visit (e.g. a build ADVANCED before a CI/CD RETURN) must not let the
+    // daemon re-advance the issue past the stage it was just returned to.
+    await client.query(
+      `DELETE FROM issue_stage_outcome WHERE issue_id = $1 AND stage = $2`,
+      [issue_id, requestedStage]
+    );
     await client.query("COMMIT");
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, issue: transitionUpdate.rows[0], task_id: null,
