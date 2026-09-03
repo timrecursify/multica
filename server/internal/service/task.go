@@ -1098,27 +1098,7 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		return db.AgentTaskQueue{}, fmt.Errorf("agent has no runtime")
 	}
 
-	// MINT-5 dispatch admission gate: enforce the operator's queue-depth /
-	// concurrency admission policy before persisting a new task, so an
-	// overloaded dispatcher stops feeding a wave instead of accepting it and
-	// then stalling. Assign the class from the trigger: a member-authored
-	// trigger is critical; an agent-authored delegation is standard. Any
-	// gated task is refused here and never lands in the queue.
 	admissionClass := admissionClassForTrigger(triggerCommentID)
-	if err := s.admitWithGate(ctx, admissionClass); err != nil {
-		var deferred *dispatchDeferredError
-		if errors.As(err, &deferred) {
-			fireAt = pgtype.Timestamptz{Time: time.Now().Add(deferred.retryAfter), Valid: true}
-		} else {
-			slog.Info("task enqueue admission-gated",
-				"issue_id", util.UUIDToString(issue.ID),
-				"agent_id", util.UUIDToString(issue.AssigneeID),
-				"class", admissionClass,
-				"reason", err.Error(),
-			)
-			return db.AgentTaskQueue{}, err
-		}
-	}
 
 	// The issue assignee reacting to an agent-authored comment is a
 	// comment_source attribution (a special case of delegation); a member
@@ -1164,8 +1144,30 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
 	}
 	var task db.AgentTaskQueue
+	insertQueries := s.Queries
+	var tx pgx.Tx
+	if s.DispatchAdmission != nil && (s.DispatchAdmission.MaxQueueDepth > 0 || s.DispatchAdmission.MaxConcurrent > 0) {
+		tx, err = s.TxStarter.Begin(ctx)
+		if err != nil {
+			return db.AgentTaskQueue{}, fmt.Errorf("begin admission enqueue: %w", err)
+		}
+		defer tx.Rollback(ctx)
+		insertQueries = s.Queries.WithTx(tx)
+		if err = insertQueries.LockDispatchAdmission(ctx); err != nil {
+			return db.AgentTaskQueue{}, fmt.Errorf("lock admission: %w", err)
+		}
+		if err = s.admitWithGateOn(ctx, insertQueries, admissionClass); err != nil {
+			var deferred *dispatchDeferredError
+			if errors.As(err, &deferred) {
+				fireAt = pgtype.Timestamptz{Time: time.Now().Add(deferred.retryAfter), Valid: true}
+			} else {
+				return db.AgentTaskQueue{}, err
+			}
+		}
+		createParams.FireAt = fireAt
+	}
 	if fireAt.Valid {
-		task, err = s.Queries.CreateDeferredChannelIssueTask(ctx, db.CreateDeferredChannelIssueTaskParams{
+		task, err = insertQueries.CreateDeferredChannelIssueTask(ctx, db.CreateDeferredChannelIssueTaskParams{
 			AgentID:              createParams.AgentID,
 			RuntimeID:            createParams.RuntimeID,
 			IssueID:              createParams.IssueID,
@@ -1191,7 +1193,12 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 			FireAt:               fireAt,
 		})
 	} else {
-		task, err = s.Queries.CreateAgentTask(ctx, createParams)
+		task, err = insertQueries.CreateAgentTask(ctx, createParams)
+	}
+	if tx != nil {
+		if err == nil {
+			err = tx.Commit(ctx)
+		}
 	}
 	if err != nil {
 		slog.Error("task enqueue failed", "issue_id", util.UUIDToString(issue.ID), "error", err)
@@ -1283,21 +1290,6 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	}
 	var admissionDeferred bool
 	var admissionFireAt pgtype.Timestamptz
-	if err := s.admitWithGate(ctx, mentionClass); err != nil {
-		var deferred *dispatchDeferredError
-		if errors.As(err, &deferred) {
-			admissionDeferred = true
-			admissionFireAt = pgtype.Timestamptz{Time: time.Now().Add(deferred.retryAfter), Valid: true}
-		} else {
-			slog.Info("mention task enqueue admission-gated",
-				"issue_id", util.UUIDToString(issue.ID),
-				"agent_id", util.UUIDToString(agentID),
-				"class", mentionClass,
-				"reason", err.Error(),
-			)
-			return db.AgentTaskQueue{}, err
-		}
-	}
 
 	// An explicit mention / thread-parent / squad-leader hop from an
 	// agent-authored comment is a delegation (the parent task's human is
@@ -1314,7 +1306,29 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 	originatorUserID := attr.UserID
 	runtimeMCPOverlay := s.buildRuntimeMCPOverlay(ctx, originatorUserID, agent)
 	attrSource, attrDelegatedFrom, attrEvidenceKind, attrEvidenceRef := attributionCreateParams(attr)
-	task, err := s.Queries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
+	insertQueries := s.Queries
+	var tx pgx.Tx
+	if s.DispatchAdmission != nil && (s.DispatchAdmission.MaxQueueDepth > 0 || s.DispatchAdmission.MaxConcurrent > 0) {
+		tx, err = s.TxStarter.Begin(ctx)
+		if err != nil {
+			return db.AgentTaskQueue{}, fmt.Errorf("begin admission enqueue: %w", err)
+		}
+		defer tx.Rollback(ctx)
+		insertQueries = s.Queries.WithTx(tx)
+		if err = insertQueries.LockDispatchAdmission(ctx); err != nil {
+			return db.AgentTaskQueue{}, fmt.Errorf("lock admission: %w", err)
+		}
+		if err = s.admitWithGateOn(ctx, insertQueries, mentionClass); err != nil {
+			var deferred *dispatchDeferredError
+			if errors.As(err, &deferred) {
+				admissionDeferred = true
+				admissionFireAt = pgtype.Timestamptz{Time: time.Now().Add(deferred.retryAfter), Valid: true}
+			} else {
+				return db.AgentTaskQueue{}, err
+			}
+		}
+	}
+	task, err := insertQueries.CreateAgentTask(ctx, db.CreateAgentTaskParams{
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
@@ -1343,6 +1357,9 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		// from a later request against a new HEAD (TEN-356).
 		HeadSha: headShaText(s.ResolveIssueReviewSHA(ctx, issue.ID)),
 	})
+	if tx != nil && err == nil {
+		err = tx.Commit(ctx)
+	}
 	if err != nil {
 		// A concurrent enqueue for the same (issue, agent) won the race and the
 		// unique index rejected this insert. That is benign — a sibling run
@@ -3370,9 +3387,32 @@ func (s *TaskService) ClaimTasksForRuntimes(ctx context.Context, runtimeIDs []pg
 }
 
 func (s *TaskService) PromoteDueDeferredTasksForRuntime(ctx context.Context, runtimeID pgtype.UUID) error {
-	tasks, err := s.Queries.PromoteDueDeferredTasksForRuntime(ctx, runtimeID)
+	q := s.Queries
+	var tx pgx.Tx
+	if s.DispatchAdmission != nil && (s.DispatchAdmission.MaxQueueDepth > 0 || s.DispatchAdmission.MaxConcurrent > 0) {
+		var err error
+		tx, err = s.TxStarter.Begin(ctx)
+		if err != nil {
+			return fmt.Errorf("begin deferred promotion: %w", err)
+		}
+		defer tx.Rollback(ctx)
+		q = s.Queries.WithTx(tx)
+		if err = q.LockDispatchAdmission(ctx); err != nil {
+			return fmt.Errorf("lock admission: %w", err)
+		}
+		if err = s.admitWithGateOn(ctx, q, dispatch.ClassStandard); err != nil {
+			// Capacity is still unavailable; leave rows deferred for the next sweep.
+			return nil
+		}
+	}
+	tasks, err := q.PromoteDueDeferredTasksForRuntime(ctx, runtimeID)
 	if err != nil {
 		return fmt.Errorf("promote due deferred tasks: %w", err)
+	}
+	if tx != nil {
+		if err = tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit deferred promotion: %w", err)
+		}
 	}
 	for _, task := range tasks {
 		slog.Info("deferred fallback task promoted",

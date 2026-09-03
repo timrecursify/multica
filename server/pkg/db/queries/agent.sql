@@ -1336,6 +1336,12 @@ SELECT
   (SELECT count(*) FROM agent_task_queue WHERE status = 'queued')::bigint AS queued_depth,
   (SELECT count(*) FROM agent_task_queue WHERE status IN ('dispatched', 'running', 'waiting_local_directory'))::bigint AS active_concurrent;
 
+-- name: LockDispatchAdmission :exec
+-- Serialize admission snapshots with the following enqueue insert. The
+-- transaction-scoped advisory lock spans dispatcher instances and prevents a
+-- check-then-insert race from exceeding configured capacity.
+SELECT pg_advisory_xact_lock(hashtextextended('multica:dispatch-admission', 0));
+
 -- name: GetAgentForClaimUpdate :one
 SELECT * FROM agent
 WHERE id = $1

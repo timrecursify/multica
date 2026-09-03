@@ -5695,6 +5695,18 @@ func (q *Queries) LockAgentForAutopilotAssignment(ctx context.Context, arg LockA
 	return i, err
 }
 
+const lockDispatchAdmission = `-- name: LockDispatchAdmission :exec
+SELECT pg_advisory_xact_lock(hashtextextended('multica:dispatch-admission', 0))
+`
+
+// Serialize admission snapshots with the following enqueue insert. The
+// transaction-scoped advisory lock spans dispatcher instances and prevents a
+// check-then-insert race from exceeding configured capacity.
+func (q *Queries) LockDispatchAdmission(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, lockDispatchAdmission)
+	return err
+}
+
 const markAgentTaskWaitingLocalDirectory = `-- name: MarkAgentTaskWaitingLocalDirectory :one
 UPDATE agent_task_queue
 SET status = 'waiting_local_directory',
