@@ -104,11 +104,15 @@ async function rescopeCompletedNoArtifactQc(client, { postRelay, logger = consol
         AND NOT (i.metadata ? 'no_artifact_rescope_consumed_at')
         AND t.status = 'completed'
         AND t.context->>'to_stage' = 'In Review'
+        AND t.result->>'output' ~* '^\\s*QC[- ]BLOCKED'
         AND COALESCE(a.model, a.runtime_config->>'model') = ANY($1::text[])
         AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $2::text
         AND NOT EXISTS (
           SELECT 1 FROM qc_verdict verdict WHERE verdict.issue_id = t.issue_id
             AND verdict.created_at >= t.created_at)
+        AND NOT EXISTS (
+          SELECT 1 FROM agent_task_queue live WHERE live.issue_id = t.issue_id
+            AND live.status IN ('queued', 'running'))
       ORDER BY t.issue_id, t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
       LIMIT $3`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT, noArtifactRescopeBatch(env)]
   );
