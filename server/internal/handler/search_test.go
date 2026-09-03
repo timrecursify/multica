@@ -76,24 +76,42 @@ func TestBuildSearchQuery_MultiTerm(t *testing.T) {
 
 func TestBuildSearchQuery_MultiTermDoesNotRepeatPhrasePredicate(t *testing.T) {
 	query, _ := buildSearchQuery(linearTestContract, "task.list operation failed", []string{"task.list", "operation", "failed"}, 0, false, false)
-	fromStart := strings.Index(query, "FROM issue i")
-	if fromStart == -1 {
-		t.Fatalf("query does not contain the issue source: %s", query)
-	}
-	whereOffset := strings.Index(query[fromStart:], "WHERE ")
-	whereStart := fromStart + whereOffset
+	// Select the outer WHERE: multi-word queries prepend a CTE containing its
+	// own issue source and WHERE clause before the final SELECT.
+	whereStart := strings.LastIndex(query, "\n\tWHERE i.workspace_id = ")
 	orderStart := strings.LastIndex(query, "ORDER BY ")
-	if whereOffset == -1 || orderStart <= whereStart {
+	if whereStart == -1 || orderStart <= whereStart {
 		t.Fatalf("query does not contain a bounded WHERE clause: %s", query)
 	}
 	whereClause := query[whereStart:orderStart]
 	if strings.Contains(whereClause, "$2") {
 		t.Errorf("multi-word WHERE repeats the redundant full-phrase predicate: %s", whereClause)
 	}
+	// Term parameters live in the candidate CTE, so assert their presence in
+	// the complete query while keeping the redundant phrase check outer-scoped.
 	for _, termParam := range []string{"$5", "$6", "$7"} {
-		if !strings.Contains(whereClause, termParam) {
+		if !strings.Contains(query, termParam) {
 			t.Errorf("multi-word WHERE lost term predicate %s: %s", termParam, whereClause)
 		}
+	}
+}
+
+func TestBuildSearchQuery_MultiTermUsesMaterializedCandidateIntersection(t *testing.T) {
+	query, _ := buildSearchQuery(linearTestContract, "no active lease", []string{"no", "active", "lease"}, 0, false, false)
+
+	if !strings.Contains(query, "WITH matching_issue_ids AS MATERIALIZED") {
+		t.Fatalf("multi-word search must narrow candidate IDs before ranking: %s", query)
+	}
+	if got := strings.Count(query, "INTERSECT"); got != 2 {
+		t.Errorf("candidate selection has %d intersections, want 2 for three terms: %s", got, query)
+	}
+	if !strings.Contains(query, "i.id IN (SELECT id FROM matching_issue_ids)") {
+		t.Errorf("main query does not consume the narrowed candidate IDs: %s", query)
+	}
+	// The candidate comment lookup is workspace-scoped and set-based; it must
+	// not be the old c.issue_id = i.id correlated predicate.
+	if !strings.Contains(query, "SELECT c.issue_id FROM comment c") || !strings.Contains(query, "c.workspace_id = $4") {
+		t.Errorf("candidate comment lookup lost workspace-scoped indexable path: %s", query)
 	}
 }
 
