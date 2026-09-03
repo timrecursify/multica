@@ -1233,7 +1233,7 @@ async function relayAdvance(req, res, body) {
   try {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
       operator_rescope_issue_id, operator_terminal_exit, operator_release } = body;
-    
+
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
       res.writeHead(401, { "Content-Type": "application/json" });
