@@ -105,5 +105,20 @@ function validateQcVerdict(input) {
     ? validateExternalVerdict(input) : validateInternalVerdict(input || {});
 }
 
+function validateLiveVerdict({ task, evidence }) {
+  if (!task || task.status !== "running" || task.context?.to_stage !== "In Review") {
+    return { ok: false, reason: "assigned_running_sol_low_in_review_qc_task_required" };
+  }
+  const lane = taskLane(task);
+  if (!isQcLane(lane.model, lane.effort)) return { ok: false, reason: "completed_sol_low_qc_required" };
+  const invalid = validateEvidence(evidence);
+  if (invalid) return { ok: false, reason: invalid };
+  if (evidence.model !== lane.model || evidence.effort !== lane.effort) {
+    return { ok: false, reason: "qc_task_evidence_mismatch" };
+  }
+  return { ok: true, binding: { task_id: task.id, issue_id: task.issue_id,
+    workspace_id: task.workspace_id, model: lane.model, effort: lane.effort }, evidence };
+}
+
 module.exports = { FAILURE_CLASSES, readTaskEvidence, validateEvidence, taskLane, internalBinding,
-  validateInternalVerdict, validateExternalVerdict, validateQcVerdict };
+  validateInternalVerdict, validateExternalVerdict, validateQcVerdict, validateLiveVerdict };

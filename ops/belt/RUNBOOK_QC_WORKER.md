@@ -12,7 +12,10 @@ Emit the model and effort your agent actually runs (see your task context); the 
    `BOUND_SHA`; otherwise use the BLOCKED procedure.
 3. Run the smallest check that can prove or disprove each criterion.
 4. Compute the exact MD5 of the complete tracked-tree manifest at `BOUND_SHA`.
-5. Use the verdict procedure below. Do not write `qc_verdict` with SQL.
+5. Use the verdict procedure below while the assigned QC task is still
+   `running` on the `In Review` stage. The verdict command's SHA/MD5 payload
+   is the evidence used for the live write; `QC_EVIDENCE_JSON` in the final
+   task output is post-run audit evidence. Do not write `qc_verdict` with SQL.
 
 The managed workdir is not a repository. If no pull request, repository,
 checkout, bound SHA, or review evidence is available, use `FAIL` with a
