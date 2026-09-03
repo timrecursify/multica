@@ -8,9 +8,19 @@ const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "def
 const UNSTARTED = ["queued", "dispatched", "waiting_local_directory", "deferred"];
 const ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('v3-reconciler:' || $1::text))";
 
+// A rollup (an issue that still has a non-terminal child) is dispositioned by
+// its children, not by a builder of its own. A leaf dispatches whether or not it
+// has a parent: bundling children under a MEGA starved them permanently.
+const OPEN_CHILD_SQL = `NOT EXISTS (SELECT 1 FROM issue c
+   WHERE c.parent_issue_id = i.id AND c.status NOT IN ('Done', 'Archived', 'Cancelled'))`;
+
 function issueCandidatesSql() {
-  return `SELECT id, workspace_id, status, priority, metadata, qc_fail_count
-            FROM issue WHERE status = ANY($1::text[]) AND parent_issue_id IS NULL ORDER BY id`;
+  return `SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata, i.qc_fail_count
+            FROM issue i WHERE i.status = ANY($1::text[]) AND ${OPEN_CHILD_SQL} ORDER BY i.id`;
+}
+
+function isLeafSql() {
+  return `SELECT ${OPEN_CHILD_SQL} AS is_leaf FROM issue i WHERE i.id = $1::uuid`;
 }
 
 function liveTasksSql() {
@@ -229,9 +239,14 @@ async function reconcileIssue(client, issueId, options = {}) {
       [issueId]
     );
     const issue = locked.rows[0];
-    if (!issue || issue.parent_issue_id || !DISPATCHABLE.has(issue.status)) {
+    if (!issue || !DISPATCHABLE.has(issue.status)) {
       await client.query("COMMIT");
       return { action: "skipped" };
+    }
+    const leaf = (await client.query(isLeafSql(), [issue.id])).rows[0];
+    if (!leaf || leaf.is_leaf === false) {
+      await client.query("COMMIT");
+      return { action: "skipped", reason: "rollup_has_open_children" };
     }
     if (options.skipStages.has(issue.status)) {
       // Operator-disabled stage (e.g. Spec handled off-belt). No task, no state change.
@@ -405,4 +420,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, reconcileIssue, reconcileCycle };
