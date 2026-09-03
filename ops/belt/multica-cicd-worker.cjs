@@ -253,8 +253,11 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
     // marker: it has no jobs and says nothing about this SHA.
     // Cancelled runs (superseded by a newer push, or operator queue trims)
     // say nothing about the SHA either.
+    const rawCount = (runs.workflow_runs || []).length;
     runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/') && r.conclusion !== 'cancelled');
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
+    // Only cancelled or invalid runs: CI was attempted, treat as not yet checked.
+    if (rawCount && !(runs.workflow_runs || []).length) return 'no_checks';
     if (!(runs.workflow_runs || []).length) {
       const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
       return Number.isFinite(ageMinutes) && ageMinutes >= CI_ABSENT_MINUTES ? 'absent' : 'no_checks';
