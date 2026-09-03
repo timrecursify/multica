@@ -371,6 +371,10 @@ func (c *Client) ReportTaskMessages(ctx context.Context, taskID string, messages
 }
 
 func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, prURL, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID string) error {
+	return c.CompleteTaskWithPublication(ctx, taskID, output, branchName, prURL, sessionID, workDir, sessionRolloutMissing, retiredSessionID, nil)
+}
+
+func (c *Client) CompleteTaskWithPublication(ctx context.Context, taskID, output, branchName, prURL, sessionID, workDir string, sessionRolloutMissing bool, retiredSessionID string, publication *PublicationReceipt) error {
 	body := map[string]any{"output": output}
 	if branchName != "" {
 		body["branch_name"] = branchName
@@ -389,6 +393,10 @@ func (c *Client) CompleteTask(ctx context.Context, taskID, output, branchName, p
 	}
 	if retiredSessionID != "" {
 		body["retired_session_id"] = retiredSessionID
+	}
+	if publication != nil {
+		body["publication"] = publication
+		body["implementation_sha"] = publication.SHA
 	}
 	return c.postJSONWithRetry(ctx, fmt.Sprintf("/api/daemon/tasks/%s/complete", taskID), body, nil, defaultTerminalRetrySchedule)
 }
