@@ -132,6 +132,40 @@ func TestShouldCleanTaskDir_CancelledIssueOverTTL(t *testing.T) {
 	}
 }
 
+func TestShouldCleanTaskDir_IssueTaskRequiresItsOwnTerminalTTL(t *testing.T) {
+	t.Parallel()
+	const taskID = "22222222-2222-2222-2222-222222222223"
+
+	cases := []struct {
+		name        string
+		status      string
+		completedAt time.Time
+		want        gcAction
+	}{
+		{"terminal and expired", "completed", time.Now().Add(-10 * 24 * time.Hour), gcActionClean},
+		{"terminal but too recent", "completed", time.Now().Add(-time.Hour), gcActionSkip},
+		{"nonterminal", "running", time.Now().Add(-10 * 24 * time.Hour), gcActionSkip},
+		{"terminal without completion time", "failed", time.Time{}, gcActionSkip},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			mux := http.NewServeMux()
+			mux.HandleFunc("/api/daemon/tasks/"+taskID+"/gc-check", func(w http.ResponseWriter, r *http.Request) {
+				json.NewEncoder(w).Encode(map[string]any{"status": tc.status, "completed_at": tc.completedAt})
+			})
+			d := newGCTestDaemon(t, mux)
+			taskDir := createTaskDir(t, d.cfg.WorkspacesRoot, "ws1", "task", &execenv.GCMeta{
+				Kind: execenv.GCKindIssue, IssueID: "issue", TaskID: taskID, WorkspaceID: "ws1",
+			})
+			if got := d.shouldCleanTaskDir(context.Background(), taskDir); got != tc.want {
+				t.Fatalf("action: want %d, got %d", tc.want, got)
+			}
+		})
+	}
+}
+
 func TestShouldCleanTaskDir_OpenIssueSkipped(t *testing.T) {
 	t.Parallel()
 	issueID := "33333333-3333-3333-3333-333333333333"
@@ -293,7 +327,9 @@ func TestCleanTaskDir_RemovesDirectory(t *testing.T) {
 		t.Fatal("task dir should exist before cleanup")
 	}
 
-	d.cleanTaskDir(taskDir)
+	if !d.cleanTaskDir(taskDir) {
+		t.Fatal("cleanTaskDir reported failure")
+	}
 
 	if _, err := os.Stat(taskDir); !os.IsNotExist(err) {
 		t.Fatal("task dir should be removed after cleanup")
@@ -1703,7 +1739,7 @@ func TestGCMetaForTask(t *testing.T) {
 			name: "issue task",
 			task: Task{ID: "t3", WorkspaceID: "ws", IssueID: "i1"},
 			want: execenv.GCKindIssue,
-			idOK: func(m execenv.GCMeta) bool { return m.IssueID == "i1" },
+			idOK: func(m execenv.GCMeta) bool { return m.IssueID == "i1" && m.TaskID == "t3" },
 		},
 		{
 			name: "quick-create task — issue_id always empty at WriteGCMeta time",
