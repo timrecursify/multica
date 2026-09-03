@@ -37,11 +37,12 @@ function ownerSql() {
              AND policy.stage_name = pool.stage_name AND policy.enabled = true
             JOIN agent a ON a.id = pool.agent_id AND a.workspace_id = pool.workspace_id
             LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
-             AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
+             AND own_runtime.workspace_id = pool.workspace_id AND own_runtime.status = 'online'
             LEFT JOIN LATERAL (
               SELECT ar.id, ar.provider FROM agent_runtime ar
                WHERE ar.workspace_id = pool.workspace_id
-                 AND ar.provider = 'codex' AND ar.status = 'online'
+                 AND ar.status = 'online'
+                 AND ar.provider = CASE WHEN a.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END
                ORDER BY ar.updated_at DESC LIMIT 1
             ) online_runtime ON true
            WHERE pool.workspace_id = $1::uuid AND pool.stage_name = $2
