@@ -26,6 +26,9 @@ Paths below are relative to that root and must stay inside it at deploy time.
 | `ops/belt/qc-lane.cjs` | `/home/newadmin/gsp-multica/qc-lane.cjs` | `multica-relay-advance` dependency | Copied atomically with the relay daemon by `ops/belt/deploy.sh` |
 | `ops/belt/reconciler.cjs` | `/home/newadmin/gsp-multica/reconciler.cjs` | `multica-relay-advance` dependency | Copied atomically with the relay daemon by `ops/belt/deploy.sh` |
 | `ops/belt/stage-outcome.cjs` | `/home/newadmin/gsp-multica/stage-outcome.cjs` | `multica-relay-advance` dependency | Copied atomically with the relay daemon by `ops/belt/deploy.sh` |
+| `ops/belt/transition-policy.cjs` | `/home/newadmin/gsp-multica/transition-policy.cjs` | relay dependencies | Copied atomically with the relay daemon by `ops/belt/deploy.sh` |
+| `ops/belt/qc-verdict-policy.cjs` | `/home/newadmin/gsp-multica/qc-verdict-policy.cjs` | relay dependencies | Copied atomically with the relay daemon by `ops/belt/deploy.sh` |
+| `ops/belt/stage-routing.json` | `/home/newadmin/gsp-multica/stage-routing.json` | relay dependencies | Copied atomically with the relay daemon by `ops/belt/deploy.sh` |
 | `ops/gsp-belt/relay/multica-relay-advance-launcher.cjs` | `<release>/ops/gsp-belt/relay/multica-relay-advance-launcher.cjs` | `multica-relay-advance` | Renders env from operator `.env` |
 | `ops/gsp-belt/relay/multica-relay-advance-wrapper.sh` | `<release>/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh` | `multica-relay-advance` | PM2 entry |
 | Not run by PM2 — migration/parity SQL kept for provenance | `<release>/ops/gsp-belt/sql/*.sql` | (`noc2`/`prod` parity; seed) | Read-only, applied separately |
