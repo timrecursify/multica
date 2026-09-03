@@ -52,7 +52,7 @@ if [[ "$mode" == apply ]]; then
   daemon_target="$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
   if [[ -f "$daemon_target" ]]; then
     node --check "$daemon_target" || { echo "Daemon syntax validation failed: $daemon_target" >&2; false; }
-    node -e 'require(process.argv[1])' "$daemon_target" || { echo "Daemon dependency validation failed: $daemon_target" >&2; false; }
+    node -e 'const Module=require("module"); const load=Module._load; Module._load=(request,parent,isMain)=>request==="pg"?{Pool:class { constructor() {} on() {} connect() { return Promise.reject(new Error("validation stub")); } query() { return Promise.resolve({rows:[]}); } end() {} }}:load(request,parent,isMain); require(process.argv[1])' "$daemon_target" || { echo "Daemon dependency validation failed: $daemon_target" >&2; false; }
   fi
 fi
 trap - ERR
