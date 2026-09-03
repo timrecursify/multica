@@ -70,16 +70,21 @@ function settingsFor(options = {}) {
     issueCooldownMinutes: positive(options.issueCooldownMinutes ?? process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
     completedStageCooldownMinutes: positive(options.completedStageCooldownMinutes ?? process.env.RECONCILE_COMPLETED_STAGE_COOLDOWN_MINUTES, 720),
     typedOutcomes: options.typedOutcomes ?? process.env.RECONCILE_TYPED_OUTCOMES === "1",
+    humanReviewRouting: options.humanReviewRouting ?? process.env.RECONCILE_HUMAN_REVIEW_ROUTING !== "0",
+    maxHumanReviewPerCycle: positive(options.maxHumanReviewPerCycle ?? process.env.RECONCILE_MAX_HUMAN_REVIEW_PER_CYCLE, 5),
     skipStages: new Set(String(options.skipStages ?? process.env.RECONCILE_SKIP_STAGES ?? "").split(",").map((v) => v.trim()).filter(Boolean)),
-    budget: options.budget || { created: 0, byAgent: new Map() }
+    budget: options.budget || { created: 0, humanReview: 0, byAgent: new Map() }
   };
 }
 
+// Routes a stuck issue off its stage and onto a human's board. transition-policy
+// lists every `* -> Human Review` row with actors ['operator'], so this asks as
+// the operator the belt is acting for; 'system' was refused as actor_denied.
 async function moveToHumanReview(client, issue, reason, options) {
   const verdict = policyFor(options)({
-    from: issue.status, to: "Human Review", actor: "system", evidence: { blocker: reason }
+    from: issue.status, to: "Human Review", actor: "operator", evidence: { blocker: reason }
   });
-  if (!verdict?.ok) throw new Error(`reconcile policy rejected Human Review: ${reason}`);
+  if (!verdict?.ok) throw new Error(`reconcile policy rejected Human Review: ${reason} (${verdict?.code})`);
   await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
   await client.query("UPDATE issue SET status = 'Human Review', updated_at = NOW() WHERE id = $1::uuid", [issue.id]);
   await client.query(
@@ -88,6 +93,46 @@ async function moveToHumanReview(client, issue, reason, options) {
     [issue.id, issue.status, reason]
   );
   return { action: "human_review", reason };
+}
+
+// Spec is operator-owned here (RECONCILE_SKIP_STAGES) and RULES bars Spec -> Human
+// Review, so routing only ever fires from a belt execution stage.
+const HUMAN_REVIEW_FROM = new Set(["Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
+const LINK_TABLE = { ci: "issue_pull_request", sha: "issue_pull_request", dependency: "issue_dependency" };
+
+// A recorded BLOCKED outcome is terminal when no machine-observable input remains
+// that could ever change the stage input hash and re-open the stage:
+//   human      - definitionally a person's call, never a hash event.
+//   ci / sha   - need a linked PR to supply a head sha or a checks rollup.
+//   dependency - needs a linked issue_dependency row to supply a state.
+// quota is excluded: it clears on its own once the provider window resets.
+async function terminalBlocker(client, issue, prior) {
+  if (!prior || prior.outcome !== "BLOCKED") return null;
+  const why = prior.blocked_on;
+  if (why === "human") return "blocked_human";
+  const table = LINK_TABLE[why];
+  if (!table) return null;
+  const linked = table === "issue_dependency"
+    ? await client.query("SELECT 1 FROM issue_dependency WHERE issue_id = $1::uuid LIMIT 1", [issue.id])
+    : await client.query("SELECT 1 FROM issue_pull_request WHERE issue_id = $1::uuid LIMIT 1", [issue.id]);
+  return linked.rows.length ? null : `blocked_${why}_unobservable`;
+}
+
+// Returns a human_review result, or null to leave the issue skipped as before.
+async function routeTerminalBlocker(client, issue, prior, options) {
+  if (!options.humanReviewRouting || !HUMAN_REVIEW_FROM.has(issue.status)) return null;
+  if (options.budget.humanReview >= options.maxHumanReviewPerCycle) return null;
+  const reason = await terminalBlocker(client, issue, prior);
+  if (!reason) return null;
+  try {
+    const result = await moveToHumanReview(client, issue, reason, options);
+    options.budget.humanReview += 1;
+    console.log(`[reconcile] ${issue.id} ${issue.status} -> Human Review (${reason})`);
+    return result;
+  } catch (error) {
+    console.error(`[reconcile] Human Review route failed issue=${issue.id} ${error.message}`);
+    return null;
+  }
 }
 
 async function reconcileIssue(client, issueId, options = {}) {
@@ -151,8 +196,11 @@ async function reconcileIssue(client, issueId, options = {}) {
       // GSP-1826: a recorded outcome for this stage with unchanged inputs is final until the inputs change.
       const eligibility = await stageEligibility(client, issue.id, issue.status);
       if (!eligibility.eligible) {
+        // Nothing left to observe means nothing will ever re-open this stage, so the
+        // issue leaves the belt for a human instead of resting invisibly in Queue.
+        const routed = await routeTerminalBlocker(client, issue, eligibility.prior, options);
         await client.query("COMMIT");
-        return { action: "skipped", reason: eligibility.reason };
+        return routed || { action: "skipped", reason: eligibility.reason };
       }
     }
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
@@ -238,7 +286,7 @@ async function reconcileIssue(client, issueId, options = {}) {
 }
 
 async function reconcileCycle(client, options = {}) {
-  const settings = settingsFor({ ...options, budget: { created: 0, byAgent: new Map() } });
+  const settings = settingsFor({ ...options, budget: { created: 0, humanReview: 0, byAgent: new Map() } });
   const rows = (await client.query(issueCandidatesSql(), [[...DISPATCHABLE]])).rows;
   const counts = { created: 0, skipped: 0, humanReview: 0, alreadyLive: 0, error: 0 };
   const results = [];
@@ -268,4 +316,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, reconcileIssue, reconcileCycle };
