@@ -340,6 +340,47 @@ func (q *Queries) CreateIssueWithOrigin(ctx context.Context, arg CreateIssueWith
 	return i, err
 }
 
+const createRelayRunLog = `-- name: CreateRelayRunLog :one
+INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
+VALUES ($1, $2, $3, $4, $5, $6)
+RETURNING id, issue_id, from_stage, to_stage, agent_id, task_id, status, created_at
+`
+
+type CreateRelayRunLogParams struct {
+	IssueID   pgtype.UUID `json:"issue_id"`
+	FromStage string      `json:"from_stage"`
+	ToStage   pgtype.Text `json:"to_stage"`
+	AgentID   pgtype.UUID `json:"agent_id"`
+	TaskID    pgtype.UUID `json:"task_id"`
+	Status    string      `json:"status"`
+}
+
+// Records a stage transition attempt + its successor task for audit. Written
+// inside the relay advancement transaction only when a successor task was
+// created, so a dedup (task already pending) does not write a second row.
+func (q *Queries) CreateRelayRunLog(ctx context.Context, arg CreateRelayRunLogParams) (RelayRunLog, error) {
+	row := q.db.QueryRow(ctx, createRelayRunLog,
+		arg.IssueID,
+		arg.FromStage,
+		arg.ToStage,
+		arg.AgentID,
+		arg.TaskID,
+		arg.Status,
+	)
+	var i RelayRunLog
+	err := row.Scan(
+		&i.ID,
+		&i.IssueID,
+		&i.FromStage,
+		&i.ToStage,
+		&i.AgentID,
+		&i.TaskID,
+		&i.Status,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const deleteIssue = `-- name: DeleteIssue :exec
 WITH target AS (
     SELECT issue.id FROM issue WHERE issue.id = $1 AND issue.workspace_id = $2
@@ -1303,6 +1344,52 @@ type LockIssueForDescriptionUpdateParams struct {
 // while holding this lock, then performs UpdateIssue in the same transaction.
 func (q *Queries) LockIssueForDescriptionUpdate(ctx context.Context, arg LockIssueForDescriptionUpdateParams) (Issue, error) {
 	row := q.db.QueryRow(ctx, lockIssueForDescriptionUpdate, arg.ID, arg.WorkspaceID)
+	var i Issue
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Title,
+		&i.Description,
+		&i.Status,
+		&i.Priority,
+		&i.AssigneeType,
+		&i.AssigneeID,
+		&i.CreatorType,
+		&i.CreatorID,
+		&i.ParentIssueID,
+		&i.AcceptanceCriteria,
+		&i.ContextRefs,
+		&i.Position,
+		&i.DueDate,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Number,
+		&i.ProjectID,
+		&i.OriginType,
+		&i.OriginID,
+		&i.FirstExecutedAt,
+		&i.StartDate,
+		&i.Metadata,
+		&i.Stage,
+		&i.Properties,
+		&i.QcFailCount,
+	)
+	return i, err
+}
+
+const lockIssueForRelayAdvance = `-- name: LockIssueForRelayAdvance :one
+
+SELECT id, workspace_id, title, description, status, priority, assignee_type, assignee_id, creator_type, creator_id, parent_issue_id, acceptance_criteria, context_refs, position, due_date, created_at, updated_at, number, project_id, origin_type, origin_id, first_executed_at, start_date, metadata, stage, properties, qc_fail_count FROM issue
+WHERE id = $1
+FOR UPDATE
+`
+
+// Exclusive row lock on the issue for the relay issue-stage advancement service.
+// The relay must update the issue status and insert the successor agent_task_queue in
+// one atomic transaction; the FOR UPDATE serializes concurrent relay requests so
+// repeated/concurrent delivery resolves idempotently and cannot double-enqueue.
+func (q *Queries) LockIssueForRelayAdvance(ctx context.Context, id pgtype.UUID) (Issue, error) {
+	row := q.db.QueryRow(ctx, lockIssueForRelayAdvance, id)
 	var i Issue
 	err := row.Scan(
 		&i.ID,

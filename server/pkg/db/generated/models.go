@@ -927,6 +927,17 @@ type QuickAction struct {
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RelayRunLog struct {
+	ID        int64              `json:"id"`
+	IssueID   pgtype.UUID        `json:"issue_id"`
+	FromStage string             `json:"from_stage"`
+	ToStage   pgtype.Text        `json:"to_stage"`
+	AgentID   pgtype.UUID        `json:"agent_id"`
+	TaskID    pgtype.UUID        `json:"task_id"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
 type RelayStageAgentPool struct {
 	WorkspaceID    pgtype.UUID        `json:"workspace_id"`
 	StageName      string             `json:"stage_name"`
