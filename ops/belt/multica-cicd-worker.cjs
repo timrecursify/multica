@@ -333,20 +333,33 @@ async function sweep() {
         states.push({ pr: cand,
           info: JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit'])) });
       }
+      // A closed, unmerged pull request is a dead end only when nothing
+      // replaced it. gsp#1577 cited sk-cli#986 (closed) and its replacement
+      // #1123 (open, mergeable): returning on #986 sent the builder to rebase
+      // #1123 four times in 30 minutes (2026-09-03 06:05Z). A superseded PR is
+      // ignored; the ticket returns only when every cited PR is closed.
       const closed = states.filter(s2 => s2.info.state === 'CLOSED');
-      if (closed.length) {
+      const alive = states.filter(s2 => s2.info.state !== 'CLOSED');
+      if (closed.length && !alive.length) {
         await returnIssueToBuild(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '));
         continue;
       }
-      const openStates = states.filter(s2 => s2.info.state !== 'MERGED');
+      if (closed.length) {
+        log(`SUPERSEDED #${issue.number} ignoring ${closed.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', ')} (closed; ${alive.length} live PR(s) remain)`);
+      }
+      const openStates = alive.filter(s2 => s2.info.state !== 'MERGED');
       if (!openStates.length) {
-        const mergedSha = states[0].info.mergeCommit?.oid;
-        if (states.length !== 1 || !/^[0-9a-f]{40}$/.test(mergedSha || '')) {
+        // Several merged PRs finish a ticket when the newest of them is
+        // deployed (gsp#1058: four merged sk-cli PRs, returned every poll).
+        const merged = alive.filter(s2 => /^[0-9a-f]{40}$/.test(s2.info.mergeCommit?.oid || ''))
+          .sort((a, b) => String(b.info.mergedAt || '').localeCompare(String(a.info.mergedAt || '')));
+        if (!merged.length) {
           await returnIssueToBuild(issue, 'exactly one merged PR with a full merge SHA is required');
           continue;
         }
-        await routeFinishedPR(issue, 'merged PR', mergedSha, {
-          repo: states[0].pr.repo, headSha: states[0].info.headRefOid, createdAt: states[0].info.createdAt
+        const last = merged[0];
+        await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
+          repo: last.pr.repo, headSha: last.info.headRefOid, createdAt: last.info.createdAt
         });
         continue;
       }
