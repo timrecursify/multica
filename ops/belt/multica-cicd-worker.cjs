@@ -232,6 +232,9 @@ function hasBarePRReference(work) {
 function ciState(repo, sha, createdAt, now = Date.now()) {
   try {
     const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=30`]));
+    // A run whose name is its file path is GitHub's 'invalid workflow file'
+    // marker: it has no jobs and says nothing about this SHA.
+    runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/'));
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
     if (!(runs.workflow_runs || []).length) {
       const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
