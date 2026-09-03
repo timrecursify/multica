@@ -25,6 +25,21 @@ function initializeRuntime() {
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
 const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
+// Retroactive CI (Tim 2026-09-02 16:16Z: admin merge + admin deploy with
+// retroactive CI/CD for speed; risk paths still wait). Repos listed here merge
+// a mergeable PR while its CI is still pending unless the diff touches a risk
+// path; main CI validates after the merge.
+const RETRO_REPOS = new Set((process.env.CICD_RETROACTIVE_REPOS || '').split(',').map(s => s.trim()).filter(Boolean));
+const RISK_PATH = /(^|\/)(migrations?|drizzle)\/|\.env|secret|credential|auth|billing\/.*flag|feature-flag|\.github\/workflows\//i;
+function retroactiveEligible(repo, num) {
+  if (!RETRO_REPOS.has(repo)) return { ok: false, why: 'repo not retroactive' };
+  try {
+    const files = JSON.parse(gh(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]));
+    const risky = files.map(f => f.filename).filter(f => RISK_PATH.test(f));
+    if (risky.length) return { ok: false, why: `risk path ${risky[0]}` };
+    return { ok: true, why: `${files.length} files, no risk path` };
+  } catch (e) { return { ok: false, why: `files lookup failed: ${String(e.message).split('\n')[0].slice(0, 80)}` }; }
+}
 // Merging is the one irreversible action here, so it is opt-in and defaults on
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
@@ -328,9 +343,13 @@ async function sweep() {
       const failures = countCiFailure(issue, pr, info.headRefOid, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
-        const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
-        log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}`);
-        continue;
+        const retro = (ci === 'pending' || ci === 'no_checks') && info.mergeable === 'MERGEABLE' ? retroactiveEligible(pr.repo, pr.num) : null;
+        if (!retro || !retro.ok) {
+          const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
+          log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}${retro ? ` retro=${retro.why}` : ''}`);
+          continue;
+        }
+        log(`RETRO #${issue.number} ${pr.repo}#${pr.num} ci=${ci} merging ahead of CI (${retro.why})`);
       }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
       // Operator-owned merge, delegated to the belt (Tim 2026-09-03 01:48Z:
