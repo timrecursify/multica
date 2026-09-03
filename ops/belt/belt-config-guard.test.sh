@@ -26,7 +26,7 @@ source "$root_dir/belt-config-guard.sh"
 IFS='|' read -r expected_cap expected_root < <(daemon_launch_config)
 assert_eq '2|/tmp/gsp-workspaces' "$(MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces daemon_launch_config)" 'configured daemon launch config'
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces assert_valid
-assert_eq '32|/home/newadmin/multica-workspaces-gsp' "$(env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT bash -c 'source "$1"; daemon_launch_config' _ "$root_dir/belt-config-guard.sh")" 'undeclared daemon launch config'
+assert_eq '10|/home/newadmin/multica-workspaces-gsp' "$(env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT bash -c 'source "$1"; daemon_launch_config' _ "$root_dir/belt-config-guard.sh")" 'undeclared daemon launch config'
 export MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2
 expected_cap=2
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=bad MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces assert_invalid

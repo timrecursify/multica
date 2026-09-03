@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 set -euo pipefail
 
 # Paid lane remains explicitly opt-in.
@@ -13,16 +14,19 @@ export CODEX_BIN="$requested_codex_bin"
 # The belt executes repository build commands through this process. Keep the
 # system Go toolchain ahead of inherited user paths for every task.
 export PATH="/usr/local/go/bin:${PATH}"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
 
+cpu_count="$(belt_cpu_count)" || exit 64
 cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}"
 root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
 help_timeout="${MULTICA_DAEMON_HELP_TIMEOUT_SECONDS:-5}"
-if [[ -z "$cap_raw" ]]; then
-  echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be set (no default is assumed)" >&2
+if [[ -n "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS+x}" && ! "$cap_raw" =~ ^[1-9][0-9]*$ ]]; then
+  echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer" >&2
   exit 64
 fi
-if [[ ! "$cap_raw" =~ ^[1-9][0-9]*$ ]]; then
-  echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer" >&2
+if [[ -z "$cap_raw" ]]; then cap_raw="$(belt_resolve_concurrency)" || exit 64; fi
+if (( cap_raw > cpu_count )); then
+  echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must not exceed CPU count ($cpu_count)" >&2
   exit 64
 fi
 if [[ -z "$root" || "$root" != /* ]]; then

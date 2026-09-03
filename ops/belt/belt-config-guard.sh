@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 # Belt config guard.
 # shellcheck disable=SC2016 # Literal shell fragments are checked below.
 # shellcheck disable=SC2009 # The full command line is required for flag validation.
@@ -16,7 +17,9 @@ readonly SK=/home/newadmin/bin/sk
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
-readonly WANT_CONCURRENCY=32
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
+WANT_CONCURRENCY="$(belt_resolve_concurrency)"
+readonly WANT_CONCURRENCY
 readonly WANT_WORKSPACES_ROOT=/home/newadmin/multica-workspaces-gsp
 readonly BUILD_AGENT=gsp-build-deepseek-flash-1
 # 2026-08-31 14:20 UTC: global 12 -> 20, build capacity 3 -> 15, QC 4 each.
@@ -134,7 +137,7 @@ daemon_launch_config() {
 validate_daemon_launch_config() {
   local cap root
   IFS='|' read -r cap root < <(daemon_launch_config)
-  [[ "$cap" =~ ^[1-9][0-9]*$ ]] && [[ -n "$root" && "$root" == /* ]]
+  [[ "$cap" =~ ^[1-9][0-9]*$ ]] && (( cap <= $(belt_cpu_count) )) && [[ -n "$root" && "$root" == /* ]]
 }
 
 wrapper_has_explicit_concurrency_flag() {
