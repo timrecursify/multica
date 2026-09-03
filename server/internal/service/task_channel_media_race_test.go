@@ -246,7 +246,7 @@ func TestDeferredChannelIssueTaskPromotesAfterMediaSettlement(t *testing.T) {
 	var issueID pgtype.UUID
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_type, creator_id, number)
-		VALUES ($1, 'Channel media', 'todo', 'none', 'agent', $2, 'member', $3, 880001)
+		VALUES ($1, 'Channel media', 'Queue', 'none', 'agent', $2, 'member', $3, 880001)
 		RETURNING id`, workspaceID, agentID, userID).Scan(&issueID); err != nil {
 		t.Fatalf("seed issue: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestDeferredChannelIssueTaskConflictsWithQueuedSiblingAtDatabase(t *testing
 	var issueID pgtype.UUID
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, assignee_type, assignee_id, creator_type, creator_id, number)
-		VALUES ($1, 'Channel media uniqueness', 'todo', 'none', 'agent', $2, 'member', $3, 880002)
+		VALUES ($1, 'Channel media uniqueness', 'Queue', 'none', 'agent', $2, 'member', $3, 880002)
 		RETURNING id`, workspaceID, agentID, userID).Scan(&issueID); err != nil {
 		t.Fatalf("seed issue: %v", err)
 	}

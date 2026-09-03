@@ -1,7 +1,20 @@
 import type { Label } from "./label";
 import type { IssuePropertyValues } from "./property";
 
+// The capitalised values are the canonical issue_status_check and relay
+// vocabulary. Lowercase spellings are retained only for compatibility while a
+// client may still receive a response from an older server.
 export type IssueStatus =
+  | "Registered"
+  | "Spec"
+  | "Queue"
+  | "In Progress"
+  | "In Review"
+  | "Human Review"
+  | "CI/CD & Deploy"
+  | "Done"
+  | "Archived"
+  | "Cancelled"
   | "backlog"
   | "todo"
   | "in_progress"

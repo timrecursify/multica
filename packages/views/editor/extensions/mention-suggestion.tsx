@@ -16,6 +16,7 @@ import { flattenIssueBuckets, issueKeys } from "@multica/core/issues/queries";
 import { workspaceKeys } from "@multica/core/workspace/queries";
 import { useAuthStore } from "@multica/core/auth";
 import { canAssignAgentToIssue } from "@multica/core/permissions";
+import { isCancelledIssueStatus } from "@multica/core/issues/config/status";
 import { isAgentRuntimeBound } from "@multica/core/agents";
 import { api } from "@multica/core/api";
 import {
@@ -194,7 +195,7 @@ function mergeMentionItems(
  */
 function isDemotedCancelled(item: MentionItem, query: string): boolean {
   if (isPinnedAboveTruncation(item, query)) return false;
-  if (item.type === "issue") return item.status === "cancelled";
+  if (item.type === "issue") return isCancelledIssueStatus(item.status);
   if (item.type === "project") return item.projectStatus === "cancelled";
   return false;
 }

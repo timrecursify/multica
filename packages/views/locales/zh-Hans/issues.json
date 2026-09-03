@@ -13,7 +13,17 @@
     "in_review": "审核中",
     "done": "已完成",
     "blocked": "已阻塞",
-    "cancelled": "已取消"
+    "cancelled": "已取消",
+    "Registered": "已登记",
+    "Spec": "规格",
+    "Queue": "队列",
+    "In Progress": "进行中",
+    "In Review": "评审中",
+    "Human Review": "人工评审",
+    "CI/CD & Deploy": "CI/CD 与部署",
+    "Done": "已完成",
+    "Archived": "已归档",
+    "Cancelled": "已取消"
   },
   "priority": {
     "urgent": "紧急",

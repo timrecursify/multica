@@ -719,8 +719,15 @@ func TestSweepDoesNotResetIssueAlreadyInReview(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to query issue status: %v", err)
 	}
-	if issueStatus != "in_review" {
-		t.Fatalf("expected issue status 'in_review' to be preserved, got '%s'", issueStatus)
+	if issueStatus != "In Review" {
+		t.Fatalf("expected issue status 'In Review' to be preserved, got '%s'", issueStatus)
+	}
+}
+
+func TestQueuedTaskTTLFromEnv(t *testing.T) {
+	t.Setenv(queuedTaskTTLEnv, "90m")
+	if got := queuedTaskTTLFromEnv(); got != 90*time.Minute {
+		t.Fatalf("queued task TTL = %s, want 90m", got)
 	}
 }
 
@@ -734,6 +741,11 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	t.Setenv(queuedTaskTTLEnv, "2h")
+	queuedTaskTTL := queuedTaskTTLFromEnv()
+	if queuedTaskTTL != 2*time.Hour {
+		t.Fatalf("queued task TTL = %s, want 2h", queuedTaskTTL)
+	}
 
 	// Find the integration test agent
 	var agentID, runtimeID string
@@ -747,14 +759,17 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 		t.Fatalf("failed to find test agent: %v", err)
 	}
 
-	// One ancient queued task (should expire) and one fresh queued task (should not).
+	// One task older than the configured TTL (should expire) and one younger
+	// than it (should not).
 	// Constraint: idx_one_pending_task_per_issue_agent → use distinct issues.
 	mkIssue := func(label string) string {
 		var issueID string
 		if err := testPool.QueryRow(ctx, `
-			WITH bumped AS (
-				UPDATE workspace SET issue_counter = issue_counter + 1
-				WHERE id = $1 RETURNING issue_counter
+		WITH bumped AS (
+			UPDATE workspace
+			SET issue_counter = GREATEST(issue_counter,
+				(SELECT COALESCE(MAX(number), 0) FROM issue WHERE workspace_id = $1)) + 1
+			WHERE id = $1 RETURNING issue_counter
 			)
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, assignee_type, assignee_id, number)
 			SELECT $1, $3, 'Spec', 'none', 'member', m.user_id, 'agent', $2, (SELECT issue_counter FROM bumped)
@@ -782,26 +797,15 @@ func TestExpireStaleQueuedTasks(t *testing.T) {
 	}
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority, created_at)
-		VALUES ($1, $2, $3, 'queued', 0, now())
+		VALUES ($1, $2, $3, 'queued', 0, now() - interval '90 minutes')
 		RETURNING id
 	`, agentID, runtimeID, freshIssueID).Scan(&freshTaskID); err != nil {
 		t.Fatalf("failed to insert fresh queued task: %v", err)
 	}
 
 	queries := db.New(testPool)
-	failed, err := queries.ExpireStaleQueuedTasks(ctx, db.ExpireStaleQueuedTasksParams{
-		TtlSecs:    3600.0, // 1h TTL — old task is 5h, fresh task is 0s
-		MaxPerTick: 100,
-	})
-	if err != nil {
-		t.Fatalf("ExpireStaleQueuedTasks failed: %v", err)
-	}
-	if len(failed) != 1 {
-		t.Fatalf("expected exactly 1 expired task, got %d", len(failed))
-	}
-	if failed[0].ID.Bytes != parseUUIDBytes(oldTaskID) {
-		t.Fatalf("expired the wrong task: got %x", failed[0].ID.Bytes)
-	}
+	taskService := service.NewTaskService(queries, testPool, nil, events.New())
+	sweepExpiredQueuedTasks(ctx, queries, taskService, queuedTaskTTL)
 
 	// DB assertions: old → failed/queued_expired, fresh → still queued.
 	var oldStatus, oldReason, oldErr string
@@ -864,9 +868,11 @@ func TestExpireStaleQueuedTasksRespectsBatchLimit(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		var issueID string
 		if err := testPool.QueryRow(ctx, `
-			WITH bumped AS (
-				UPDATE workspace SET issue_counter = issue_counter + 1
-				WHERE id = $1 RETURNING issue_counter
+		WITH bumped AS (
+			UPDATE workspace
+			SET issue_counter = GREATEST(issue_counter,
+				(SELECT COALESCE(MAX(number), 0) FROM issue WHERE workspace_id = $1)) + 1
+			WHERE id = $1 RETURNING issue_counter
 			)
 			INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, assignee_type, assignee_id, number)
 			SELECT $1, 'Queued TTL batch test', 'Spec', 'none', 'member', m.user_id, 'agent', $2, (SELECT issue_counter FROM bumped)

@@ -1,0 +1,22 @@
+[Unit]
+Description=PPP Multica native Codex daemon (one instance per workspace root)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/multica/ppp-daemon.env
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=MULTICA_DAEMON_ALLOWED_PROVIDERS=codex
+WorkingDirectory=%h
+ExecStart=%h/bin/multica-daemon-ppp.sh
+Restart=always
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

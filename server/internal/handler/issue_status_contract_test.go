@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -36,9 +37,11 @@ func TestIssueStatusContractProfilesShareCanonicalStorage(t *testing.T) {
 	ppp := mustTestStatusContract(IssueStatusProfilePPP)
 
 	for _, tc := range []struct{ input, want string }{
-		{"todo", "Spec"}, {"backlog", "Spec"}, {"Spec", "Spec"},
-		{"Queue", "Queue"}, {"In Progress", "in_progress"}, {"Building", "in_progress"},
-		{"In Review", "in_review"}, {"QC", "in_review"}, {"Human Review", "Human Review"},
+		{"todo", "Spec"}, {"backlog", "Spec"}, {"Registered", "Registered"}, {"Spec", "Spec"},
+		{"Queue", "Queue"}, {"In Progress", "In Progress"}, {"in_progress", "In Progress"}, {"Building", "In Progress"},
+		{"In Review", "In Review"}, {"in_review", "In Review"}, {"QC", "In Review"}, {"Human Review", "Human Review"},
+		{"CI/CD & Deploy", "CI/CD & Deploy"},
+		{"Parked", "Parked"}, {"Rejected", "Rejected"},
 		{"blocked", "Human Review"}, {"Done", "Done"}, {"done", "Done"},
 		{"Cancelled", "Cancelled"}, {"cancelled", "Cancelled"}, {"Archived", "Archived"},
 	} {
@@ -54,6 +57,18 @@ func TestIssueStatusContractProfilesShareCanonicalStorage(t *testing.T) {
 	}
 	if got := ppp.DisplayStatus("Spec"); got != "Spec" {
 		t.Errorf("ppp display Spec = %q, want Spec", got)
+	}
+}
+
+func TestIssueStatusContractCanonicalStatusesMatchRelayVocabulary(t *testing.T) {
+	want := []string{
+		"Registered", "Spec", "Queue", "In Progress", "In Review",
+		"Human Review", "Parked", "Rejected", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
+	}
+	for _, profile := range []IssueStatusProfile{IssueStatusProfileLinear, IssueStatusProfilePPP} {
+		if got := mustTestStatusContract(profile).CanonicalStatuses(); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s canonical statuses = %#v, want %#v", profile, got, want)
+		}
 	}
 }
 
@@ -95,7 +110,7 @@ func TestIssueStatusContractDefaultAndTerminal(t *testing.T) {
 		if !contract.IsTerminal("Done") || !contract.IsTerminal("Cancelled") || !contract.IsTerminal("Archived") {
 			t.Errorf("%s terminals not recognized", contract.Profile())
 		}
-		if contract.IsTerminal("Spec") || contract.IsTerminal("in_progress") {
+		if contract.IsTerminal("Spec") || contract.IsTerminal("In Progress") {
 			t.Errorf("%s non-terminal statuses reported terminal", contract.Profile())
 		}
 	}
@@ -105,10 +120,10 @@ func TestIssueStatusContractOrderCASE(t *testing.T) {
 	for _, profile := range []IssueStatusProfile{IssueStatusProfileLinear, IssueStatusProfilePPP} {
 		contract := mustTestStatusContract(profile)
 		expr := contract.orderCASE("i.status")
-		if !strings.Contains(expr, "WHEN 'Spec' THEN 0") {
+		if !strings.Contains(expr, "WHEN 'Registered' THEN 0") {
 			t.Errorf("%s orderCASE missing canonical first status: %s", profile, expr)
 		}
-		if !strings.Contains(expr, "WHEN 'Archived' THEN 7") {
+		if !strings.Contains(expr, "WHEN 'Cancelled' THEN 11") {
 			t.Errorf("%s orderCASE missing canonical last status: %s", profile, expr)
 		}
 	}

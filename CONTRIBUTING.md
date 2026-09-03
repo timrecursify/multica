@@ -313,6 +313,41 @@ Notes:
 - E2E tests create their own workspace and issue fixtures
 - the check flow starts backend/frontend only if they are not already running
 
+
+## Repo Test Profiles
+
+Hermetic, committed `sk repo test` profiles live in `.sk/repo.toml` and run
+against a clean archived checkout without the caller's shell, environment, or
+network. Use them for bounded operations checks instead of ad hoc local
+commands:
+
+1. `sk repo test --path <checkout> --profile bash-syntax --json` — runs
+   `bash -n` over every committed `.sh` artifact and names any file that fails
+   to parse.
+2. `sk repo test --path <checkout> --profile diff-whitespace --json` — rejects
+   trailing whitespace in tracked source and documentation text and names the
+   offending `file:line`.
+3. `sk repo test --path <checkout> --profile docs-lint --json` — applies the
+   committed offline ruleset in `.sk/scripts/docs-rules.toml` to the
+   maintained Markdown/MDX documentation and names the offending `file:line`.
+4. `sk repo test --path <checkout> --profile backend --json` — runs the Linux
+   CI backend sequence: Helm verification, `go build ./...`, migrations,
+   `scripts/test-go.test.sh`, then `scripts/test-go.sh --race`. It requires
+   reachable PostgreSQL and Redis services on loopback. The profile supplies
+   CI's fixed local service URLs and excludes caller environment; its runner
+   rejects a non-loopback service URL if invoked directly.
+5. `sk repo test --path <checkout> --profile parked-diagnosis-node-tests --json`
+   — runs the committed parked-diagnosis CJS suites
+   `ops/belt/backfill-parked-diagnosis.test.cjs` and
+   `ops/belt/parked-diagnosis.test.cjs` with Node's built-in test runner.
+
+Discovery is bound to the committed listings under `.sk/` (`.sk/tracked-sh.txt`,
+`.sk/tracked-docs.txt`), so checks never depend on `git`, caller credentials,
+or mutable files in your working tree. Add a shell file to the listing only if
+it should be covered by `bash-syntax`; enable or disable a documentation rule
+in `.sk/scripts/docs-rules.toml` with `true`/`false`.
+
+
 ## Local Codex Daemon
 
 Run the local daemon:

@@ -26,22 +26,22 @@ func TestStageBarrierClosed_Unstaged(t *testing.T) {
 	}{
 		{
 			name:     "last child still leaves a sibling open",
-			children: []db.Issue{child(0, "done"), child(0, "in_progress")},
+			children: []db.Issue{child(0, "Done"), child(0, "In Progress")},
 			want:     false,
 		},
 		{
 			name:     "every child terminal closes the single implicit stage",
-			children: []db.Issue{child(0, "done"), child(0, "done")},
+			children: []db.Issue{child(0, "Done"), child(0, "Done")},
 			want:     true,
 		},
 		{
 			name:     "a backlog sibling holds the barrier open (no surprise cascade)",
-			children: []db.Issue{child(0, "done"), child(0, "backlog")},
+			children: []db.Issue{child(0, "Done"), child(0, "Spec")},
 			want:     false,
 		},
 		{
 			name:     "cancelled counts as terminal",
-			children: []db.Issue{child(0, "done"), child(0, "cancelled")},
+			children: []db.Issue{child(0, "Done"), child(0, "Cancelled")},
 			want:     true,
 		},
 	}
@@ -49,7 +49,7 @@ func TestStageBarrierClosed_Unstaged(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// completed is one of the terminal children; identity doesn't matter
 			// for the unstaged path.
-			if got := stageBarrierClosed(tt.children, child(0, "done")); got != tt.want {
+			if got := stageBarrierClosed(tt.children, child(0, "Done")); got != tt.want {
 				t.Fatalf("stageBarrierClosed = %v, want %v", got, tt.want)
 			}
 		})
@@ -60,44 +60,44 @@ func TestStageBarrierClosed_Staged(t *testing.T) {
 	// Three stages: 1 has two children, 2 has two, 3 has one.
 	t.Run("stage 1 not fully done does not fire", func(t *testing.T) {
 		children := []db.Issue{
-			child(1, "done"), child(1, "in_progress"),
-			child(2, "backlog"), child(2, "backlog"),
-			child(3, "backlog"),
+			child(1, "Done"), child(1, "In Progress"),
+			child(2, "Spec"), child(2, "Spec"),
+			child(3, "Spec"),
 		}
-		if stageBarrierClosed(children, child(1, "done")) {
+		if stageBarrierClosed(children, child(1, "Done")) {
 			t.Fatal("expected barrier not closed while stage 1 has an open child")
 		}
 	})
 
 	t.Run("closing stage 1 fires even though later stages are parked", func(t *testing.T) {
-		children := []db.Issue{
-			child(1, "done"), child(1, "done"),
-			child(2, "backlog"), child(2, "backlog"),
-			child(3, "backlog"),
+			children := []db.Issue{
+			child(1, "Done"), child(1, "Done"),
+			child(2, "Spec"), child(2, "Spec"),
+			child(3, "Spec"),
 		}
-		if !stageBarrierClosed(children, child(1, "done")) {
+			if !stageBarrierClosed(children, child(1, "Done")) {
 			t.Fatal("expected stage 1 barrier to close")
 		}
 	})
 
 	t.Run("closing stage 2 fires when stages 1 and 2 are terminal", func(t *testing.T) {
 		children := []db.Issue{
-			child(1, "done"), child(1, "done"),
-			child(2, "done"), child(2, "done"),
-			child(3, "backlog"),
+			child(1, "Done"), child(1, "Done"),
+			child(2, "Done"), child(2, "Done"),
+			child(3, "Spec"),
 		}
-		if !stageBarrierClosed(children, child(2, "done")) {
+			if !stageBarrierClosed(children, child(2, "Done")) {
 			t.Fatal("expected stage 2 barrier to close")
 		}
 	})
 
 	t.Run("final stage closes once its child finishes", func(t *testing.T) {
 		children := []db.Issue{
-			child(1, "done"), child(1, "done"),
-			child(2, "done"), child(2, "done"),
-			child(3, "done"),
+			child(1, "Done"), child(1, "Done"),
+			child(2, "Done"), child(2, "Done"),
+			child(3, "Done"),
 		}
-		if !stageBarrierClosed(children, child(3, "done")) {
+			if !stageBarrierClosed(children, child(3, "Done")) {
 			t.Fatal("expected final stage barrier to close")
 		}
 	})
@@ -105,9 +105,9 @@ func TestStageBarrierClosed_Staged(t *testing.T) {
 
 func TestStageProgressSummary(t *testing.T) {
 	children := []db.Issue{
-		child(1, "done"), child(1, "done"), child(1, "done"),
-		child(2, "backlog"), child(2, "backlog"), child(2, "backlog"), child(2, "backlog"),
-		child(3, "backlog"), child(3, "backlog"),
+		child(1, "Done"), child(1, "Done"), child(1, "Done"),
+		child(2, "Spec"), child(2, "Spec"), child(2, "Spec"), child(2, "Spec"),
+		child(3, "Spec"), child(3, "Spec"),
 	}
 	summary, next := stageProgressSummary(children, 1)
 	want := "Stage 1: 3/3 done; Stage 2: 0/4 done (next); Stage 3: 0/2 done"
@@ -121,8 +121,8 @@ func TestStageProgressSummary(t *testing.T) {
 
 func TestStageProgressSummary_FinalStageNoNext(t *testing.T) {
 	children := []db.Issue{
-		child(1, "done"), child(1, "done"),
-		child(2, "done"),
+		child(1, "Done"), child(1, "Done"),
+		child(2, "Done"),
 	}
 	_, next := stageProgressSummary(children, 2)
 	if next != 0 {
@@ -133,9 +133,9 @@ func TestStageProgressSummary_FinalStageNoNext(t *testing.T) {
 func TestStageProgressSummary_SkipsUnstaged(t *testing.T) {
 	// An unstaged child must not appear as "Stage 0" nor inflate any stage.
 	children := []db.Issue{
-		child(0, "backlog"), // unstaged — ignored
-		child(1, "done"), child(1, "done"),
-		child(2, "backlog"),
+		child(0, "Spec"), // unstaged — ignored
+		child(1, "Done"), child(1, "Done"),
+		child(2, "Spec"),
 	}
 	summary, next := stageProgressSummary(children, 1)
 	want := "Stage 1: 2/2 done; Stage 2: 0/1 done (next)"
@@ -190,16 +190,16 @@ func TestStageAdvanceInstruction(t *testing.T) {
 func TestStageBarrierClosed_CancelledClosesStage(t *testing.T) {
 	t.Run("staged: cancelling the last open child closes the stage", func(t *testing.T) {
 		children := []db.Issue{
-			child(1, "done"), child(1, "cancelled"),
-			child(2, "backlog"),
+			child(1, "Done"), child(1, "Cancelled"),
+			child(2, "Spec"),
 		}
-		if !stageBarrierClosed(children, child(1, "cancelled")) {
+			if !stageBarrierClosed(children, child(1, "Cancelled")) {
 			t.Fatal("expected the stage to close when its last open child is cancelled")
 		}
 	})
 	t.Run("unstaged: cancel of the last open child closes the implicit stage", func(t *testing.T) {
-		children := []db.Issue{child(0, "done"), child(0, "cancelled")}
-		if !stageBarrierClosed(children, child(0, "cancelled")) {
+		children := []db.Issue{child(0, "Done"), child(0, "Cancelled")}
+		if !stageBarrierClosed(children, child(0, "Cancelled")) {
 			t.Fatal("expected the implicit stage to close on cancel")
 		}
 	})
@@ -210,19 +210,19 @@ func TestStageBarrierClosed_CancelledClosesStage(t *testing.T) {
 func TestStageBarrierClosed_UnstagedIgnoredInStagedSet(t *testing.T) {
 	t.Run("a non-terminal unstaged child does not block stage 1", func(t *testing.T) {
 		children := []db.Issue{
-			child(1, "done"), child(1, "done"),
-			child(0, "backlog"), // unstaged, still open — must NOT block
+			child(1, "Done"), child(1, "Done"),
+			child(0, "Spec"), // unstaged, still open — must NOT block
 		}
-		if !stageBarrierClosed(children, child(1, "done")) {
+		if !stageBarrierClosed(children, child(1, "Done")) {
 			t.Fatal("expected stage 1 to close; an unstaged child must not hold it open")
 		}
 	})
 	t.Run("completing an unstaged child in a staged set closes nothing", func(t *testing.T) {
 		children := []db.Issue{
-			child(1, "backlog"),
-			child(0, "done"), // the just-completed unstaged child
+			child(1, "Spec"),
+			child(0, "Done"), // the just-completed unstaged child
 		}
-		if stageBarrierClosed(children, child(0, "done")) {
+		if stageBarrierClosed(children, child(0, "Done")) {
 			t.Fatal("an unstaged child's completion must not fire a stage barrier")
 		}
 	})

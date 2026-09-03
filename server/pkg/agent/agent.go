@@ -182,8 +182,11 @@ const CostUSDTicksPerUSD = 10_000_000_000
 
 // Result is the final outcome after an agent session completes.
 type Result struct {
-	Status     string // "completed", "failed", "aborted", "timeout", "cancelled"
-	Output     string // final user-facing output selected by the backend
+	Status string // "completed", "failed", "aborted", "timeout", "cancelled"
+	Output string // final user-facing output selected by the backend
+	// PRURL is the URL returned by a structured pull-request creation result.
+	// It is empty when the task did not open a pull request.
+	PRURL      string
 	Error      string // error message if failed
 	DurationMs int64
 	SessionID  string
@@ -232,6 +235,10 @@ type Config struct {
 	RuntimeID      string
 	DaemonVersion  string
 	CodexVersion   string
+	// CodexLeaseDir holds daemon-owned, crash-recovery process leases. It is
+	// intentionally outside task workdirs, which may be removed after a task.
+	CodexLeaseDir string
+	DaemonID      string
 	// BuiltinRuntime reports that ExecutablePath is the provider's own
 	// discovered binary rather than a custom runtime profile's command. A
 	// custom profile keeps its protocol family as the provider, so the

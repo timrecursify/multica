@@ -1120,6 +1120,69 @@ func TestResolveTaskRunID(t *testing.T) {
 	}
 }
 
+func TestRunIssueCancelTaskUsesExactTaskEndpointWithoutListing(t *testing.T) {
+	const taskID = "abcd1234-0000-0000-0000-000000000000"
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.Method != http.MethodPost || r.URL.Path != "/api/tasks/"+taskID+"/cancel" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"id": taskID, "status": "cancelled"})
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	cmd := &cobra.Command{}
+	cmd.Flags().String("issue", "", "")
+	cmd.Flags().String("output", "json", "")
+	if _, err := captureStdout(t, func() error { return runIssueCancelTask(cmd, []string{taskID}) }); err != nil {
+		t.Fatalf("runIssueCancelTask: %v", err)
+	}
+	if len(paths) != 1 {
+		t.Fatalf("request count = %d, want 1 (%v)", len(paths), paths)
+	}
+}
+
+func TestRunIssueCancelTaskScopesExactUUIDToIssue(t *testing.T) {
+	const (
+		issueID = "1881a167-4bb6-4602-944b-f40ce4192fe6"
+		taskID  = "abcd1234-0000-0000-0000-000000000000"
+	)
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/issues/MUL-1852":
+			json.NewEncoder(w).Encode(map[string]any{"id": issueID, "identifier": "MUL-1852"})
+		case "/api/issues/" + issueID + "/tasks/" + taskID + "/cancel":
+			json.NewEncoder(w).Encode(map[string]any{"id": taskID, "status": "cancelled"})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	t.Setenv("MULTICA_SERVER_URL", srv.URL)
+	t.Setenv("MULTICA_WORKSPACE_ID", "ws-1")
+	t.Setenv("MULTICA_TOKEN", "test-token")
+	cmd := &cobra.Command{}
+	cmd.Flags().String("issue", "", "")
+	cmd.Flags().String("output", "json", "")
+	_ = cmd.Flags().Set("issue", "MUL-1852")
+	if _, err := captureStdout(t, func() error { return runIssueCancelTask(cmd, []string{taskID}) }); err != nil {
+		t.Fatalf("runIssueCancelTask: %v", err)
+	}
+	if want := []string{"/api/issues/MUL-1852", "/api/issues/" + issueID + "/tasks/" + taskID + "/cancel"}; fmt.Sprint(paths) != fmt.Sprint(want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+}
+
 func TestRunIssueRunMessagesResolvesShortTaskPrefix(t *testing.T) {
 	issueID := "1881a167-4bb6-4602-944b-f40ce4192fe6"
 	taskID := "abcd1234-0000-0000-0000-000000000000"
@@ -2690,21 +2753,27 @@ func TestValidIssueStatuses(t *testing.T) {
 	// against either board during the convergence rollout. Every spelling the
 	// server accepts on either profile must be CLI-valid.
 	expected := map[string]bool{
-		"backlog":      true,
-		"todo":         true,
-		"in_progress":  true,
-		"in_review":    true,
-		"done":         true,
-		"blocked":      true,
-		"cancelled":    true,
-		"Spec":         true,
-		"Queue":        true,
-		"In Progress":  true,
-		"In Review":    true,
-		"Human Review": true,
-		"Done":         true,
-		"Cancelled":    true,
-		"Archived":     true,
+		"backlog":        true,
+		"todo":           true,
+		"in_progress":    true,
+		"in_review":      true,
+		"done":           true,
+		"blocked":        true,
+		"cancelled":      true,
+		"Registered":     true,
+		"Spec":           true,
+		"Queue":          true,
+		"Building":       true,
+		"In Progress":    true,
+		"QC":             true,
+		"In Review":      true,
+		"Human Review":   true,
+		"CI/CD & Deploy": true,
+		"Done":           true,
+		"Blocked":        true,
+		"Cancelled":      true,
+		"Archived":       true,
+		"dead_letter": true,
 	}
 	for _, s := range validIssueStatuses {
 		if !expected[s] {
@@ -2728,6 +2797,27 @@ func TestValidateIssueStatus(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "backlog") {
 		t.Errorf("error should list valid statuses, got: %v", err)
+	}
+}
+
+func TestTerminalIssueStatusIsRelayOwned(t *testing.T) {
+	for _, status := range []string{"done", "cancelled", "Done", "Cancelled", "Archived"} {
+		if !isTerminalIssueStatus(status) {
+			t.Errorf("terminal status %q must be relay-owned", status)
+		}
+	}
+	for _, status := range []string{"Queue", "In Progress", "Human Review", "Blocked", "dead_letter"} {
+		if isTerminalIssueStatus(status) {
+			t.Errorf("non-terminal status %q must remain CLI-eligible", status)
+		}
+		if err := validateDirectIssueStatusWrite(status); err != nil {
+			t.Errorf("direct non-terminal write %q rejected: %v", status, err)
+		}
+	}
+	for _, status := range []string{"done", "cancelled", "Done", "Cancelled", "Archived"} {
+		if err := validateDirectIssueStatusWrite(status); err == nil {
+			t.Errorf("direct terminal write %q must be rejected", status)
+		}
 	}
 }
 
@@ -2769,6 +2859,34 @@ func TestRunIssueCreateRejectsInvalidStatusBeforeRequest(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "valid values") {
 		t.Fatalf("expected valid values error, got: %v", err)
+	}
+}
+
+func TestTerminalStatusesAreRejectedByEveryDirectCLIWritePath(t *testing.T) {
+	for _, status := range []string{"done", "cancelled", "Done", "Cancelled", "Archived"} {
+		t.Run(status+"/create", func(t *testing.T) {
+			cmd := newIssueCreateTestCmd()
+			_ = cmd.Flags().Set("title", "Terminal status")
+			_ = cmd.Flags().Set("status", status)
+			if err := runIssueCreate(cmd, nil); err == nil || !strings.Contains(err.Error(), "relay-owned") {
+				t.Fatalf("runIssueCreate(%q) error = %v, want relay-owned rejection", status, err)
+			}
+		})
+		t.Run(status+"/update", func(t *testing.T) {
+			cmd := &cobra.Command{Use: "update"}
+			cmd.Flags().String("status", "", "")
+			cmd.Flags().String("priority", "", "")
+			_ = cmd.Flags().Set("status", status)
+			if err := runIssueUpdate(cmd, []string{"MUL-1"}); err == nil || !strings.Contains(err.Error(), "relay-owned") {
+				t.Fatalf("runIssueUpdate(%q) error = %v, want relay-owned rejection", status, err)
+			}
+		})
+		t.Run(status+"/status", func(t *testing.T) {
+			cmd := &cobra.Command{Use: "status"}
+			if err := runIssueStatus(cmd, []string{"MUL-1", status}); err == nil || !strings.Contains(err.Error(), "relay-owned") {
+				t.Fatalf("runIssueStatus(%q) error = %v, want relay-owned rejection", status, err)
+			}
+		})
 	}
 }
 

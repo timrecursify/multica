@@ -13,7 +13,17 @@
     "in_review": "리뷰 중",
     "done": "완료",
     "blocked": "막힘",
-    "cancelled": "취소됨"
+    "cancelled": "취소됨",
+    "Registered": "등록됨",
+    "Spec": "사양",
+    "Queue": "대기열",
+    "In Progress": "진행 중",
+    "In Review": "검토 중",
+    "Human Review": "사람 검토",
+    "CI/CD & Deploy": "CI/CD 및 배포",
+    "Done": "완료",
+    "Archived": "보관됨",
+    "Cancelled": "취소됨"
   },
   "priority": {
     "urgent": "긴급",

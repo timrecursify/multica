@@ -230,6 +230,7 @@ func TestChildDone_SquadPrivateLeader_PlainMemberWakesLeader(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := newRequestAs(ownerID, "POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":         "parent with private-leader squad",
+		"status":        "Queue",
 		"assignee_type": "squad",
 		"assignee_id":   squadID,
 	})
@@ -329,6 +330,7 @@ func TestChildDone_SquadPrivateLeader_AgentActorWakesLeader(t *testing.T) {
 	w := httptest.NewRecorder()
 	r := newRequestAs(ownerID, "POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":         "parent with private-leader squad (agent child-done)",
+		"status":        "Queue",
 		"assignee_type": "squad",
 		"assignee_id":   squadID,
 	})

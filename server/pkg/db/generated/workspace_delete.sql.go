@@ -26,6 +26,14 @@ deleted_pins AS (
 deleted_daemon_tokens AS (
     DELETE FROM daemon_token WHERE daemon_token.workspace_id = $1
 ),
+deleted_relay_stage_agent_pool AS (
+    DELETE FROM relay_stage_agent_pool
+    WHERE relay_stage_agent_pool.workspace_id = $1
+),
+deleted_relay_stage_config AS (
+    DELETE FROM relay_stage_config
+    WHERE relay_stage_config.workspace_id = $1
+),
 detached_feedback AS (
     UPDATE feedback
     SET workspace_id = NULL

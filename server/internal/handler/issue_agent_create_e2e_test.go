@@ -90,6 +90,7 @@ func TestAgentCreateOriginator_E2E_CreateAssignSquad_PrivateWorkerTriggered(t *t
 	w := httptest.NewRecorder()
 	r := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":         "MUL-4305 E2E agent-created + squad-assigned",
+		"status":        "Queue",
 		"assignee_type": "squad",
 		"assignee_id":   squadID,
 	})
@@ -208,7 +209,8 @@ func TestAgentCreateOriginator_E2E_UpdateAssignSquad_HandlerGateAdmitsPrivateLea
 	// Agent A creates an unassigned issue via the ordinary path.
 	w := httptest.NewRecorder()
 	r := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
-		"title": "MUL-4305 E2E unassigned then squad-assigned",
+		"title":  "MUL-4305 E2E unassigned then squad-assigned",
+		"status": "Queue",
 	})
 	r.Header.Set("X-Agent-ID", creatorAID)
 	r.Header.Set("X-Task-ID", creatorTaskID)

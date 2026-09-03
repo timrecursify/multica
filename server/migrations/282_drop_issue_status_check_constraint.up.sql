@@ -17,25 +17,30 @@ UPDATE issue
 SET status = CASE status
     WHEN 'backlog' THEN 'Spec'
     WHEN 'todo' THEN 'Spec'
-    WHEN 'Registered' THEN 'Spec'
-    WHEN 'Building' THEN 'in_progress'
-    WHEN 'In Progress' THEN 'in_progress'
-    WHEN 'QC' THEN 'in_review'
-    WHEN 'In Review' THEN 'in_review'
+    WHEN 'Building' THEN 'In Progress'
+    WHEN 'in_progress' THEN 'In Progress'
+    WHEN 'QC' THEN 'In Review'
+    WHEN 'in_review' THEN 'In Review'
     WHEN 'blocked' THEN 'Human Review'
     WHEN 'Blocked' THEN 'Human Review'
     WHEN 'done' THEN 'Done'
     WHEN 'cancelled' THEN 'Cancelled'
     WHEN 'dead_letter' THEN 'Cancelled'
-    -- Unknown pre-up values are intentionally canonicalized to Spec. Their
+    -- Existing canonical relay statuses (including Registered, Parked,
+    -- Rejected, and CI/CD & Deploy) fall through unchanged. Unknown pre-up
+    -- values are intentionally canonicalized to Spec. Their
     -- exact original value is retained in issue_status_282_rollback for down.
     ELSE 'Spec'
 END
 WHERE status NOT IN
-    ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived');
+    ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
+     'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
+     'Archived', 'Cancelled');
 
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
-    ('Spec', 'Queue', 'in_progress', 'in_review', 'Human Review', 'Done', 'Cancelled', 'Archived'));
+    ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
+     'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
+     'Archived', 'Cancelled'));
 
 -- New rows that omit status must also enter the canonical vocabulary.
 ALTER TABLE issue ALTER COLUMN status SET DEFAULT 'Spec';

@@ -1,0 +1,1841 @@
+const assert = require('node:assert/strict');
+const test = require('node:test');
+const fs = require('node:fs');
+const { qcCompletionAdvance } = require('./parity/multica-relay-advance-daemon.cjs');
+const { classifyStageRoute } = require('./stage-routing.cjs');
+
+process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
+process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
+// This handler test sends fixed fixture credentials. Do not inherit a live
+// relay credential, which would make the expected 201 path return 403.
+process.env.RELAY_AGENT_SECRET = 'test-relay-secret';
+process.env.RELAY_OPERATOR_SECRET = 'test-operator-secret';
+process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
+
+test('stage routing applies only the required QC and deploy lanes', () => {
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
+    files: ['server/migrations/999_risk.up.sql'] }), { kind: 'risk', toStage: 'In Review' });
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/ppp', state: 'OPEN',
+    files: ['apps/billing/server/src/listener.ts'] }), { kind: 'risk', toStage: 'In Review' });
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
+    files: ['ops/belt/multica-bridge.cjs'] }), { kind: 'runtime', toStage: 'CI/CD & Deploy' });
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'MERGED',
+    files: ['ops/belt/README.md'] }), { kind: 'merge_only', toStage: 'Done' });
+  assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
+    files: ['ops/belt/README.md'] }),
+    { kind: 'merge_only', toStage: null, reason: 'non_runtime_pr_not_merged' });
+});
+
+const {
+  existingStageTask,
+  replaceStageTask,
+  ownerStageForTransition,
+  ensureCompletedRelayLog,
+  completedTerminalRelayLog,
+  isBookkeepingTransition,
+  recordBookkeepingHandoff,
+  validateRelayVerdict,
+  hasCurrentPassWorkProduct,
+  relayRedirect,
+  passVerdictRescopeForbidden,
+  latestCompletedSolLowQcTask,
+  qcTaskEvidenceMismatch,
+  relayVerdict,
+  relayAdvance,
+  setTestClientFactory,
+  isCicdReturn,
+  consumeCicdReturnAuthorization,
+  authorizeCicdReturnCapBypass,
+  selectPoolOwner,
+  selectStageOwner,
+  applyDisposition,
+  consumeParkedQcRecovery,
+  isNoArtifactQcBlock,
+  operatorRescopeIssueId,
+  issueImplementationArtifact,
+  implementationEvidence,
+  noArtifactRescopeAdmission,
+  consumeNoArtifactRescope,
+  latestQcNoArtifactSignal,
+  retryEscalationReason,
+  verifiedRetryEscalation,
+  retryEscalationSourceTask,
+  capEscalationVerified,
+  retryEscalationLoop,
+  authorizeRelayStatusWrites,
+  rerunParkedDiagnosis,
+  relayDiagnosisRerun,
+  isTerminalStage,
+  isNoDispatchArrivalStage
+} = require('./multica-bridge.cjs');
+
+test('relay receipts identify a changed destination and preserve its cause', () => {
+  assert.equal(relayRedirect('CI/CD & Deploy', 'CI/CD & Deploy', null), null);
+  assert.deepEqual(relayRedirect('CI/CD & Deploy', 'Spec', { reason: 'lifetime_task_limit' }), {
+    redirected: true,
+    requested_stage: 'CI/CD & Deploy',
+    status: 'Spec',
+    reason: 'retry_escalation'
+  });
+  assert.equal(relayRedirect('Queue', 'Parked', null).reason, 'relay_stage_policy');
+  const specRedirect = relayRedirect('CI/CD & Deploy', 'Spec', { reason: 'lifetime_task_limit' });
+  assert.equal(passVerdictRescopeForbidden(specRedirect, { verdict: 'PASS' }), true);
+  assert.equal(passVerdictRescopeForbidden(specRedirect, { verdict: 'FAIL' }), false);
+  assert.equal(passVerdictRescopeForbidden(relayRedirect('Spec', 'CI/CD & Deploy', null), { verdict: 'PASS' }), false);
+});
+
+test('comment-reply tasks do not consume lifetime or stage-cycle cap history', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') {
+    return t.skip('integration test requires the Multica test DATABASE_URL');
+  }
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  const schema = `relay_comment_caps_${Date.now()}`;
+  const workspaceId = '323e4567-e89b-42d3-a456-426614174000';
+  const agentId = '423e4567-e89b-42d3-a456-426614174000';
+  const lifetimeIssueId = '123e4567-e89b-42d3-a456-426614174000';
+  const cycleIssueId = '223e4567-e89b-42d3-a456-426614174000';
+  const commentId = '523e4567-e89b-42d3-a456-426614174000';
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`CREATE TABLE ${schema}.agent_task_queue (
+      id uuid PRIMARY KEY DEFAULT gen_random_uuid(), agent_id uuid NOT NULL, issue_id uuid NOT NULL,
+      workspace_id uuid NOT NULL, context jsonb NOT NULL DEFAULT '{}'::jsonb,
+      trigger_comment_id uuid, status text NOT NULL DEFAULT 'queued', started_at timestamptz,
+      completed_at timestamptz, created_at timestamptz NOT NULL DEFAULT now()
+    ); CREATE TABLE ${schema}.qc_verdict (
+      issue_id uuid NOT NULL, checker_id uuid NOT NULL, created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const task = async (issueId, stage, reply, kind = null) => admin.query(
+      `INSERT INTO ${schema}.agent_task_queue (agent_id, issue_id, workspace_id, context, trigger_comment_id)
+       VALUES ($1, $2, $3, jsonb_strip_nulls(jsonb_build_object('to_stage', $4::text, 'kind', $6::text)), $5)`,
+      [agentId, issueId, workspaceId, stage, reply ? commentId : null, kind]
+    );
+    for (let index = 0; index < 6; index += 1) await task(lifetimeIssueId, 'Queue', true);
+    await task(lifetimeIssueId, 'Queue', false);
+    for (let index = 0; index < 2; index += 1) await task(cycleIssueId, 'Queue', true);
+    await task(cycleIssueId, 'Queue', false);
+    await task(cycleIssueId, 'Queue', false, 'retry_escalation');
+    const client = new Client({ connectionString: databaseUrl });
+    await client.connect();
+    await client.query(`SET search_path TO ${schema}`);
+    try {
+      await t.test('six comment replies plus one stage task advances without lifetime_task_limit', async () => {
+        assert.equal(await capEscalationVerified(client, { id: lifetimeIssueId, metadata: {} },
+          'lifetime_task_limit', 'Queue'), false);
+      });
+      await t.test('comment replies and an escalation task do not consume the stage-cycle cap', async () => {
+        assert.equal(await capEscalationVerified(client, { id: cycleIssueId, metadata: {} },
+          'stage_cycle_limit', 'Queue'), false);
+      });
+    } finally { await client.end(); }
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+    await admin.end();
+  }
+});
+
+test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue WHERE')) return { rowCount: 1, rows: [{ id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'w', status: 'Parked', priority: 'low' }] };
+    if (sql.includes("operator_rerun_idem_key")) return { rowCount: 1, rows: [{ id: 'existing-task' }] };
+    return { rowCount: 0, rows: [] };
+  } };
+  const result = await rerunParkedDiagnosis(client, { issue_id: '123e4567-e89b-42d3-a456-426614174000', idempotency_key: 'rerun-0001' });
+  assert.deepEqual(result, { ok: true, replay: true, task_id: 'existing-task' });
+  assert.match(calls[0].sql, /pg_advisory_xact_lock/);
+});
+
+test('Parked diagnosis rerun logs classified and unexpected database exceptions', async (t) => {
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+  const payload = { agent_token: 'test-relay-secret', issue_id: issueId, idempotency_key: 'rerun-0001' };
+  const originalError = console.error;
+  for (const scenario of [
+    { name: 'allowlisted runtime refusal', error: Object.assign(new Error('selected runtime was removed'), {
+      code: '23514', constraint: 'agent_task_queue_active_requires_runtime' }), status: 409,
+      body: { error: 'diagnosis_runtime_unavailable' } },
+    { name: 'unclassified database error', error: Object.assign(new Error('database unavailable'), {
+      code: '08006', constraint: 'unrelated_constraint' }), status: 500,
+      body: { error: 'internal_error' } }
+  ]) {
+    await t.test(scenario.name, async () => {
+      scenario.error.stack = `stack for ${scenario.name}`;
+      const calls = [];
+      const client = {
+        async connect() { calls.push('connect'); },
+        async query(sql) {
+          calls.push(sql);
+          if (sql === "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 805))") throw scenario.error;
+          return { rowCount: 0, rows: [] };
+        },
+        async end() { calls.push('end'); }
+      };
+      const response = { status: null, body: null,
+        writeHead(status) { this.status = status; }, end(body) { this.body = JSON.parse(body); } };
+      const logs = [];
+      setTestClientFactory(() => client);
+      console.error = (line) => logs.push(JSON.parse(line));
+      try {
+        await relayDiagnosisRerun({}, response, payload);
+      } finally {
+        console.error = originalError;
+        setTestClientFactory(null);
+      }
+      assert.equal(response.status, scenario.status);
+      assert.deepEqual(response.body, scenario.body);
+      assert.deepEqual(calls.slice(-2), ['ROLLBACK', 'end']);
+      assert.deepEqual(logs, [{ event: 'relay_parked_diagnosis_rerun_failed', issue_id: issueId,
+        message: scenario.error.message, stack: scenario.error.stack, code: scenario.error.code,
+        constraint: scenario.error.constraint }]);
+    });
+  }
+});
+
+test('relay status authority is transaction-local', async () => {
+  const calls = [];
+  await authorizeRelayStatusWrites({ query: async (sql) => calls.push(sql) });
+  assert.deepEqual(calls, ["SELECT set_config('multica.relay_authorized', 'on', true)"]);
+});
+
+test('relay advance authorizes status writes after beginning its transaction', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const relay = source.slice(source.indexOf('async function relayAdvance'));
+  assert.match(relay, /await client\.query\("BEGIN"\);\s+await authorizeRelayStatusWrites\(client\);/);
+});
+
+test('status authority migration rejects non-relay changes and is reversible', () => {
+  const up = fs.readFileSync(require.resolve('../../server/migrations/297_relay_status_authority.up.sql'), 'utf8');
+  const down = fs.readFileSync(require.resolve('../../server/migrations/297_relay_status_authority.down.sql'), 'utf8');
+  assert.match(up, /BEFORE UPDATE OF status ON issue/);
+  assert.match(up, /current_setting\('multica\.relay_authorized', true\) IS DISTINCT FROM 'on'/);
+  assert.match(up, /ERRCODE = '42501'/);
+  assert.match(down, /DROP TRIGGER IF EXISTS issue_status_relay_authority ON issue/);
+  assert.match(down, /DROP FUNCTION IF EXISTS require_relay_status_authority/);
+});
+
+test('retry escalation accepts only named bounded triggers', () => {
+  assert.equal(retryEscalationReason('retry_escalation:completion_failed'), 'completion_failed');
+  assert.equal(retryEscalationReason('retry_escalation:stage_cycle_limit'), 'stage_cycle_limit');
+  assert.equal(retryEscalationReason('retry_escalation:delete_everything'), null);
+  assert.equal(retryEscalationReason('completion_failed'), null);
+});
+
+test('a second retry escalation for one stage is parked', () => {
+  assert.equal(retryEscalationLoop({ metadata: { retry_escalation: {
+    trigger_stage: 'Spec' } } }, 'Spec'), true);
+  assert.equal(retryEscalationLoop({ metadata: { retry_escalation: {
+    trigger_stage: 'Queue' } } }, 'Spec'), false);
+});
+
+test('completion escalation is bound to one exact completed failed task', async () => {
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review', metadata: {} };
+  const client = { query: async (sql, values) => {
+    assert.match(sql, /t\.context->>'to_stage' = \$4::text OR EXISTS/);
+    assert.match(sql, /r\.task_id = t\.id AND r\.issue_id = t\.issue_id/);
+    assert.deepEqual(values, [taskId, issue.id, issue.workspace_id, issue.status]);
+    return { rows: [{ status: 'completed', result: { output: 'QC VERDICT: FAIL' }, error: null }] };
+  } };
+  const result = await verifiedRetryEscalation(client, issue, {
+    to_stage: 'Spec', reason: 'retry_escalation:completion_failed',
+    retry_escalation_task_id: taskId, retry_escalation_stage: issue.status
+  });
+  assert.deepEqual(result, { reason: 'completion_failed', trigger_stage: 'In Review',
+    source_task_id: taskId });
+});
+
+test('retry escalation refuses a consumed source task', async () => {
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review',
+    metadata: { retry_escalation: { source_task_id: taskId } } };
+  const client = { query: async () => { throw new Error('must not query'); } };
+  assert.equal(await verifiedRetryEscalation(client, issue, {
+    to_stage: 'Spec', reason: 'retry_escalation:completion_failed',
+    retry_escalation_task_id: taskId, retry_escalation_stage: issue.status
+  }), false);
+});
+
+test('cap escalation binds one exact active source task in the current stage', async () => {
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
+  const client = { query: async (sql, values) => {
+    assert.match(sql, /t\.status IN \('queued','dispatched','running','waiting_local_directory','deferred'\)/);
+    assert.match(sql, /t\.context->>'to_stage' = \$3::text/);
+    assert.match(sql, /LIMIT 2 FOR UPDATE OF t/);
+    assert.deepEqual(values, [issue.id, issue.workspace_id, issue.status, taskId]);
+    return { rows: [{ id: taskId }] };
+  } };
+  assert.equal(await retryEscalationSourceTask(client, issue, taskId), taskId);
+});
+
+test('cap escalation fails closed when source lineage is ambiguous or invalid', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
+  let queries = 0;
+  const client = { query: async () => {
+    queries += 1;
+    return { rows: [{ id: 'one' }, { id: 'two' }] };
+  } };
+  assert.equal(await retryEscalationSourceTask(client, issue), null);
+  assert.equal(await retryEscalationSourceTask(client, issue, 'not-a-uuid'), null);
+  assert.equal(queries, 1);
+});
+
+test('Parked evidence QC return is a canonical consumed-release-only edge', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /function verifiedParkedEvidenceRelease/);
+  assert.match(source, /\^runtime_evidence_verified:/);
+  assert.match(source, /parseRuntimeEvidenceReference/);
+  assert.match(source, /parked_release_once !== true/);
+  assert.match(source, /parkedEvidenceQcRelease/);
+  assert.match(source, /parkedRelease \|\| parkedEvidenceQcRelease/);
+  assert.match(source, /context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
+});
+
+test('Parked evidence return selects the canonical In Review QC owner', () => {
+  assert.equal(ownerStageForTransition('Parked', 'In Review'), 'In Progress');
+  assert.equal(ownerStageForTransition('Parked', 'Spec'), 'Registered');
+});
+
+test('exact #23696 recovery marker bypasses one capped QC admission, then is consumed', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', status: 'Parked' };
+  const reason = 'runtime_evidence_verified:task:223e4567-e89b-42d3-a456-426614174000';
+  let writes = 0;
+  const client = { query: async (sql, values) => {
+    writes += 1; assert.match(sql, /- 'parked_qc_recovery'/); assert.deepEqual(values, [issue.id, 'task:223e4567-e89b-42d3-a456-426614174000']);
+    return { rowCount: writes === 1 ? 1 : 0, rows: writes === 1 ? [{ id: issue.id }] : [] };
+  } };
+  assert.equal(await consumeParkedQcRecovery(client, issue, 'In Review', reason, true), true);
+  assert.equal(await consumeParkedQcRecovery(client, issue, 'In Review', reason, true), false);
+  assert.equal(await consumeParkedQcRecovery(client, issue, 'In Review', reason, false), false);
+  assert.equal(await consumeParkedQcRecovery(client, issue, 'Queue', reason, true), false);
+});
+
+test('ordinary capped Parked to In Review has no recovery bypass', () => {
+  const { stageCycleAdmission } = require('./guardrails.cjs');
+  assert.equal(stageCycleAdmission(2).ok, false);
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery/);
+  assert.match(source, /consumeParkedQcRecovery\(\s*client, issue, to_stage, reason, parkedEvidenceQcRelease/);
+});
+
+test('NO-SHA QC block recognises only an artifact-free blocked result', () => {
+  assert.equal(isNoArtifactQcBlock(
+    'QC-BLOCKED: no implementation SHA or linked PR exists; no immutable tracked-tree artifact is available.'), true);
+  assert.equal(isNoArtifactQcBlock('QC-BLOCKED\nNO-SHA: no code change applies.'), true);
+  assert.equal(isNoArtifactQcBlock('QC VERDICT: PASS\nNO-SHA'), false);
+  assert.equal(isNoArtifactQcBlock('QC-BLOCKED: no implementation SHA\nQC_EVIDENCE_JSON={}'), false);
+  assert.equal(isNoArtifactQcBlock(
+    'QC-BLOCKED: inspect https://github.com/acme/repo/pull/42 before continuing'), false);
+  assert.equal(isNoArtifactQcBlock(
+    'QC-BLOCKED: bound SHA 0123456789012345678901234567890123456789 is unavailable'), false);
+});
+
+test('operator re-scope request is explicit and bound to one UUID', () => {
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  assert.equal(operatorRescopeIssueId(id, null), id);
+  assert.equal(operatorRescopeIssueId(null,
+    `RETURN:Spec — QC-BLOCKED NO-SHA operator re-scope ${id}`), id);
+  assert.equal(operatorRescopeIssueId(null, 'RETURN:Spec — retry this ticket'), null);
+});
+
+test('artifact lookup accepts canonical metadata and ignores prose', async () => {
+  for (const field of ['has_qc_verdict', 'has_builder_artifact', 'has_comment_artifact']) {
+    const client = { query: async (sql, values) => {
+      assert.match(sql, /FROM qc_verdict/);
+      assert.doesNotMatch(sql, /agent_task_queue|comment/);
+      assert.deepEqual(values, ['issue-1']);
+      return { rows: [{ has_qc_verdict: field === 'has_qc_verdict' }] };
+    } };
+    assert.equal(await issueImplementationArtifact(client, { id: 'issue-1', metadata: {} }), field === 'has_qc_verdict');
+  }
+});
+
+test('In Progress -> In Review dispatch requires canonical implementation evidence', async () => {
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  const prUrl = 'https://github.com/acme/relay/pull/42';
+  const response = () => ({ status: 0, body: '', writeHead(status) { this.status = status; },
+    end(body = '') { this.body = body; } });
+  const invoke = async (metadata) => {
+    const calls = [];
+    const issue = { id: issueId, number: 1531, workspace_id: 'workspace-1', status: 'In Progress',
+      description: '', parent_issue_id: null, title: 'handoff', priority: 'medium', metadata };
+    const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+      calls.push({ sql, values });
+      if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [issue] };
+      if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'In Review' }] };
+      if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'In Review' }] };
+      if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'In Review', alt_next_stages: [] }] };
+      if (sql.includes('FROM relay_stage_agent_pool')) return { rows: [{ agent_id: 'agent-1', owner_id: 'agent-1', agent_name: 'qc',
+        archived_at: null, agent_status: 'idle', instructions: 'In Review', model: 'gpt-5.6-sol',
+        thinking_level: 'low', max_concurrent_tasks: 2, selected_runtime_id: 'runtime-1',
+        selected_runtime_provider: 'codex', active_task_count: 0, last_selected_at: null }] };
+      if (sql.includes('SELECT count(*)::int AS n FROM agent_task_queue')) return { rows: [{ n: 0 }] };
+      if (sql.includes('FROM agent_task_queue\n          WHERE issue_id') && sql.includes('FOR UPDATE')) return { rows: [] };
+      if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) return { rowCount: 1, rows: [{ id: issueId, status: 'In Review' }] };
+      if (sql.includes('INSERT INTO agent_task_queue (')) return { rows: [{ id: 'qc-task-1' }] };
+      if (sql.includes('INSERT INTO relay_run_log')) return { rows: [{ id: 'relay-log-1' }] };
+      return { rowCount: 0, rows: [] };
+    } };
+    const res = response();
+    setTestClientFactory(() => client);
+    try { await relayAdvance({ headers: {} }, res, { issue_id: issueId, to_stage: 'In Review', agent_token: 'test-relay-secret' }); }
+    finally { setTestClientFactory(null); }
+    return { res, calls };
+  };
+
+  const valid = await invoke({ pr_url: prUrl, bound_sha: sha });
+  assert.equal(valid.res.status, 200, valid.res.body);
+  assert.equal(JSON.parse(valid.res.body).task_id, 'qc-task-1');
+  const inserts = valid.calls.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue ('));
+  assert.equal(inserts.length, 1);
+  assert.match(inserts[0].values[6], new RegExp(`ticket 1531; PR ${prUrl}; bound SHA ${sha}`));
+
+  for (const metadata of [
+    {}, { pr_url: prUrl }, { bound_sha: sha },
+    { pr_url: 'not a URL', bound_sha: sha },
+    { pr_url: prUrl, bound_sha: sha.toUpperCase() },
+    { head_sha: sha, commit_sha: sha, note: `PR ${prUrl} SHA ${sha}` }
+  ]) {
+    const rejected = await invoke(metadata);
+    assert.equal(rejected.res.status, 409);
+    assert.equal(JSON.parse(rejected.res.body).error, 'implementation_evidence_required');
+    assert.equal(rejected.calls.some(({ sql }) => sql.includes('INSERT INTO agent_task_queue (')), false);
+    assert.equal(rejected.calls.some(({ sql }) => sql === 'ROLLBACK'), true);
+  }
+});
+
+test('operator re-scope admits only the exact issue UUID and completed Sol-low NO-SHA block', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
+    status: 'In Review', metadata: {} };
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM agent_task_queue t')) return { rows: [{ id: 'qc-task', status: 'completed',
+      result: { output: 'QC-BLOCKED: no implementation SHA or PR exists.' } }] };
+    return { rows: [{ has_qc_verdict: false, has_builder_artifact: false,
+      has_comment_artifact: false }] };
+  } };
+  assert.equal(await noArtifactRescopeAdmission(client, issue, 'Spec', issue.id), true);
+  assert.equal(calls.length, 2);
+  assert.equal(await noArtifactRescopeAdmission(client, issue, 'In Progress', null), true);
+  assert.equal(calls.length, 4);
+  assert.equal(await noArtifactRescopeAdmission(client, issue, 'Spec',
+    '223e4567-e89b-42d3-a456-426614174000'), false);
+  assert.equal(await noArtifactRescopeAdmission(client, issue, 'In Progress', issue.id), false);
+  assert.equal(calls.length, 4, 'invalid operator requests must do no evidence queries');
+  assert.equal(await noArtifactRescopeAdmission(client, { ...issue, status: 'Human Review' },
+    'Spec', issue.id), true);
+});
+
+test('operator re-scope rejects consumed, artifact-bearing, and PASS/FAIL flights', async () => {
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  const issue = { id, workspace_id: 'workspace-1', status: 'In Review', metadata: {} };
+  assert.equal(await noArtifactRescopeAdmission({ query: async () => { throw new Error('queried'); } },
+    { ...issue, metadata: { no_artifact_rescope_consumed_at: '2026-09-01T19:00:00Z' } },
+    'Spec', id), false);
+  const taskClient = (output, artifact = false) => ({ query: async (sql) =>
+    sql.includes('FROM agent_task_queue t')
+      ? { rows: [{ status: 'completed', result: { output } }] }
+      : { rows: [{ has_qc_verdict: artifact, has_builder_artifact: false,
+          has_comment_artifact: false }] } });
+  assert.equal(await noArtifactRescopeAdmission(taskClient('QC VERDICT: PASS'), issue, 'Spec', id), false);
+  assert.equal(await noArtifactRescopeAdmission(
+    taskClient('QC-BLOCKED: no implementation SHA exists.', true), issue, 'Spec', id), false);
+});
+
+test('operator re-scope authorization is consumed once in issue metadata', async () => {
+  let calls = 0;
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000' };
+  const client = { query: async (sql, values) => {
+    calls += 1;
+    assert.match(sql, /no_artifact_rescope_consumed_at/);
+    assert.match(sql, /status IN \('In Review', 'Human Review'\)/);
+    assert.deepEqual(values, [issue.id]);
+    return { rowCount: calls === 1 ? 1 : 0 };
+  } };
+  assert.equal(await consumeNoArtifactRescope(client, issue), true);
+  assert.equal(await consumeNoArtifactRescope(client, issue), false);
+});
+
+test('Human Review guard reads only the latest active-or-completed Sol-low QC flight', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ result: null,
+      content: 'QC-BLOCKED: no implementation SHA or linked PR exists.' }] };
+  } };
+  const issue = { id: 'issue-1', workspace_id: 'workspace-1' };
+  assert.equal(await latestQcNoArtifactSignal(client, issue), true);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].sql, /t\.status IN \('queued','dispatched','running'/);
+  assert.match(calls[0].sql, /LEFT JOIN LATERAL/);
+  assert.match(calls[0].sql, /ORDER BY t\.created_at DESC, t\.id DESC LIMIT 1/);
+  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1', ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
+});
+
+test('technical QC block cannot route to Human Review and exact re-scope bypasses configured edge and caps', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /technical_human_review_forbidden/);
+  assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
+  assert.match(source,
+    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope/);
+  assert.match(source,
+    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope/);
+  assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
+  assert.match(source, /operator_rescope_issue_id: issue\.id/);
+  assert.match(source, /if \(noArtifactRescope && to_stage === "In Progress"\) \{\s+to_stage = "Spec";/);
+  assert.match(source, /let retryEscalation = noArtifactRescope \? null/);
+  assert.match(source, /to_stage === "Spec" && !noArtifactRescope/);
+});
+
+const validVerdict = Object.freeze({
+  issue_id: '123e4567-e89b-42d3-a456-426614174000', checker: 'BRAVO-000517',
+  verdict: 'PASS', work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e',
+  bound_sha: '0123456789012345678901234567890123456789',
+  observed_sha: '0123456789012345678901234567890123456789', failure_class: 'none',
+  qualifying: true, model: 'gpt-5.6-sol', effort: 'low', idem_key: 'qc-verdict-000517'
+});
+const qcResult = (evidence = validVerdict) => ({ output: `QC completed\nQC_EVIDENCE_JSON=${JSON.stringify(evidence)}` });
+const runbookVerdict = ({ verdict = 'PASS', failureClass = 'none', qualifying = true,
+  idemKey, reworkSummary = '', blockedReason = '' } = {}) => ({
+  ...validVerdict,
+  verdict,
+  failure_class: failureClass,
+  qualifying,
+  idem_key: idemKey,
+  notes: verdict === 'FAIL'
+    ? (blockedReason ? `BLOCKED: ${blockedReason}` : reworkSummary)
+    : ''
+});
+
+test('verdict validation accepts the sanctioned CLI checker field and rejects forged lane metadata', () => {
+  assert.equal(validateRelayVerdict(validVerdict), null);
+  assert.equal(validateRelayVerdict({ ...validVerdict, checker: undefined }), 'invalid_checker');
+  assert.equal(validateRelayVerdict({ ...validVerdict, observed_sha: 'f123456789012345678901234567890123456789' }), 'sha_binding_mismatch');
+  assert.equal(validateRelayVerdict({ ...validVerdict, work_product_md5: 'not-an-md5' }), 'invalid_work_product_md5');
+  assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
+  assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
+  assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
+});
+
+test('routing rejections expose only bounded agent routing fields', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /actual_model: preflight\.model/);
+  assert.match(source, /actual_effort: preflight\.effort/);
+  assert.match(source, /expected_model: preflight\.expected_model/);
+  assert.doesNotMatch(source, /routing:.*runtime_config/s);
+});
+
+test('QC evidence parser accepts exactly one structured output marker', () => {
+  assert.equal(qcTaskEvidenceMismatch({ result: qcResult() }, validVerdict), null);
+  assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC_EVIDENCE_JSON={bad}' } }, validVerdict), 'qc_task_evidence_required');
+  assert.equal(qcTaskEvidenceMismatch({ result: { output: `${qcResult().output}\nQC_EVIDENCE_JSON=${JSON.stringify(validVerdict)}` } }, validVerdict), 'qc_task_evidence_required');
+  assert.equal(qcTaskEvidenceMismatch({ result: { output: 'QC VERDICT: PASS' } }, validVerdict), 'qc_task_evidence_required');
+});
+
+test('verdict checker identity is selected from the completed same-workspace Sol-low QC task', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low', context: { head_sha: validVerdict.bound_sha } }] };
+  } };
+  const task = await latestCompletedSolLowQcTask(client, 'issue-1', 'workspace-1');
+  assert.equal(task.agent_id, 'agent-1');
+  assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1', null, ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
+  assert.match(calls[0].sql, /i\.workspace_id = t\.workspace_id/);
+  assert.match(calls[0].sql, /a\.workspace_id = i\.workspace_id/);
+  assert.match(calls[0].sql, /t\.context->>'to_stage' = 'In Review'/);
+  assert.match(calls[0].sql, /COALESCE\(a\.model, a\.runtime_config->>'model'\) = ANY\(\$4::text\[\]\)/);
+  assert.match(calls[0].sql, /COALESCE\(a\.thinking_level, a\.runtime_config->>'reasoning_effort'\) = \$5::text/);
+  assert.match(calls[0].sql, /ORDER BY t\.completed_at DESC NULLS LAST/);
+});
+
+test('completed In Review rerun task is admitted for the QC verdict', async () => {
+  const rerunTask = {
+    id: 'rerun-qc-task', agent_id: 'qc-agent', status: 'completed',
+    context: { to_stage: 'In Review' }, result: { output: 'QC VERDICT: PASS' },
+    agent_name: 'qc-sol-low'
+  };
+  const client = { query: async (sql, values) => {
+    assert.deepEqual(values, ['issue-in-review', 'workspace-for-issue', null, ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
+    assert.match(sql, /i\.workspace_id = t\.workspace_id/);
+    assert.match(sql, /t\.context->>'to_stage' = 'In Review'/);
+    return { rows: [rerunTask] };
+  } };
+  assert.equal(
+    await latestCompletedSolLowQcTask(client, 'issue-in-review', 'workspace-for-issue'),
+    rerunTask
+  );
+});
+
+test('explicit QC task binding selects that completed task instead of the newest one', async () => {
+  const client = { query: async (sql, values) => {
+    assert.deepEqual(values, ['issue-1', 'workspace-1', '11111111-1111-4111-8111-111111111111', ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
+    assert.match(sql, /\$3::uuid IS NULL OR t\.id = \$3::uuid/);
+    return { rows: [{ id: values[2] }] };
+  } };
+  const task = await latestCompletedSolLowQcTask(client, 'issue-1', 'workspace-1',
+    '11111111-1111-4111-8111-111111111111');
+  assert.equal(task.id, '11111111-1111-4111-8111-111111111111');
+});
+
+test('verdict route never trusts a caller supplied checker identity', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.doesNotMatch(source, /RELAY_QC_ACTOR_ID/);
+  assert.match(source, /checker_id: checkerId/);
+  assert.match(source, /payload\.checker/);
+  assert.match(source, /qcTask\.agent_name/);
+  assert.match(source, /qc_task_sha_mismatch/);
+  assert.match(source, /idempotency_conflict/);
+});
+
+test('verdict handler binds all evidence to the completed QC task and resists forgery', async () => {
+  const attempts = new Map();
+  const writes = [];
+  let taskQueryValues;
+  let task = {
+    id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1',
+    context: {}, result: qcResult()
+  };
+  const client = {
+    async connect() {}, async end() {},
+    async query(sql, values = []) {
+      if (/FROM qc_attempt/.test(sql)) return { rows: attempts.has(values[0]) ? [attempts.get(values[0])] : [] };
+      if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+      if (/FROM agent_task_queue t/.test(sql)) { taskQueryValues = values; return { rows: task ? [task] : [] }; }
+      if (/FROM qc_verdict/.test(sql)) return { rows: [] };
+      if (/INSERT INTO qc_attempt/.test(sql)) {
+        const [issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head, failure_class, qualifying, model, effort, idem_key] = values;
+        attempts.set(idem_key, { issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head, failure_class, qualifying, model, effort });
+      }
+      if (/INSERT INTO qc_verdict/.test(sql)) writes.push(values);
+      return { rows: [] };
+    }
+  };
+  setTestClientFactory(() => client);
+  const call = async (payload) => {
+    const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
+    return { ...res, json: JSON.parse(res.body) };
+  };
+  try {
+    let result = await call({ ...validVerdict, checker: 'forged-human-name' });
+    assert.equal(result.status, 201);
+    assert.equal(writes[0][2], 'qc-sol-low-1', 'checker_name must come from QC agent, not CLI checker');
+    result = await call({ ...validVerdict, idem_key: 'qc-verdict-wrong-md5', work_product_md5: 'a41d8cd98f00b204e9800998ecf8427e' });
+    assert.equal(result.json.error, 'qc_task_work_product_mismatch');
+    task = { ...task, result: qcResult({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false }) };
+    result = await call({ ...validVerdict, idem_key: 'qc-verdict-fail-pass' });
+    assert.equal(result.json.error, 'qc_task_verdict_mismatch');
+    task = null;
+    result = await call({ ...validVerdict, idem_key: 'qc-verdict-cross-workspace' });
+    assert.equal(result.json.error, 'completed_sol_low_qc_required');
+    task = { id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1', context: {}, result: qcResult() };
+    result = await call({ ...validVerdict, checker: 'replay-forgery' });
+    assert.equal(result.status, 200, 'same immutable evidence must replay despite a forged checker string');
+    result = await call({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false });
+    assert.equal(result.json.error, 'idempotency_conflict');
+    const explicitTaskId = '11111111-1111-4111-8111-111111111111';
+    task = { ...task, id: explicitTaskId, result: qcResult() };
+    result = await call({ ...validVerdict, idem_key: 'qc-explicit-task-binding', qc_task_id: explicitTaskId });
+    assert.equal(result.status, 201);
+    assert.deepEqual(taskQueryValues, [validVerdict.issue_id, 'workspace-1', explicitTaskId,
+      ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
+    assert.match(writes.at(-1)[5], new RegExp(`relay_task_id=${explicitTaskId}`));
+  } finally {
+    setTestClientFactory(null);
+  }
+});
+
+test('operator external QC requires its distinct secret and Sol-low evidence lane', async () => {
+  const writes = [];
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    if (/FROM agent_task_queue t/.test(sql)) assert.fail('external QC must not read a task row');
+    if (/FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/INSERT INTO qc_attempt|INSERT INTO qc_verdict/.test(sql)) writes.push(values);
+    return { rows: [] };
+  } };
+  const call = async (payload, headers = {}) => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({ headers }, res, { agent_token: 'test-relay-secret', ...payload });
+    return { ...res, json: JSON.parse(res.body) };
+  };
+  setTestClientFactory(() => client);
+  try {
+    const external = { ...validVerdict, idem_key: 'external-qc-accepted-0001', operator_external_qc: true, reason: 'outside belt PR QC' };
+    assert.equal((await call(external, { 'x-relay-operator-secret': 'test-operator-secret' })).status, 201);
+    assert.match(writes[0][11], /operator_external_qc=outside belt PR QC/);
+    assert.deepEqual(writes[1].slice(0, 3), [validVerdict.issue_id,
+      '00000000-0000-0000-0000-000000000000', external.checker],
+    'external QC verdict insert uses the bridge system actor and operator callsign');
+    assert.equal((await call({ ...external, idem_key: 'external-qc-no-secret-0002' })).status, 403);
+    const wrongLane = await call({ ...external, idem_key: 'external-qc-wrong-lane-003', model: 'other-model' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+    assert.equal(wrongLane.json.error, 'invalid_qc_lane');
+  } finally { setTestClientFactory(null); }
+});
+
+test('PASS replay writes once, but an older bound task cannot replace a newer FAIL', async () => {
+  const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'pass-agent',
+    agent_name: 'qc-sol-low-pass', context: {}, result: qcResult(), completed_at: '2026-01-01T00:00:00Z' };
+  const prior = { issue_id: validVerdict.issue_id, checker_name: task.agent_name,
+    verdict: 'PASS', work_product_md5: validVerdict.work_product_md5,
+    bound_sha: validVerdict.bound_sha, observed_head: validVerdict.observed_sha,
+    failure_class: validVerdict.failure_class, qualifying: validVerdict.qualifying,
+    model: validVerdict.model, effort: validVerdict.effort };
+  let verdict = null;
+  let writes = 0;
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [prior] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
+    if (/FROM qc_verdict/.test(sql)) return { rows: verdict ? [verdict] : [] };
+    if (/INSERT INTO qc_verdict/.test(sql)) {
+      writes += 1;
+      verdict = { issue_id: values[0], checker_id: values[1], notes: values[5], created_at: '2026-01-01T00:01:00Z' };
+    }
+    if (/UPDATE qc_verdict/.test(sql)) writes += 1;
+    return { rows: [] };
+  } };
+  const post = async () => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...validVerdict, qc_task_id: task.id });
+    return { ...res, json: JSON.parse(res.body) };
+  };
+  setTestClientFactory(() => client);
+  try {
+    assert.equal((await post()).status, 200);
+    assert.equal((await post()).status, 200);
+    assert.equal(writes, 1, 'a second PASS replay must not duplicate its verdict row');
+    verdict = { issue_id: validVerdict.issue_id, checker_id: 'fail-agent', notes: 'relay_task_id=newer-task',
+      created_at: '2026-01-02T00:00:00Z' };
+    const result = await post();
+    assert.equal(result.status, 409);
+    assert.equal(result.json.error, 'qc_verdict_newer_than_bound_qc_task');
+    assert.equal(writes, 1, 'the older PASS replay must not overwrite the newer FAIL');
+  } finally { setTestClientFactory(null); }
+});
+
+test('FAIL replay does not write a qc_verdict row', async () => {
+  const fail = { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false };
+  const task = { id: '22222222-2222-4222-8222-222222222222', agent_id: 'fail-agent',
+    agent_name: 'qc-sol-low-fail', context: {}, result: qcResult(fail), completed_at: '2026-01-01T00:00:00Z' };
+  const prior = { issue_id: fail.issue_id, checker_name: task.agent_name, verdict: fail.verdict,
+    work_product_md5: fail.work_product_md5, bound_sha: fail.bound_sha, observed_head: fail.observed_sha,
+    failure_class: fail.failure_class, qualifying: fail.qualifying, model: fail.model, effort: fail.effort };
+  let verdictWrites = 0;
+  const client = { async connect() {}, async end() {}, async query(sql) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [prior] };
+    if (/INSERT INTO qc_verdict|UPDATE qc_verdict/.test(sql)) verdictWrites += 1;
+    return { rows: [] };
+  } };
+  const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...fail, qc_task_id: task.id });
+    assert.equal(res.status, 200);
+    assert.equal(verdictWrites, 0);
+  } finally { setTestClientFactory(null); }
+});
+
+test('runbook-shaped verdicts advance through the relay handler', async () => {
+  const attempts = [];
+  const verdicts = [];
+  const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'qc-agent',
+    agent_name: 'qc-sol-low', context: {}, result: qcResult() };
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM qc_attempt/.test(sql)) return { rows: [] };
+    if (/SELECT id, workspace_id FROM issue/.test(sql) || /FROM "issue"\s+WHERE id = \$1\s+FOR UPDATE/.test(sql)) {
+      return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1', status: 'In Review',
+        description: '', parent_issue_id: null, title: 'QC fixture', priority: 'none', metadata: {} }] };
+    }
+    if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
+    if (/SELECT verdict, work_product_md5 FROM qc_verdict/.test(sql)) {
+      const latest = verdicts.at(-1);
+      return { rows: latest ? [{ verdict: latest[3], work_product_md5: latest[4] }] : [] };
+    }
+    if (/FROM qc_verdict/.test(sql)) return { rows: [] };
+    if (/INSERT INTO qc_attempt/.test(sql)) attempts.push(values);
+    if (/INSERT INTO qc_verdict/.test(sql)) verdicts.push(values);
+    if (/SELECT stage_name FROM relay_stage_config/.test(sql)) return { rows: [{ stage_name: values[1] }] };
+    if (/SELECT next_stage, alt_next_stages/.test(sql)) return { rows: [{ next_stage: 'CI/CD & Deploy', alt_next_stages: ['In Progress'] }] };
+    if (/SELECT t\.result, c\.content/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_config rsc/.test(sql)) return { rows: [{ agent_id: null, agent_name: null, owner_id: null }] };
+    if (/UPDATE "issue"\s+SET status/.test(sql)) return { rowCount: 1, rows: [{ id: validVerdict.issue_id, status: values[0] }] };
+    return { rows: [] };
+  } };
+  const post = async (payload) => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
+    return res;
+  };
+  setTestClientFactory(() => client);
+  try {
+    const pass = runbookVerdict({ idemKey: 'qc-runbook-pass-0001' });
+    task.result = qcResult(pass);
+    assert.equal((await post(pass)).status, 201);
+    const values = attempts[0];
+    const row = { task_id: task.id, to_stage: 'In Review', next_stage: 'CI/CD & Deploy', task_status: 'completed',
+      task_agent_id: task.agent_id, task_agent_model: 'gpt-5.6-sol', task_agent_effort: 'low',
+      qc_verdict_checker_id: task.agent_id, qc_verdict: 'PASS', qc_verdict_work_product_md5: pass.work_product_md5,
+      qc_attempt_verdict: values[2], qc_attempt_work_product_md5: values[3], qc_attempt_bound_sha: values[4],
+      qc_attempt_observed_sha: values[5], qc_attempt_qualifying: values[7], qc_attempt_evidence_task_id: task.id,
+      qc_attempt_evidence_agent_id: task.agent_id, qc_attempt_evidence_agent_model: 'gpt-5.6-sol', qc_attempt_evidence_agent_effort: 'low' };
+    const advance = async (to_stage) => {
+      const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+      await relayAdvance({}, res, { issue_id: validVerdict.issue_id, to_stage,
+        agent_token: 'test-relay-secret', current_work_product_md5: pass.work_product_md5 });
+      return { ...res, json: JSON.parse(res.body) };
+    };
+    assert.equal((await advance('CI/CD & Deploy')).json.issue.status, 'CI/CD & Deploy');
+    const failed = runbookVerdict({ verdict: 'FAIL', failureClass: 'implementation', qualifying: false,
+      idemKey: 'qc-runbook-fail-0001', reworkSummary: 'Restore the missing validation.' });
+    assert.equal(failed.notes, 'Restore the missing validation.');
+    const blocked = runbookVerdict({ verdict: 'FAIL', failureClass: 'evidence', qualifying: false,
+      idemKey: 'qc-runbook-blocked-0001', blockedReason: 'add the pull request and full SHA.' });
+    task.result = qcResult(blocked);
+    assert.equal((await post(blocked)).status, 201);
+    assert.equal(verdicts[1][3], 'FAIL');
+    assert.match(verdicts[1][5], /BLOCKED: add the pull request and full SHA\./);
+    assert.equal((await advance('In Progress')).json.issue.status, 'In Progress');
+  } finally { setTestClientFactory(null); }
+});
+
+test('QC runbook emits bridge evidence and advances both verdict dispositions', () => {
+  const runbook = fs.readFileSync(require.resolve('./RUNBOOK_QC_WORKER.md'), 'utf8');
+  assert.match(runbook, /QC_EVIDENCE_JSON=/);
+  assert.match(runbook, /sk multica verdict "\$NUMBER" --board "\$BOARD" --verdict "\$VERDICT"/);
+  assert.match(runbook, /--bound-sha "\$BOUND_SHA" --observed-sha "\$OBSERVED_SHA"/);
+  assert.match(runbook, /--work-product-md5 "\$WORK_PRODUCT_MD5" --failure-class "\$FAILURE_CLASS"/);
+  assert.match(runbook, /--qualifying "\$QUALIFYING" --model gpt-5\.6-sol --effort low --idem-key "\$IDEM_KEY"/);
+  assert.match(runbook, /--notes "\$VERDICT_NOTES"/);
+  assert.match(runbook, /VERDICT_NOTES="\$\{REWORK_SUMMARY:\?set a concise rework summary\}"/);
+  assert.match(runbook, /VERDICT_NOTES="BLOCKED: \$BLOCKED_REASON"/);
+  assert.match(runbook, /verdict` must accept `--board gsp`/);
+  assert.match(runbook, /--to "CI\/CD & Deploy" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
+  assert.match(runbook, /--to "In Progress" --current-work-product-md5 "\$WORK_PRODUCT_MD5"/);
+  assert.match(runbook, /BLOCKED: <reason>/);
+  assert.match(runbook, /git -C "\$CHECKOUT" ls-tree -r --full-tree "\$BOUND_SHA" \| LC_ALL=C sort \| md5sum/);
+  assert.doesNotMatch(runbook, /What changed.*md5sum|WORK_PRODUCT="\$\(jq/);
+  assert.doesNotMatch(runbook, /curl --|RELAY_URL|RELAY_AGENT_SECRET/);
+});
+
+test('only a named CI/CD return is eligible for a repair authorization', () => {
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
+    'RETURN:In Progress — owner/repo#1 merge conflict; verify master..merge diff after rebase'), true);
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress', ''), false);
+  assert.equal(isCicdReturn('In Review', 'In Progress',
+    'RETURN:In Progress — retry'), false);
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'Queue',
+    'RETURN:Queue — retry'), false);
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
+    'RETURN:In Progress — arbitrary caller text'), false);
+  assert.equal(isCicdReturn('CI/CD & Deploy', 'In Progress',
+    'RETURN:In Progress — owner/repo#8 no CI runs after 20 minutes'), true);
+});
+
+test('CI/CD return authorization is consumed only by a cap bypass after admission', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: calls.length === 1 ? [{ id: 'issue-1' }] : [] };
+  } };
+
+  assert.equal(await authorizeCicdReturnCapBypass(client, 'issue-1', false), false);
+  assert.equal(await authorizeCicdReturnCapBypass(client, 'issue-1', true), true);
+  assert.equal(await authorizeCicdReturnCapBypass(client, 'issue-1', true), false);
+  assert.equal(calls.length, 2);
+  assert.match(calls[0].sql, /cicd_return_consumed_at/);
+  assert.match(calls[0].sql, /NOT \(COALESCE\(metadata, '\{\}'::jsonb\) \? 'cicd_return_consumed_at'\)/);
+  assert.deepEqual(calls[0].values, ['issue-1']);
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const admission = source.indexOf('const admission = crossStageExecutionAdmission');
+  const authorization = source.indexOf('await authorizeCicdReturnCapBypass');
+  assert.ok(admission >= 0 && authorization > admission,
+    'the 202 cross-stage admission must precede authorization consumption');
+  assert.match(source, /!issue\.metadata\?\.cicd_return_consumed_at/);
+});
+
+function scoper(overrides = {}) {
+  return {
+    agent_id: 'agent-b', agent_name: 'ppp-spec-sol-low-2', owner_id: 'agent-b',
+    runtime_id: 'runtime-1', archived_at: null, agent_status: 'idle',
+    instructions: 'Own Spec tickets only.', model: 'gpt-5.6-sol', thinking_level: 'low',
+    selected_runtime_id: 'runtime-1', active_task_count: 0, max_concurrent_tasks: 1, ...overrides
+  };
+}
+
+test('scoper pool selects the least-loaded eligible Sol-low owner', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    return { rows: [scoper({ agent_id: 'agent-b', active_task_count: 0 }),
+      scoper({ agent_id: 'agent-a', active_task_count: 1 })] };
+  } };
+  const owner = await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec');
+  assert.equal(owner.agent_id, 'agent-b');
+  assert.match(calls[0].sql, /pg_advisory_xact_lock/);
+  assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
+  assert.deepEqual(calls[0].values, ['workspace-1', 'Spec']);
+  assert.deepEqual(calls[1].values, ['workspace-1', 'Spec']);
+});
+
+test('configured stage pool fails closed when its members are incompatible', async () => {
+  const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
+    ? { rows: [] } : { rows: [scoper({ instructions: 'Own Queue tickets only.' })] } };
+  await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
+    /No eligible stage owner in pool/);
+});
+
+test('configured stage pool queues on the least-loaded member when every member is at capacity', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    return { rows: [
+      scoper({ agent_id: 'more-loaded', active_task_count: 3, max_concurrent_tasks: 3 }),
+      scoper({ agent_id: 'least-loaded', active_task_count: 2, max_concurrent_tasks: 2,
+        last_selected_at: '2026-01-01T00:00:00Z' })
+    ] };
+  } };
+  const owner = await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec');
+  assert.equal(owner.agent_id, 'least-loaded');
+  assert.match(calls[2].sql, /SET last_selected_at = NOW/);
+});
+
+test('empty stage pool preserves the canonical relay owner fallback', async () => {
+  const calls = [];
+  const fallback = { agent_id: 'canonical-agent' };
+  const client = { query: async (sql) => {
+    calls.push(sql);
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
+    return { rows: [fallback] };
+  } };
+  assert.equal(await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'), fallback);
+  assert.match(calls[2], /FROM relay_stage_config/);
+});
+
+test('pool selection applies to Queue and rotates equal-load agents', async () => {
+  const calls = [];
+  const builders = [
+    scoper({ agent_id: 'builder-older', agent_name: 'build-a', model: 'gpt-5.6-terra',
+      instructions: 'Use this runbook when the issue is in Queue.', last_selected_at: '2026-01-01T00:00:00Z' }),
+    scoper({ agent_id: 'builder-newer', agent_name: 'build-b', model: 'gpt-5.6-terra',
+      instructions: 'Use this runbook when the issue is in Queue.', last_selected_at: '2026-02-01T00:00:00Z' })
+  ];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: builders };
+    return { rows: [] };
+  } };
+  const selected = await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue');
+  assert.equal(selected.agent_id, 'builder-older');
+  assert.match(calls[1].sql, /ORDER BY active_task_count, p\.last_selected_at NULLS FIRST, p\.agent_id/);
+  assert.match(calls[2].sql, /SET last_selected_at = NOW/);
+  assert.deepEqual(calls[2].values, ['workspace-1', 'Queue', 'builder-older']);
+});
+
+test('pool selection chooses the older Date-valued rotation timestamp', async () => {
+  const builders = [
+    scoper({ agent_id: 'builder-sunday', active_task_count: 0,
+      instructions: 'Own Queue tickets only.',
+      last_selected_at: new Date('2026-08-30T10:00:00Z') }),
+    scoper({ agent_id: 'builder-monday', active_task_count: 0,
+      instructions: 'Own Queue tickets only.',
+      last_selected_at: new Date('2026-08-31T09:00:00Z') })
+  ];
+  const client = { query: async (sql) => {
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: builders };
+    return { rows: [] };
+  } };
+  const selected = await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue');
+  assert.equal(selected.agent_id, 'builder-sunday');
+});
+
+test('nine one-slot builders fill fairly and a tenth waits until capacity frees', async () => {
+  const agents = Array.from({ length: 9 }, (_, index) => ({
+    agent_id: `builder-${index + 1}`,
+    agent_name: `gsp-build-terra-low-${String(index + 1).padStart(2, '0')}`,
+    owner_id: `builder-${index + 1}`,
+    agent_status: 'idle', archived_at: null, instructions: 'Queue allowed',
+    max_concurrent_tasks: 1, active_task_count: 0,
+    selected_runtime_id: 'runtime-1', selected_runtime_provider: 'codex',
+    last_selected_at: null
+  }));
+  const active = new Set();
+  const client = { query: async (sql, values = []) => {
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool p/.test(sql)) {
+      return { rows: agents.map((agent) => ({ ...agent,
+        active_task_count: active.has(agent.agent_id) ? 1 : 0,
+        last_selected_at: active.has(agent.agent_id) ? new Date().toISOString() : null
+      })) };
+    }
+    if (/UPDATE relay_stage_agent_pool SET last_selected_at/.test(sql)) {
+      active.add(values[2]);
+      return { rows: [] };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  }};
+  const selected = [];
+  for (let index = 0; index < 9; index += 1) {
+    selected.push((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id);
+  }
+  assert.equal(new Set(selected).size, 9);
+  assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
+  active.delete(selected[0]);
+  assert.equal((await selectPoolOwner(client, 'workspace-1', 'Spec', 'Queue')).agent_id, selected[0]);
+});
+
+test('twenty concurrent stage retries create one active successor task', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') {
+    return t.skip('integration test requires a real DATABASE_URL');
+  }
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  await admin.connect();
+  const schema = `relay_pool_retry_${Date.now()}`;
+  const issueId = '11111111-1111-1111-1111-111111111111';
+  const agentId = '22222222-2222-2222-2222-222222222222';
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`SET search_path TO ${schema}`);
+    await admin.query(`CREATE TABLE agent_task_queue (
+      id uuid PRIMARY KEY DEFAULT (md5(random()::text || clock_timestamp()::text))::uuid, agent_id uuid NOT NULL,
+      issue_id uuid NOT NULL, workspace_id uuid NOT NULL, status text NOT NULL,
+      priority integer NOT NULL, runtime_id uuid, context jsonb NOT NULL,
+      trigger_summary text, force_fresh_session boolean, originator_source text,
+      trigger_evidence_kind text, completed_at timestamptz, prepare_lease_expires_at timestamptz,
+      failure_reason text, created_at timestamptz NOT NULL DEFAULT now()
+    ); CREATE TABLE relay_run_log (
+      id serial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
+      to_stage text, agent_id uuid, task_id uuid, status text NOT NULL,
+      created_at timestamptz NOT NULL DEFAULT now()
+    )`);
+    const task = {
+      issueId, workspaceId: '33333333-3333-3333-3333-333333333333',
+      fromStage: 'Spec', toStage: 'Queue', agentId,
+      priority: 1, runtimeId: null,
+      serialize: true,
+      context: JSON.stringify({ source: 'relay-advance', to_stage: 'Queue' }),
+      triggerSummary: 'concurrency test'
+    };
+    const retry = async () => {
+      const client = new Client({ connectionString: databaseUrl });
+      await client.connect();
+      try {
+        await client.query(`SET search_path TO ${schema}`);
+        await client.query('BEGIN');
+        const result = await replaceStageTask(client, task);
+        await client.query('COMMIT');
+        return result;
+      } finally { await client.end(); }
+    };
+    await Promise.all(Array.from({ length: 20 }, retry));
+    const { rows } = await admin.query(`SELECT count(*)::int AS count
+      FROM agent_task_queue WHERE issue_id=$1::uuid AND status='queued'`, [issueId]);
+    assert.equal(rows[0].count, 1);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
+test('twenty concurrent Queue entries through both routes rotate across equal-load pool agents', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') {
+    return t.skip('integration test requires a real DATABASE_URL');
+  }
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  await admin.connect();
+  const schema = `relay_pool_queue_${Date.now()}`;
+  const workspaceId = '33333333-3333-3333-3333-333333333333';
+  const runtimeId = '44444444-4444-4444-4444-444444444444';
+  try {
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    await admin.query(`SET search_path TO ${schema}`);
+    await admin.query(`CREATE TABLE relay_stage_pool (
+      workspace_id uuid NOT NULL, stage_name text NOT NULL, enabled boolean NOT NULL
+    ); CREATE TABLE relay_stage_agent_pool (
+      workspace_id uuid NOT NULL, stage_name text NOT NULL, agent_id uuid NOT NULL,
+      enabled boolean NOT NULL, last_selected_at timestamptz
+    ); CREATE TABLE agent (
+      id uuid PRIMARY KEY, workspace_id uuid NOT NULL, name text NOT NULL, runtime_id uuid,
+      archived_at timestamptz, status text NOT NULL, instructions text, model text,
+      thinking_level text, max_concurrent_tasks integer NOT NULL, runtime_config jsonb
+    ); CREATE TABLE agent_runtime (
+      id uuid PRIMARY KEY, workspace_id uuid NOT NULL, provider text NOT NULL, status text NOT NULL,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    ); CREATE TABLE agent_task_queue (agent_id uuid NOT NULL, status text NOT NULL)`);
+    await admin.query(`INSERT INTO relay_stage_pool (workspace_id, stage_name, enabled)
+      VALUES ($1::uuid, 'Queue', true)`, [workspaceId]);
+    await admin.query(`INSERT INTO agent_runtime (id, workspace_id, provider, status)
+      VALUES ($1::uuid, $2::uuid, 'codex', 'online')`, [runtimeId, workspaceId]);
+    for (let index = 1; index <= 20; index += 1) {
+      const agentId = `00000000-0000-0000-0000-${String(index).padStart(12, '0')}`;
+      await admin.query(`INSERT INTO agent
+        (id, workspace_id, name, runtime_id, status, instructions, max_concurrent_tasks)
+        VALUES ($1::uuid, $2::uuid, $3, $4::uuid, 'idle', 'read RUNBOOK_BUILD_WORKER.md', 1)`,
+      [agentId, workspaceId, `builder-${index}`, runtimeId]);
+      await admin.query(`INSERT INTO relay_stage_agent_pool
+        (workspace_id, stage_name, agent_id, enabled) VALUES ($1::uuid, 'Queue', $2::uuid, true)`,
+      [workspaceId, agentId]);
+    }
+    const select = async (fromStage) => {
+      const client = new Client({ connectionString: databaseUrl });
+      await client.connect();
+      try {
+        await client.query(`SET search_path TO ${schema}`);
+        await client.query('BEGIN');
+        const selected = await selectStageOwner(client, workspaceId,
+          ownerStageForTransition(fromStage, 'Queue'), 'Queue');
+        await client.query('COMMIT');
+        return selected.agent_id;
+      } finally { await client.end(); }
+    };
+    const selected = await Promise.all(Array.from({ length: 20 }, (_, index) =>
+      select(index % 2 === 0 ? 'Spec' : 'In Progress')));
+    assert.equal(new Set(selected).size, 20);
+  } finally {
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    await admin.end();
+  }
+});
+
+test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', () => {
+  assert.equal(isBookkeepingTransition('Queue', 'In Progress'), true);
+  assert.equal(isBookkeepingTransition('Spec', 'Queue'), false);
+  assert.equal(isBookkeepingTransition('In Progress', 'In Review'), false);
+});
+
+test('bookkeeping handoff links the existing builder task to the QC trigger', async () => {
+  const calls = [];
+  const replies = [
+    { rows: [{ id: 'builder-task', agent_id: 'builder-agent', status: 'completed',
+      result: { output: 'Implemented the fix; work product: PR #123' } }] },
+    { rows: [{ id: 'handoff-log' }] }
+  ];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return replies.shift();
+  } };
+
+  const result = await recordBookkeepingHandoff(client, 'issue-1');
+
+  assert.deepEqual(result, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.match(calls[0].sql, /context->>'to_stage' = 'Queue'/);
+  assert.match(calls[0].sql, /status = 'completed'/);
+  assert.match(calls[0].sql, /SELECT id, agent_id, status, result/);
+  assert.match(calls[1].sql, /INSERT INTO relay_run_log/);
+  assert.deepEqual(calls[1].values, ['issue-1', 'builder-agent', 'builder-task']);
+  assert.doesNotMatch(calls.map(({ sql }) => sql).join('\n'), /INSERT INTO agent_task_queue/);
+});
+
+test('bookkeeping handoff rejects a running predecessor even if a mock returns it', async () => {
+  const calls = [];
+  const client = { query: async (sql) => {
+    calls.push(sql);
+    return { rows: [{ id: 'running-builder', agent_id: 'builder-agent', status: 'running',
+      result: { output: 'work product: PR #123' } }] };
+  } };
+
+  assert.equal(await recordBookkeepingHandoff(client, 'issue-running'), null);
+  assert.equal(calls.length, 1);
+  assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
+});
+
+test('bookkeeping handoff rejects a failed predecessor and missing work product', async () => {
+  for (const task of [
+    { id: 'failed-builder', agent_id: 'builder-agent', status: 'completed', result: { output: 'FAILED: tests' } },
+    { id: 'empty-builder', agent_id: 'builder-agent', status: 'completed', result: null }
+  ]) {
+    const calls = [];
+    const client = { query: async (sql) => {
+      calls.push(sql);
+      return { rows: [task] };
+    } };
+    assert.equal(await recordBookkeepingHandoff(client, 'issue-invalid'), null);
+    assert.equal(calls.length, 1);
+    assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
+  }
+});
+
+test('bookkeeping handoff replay reuses the existing correlated relay row', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return calls.length % 2 === 1
+      ? { rows: [{ id: 'builder-task', agent_id: 'builder-agent', status: 'completed',
+          result: { output: 'work product: PR #123' } }] }
+      : { rows: [{ id: 'handoff-log' }] };
+  } };
+
+  const first = await recordBookkeepingHandoff(client, 'issue-replay');
+  const second = await recordBookkeepingHandoff(client, 'issue-replay');
+  assert.deepEqual(first, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.deepEqual(second, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.equal(calls.filter(({ sql }) => /INSERT INTO relay_run_log/.test(sql)).length, 2);
+  assert.match(calls[1].sql, /WHERE NOT EXISTS/);
+});
+
+test('bookkeeping handoff refuses a Queue shortcut without a builder predecessor', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [] };
+  } };
+
+  assert.equal(await recordBookkeepingHandoff(client, 'issue-without-build'), null);
+  assert.equal(calls.length, 1);
+  assert.doesNotMatch(calls[0].sql, /INSERT INTO relay_run_log/);
+});
+
+test('relay dispatch gates bypass paid admission only for the bookkeeping hop', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /isExecutionStage\(to_stage\) && !parkedRelease && !bookkeepingTransition/);
+  assert.match(source, /isExecutionStage\(to_stage\) && !bookkeepingTransition/);
+  assert.match(source, /if \(bookkeepingTransition\) \{[\s\S]*relayLogId = bookkeepingHandoff\.relayLogId/);
+});
+
+test('transition owner selection preserves forward lanes and routes backward branches to lane owners', () => {
+  assert.equal(ownerStageForTransition('Spec', 'Queue'), 'Spec');
+  assert.equal(ownerStageForTransition('In Progress', 'In Review'), 'In Progress');
+  assert.equal(ownerStageForTransition('In Review', 'In Progress'), 'Queue');
+  assert.equal(ownerStageForTransition('Human Review', 'In Review'), 'In Progress');
+  assert.equal(ownerStageForTransition('CI/CD & Deploy', 'Queue'), 'Queue');
+  assert.equal(ownerStageForTransition('CI/CD & Deploy', 'In Progress'), 'Queue');
+  assert.equal(ownerStageForTransition('CI/CD & Deploy', 'Spec'), 'Registered');
+  assert.equal(ownerStageForTransition('Queue', 'Spec'), 'Registered');
+  assert.equal(ownerStageForTransition('Parked', 'Spec'), 'Registered');
+});
+
+function transition() {
+  return {
+    issueId: 'issue-1', fromStage: 'In Progress', toStage: 'In Review',
+    workspaceId: 'workspace-1',
+    agentId: 'agent-1', priority: 3, runtimeId: 'runtime-1',
+    context: JSON.stringify({ from_stage: 'In Progress', to_stage: 'In Review' }),
+    triggerSummary: 'Relay stage transition: In Progress -> In Review'
+  };
+}
+
+test('stage transition supersedes stale work before enqueuing and logging its successor', async () => {
+  const calls = [];
+  const replies = [{ rows: [] }, { rows: [{ id: 'task-new' }] }, { rows: [{ id: 'log-new' }] }];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return replies.shift();
+  } };
+
+  const result = await replaceStageTask(client, transition());
+
+  assert.deepEqual(result, { taskId: 'task-new', relayLogId: 'log-new' });
+  assert.match(calls[0].sql, /failure_reason = 'relay_stage_transition_superseded'/);
+  assert.deepEqual(calls[0].values, ['issue-1',
+    ['queued', 'dispatched', 'waiting_local_directory', 'deferred'], 'In Review']);
+  assert.match(calls[0].sql, /context \? 'to_stage'/);
+  assert.match(calls[0].sql, /NOT LIKE 'manual%'/);
+  assert.match(calls[0].sql, /'Human Review', 'Parked', 'Rejected'/);
+  assert.match(calls[1].sql, /WHERE NOT EXISTS/);
+  assert.match(calls[1].sql, /agent_id, issue_id, workspace_id/);
+  assert.equal(calls[1].values[2], 'workspace-1');
+  assert.match(calls[2].sql, /INSERT INTO relay_run_log/);
+  assert.deepEqual(calls[2].values, ['issue-1', 'In Progress', 'In Review', 'agent-1', 'task-new']);
+});
+
+test('stage transition never cancels an active paid predecessor', async () => {
+  const calls = [];
+  const replies = [{ rows: [] }, { rows: [{ id: 'task-new' }] }, { rows: [{ id: 'log-new' }] }];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return replies.shift();
+  } };
+  await replaceStageTask(client, transition());
+  assert.doesNotMatch(calls[0].sql, /status IN \([^)]*'running'/);
+  assert.deepEqual(calls[0].values[1],
+    ['queued', 'dispatched', 'waiting_local_directory', 'deferred']);
+});
+
+test('relay dispositions preserve already-running paid work', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const disposition = source.slice(source.indexOf('async function applyDisposition'),
+    source.indexOf('// The spec agent'));
+  assert.doesNotMatch(disposition, /status IN \([^)]*'running'/);
+  assert.match(disposition, /status IN \('queued','dispatched','waiting_local_directory','deferred'\)/);
+});
+
+test('cross-stage admission returns a bounded defer for active predecessors', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /res\.writeHead\(202, \{ 'Content-Type': 'application\/json', 'Retry-After': '15' \}\)/);
+  assert.match(source, /retry_after_seconds: 15/);
+  assert.match(source, /message: 'a prior relay execution is still active/);
+});
+
+test('stage transition fails before commit when no successor task exists', async () => {
+  const calls = [];
+  const replies = [{ rows: [] }, { rows: [] }, { rows: [] }];
+  const client = { query: async (sql) => {
+    calls.push(sql);
+    return replies.shift();
+  } };
+
+  await assert.rejects(() => replaceStageTask(client, transition()),
+    /relay successor task was not created/);
+  assert.equal(calls.length, 3);
+  assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
+});
+
+test('builder dispatcher rejects diagnosis tasks marked no_builder', async () => {
+  const { replaceStageTask } = require('./multica-bridge.cjs');
+  let queries = 0;
+  await assert.rejects(() => replaceStageTask({ query: async () => { queries++; } }, {
+    ...transition(), context: JSON.stringify({ kind: 'parked_diagnosis', no_builder: true })
+  }), /no_builder diagnosis task/);
+  assert.equal(queries, 0);
+});
+
+test('an already-created matching successor is linked instead of permitting a taskless transition', async () => {
+  const replies = [{ rows: [] }, { rows: [] }, { rows: [{ id: 'task-existing' }] }, { rows: [] }];
+  const client = { query: async () => replies.shift() };
+
+  const result = await replaceStageTask(client, transition());
+
+  assert.deepEqual(result, { taskId: 'task-existing', relayLogId: null });
+});
+
+test('an already-applied transition locates its existing live successor task', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ id: 'task-existing' }] };
+  } };
+
+  const taskId = await existingStageTask(client, 'issue-1', 'In Review');
+
+  assert.equal(taskId, 'task-existing');
+  assert.match(calls[0].sql, /status::text = ANY/);
+  assert.match(calls[0].sql, /FOR UPDATE/);
+  assert.deepEqual(calls[0].values, ['issue-1',
+    ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred'], 'In Review']);
+});
+
+test('deploy close upgrades one oldest pending relay row', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return calls.length === 1 ? { rows: [{ id: 41 }, { id: 42 }] } : { rows: [] };
+  } };
+
+  const id = await ensureCompletedRelayLog(client, 'issue-1', 'CI/CD & Deploy', 'Done');
+
+  assert.equal(id, 41);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].sql, /ORDER BY created_at, id\s+LIMIT 1/);
+});
+
+test('deploy close inserts one completed relay row when no pending row exists', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return calls.length === 2 ? { rows: [{ id: 42 }] } : { rows: [] };
+  } };
+
+  const id = await ensureCompletedRelayLog(client, 'issue-2', 'CI/CD & Deploy', 'Done');
+
+  assert.equal(id, 42);
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].sql, /INSERT INTO relay_run_log/);
+});
+
+test('terminal close retry reuses the existing completed row', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return calls.length === 3 ? { rows: [{ id: 43 }] } : { rows: [] };
+  } };
+
+  const id = await ensureCompletedRelayLog(client, 'issue-3', 'CI/CD & Deploy', 'Done');
+
+  assert.equal(id, 43);
+  assert.equal(calls.length, 3);
+  assert.match(calls[2].sql, /status = 'completed'/);
+});
+
+test('terminal already-applied replay returns its completed relay log ID', async () => {
+  const client = { query: async () => ({ rows: [{ id: 44 }] }) };
+  assert.equal(await completedTerminalRelayLog(client, 'issue-4', 'Cancelled'), 44);
+});
+
+test('release admission is explicit, one-use, and resets task history by time', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /parked_release_once === true/);
+  assert.match(source,
+    /if \(!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&\s+!parkedDiagnosisDone && !noArtifactRescope && !allowedStages\.includes/);
+  assert.match(source, /reason: "parked_release_required"/);
+  assert.match(source, /created_at >= \$3/);
+  assert.match(source, /created_at >= \$2/);
+  assert.match(source, /'parked_release_once'.*'\{parked_release_at\}'/s);
+  assert.match(source, /\["Queue", "Spec"\]\.includes\(to_stage\)/);
+  assert.match(source, /if \(!bindingSpec && parkedRelease\) \{[\s\S]*?to_stage = "Spec"/);
+});
+
+test('operator Human Review release is authenticated, bounded, and auditable', async (t) => {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl || databaseUrl === 'postgres://test') return t.skip('integration test requires a real DATABASE_URL');
+  const { Client } = require('pg');
+  const admin = new Client({ connectionString: databaseUrl });
+  let countClient;
+  const schema = `relay_human_review_release_${Date.now()}`;
+  const workspaceId = '11111111-1111-1111-1111-111111111111';
+  const agentId = '22222222-2222-2222-2222-222222222222';
+  const runtimeId = '33333333-3333-3333-3333-333333333333';
+  const response = () => ({ status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } });
+  const invoke = async (body, headers = {}) => {
+    setTestClientFactory(() => {
+      const client = new Client({ connectionString: databaseUrl });
+      const connect = client.connect.bind(client);
+      client.connect = async () => { await connect(); await client.query(`SET search_path TO ${schema}`); };
+      return client;
+    });
+    const res = response();
+    try { await relayAdvance({ headers }, res, { agent_token: 'test-relay-secret', ...body }); }
+    finally { setTestClientFactory(null); }
+    return res;
+  };
+  const insertIssue = async (id, status = 'Human Review') => admin.query(
+    `INSERT INTO "${schema}".issue (id, workspace_id, status, title, priority, metadata)
+     VALUES ($1, $2, $3, 'release test', 'medium', '{}'::jsonb)`, [id, workspaceId, status]);
+  try {
+    await admin.connect();
+    await admin.query(`CREATE SCHEMA ${schema}`);
+    countClient = new Client({ connectionString: databaseUrl });
+    await countClient.connect();
+    await countClient.query(`SET search_path TO ${schema}`);
+    await admin.query(`CREATE TABLE "${schema}".issue (id uuid PRIMARY KEY, workspace_id uuid NOT NULL,
+      status text NOT NULL, description text DEFAULT '', parent_issue_id uuid, title text NOT NULL,
+      priority text NOT NULL, metadata jsonb, updated_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".relay_stage_config (id bigserial PRIMARY KEY, workspace_id uuid NOT NULL,
+      stage_name text NOT NULL, next_stage text, alt_next_stages text[], agent_id uuid, agent_name text);
+      CREATE TABLE "${schema}".agent (id uuid PRIMARY KEY, workspace_id uuid NOT NULL, name text NOT NULL,
+      runtime_id uuid, archived_at timestamptz, status text NOT NULL, instructions text, model text,
+      thinking_level text, max_concurrent_tasks integer, runtime_config jsonb);
+      CREATE TABLE "${schema}".agent_runtime (id uuid PRIMARY KEY, workspace_id uuid NOT NULL,
+      provider text NOT NULL, status text NOT NULL, updated_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".relay_stage_pool (workspace_id uuid NOT NULL, stage_name text NOT NULL, enabled boolean NOT NULL);
+      CREATE TABLE "${schema}".relay_stage_agent_pool (workspace_id uuid NOT NULL, stage_name text NOT NULL,
+      agent_id uuid NOT NULL, enabled boolean NOT NULL, last_selected_at timestamptz);
+      CREATE TABLE "${schema}".agent_task_queue (id uuid PRIMARY KEY DEFAULT gen_random_uuid(), agent_id uuid NOT NULL,
+      issue_id uuid NOT NULL, workspace_id uuid NOT NULL, status text NOT NULL, priority integer NOT NULL DEFAULT 0,
+      runtime_id uuid, context jsonb NOT NULL DEFAULT '{}'::jsonb, trigger_summary text, force_fresh_session boolean,
+      originator_source text, trigger_evidence_kind text, result jsonb, error text, started_at timestamptz, completed_at timestamptz,
+      prepare_lease_expires_at timestamptz, failure_reason text, trigger_comment_id uuid,
+      created_at timestamptz NOT NULL DEFAULT now());
+      CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
+      to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
+      CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
+      author_type text, author_id uuid, content text, type text, created_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, checker_id uuid, verdict text,
+      work_product_md5 text, created_at timestamptz DEFAULT now());`);
+    await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
+    await admin.query(`INSERT INTO "${schema}".agent (id, workspace_id, name, runtime_id, status, instructions, model, thinking_level, max_concurrent_tasks)
+      VALUES ($1, $2, 'builder', $3, 'idle', 'In Progress\nCI/CD & Deploy', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_pool VALUES
+      ($1, 'In Progress', true), ($1, 'CI/CD & Deploy', true)`, [workspaceId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_agent_pool VALUES
+      ($1, 'In Progress', $2, true, NULL), ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage) VALUES
+      ($1, 'Human Review', 'In Progress'), ($1, 'Done', 'CI/CD & Deploy'),
+      ($1, 'CI/CD & Deploy', 'Done'), ($1, 'In Progress', 'In Review'),
+      ($1, 'Parked', 'Queue'), ($1, 'Queue', 'In Progress')`, [workspaceId]);
+
+    await t.test('releases at the cycle limit, enqueues work, persists metadata, and logs', async () => {
+      const issueId = '44444444-4444-4444-4444-444444444444';
+      await insertIssue(issueId);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
+        VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'),
+               ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved by operator' },
+        { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      const task = await admin.query(`SELECT context->>'to_stage' AS stage FROM "${schema}".agent_task_queue WHERE issue_id = $1 AND status = 'queued'`, [issueId]);
+      const issue = await admin.query(`SELECT status, metadata FROM "${schema}".issue WHERE id = $1`, [issueId]);
+      const log = await admin.query(`SELECT status FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
+      assert.deepEqual(task.rows, [{ stage: 'In Progress' }]);
+      assert.equal(issue.rows[0].status, 'In Progress');
+      assert.equal(issue.rows[0].metadata.human_review_release_reason, 'approved by operator');
+      assert.ok(issue.rows[0].metadata.human_review_release_at);
+      assert.equal(log.rows.length, 1);
+    });
+    await t.test('verdict-less completed In Review tasks do not consume either cap, while verdict-bearing tasks do', async () => {
+      const issueId = '55555555-5555-5555-5555-555555555555';
+      await insertIssue(issueId);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context, started_at, completed_at)
+        VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}', now() - interval '1 minute', now()),
+               ($1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}', now() - interval '1 minute', now())`,
+      [agentId, issueId, workspaceId]);
+      assert.equal(await capEscalationVerified(countClient, { id: issueId, metadata: {} },
+        'stage_cycle_limit', 'In Review'), false);
+      assert.equal(await capEscalationVerified(countClient, { id: issueId, metadata: {} },
+        'lifetime_task_limit', 'In Review'), false);
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, created_at)
+        VALUES ($1, $2, 'PASS', now() - interval '30 seconds'),
+               ($1, $2, 'FAIL', now() - interval '30 seconds')`, [issueId, agentId]);
+      assert.equal(await capEscalationVerified(countClient, { id: issueId, metadata: {} },
+        'stage_cycle_limit', 'In Review'), true);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context, started_at, completed_at)
+        SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}',
+          now() - interval '1 minute', now() FROM generate_series(1, 4)`,
+      [agentId, issueId, workspaceId]);
+      assert.equal(await capEscalationVerified(countClient, { id: issueId, metadata: {} },
+        'lifetime_task_limit', 'In Review'), true);
+    });
+    await t.test('persists caller CI/CD parking evidence in the relay audit row', async () => {
+      const issueId = '45454545-4545-4545-4545-454545454545';
+      await insertIssue(issueId);
+      const audit = { cicd_worker: { reason: 'no PR referenced', pr_state: null,
+        pr_url: null, checked_at: '2026-09-02T00:00:00.000Z' } };
+      const res = await invoke({ issue_id: issueId, to_stage: 'Parked', parked_audit: audit });
+      assert.equal(res.status, 200);
+      const log = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
+      assert.equal(log.rows[0].parked_audit.cicd_worker.reason, 'no PR referenced');
+      assert.deepEqual(log.rows[0].parked_audit.cicd_worker, audit.cicd_worker);
+      assert.equal(log.rows[0].parked_audit.trigger, 'relay_advance');
+    });
+    await t.test('rejects a missing operator header without a task', async () => {
+      const issueId = '56555555-5555-5555-5555-555555555555'; await insertIssue(issueId);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved' });
+      assert.equal(res.status, 403); assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
+      assert.equal((await admin.query(`SELECT count(*)::int AS n FROM "${schema}".agent_task_queue WHERE issue_id = $1`, [issueId])).rows[0].n, 0);
+    });
+    await t.test('requires retry escalation source evidence without the marker', async () => {
+      const issueId = '66666666-6666-6666-6666-666666666666'; await insertIssue(issueId);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context) VALUES
+        ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'), ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Progress' });
+      assert.equal(res.status, 409); assert.equal(JSON.parse(res.body).error, 'retry_escalation_source_task_required');
+    });
+    await t.test('rejects the relay secret as an operator header', async () => {
+      const issueId = '77777777-7777-7777-7777-777777777777'; await insertIssue(issueId);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved' },
+        { 'x-relay-operator-secret': 'test-relay-secret' });
+      assert.equal(res.status, 403); assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
+    });
+    await t.test('authenticated terminal exit bypasses caps and audits the reason', async () => {
+      const issueId = '99999999-9999-9999-9999-999999999999'; await insertIssue(issueId, 'Done');
+      for (let index = 0; index < 7; index += 1) {
+        await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
+          VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"CI/CD & Deploy"}')`, [agentId, issueId, workspaceId]);
+      }
+      const res = await invoke({ issue_id: issueId, to_stage: 'CI/CD & Deploy', operator_terminal_exit: true,
+        reason: 'PR needs deploy' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'CI/CD & Deploy');
+      const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
+      assert.deepEqual(audit.rows[0].parked_audit, { terminal_exit: { operator_marker: true,
+        reason: 'PR needs deploy' }, operator_cap_bypass: true, reason: 'PR needs deploy' });
+    });
+    await t.test('terminal exit without the operator header remains rejected', async () => {
+      const issueId = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'; await insertIssue(issueId, 'Done');
+      for (let index = 0; index < 7; index += 1) {
+        await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
+          VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"CI/CD & Deploy"}')`, [agentId, issueId, workspaceId]);
+      }
+      const res = await invoke({ issue_id: issueId, to_stage: 'CI/CD & Deploy', operator_terminal_exit: true,
+        reason: 'PR needs deploy' });
+      assert.equal(res.status, 409);
+      assert.equal(JSON.parse(res.body).error, 'retry_escalation_source_task_required');
+    });
+    await t.test('admits a PASS Rejected terminal exit with the bound MD5', async () => {
+      const issueId = 'abababab-abab-abab-abab-abababababab'; await insertIssue(issueId, 'Rejected');
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
+        VALUES ($1, $2, 'PASS', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context)
+        SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"In Review"}'
+          FROM generate_series(1, 7)`, [agentId, issueId, workspaceId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true,
+        reason: 'reopen verified PASS' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'In Review');
+      const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log
+        WHERE issue_id = $1 AND from_stage = 'Rejected' ORDER BY id DESC LIMIT 1`, [issueId]);
+      assert.deepEqual(audit.rows[0].parked_audit, { terminal_exit: { operator_marker: true,
+        reason: 'reopen verified PASS' }, operator_cap_bypass: true,
+        reason: 'reopen verified PASS' });
+    });
+    await t.test('admits the exact sk advance Rejected PASS reopen request shape', async () => {
+      const issueId = 'aeaeaeae-aeae-aeae-aeae-aeaeaeaeaeae'; await insertIssue(issueId, 'Rejected');
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
+        VALUES ($1, $2, 'PASS', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      // _multica_advance posts only these JSON fields; it has no operator flag,
+      // reason field, or x-relay-operator-secret header.
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review',
+        current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'In Review');
+    });
+    await t.test('refuses a Rejected terminal exit without the operator secret', async () => {
+      const issueId = 'acacacac-acac-acac-acac-acacacacacac'; await insertIssue(issueId, 'Rejected');
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true, reason: 'reopen' });
+      assert.equal(res.status, 409);
+    });
+    await t.test('refuses a Rejected terminal exit when the latest verdict is FAIL', async () => {
+      const issueId = 'adadadad-adad-adad-adad-adadadadadad'; await insertIssue(issueId, 'Rejected');
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
+        VALUES ($1, $2, 'FAIL', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true,
+        reason: 'reopen', current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 409);
+    });
+    await t.test('authenticated operator release exits Parked and audits the reason', async () => {
+      const issueId = '88888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context)
+        SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"Queue"}'
+          FROM generate_series(1, 7)`, [agentId, issueId, workspaceId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true, reason: 'approved' },
+        { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'Queue');
+      const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
+      assert.deepEqual(audit.rows[0].parked_audit, { parked_release: { operator_marker: true,
+        reason: 'approved' }, operator_cap_bypass: true, reason: 'approved' });
+    });
+  } finally {
+    setTestClientFactory(null);
+    await countClient?.end();
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`).catch(() => {});
+    await admin.end();
+  }
+});
+
+test('lifetime ceiling applies an auditable terminal rejection instead of a re-spec escalation', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /applyDisposition\(client, issue, lifetime\.disposition, lifetime\.reason/);
+  assert.match(source, /task_count: taskCount, target_stage: to_stage/);
+  assert.match(source, /disposition: lifetime\.disposition, disposition_applied: applied/);
+  assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
+});
+
+test('operator cap release requires the current PASS work-product hash', async () => {
+  const client = { query: async () => ({ rows: [{ verdict: 'PASS',
+    work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e' }] }) };
+  assert.equal(await hasCurrentPassWorkProduct(client, 'issue-1',
+    'E41D8CD98F00B204E9800998ECF8427E'), true);
+  assert.equal(await hasCurrentPassWorkProduct(client, 'issue-1',
+    'd41d8cd98f00b204e9800998ecf8427e'), false);
+});
+
+test('PASS verdict cap escalation is held for an authenticated operator release, never rejected', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /operator_cap_release === true/);
+  assert.match(source, /operator_cap_release_secret_required/);
+  assert.match(source, /operator_cap_release_pass_required/);
+  assert.match(source, /operator_cap_release_required/);
+  assert.match(source, /operator_cap_release: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
+  const cycleCap = source.slice(source.indexOf('const cycle = stageCycleAdmission'),
+    source.indexOf('const lifetimeHistory'));
+  assert.match(cycleCap, /if \(passVerdictProtected\) \{[\s\S]*?operator_cap_release_required[\s\S]*?return;/);
+  assert.ok(cycleCap.indexOf('operator_cap_release_required') < cycleCap.indexOf('applyDisposition'));
+  const lifetimeCap = source.slice(source.indexOf('const lifetime = lifetimeTaskAdmission'),
+    source.indexOf('// Never advance an issue into another execution lane'));
+  assert.match(lifetimeCap, /if \(passVerdictProtected\) \{[\s\S]*?operator_cap_release_required[\s\S]*?return;/);
+  assert.ok(lifetimeCap.indexOf('operator_cap_release_required') < lifetimeCap.indexOf('applyDisposition'));
+});
+
+test('parking records a reason and hands off one Sol-low diagnosis', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /recordParkAndQueueDiagnosis/);
+  assert.match(source, /disposition === 'Parked'/);
+  assert.match(source, /context->>'kind', ''\) <> 'parked_diagnosis'/);
+});
+
+test('Parked dispositions create a dedicated relay audit row before diagnosis', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('UPDATE issue SET status')) {
+      return { rowCount: 1, rows: [{ id: 'issue-1' }] };
+    }
+    if (sql.includes('INSERT INTO relay_run_log')) return { rows: [{ id: 'parked-log' }] };
+    if (sql.includes('FROM agent a')) return { rows: [] };
+    return { rows: [] };
+  } };
+  const moved = await applyDisposition(client, { id: 'issue-1', workspace_id: 'workspace-1',
+    status: 'In Review', priority: 'high' }, 'Parked', 'stage_cycle_limit', {
+    target_stage: 'In Progress', historical_tasks: 2
+  });
+
+  assert.equal(moved, true);
+  assert.match(calls[1].sql, /parked_audit/);
+  assert.deepEqual(JSON.parse(calls[1].values[2]), {
+    trigger: 'stage_cycle_limit', intended_stage: 'In Progress', attempts: 2, task_count: 2
+  });
+});
+
+test('every direct Parked transition is routed through the dedicated audit writer', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /if \(to_stage === "Parked" && result\.rowCount > 0\)/);
+  assert.match(source, /trigger: parkedAudit\?\.trigger \|\| "relay_advance"/);
+});
+
+test('an escalation-loop Parked arrival records one idempotent diagnosis handoff', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const parkedArrival = source.slice(source.indexOf('if (to_stage === "Parked" && result.rowCount > 0)'),
+    source.indexOf('if (isNoDispatchArrivalStage(to_stage))'));
+  assert.match(parkedArrival, /if \(escalationLoop === true && result\.rowCount > 0\)/);
+  assert.match(parkedArrival, /recordParkAndQueueDiagnosis\(client, issue, \{\s*\.\.\.parkedAudit, reason: 'escalation_loop'/s);
+  assert.match(parkedArrival, /result\.rowCount > 0/);
+});
+
+test('repeated escalation-loop diagnosis handoffs use the existing task idempotency key', () => {
+  const source = fs.readFileSync(require.resolve('./parked-diagnosis.cjs'), 'utf8');
+  assert.match(source, /WHERE issue_id = \$2::uuid AND context->>'kind' = \$7::text/);
+  assert.match(source, /ON CONFLICT DO NOTHING/);
+});
+
+test('QC bounce ceiling changes hands to an exact Sol-low Spec task, never Parked', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const bounce = source.slice(source.indexOf('// A QC FAIL sends the ticket back'),
+    source.indexOf('// Enforcement point: no deploy, no Done.'));
+  assert.match(bounce, /reason: "qc_bounce_ceiling"/);
+  assert.match(bounce, /source_task_id: sourceTaskId/);
+  assert.match(bounce, /to_stage = "Spec"/);
+  assert.match(bounce, /retry_escalation_source_task_required/);
+  assert.doesNotMatch(bounce, /to_stage = "Parked"/);
+});
+
+test('retry escalation requires an explicit Sol-low owner and never stores null lineage', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /!isQcLane\(owner\.model, owner\.thinking_level\)/);
+  assert.doesNotMatch(source, /source_task_id: null/);
+});
+
+test('relay request maps snake-case stage into successor task input', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /replaceStageTask\(client, \{[\s\S]*toStage: to_stage,/);
+  assert.doesNotMatch(source, /\n\s*toStage,\n/);
+});
+
+test('relay stage lookups bind configuration and owners to the issue workspace', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /workspace_id = \$1 AND stage_name = \$2/);
+  assert.match(source, /a\.workspace_id = rsc\.workspace_id/);
+  assert.match(source, /Relay owner workspace mismatch/);
+  assert.match(source, /ORDER BY rsc\.workspace_id, rsc\.id/);
+});
+
+test('terminal relay transitions are logged and Parked Done remains relay-only and PASS-gated', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.equal(isTerminalStage('Done'), true);
+  assert.equal(isTerminalStage('Cancelled'), true);
+  assert.equal(isTerminalStage('Archived'), true);
+  assert.equal(isNoDispatchArrivalStage('Parked'), true);
+  assert.match(source, /const parkedDiagnosisDone = issue\.status === "Parked" && to_stage === "Done"/);
+  assert.match(source, /to_stage === "Done"/);
+  assert.match(source, /work_product_mismatch/);
+  assert.match(source, /if \(isNoDispatchArrivalStage\(to_stage\)\)/);
+  assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
+});
+
+test('Parked disposition bypasses an incompatible pool and commits its audit without a successor task', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
+    status: 'CI/CD & Deploy', description: '', parent_issue_id: null, title: 'park me',
+    priority: 'medium', metadata: {} };
+  const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
+  const queries = [];
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    queries.push({ sql, values });
+    if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
+    if (sql.includes('FROM agent_task_queue t') && sql.includes("t.context->>'to_stage' = 'In Review'")) return { rows: [] };
+    if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Parked' }] };
+    if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Parked', alt_next_stages: [] }] };
+    if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Parked' }] };
+    if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
+      persisted.issue.status = values[0];
+      return { rowCount: 1, rows: [{ id: persisted.issue.id, status: persisted.issue.status }] };
+    }
+    if (sql.includes('UPDATE relay_run_log') && sql.includes("SET status = 'completed'")) return { rows: [] };
+    if (sql.includes("to_stage, status, parked_audit")) {
+      const row = { id: 'parked-log-1', issue_id: values[0], from_stage: values[1], to_stage: 'Parked',
+        task_id: null, status: 'completed', parked_audit: JSON.parse(values[2]) };
+      persisted.relay_run_log.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+    if (sql.includes('INSERT INTO relay_run_log')) {
+      const row = { id: 'relay-log-1', issue_id: values[0], from_stage: values[1], to_stage: values[2],
+        task_id: null, status: 'completed' };
+      persisted.relay_run_log.push(row);
+      return { rows: [{ id: row.id }] };
+    }
+    return { rowCount: 0, rows: [] };
+  } };
+  const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayAdvance({ headers: {} }, res, { issue_id: issue.id, to_stage: 'Parked',
+      parked_audit: { cicd_worker: { reason: 'no compatible owner' } }, agent_token: 'test-relay-secret' });
+  } finally {
+    setTestClientFactory(null);
+  }
+  assert.equal(res.status, 200);
+  assert.equal(JSON.parse(res.body).task_id, null);
+  assert.deepEqual(persisted.relay_run_log, [{ id: 'parked-log-1', issue_id: issue.id,
+    from_stage: 'CI/CD & Deploy', to_stage: 'Parked', task_id: null, status: 'completed',
+    parked_audit: { cicd_worker: { reason: 'no compatible owner' }, trigger: 'relay_advance',
+      intended_stage: null, attempts: 0, task_count: 0 } }]);
+  assert.deepEqual(persisted.agent_task_queue, []);
+  assert.equal(persisted.issue.status, 'Parked');
+  assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
+});
+
+test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const guard = source.slice(source.indexOf('const issue = issueResult.rows[0];'),
+    source.indexOf('const noArtifactRescope'));
+  assert.doesNotMatch(guard, /terminal_stage_relay_exit_forbidden/);
+  assert.match(source, /sourceStageResult\.rows\[0\]\?\.next_stage === to_stage/);
+  assert.match(source, /TERMINAL_STAGES = new Set\(\["Done", "Cancelled", "Archived", "Rejected"\]\)/);
+  assert.match(source, /operator_terminal_exit === true/);
+  assert.match(source, /RELAY_OPERATOR_SECRET/);
+  assert.match(source, /x-relay-operator-secret/);
+  assert.match(source, /reason\.trim\(\) !== ""/);
+  assert.match(source, /terminal_stage_operator_marker_required/);
+  assert.match(source, /!rejectedPassTerminalExit &&\s+!explicitTerminalExit/);
+  assert.match(source, /terminal_exit: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
+  assert.match(source, /parked_audit/);
+  assert.match(source, /terminalExit: explicitTerminalExit/);
+  assert.match(source, /!cycle\.ok && !operatorCapBypass/);
+  assert.match(source, /!lifetime\.ok && !operatorCapBypass/);
+});
+
+test('identical relay and operator secrets disable explicit terminal exits', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /OPERATOR_SECRET_DISABLED/);
+  assert.match(source, /RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET/);
+  assert.match(source, /terminal_stage_operator_secret_conflict/);
+});

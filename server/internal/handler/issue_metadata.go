@@ -33,6 +33,8 @@ const (
 )
 
 var issueMetadataKeyRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$`)
+var implementationEvidencePRURLRE = regexp.MustCompile(`^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[1-9][0-9]*/?$`)
+var implementationEvidenceSHA = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // SetIssueMetadataKeyRequest carries the JSON value to write under the key
 // named in the URL. Value is a RawMessage so we can preserve numeric vs.
@@ -40,6 +42,14 @@ var issueMetadataKeyRE = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_.-]{0,63}$`)
 // numbers all collapse to float64 and we'd lose integer fidelity.
 type SetIssueMetadataKeyRequest struct {
 	Value json.RawMessage `json:"value"`
+}
+
+// SetImplementationEvidenceRequest is deliberately a fixed pair rather than a
+// general metadata map: one statement writes both checkout coordinates, so QC
+// can never observe a half-written build handoff.
+type SetImplementationEvidenceRequest struct {
+	PRURL    string `json:"pr_url"`
+	BoundSHA string `json:"bound_sha"`
 }
 
 func validateIssueMetadataKey(key string) error {
@@ -192,6 +202,50 @@ func (h *Handler) SetIssueMetadataKey(w http.ResponseWriter, r *http.Request) {
 		"metadata": metadata,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"metadata": metadata})
+}
+
+func (h *Handler) SetImplementationEvidence(w http.ResponseWriter, r *http.Request) {
+	issueID := chi.URLParam(r, "id")
+	var req SetImplementationEvidenceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if !implementationEvidencePRURLRE.MatchString(req.PRURL) || !implementationEvidenceSHA.MatchString(req.BoundSHA) {
+		writeError(w, http.StatusBadRequest, "pr_url must be a GitHub pull-request URL and bound_sha must be a lowercase 40-character SHA")
+		return
+	}
+	issue, ok := h.loadIssueForUser(w, r, issueID)
+	if !ok {
+		return
+	}
+	userID, ok := requireUserID(w, r)
+	if !ok {
+		return
+	}
+	metadataJSON, err := json.Marshal(map[string]string{"pr_url": req.PRURL, "bound_sha": req.BoundSHA})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to encode implementation evidence")
+		return
+	}
+	var metadata []byte
+	err = h.DB.QueryRow(r.Context(), `UPDATE issue
+		SET metadata = COALESCE(metadata, '{}'::jsonb) || $1::jsonb, updated_at = NOW()
+		WHERE id = $2 AND workspace_id = $3 RETURNING metadata`, metadataJSON, issue.ID, issue.WorkspaceID).Scan(&metadata)
+	if err != nil {
+		if isCheckViolation(err) {
+			writeError(w, http.StatusBadRequest, "metadata exceeds the 8KB size limit")
+			return
+		}
+		slog.Warn("SetImplementationEvidence failed", append(logger.RequestAttrs(r), "error", err, "issue_id", issueID)...)
+		writeError(w, http.StatusInternalServerError, "failed to set implementation evidence")
+		return
+	}
+	workspaceID := uuidToString(issue.WorkspaceID)
+	actorType, actorID := h.resolveActor(r, userID, workspaceID)
+	parsed := parseIssueMetadata(metadata)
+	h.publish(protocol.EventIssueMetadataChanged, workspaceID, actorType, actorID, map[string]any{"issue_id": uuidToString(issue.ID), "metadata": parsed})
+	writeJSON(w, http.StatusOK, map[string]any{"metadata": parsed})
 }
 
 func (h *Handler) DeleteIssueMetadataKey(w http.ResponseWriter, r *http.Request) {

@@ -319,6 +319,7 @@ type AgentTaskResponse struct {
 	ParentTaskID       *string               `json:"parent_task_id,omitempty"`
 	IsLeaderTask       bool                  `json:"is_leader_task,omitempty"`
 	LeaderRoleResolved bool                  `json:"leader_role_resolved,omitempty"` // claim-only capability, always true here: IsLeaderTask/SquadID authoritatively answer "is this a leader run", so the daemon must not infer the role from briefing text. Servers predating it make no such promise — before #4951 they sent no is_leader_task at all, after it they sent the flag without guaranteeing a briefing — so a daemon seeing no capability keeps the legacy inference. Never rendered into a prompt; see daemon.taskIsSquadLeader (MUL-5811). Mirror field: internal/daemon/types.go, same JSON name
+	RelayManaged       bool                  `json:"relay_managed,omitempty"`        // relay-created belt task; issue stage remains relay-owned
 	Agent              *TaskAgentData        `json:"agent,omitempty"`
 	ConnectedApps      []ConnectedAppData    `json:"connected_apps,omitempty"` // daemon-claim only: per-run app capabilities mounted through runtime MCP overlays
 	Repos              []RepoData            `json:"repos,omitempty"`
@@ -685,6 +686,7 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		MaxAttempts:         t.MaxAttempts,
 		ParentTaskID:        uuidToPtr(t.ParentTaskID),
 		IsLeaderTask:        t.IsLeaderTask,
+		RelayManaged:        relayManagedTask(t),
 		CreatedAt:           timestampToString(t.CreatedAt),
 		TriggerCommentID:    uuidToPtr(t.TriggerCommentID),
 		CoalescedCommentIDs: uuidsToStrings(t.CoalescedCommentIds),
@@ -702,6 +704,35 @@ func taskToResponse(t db.AgentTaskQueue, workspaceID string) AgentTaskResponse {
 		// Attribution labels + evidence + lineage + raw user ids (pure). Names are
 		// hydrated separately on user-facing surfaces (MUL-4302 §9).
 		Attribution: taskAttributionBase(t),
+	}
+}
+
+func relayManagedTask(task db.AgentTaskQueue) bool {
+	// trigger_evidence_kind is persisted by the queue writer, unlike a handoff
+	// note, comment, assignee, or squad role. It is the authoritative provenance
+	// for the claimed envelope; relay transition and disposition work are both
+	// relay-owned and neither may self-transition.
+	if task.TriggerEvidenceKind.Valid {
+		switch task.TriggerEvidenceKind.String {
+		case "relay_stage_transition", "relay_disposition":
+			return true
+		}
+	}
+
+	// Older relay rows predate trigger_evidence_kind. Their complete persisted
+	// context still carries the source. Do not infer ownership from a comment,
+	// handoff note, assignment, or squad flag.
+	var context struct {
+		Source string `json:"source"`
+	}
+	if json.Unmarshal(task.Context, &context) != nil {
+		return false
+	}
+	switch context.Source {
+	case "relay-advance", "relay-requeue", "relay-cold-start", "relay-spec-no-artifact", "relay-qc-no-verdict":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -2439,7 +2470,7 @@ func (h *Handler) ListWorkspaceStageCounts(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	rows, err := h.Queries.ListWorkspaceStageCounts(r.Context())
+	rows, err := h.Queries.ListWorkspaceStageCounts(r.Context(), parseUUID(workspaceID))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to list stage counts")
 		return

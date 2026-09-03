@@ -56,6 +56,30 @@ func createTaskDir(t *testing.T, root, wsID, dirName string, meta *execenv.GCMet
 	return taskDir
 }
 
+func createCleanPushedWorktree(t *testing.T, taskDir string) {
+	t.Helper()
+	remote := filepath.Join(taskDir, "remote.git")
+	workDir := filepath.Join(taskDir, "workdir")
+	runTestGit(t, taskDir, "init", "--bare", remote)
+	runTestGit(t, taskDir, "clone", remote, workDir)
+	runTestGit(t, workDir, "config", "user.email", "gc-test@example.test")
+	runTestGit(t, workDir, "config", "user.name", "GC Test")
+	if err := os.WriteFile(filepath.Join(workDir, "README"), []byte("test\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runTestGit(t, workDir, "add", "README")
+	runTestGit(t, workDir, "commit", "-m", "initial")
+	runTestGit(t, workDir, "push", "-u", "origin", "HEAD")
+}
+
+func runTestGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v: %s", strings.Join(args, " "), err, output)
+	}
+}
+
 func TestShouldCleanTaskDir_DoneIssueOverTTL(t *testing.T) {
 	t.Parallel()
 	issueID := "11111111-1111-1111-1111-111111111111"
@@ -276,6 +300,29 @@ func TestCleanTaskDir_RemovesDirectory(t *testing.T) {
 	}
 }
 
+func TestApplyGCAction_OrphanRequiresSafeCheckout(t *testing.T) {
+	t.Parallel()
+	d := newGCTestDaemon(t, http.NewServeMux())
+	unsafeDir := createTaskDir(t, d.cfg.WorkspacesRoot, "ws1", "unsafe-orphan", nil)
+	stats := &gcStats{byPattern: map[string]int{}}
+
+	if cleaned := d.applyGCAction(unsafeDir, gcActionOrphan, stats); cleaned != 0 {
+		t.Fatalf("unsafe orphan cleaned = %d, want 0", cleaned)
+	}
+	if _, err := os.Stat(unsafeDir); err != nil {
+		t.Fatalf("unsafe orphan must remain: %v", err)
+	}
+
+	safeDir := createTaskDir(t, d.cfg.WorkspacesRoot, "ws1", "safe-orphan", nil)
+	createCleanPushedWorktree(t, safeDir)
+	if cleaned := d.applyGCAction(safeDir, gcActionOrphan, stats); cleaned != 1 {
+		t.Fatalf("safe orphan cleaned = %d, want 1", cleaned)
+	}
+	if _, err := os.Stat(safeDir); !os.IsNotExist(err) {
+		t.Fatalf("safe orphan must be removed: %v", err)
+	}
+}
+
 func TestGcWorkspace_CleansEmptyWorkspaceDir(t *testing.T) {
 	t.Parallel()
 	issueID := "77777777-7777-7777-7777-777777777777"
@@ -296,6 +343,7 @@ func TestGcWorkspace_CleansEmptyWorkspaceDir(t *testing.T) {
 		WorkspaceID: "ws-empty",
 		CompletedAt: time.Now(),
 	})
+	createCleanPushedWorktree(t, filepath.Join(wsDir, "only-task"))
 
 	d.gcWorkspace(context.Background(), wsDir, &gcStats{byPattern: map[string]int{}})
 
@@ -345,6 +393,8 @@ func TestGCWorkspace_BatchesAndDeduplicatesIssueChecks(t *testing.T) {
 	open := createTaskDir(t, d.cfg.WorkspacesRoot, "ws-batch", "open", &execenv.GCMeta{
 		IssueID: openID, WorkspaceID: "ws-batch", CompletedAt: time.Now(),
 	})
+	createCleanPushedWorktree(t, doneA)
+	createCleanPushedWorktree(t, doneB)
 
 	stats := &gcStats{byPattern: map[string]int{}}
 	d.gcWorkspace(context.Background(), wsDir, stats)
@@ -391,6 +441,7 @@ func TestGCWorkspace_OldServerFallbackIsCached(t *testing.T) {
 		taskDir := createTaskDir(t, d.cfg.WorkspacesRoot, tc.workspace, fmt.Sprintf("task-%d", i), &execenv.GCMeta{
 			IssueID: tc.issueID, WorkspaceID: tc.workspace, CompletedAt: time.Now().Add(-10 * 24 * time.Hour),
 		})
+		createCleanPushedWorktree(t, taskDir)
 		d.gcWorkspace(context.Background(), wsDir, &gcStats{byPattern: map[string]int{}})
 		if _, err := os.Stat(taskDir); !os.IsNotExist(err) {
 			t.Fatalf("legacy fallback did not clean %s", taskDir)

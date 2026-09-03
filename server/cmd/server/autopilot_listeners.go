@@ -31,7 +31,7 @@ func registerAutopilotListeners(bus *events.Bus, svc *service.AutopilotService) 
 			return
 		}
 		// Only handle statuses that finalize an autopilot run.
-		if issue.Status != "Done" && issue.Status != "in_review" && issue.Status != "Cancelled" && issue.Status != "Human Review" && issue.Status != "Archived" {
+		if issue.Status != "Done" && issue.Status != "In Review" && issue.Status != "Cancelled" && issue.Status != "Human Review" && issue.Status != "Archived" {
 			return
 		}
 		// Load the full issue from DB to check origin_type.

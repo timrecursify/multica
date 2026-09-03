@@ -156,6 +156,12 @@ func (h *Handler) PreviewIssueTrigger(w http.ResponseWriter, r *http.Request) {
 
 	actorType, actorID := h.resolveActor(r, userID, workspaceID)
 	resp := IssueTriggerPreviewResponse{Triggers: make([]IssueTriggerPreviewItem, 0)}
+	canonicalPreviewStatus := func(status string) string {
+		if canonical, ok := h.IssueStatusContract.Canonicalize(status); ok {
+			return canonical
+		}
+		return status
+	}
 
 	appendTrigger := func(issue db.Issue, in service.IssueTriggerInput) {
 		probe := h.issueTriggerPreviewProbe(r, actorType, actorID, workspaceID, issue)
@@ -177,7 +183,7 @@ func (h *Handler) PreviewIssueTrigger(w http.ResponseWriter, r *http.Request) {
 		}
 		status := "Spec"
 		if req.Status != nil && *req.Status != "" {
-			status = *req.Status
+			status = canonicalPreviewStatus(*req.Status)
 		}
 		candidate := db.Issue{
 			WorkspaceID:  wsUUID,
@@ -213,8 +219,8 @@ func (h *Handler) PreviewIssueTrigger(w http.ResponseWriter, r *http.Request) {
 				uuidToString(loaded.AssigneeID) != uuidToString(newAssigneeID)
 		}
 		if req.Status != nil && *req.Status != "" {
-			post.Status = *req.Status
-			in.StatusChanged = loaded.Status != *req.Status
+			post.Status = canonicalPreviewStatus(*req.Status)
+			in.StatusChanged = loaded.Status != post.Status
 		}
 		in.Issue = post
 		appendTrigger(post, in)

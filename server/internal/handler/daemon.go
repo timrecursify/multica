@@ -271,6 +271,20 @@ func normalizeProvider(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
+// normalizeModelLabel canonicalizes a model id for storage so identical models
+// group under one label regardless of how the daemon spelled them. OpenRouter's
+// "latest in family" alias uses a leading `~` marker (e.g. `~deepseek/
+// deepseek-v4-flash-latest`); the marker is transport-only and must not be
+// persisted, or the same physical model lands under two distinct labels and
+// model-grained joins/summaries split (PROD-22899, PPP-23365). Provider
+// prefixes and bare slugs are preserved verbatim — this only strips the alias
+// marker and leading/trailing whitespace.
+func normalizeModelLabel(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "~")
+	return s
+}
+
 // inheritMachineCustomName gives a freshly-inserted runtime the machine's
 // shared custom name (MUL-4217) when the machine is already named, so adding a
 // provider — or recording a failed custom-runtime profile — on a named machine
@@ -3636,7 +3650,7 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 		if err := h.Queries.UpsertTaskUsage(r.Context(), db.UpsertTaskUsageParams{
 			TaskID:           parseUUID(taskID),
 			Provider:         provider,
-			Model:            u.Model,
+			Model:            normalizeModelLabel(u.Model),
 			InputTokens:      u.InputTokens,
 			OutputTokens:     u.OutputTokens,
 			CacheReadTokens:  u.CacheReadTokens,
@@ -3646,7 +3660,7 @@ func (h *Handler) ReportTaskUsage(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("upsert task usage failed", "task_id", taskID, "model", u.Model, "error", err)
 			continue
 		}
-		h.TaskService.CaptureTaskUsage(r.Context(), task, provider, u.Model, u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens, u.CostUSDTicks)
+		h.TaskService.CaptureTaskUsage(r.Context(), task, provider, normalizeModelLabel(u.Model), u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens, u.CostUSDTicks)
 
 		// Surface prompt-cache effectiveness per run so cache hit rates are
 		// observable in logs, not just queryable from runtime_usage. The ratio

@@ -30,6 +30,16 @@ export const STATUS_LABEL: Record<IssueStatus, string> = {
   done: "Done",
   blocked: "Blocked",
   cancelled: "Cancelled",
+  Registered: "Registered",
+  Spec: "Spec",
+  Queue: "Queue",
+  "In Progress": "In Progress",
+  "In Review": "In Review",
+  "Human Review": "Human Review",
+  "CI/CD & Deploy": "CI/CD & Deploy",
+  Done: "Done",
+  Archived: "Archived",
+  Cancelled: "Cancelled",
 };
 
 export const PRIORITY_LABEL: Record<IssuePriority, string> = {

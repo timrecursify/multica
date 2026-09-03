@@ -140,7 +140,7 @@ func TestVCSWebhook_ForgejoMirrorsAndCloses(t *testing.T) {
 		t.Fatalf("unexpected rows: %+v", rows)
 	}
 	updated, _ := testHandler.Queries.GetIssue(ctx, parseUUID(issue.ID))
-	if updated.Status != "done" {
+	if updated.Status != "Done" {
 		t.Errorf("expected issue done, got %q", updated.Status)
 	}
 }
@@ -218,7 +218,7 @@ func TestVCSWebhook_ReferenceOnlyExcludedAndNonBlocking(t *testing.T) {
 	}
 
 	updated, _ := testHandler.Queries.GetIssue(ctx, parseUUID(issue.ID))
-	if updated.Status != "done" {
+	if updated.Status != "Done" {
 		t.Errorf("issue should advance despite the open reference_only PR, got %q", updated.Status)
 	}
 }
@@ -437,7 +437,7 @@ func TestVCSWebhook_GitlabMergeRequest(t *testing.T) {
 		t.Errorf("expected merged, got %q", rows[0].State)
 	}
 	updated, _ := testHandler.Queries.GetIssue(ctx, parseUUID(issue.ID))
-	if updated.Status != "done" {
+	if updated.Status != "Done" {
 		t.Errorf("expected issue done, got %q", updated.Status)
 	}
 }

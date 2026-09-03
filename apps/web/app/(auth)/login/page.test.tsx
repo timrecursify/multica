@@ -94,7 +94,11 @@ vi.mock("@multica/core/api", () => ({
   },
 }));
 
-import LoginPage from "./page";
+import { LoginPageContent } from "./login-page-content";
+
+function LoginPage() {
+  return <LoginPageContent isSyntheticTicketsHost={false} />;
+}
 
 describe("LoginPage", () => {
   beforeEach(() => {
@@ -115,6 +119,20 @@ describe("LoginPage", () => {
     expect(
       screen.getByRole("button", { name: "Continue" })
     ).toBeInTheDocument();
+  });
+
+  it("renders the Synthetic brand only in Synthetic mode", () => {
+    const { rerender } = render(
+      <LoginPageContent isSyntheticTicketsHost={false} />,
+      { wrapper: createWrapper() },
+    );
+
+    expect(screen.queryByLabelText("Synthetic")).not.toBeInTheDocument();
+    expect(screen.getByText("Sign in to Multica")).toBeInTheDocument();
+
+    rerender(<LoginPageContent isSyntheticTicketsHost />);
+
+    expect(screen.getByLabelText("Synthetic")).toBeInTheDocument();
   });
 
   it("does not call sendCode when email is empty", async () => {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/multica-ai/multica/server/internal/analytics"
@@ -42,7 +43,19 @@ func TestMain(m *testing.M) {
 		dbURL = "postgres://multica:multica@localhost:5432/multica?sslmode=disable"
 	}
 
-	pool, err := pgxpool.New(ctx, dbURL)
+	poolConfig, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		fmt.Printf("Skipping tests: invalid database URL: %v\n", err)
+		os.Exit(0)
+	}
+	// The production relay grants itself this capability inside its transaction.
+	// Handler tests issue status writes directly through the shared pool, so grant
+	// the same capability on every test-only connection instead.
+	poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) error {
+		_, err := conn.Exec(ctx, "SELECT set_config('multica.relay_authorized', 'on', false)")
+		return err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		fmt.Printf("Skipping tests: could not connect to database: %v\n", err)
 		os.Exit(0)
@@ -622,8 +635,8 @@ func TestCreateIssueExplicitBacklogPreserved(t *testing.T) {
 
 	var created IssueResponse
 	json.NewDecoder(w.Body).Decode(&created)
-	if created.Status != "backlog" {
-		t.Fatalf("CreateIssue: expected explicit 'backlog' to be preserved, got '%s'", created.Status)
+	if created.Status != "todo" {
+		t.Fatalf("CreateIssue: expected legacy backlog alias to emit 'todo', got '%s'", created.Status)
 	}
 
 	// Cleanup
@@ -1121,7 +1134,7 @@ func TestTriggerAutopilotAllowsActiveDuplicateIssue(t *testing.T) {
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
 		"title":  title,
-		"status": "todo",
+		"status": "Queue",
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
@@ -3176,7 +3189,7 @@ func TestBacklogToTodoTriggersAgent(t *testing.T) {
 	// Move the issue from backlog to todo — should trigger.
 	w = httptest.NewRecorder()
 	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{
-		"status": "todo",
+		"status": "Queue",
 	})
 	req = withURLParam(req, "id", created.ID)
 	testHandler.UpdateIssue(w, req)
@@ -3244,7 +3257,7 @@ func TestBacklogToTodoByAgentTriggersDifferentAssignee(t *testing.T) {
 	// Parent agent promotes backlog → todo on behalf of the X-Task it is
 	// currently running. Must enqueue exactly one task for the child agent.
 	w = httptest.NewRecorder()
-	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "todo"})
+	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "Queue"})
 	req = withURLParam(req, "id", created.ID)
 	req.Header.Set("X-Agent-ID", parentAgent)
 	req.Header.Set("X-Task-ID", parentTask)
@@ -3306,7 +3319,7 @@ func TestBacklogToTodoByAgentSameIssueDoesNotSelfTrigger(t *testing.T) {
 	selfTask := createHandlerTestTaskForAgentOnIssue(t, selfAgent, created.ID)
 
 	w = httptest.NewRecorder()
-	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "todo"})
+	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "Queue"})
 	req = withURLParam(req, "id", created.ID)
 	req.Header.Set("X-Agent-ID", selfAgent)
 	req.Header.Set("X-Task-ID", selfTask)
@@ -3383,7 +3396,7 @@ func TestBacklogToTodoByAgentSameAgentDifferentIssue(t *testing.T) {
 	step1Task := createHandlerTestTaskForAgentOnIssue(t, agentID, step1.ID)
 
 	w = httptest.NewRecorder()
-	req = newRequest("PUT", "/api/issues/"+step2.ID, map[string]any{"status": "todo"})
+	req = newRequest("PUT", "/api/issues/"+step2.ID, map[string]any{"status": "Queue"})
 	req = withURLParam(req, "id", step2.ID)
 	req.Header.Set("X-Agent-ID", agentID)
 	req.Header.Set("X-Task-ID", step1Task)
@@ -3441,7 +3454,7 @@ func TestBatchBacklogToTodoByAgentTriggersAssignee(t *testing.T) {
 	w = httptest.NewRecorder()
 	req = newRequest("PATCH", "/api/issues/batch?workspace_id="+testWorkspaceID, map[string]any{
 		"issue_ids": []string{created.ID},
-		"updates":   map[string]any{"status": "todo"},
+		"updates":   map[string]any{"status": "Queue"},
 	})
 	req.Header.Set("X-Agent-ID", parentAgent)
 	req.Header.Set("X-Task-ID", parentTask)
@@ -3509,7 +3522,7 @@ func TestBacklogToTodoByAgentTriggersSquadLeader(t *testing.T) {
 	// Driver agent (not the leader, task is on no specific issue) promotes
 	// the squad-assigned backlog issue. Squad leader must be enqueued.
 	w = httptest.NewRecorder()
-	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "todo"})
+	req = newRequest("PUT", "/api/issues/"+created.ID, map[string]any{"status": "Queue"})
 	req = withURLParam(req, "id", created.ID)
 	req.Header.Set("X-Agent-ID", driverAgent)
 	req.Header.Set("X-Task-ID", driverTask)

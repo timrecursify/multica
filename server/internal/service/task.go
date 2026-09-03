@@ -1135,7 +1135,9 @@ func (s *TaskService) enqueueIssueTaskWithCommentPlan(ctx context.Context, issue
 		AgentID:              issue.AssigneeID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
+		WorkspaceID:          issue.WorkspaceID,
 		Priority:             priorityToInt(issue.Priority),
+		ToStage:              pgtype.Text{String: issue.Status, Valid: issue.Status != ""},
 		TriggerCommentID:     triggerCommentID,
 		CoalescedCommentIds:  coalescedCommentIDs,
 		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
@@ -1302,7 +1304,9 @@ func (s *TaskService) enqueueMentionTaskWithCommentPlan(ctx context.Context, iss
 		AgentID:              agentID,
 		RuntimeID:            agent.RuntimeID,
 		IssueID:              issue.ID,
+		WorkspaceID:          issue.WorkspaceID,
 		Priority:             priorityToInt(issue.Priority),
+		ToStage:              pgtype.Text{String: issue.Status, Valid: issue.Status != ""},
 		TriggerCommentID:     triggerCommentID,
 		CoalescedCommentIds:  coalescedCommentIDs,
 		TriggerSummary:       s.buildCommentTriggerSummary(ctx, issue.WorkspaceID, triggerCommentID),
@@ -2295,6 +2299,11 @@ var ErrTaskNoLongerQueued = errors.New("task is no longer queued")
 // CancelTaskOptions carries what the caller knows about the client that asked
 // for the cancellation.
 type CancelTaskOptions struct {
+	// Cause and actor make server-side cancellation attributable after the
+	// terminal event has been written to activity_log.
+	Cause     string
+	ActorType string
+	ActorID   string
 	// ClientSupportsDraftRestore is true when the caller can recover a prompt
 	// through the durable draft-restore path (#5219). Only such a client may be
 	// handed a deferred outcome; for anyone else the empty-transcript judgment
@@ -2396,7 +2405,20 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 	s.ReconcileAgentStatus(ctx, task.AgentID)
 
 	// Broadcast cancellation as a task:failed event so frontends clear the live card
-	s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task)
+	cause := opts.Cause
+	if cause == "" {
+		cause = "server_cancel"
+	}
+	actorType := opts.ActorType
+	if actorType == "" {
+		actorType = "system"
+	}
+	s.broadcastTaskEvent(ctx, protocol.EventTaskCancelled, task, map[string]any{
+		"cancellation_cause": cause,
+		"actor_type":         actorType,
+		"actor_id":           opts.ActorID,
+		"runtime_id":         util.UUIDToString(task.RuntimeID),
+	})
 	s.NotifyTaskFinished(task)
 
 	return &CancelTaskResult{
@@ -4683,7 +4705,7 @@ func (s *TaskService) HandleFailedTasks(ctx context.Context, tasks []db.AgentTas
 				// Reset stuck in_progress issues only when no other active
 				// task exists for the issue and no retry was just enqueued.
 				issueKey := util.UUIDToString(t.IssueID)
-				if issue.Status == "in_progress" && !processedIssues[issueKey] && !retriedIssues[issueKey] {
+				if issue.Status == "In Progress" && !processedIssues[issueKey] && !retriedIssues[issueKey] {
 					processedIssues[issueKey] = true
 					hasActive, checkErr := s.Queries.HasActiveTaskForIssue(ctx, t.IssueID)
 					if checkErr != nil {

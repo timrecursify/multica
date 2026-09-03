@@ -307,7 +307,7 @@ describe("useIssueSurfaceController", () => {
     });
     expect(listIssueTableRows).toHaveBeenCalledWith(
       expect.objectContaining({
-        group_key: "status:backlog",
+        group_key: "status:Registered",
         page: { limit: 50, cursor: null },
       }),
     );
@@ -400,7 +400,7 @@ describe("useIssueSurfaceController", () => {
       name: "project",
       surfaceKey: "project:p1",
       scope: { type: "project" as const, projectId: "p1" },
-      expected: { project_id: "p1", status: "todo" },
+      expected: { project_id: "p1", status: "Queue" },
     },
     {
       name: "my assigned",
@@ -409,7 +409,7 @@ describe("useIssueSurfaceController", () => {
       expected: {
         assignee_type: "member",
         assignee_id: "user-1",
-        status: "todo",
+        status: "Queue",
       },
     },
     {
@@ -424,7 +424,7 @@ describe("useIssueSurfaceController", () => {
       expected: {
         assignee_type: "agent",
         assignee_id: "agent-1",
-        status: "todo",
+        status: "Queue",
       },
     },
   ])("merges $name create defaults into the create modal payload", ({ scope, surfaceKey, expected }) => {
@@ -438,7 +438,7 @@ describe("useIssueSurfaceController", () => {
     );
 
     act(() => {
-      result.current.openCreateIssue({ status: "todo" });
+      result.current.openCreateIssue({ status: "Queue" });
     });
 
     expect(openModal).toHaveBeenCalledWith("create-issue", expected);
@@ -488,7 +488,7 @@ describe("useIssueSurfaceController", () => {
       result.current.moveIssue(
         "issue-1",
         {
-          status: "in_progress",
+          status: "In Progress",
           position: 42,
           project_id: "p2",
           before_id: "issue-0",
@@ -501,7 +501,7 @@ describe("useIssueSurfaceController", () => {
     expect(updateIssueMutate).toHaveBeenCalledWith(
       {
         id: "issue-1",
-        status: "in_progress",
+        status: "In Progress",
         position: 42,
         project_id: "p2",
         move_intent: {
@@ -538,13 +538,13 @@ describe("useIssueSurfaceController", () => {
     expect(result.current.selection.selectedIds).toEqual(new Set(["issue-1"]));
 
     await act(async () => {
-      await result.current.actions.batchUpdate(["issue-1"], { status: "done" });
+      await result.current.actions.batchUpdate(["issue-1"], { status: "Done" });
       await result.current.actions.batchDelete(["issue-2"]);
     });
 
     expect(batchUpdateMutateAsync).toHaveBeenCalledWith({
       ids: ["issue-1"],
-      updates: { status: "done" },
+      updates: { status: "Done" },
     });
     expect(batchDeleteMutateAsync).toHaveBeenCalledWith(["issue-2"]);
   });
@@ -641,7 +641,7 @@ describe("useIssueSurfaceController", () => {
     const listIssueTableFacets = vi.fn().mockResolvedValue({
       query_fingerprint: "sha256:facets",
       total: 0,
-      facets: [{ kind: "status", values: [{ key: "todo", count: 2 }] }],
+      facets: [{ kind: "status", values: [{ key: "Queue", count: 2 }] }],
     });
     setApiInstance({
       listIssues,
@@ -817,8 +817,8 @@ describe("useIssueSurfaceController", () => {
   it("exports every stable cursor page exactly once", async () => {
     const store = getIssueSurfaceViewStore("project:p1");
     store.getState().setViewMode("table");
-    const first = makeIssue({ id: "issue-1", status: "todo" });
-    const second = makeIssue({ id: "issue-2", status: "done" });
+    const first = makeIssue({ id: "issue-1", status: "Queue" });
+    const second = makeIssue({ id: "issue-2", status: "Done" });
     const listIssueTableRows = vi
       .fn()
       .mockResolvedValueOnce({
@@ -1044,12 +1044,12 @@ describe("useIssueSurfaceController", () => {
         (params?.offset ?? 0) === 0
           ? {
               issues: [
-                makeIssue({ id: "i-1", status: "todo" }),
-                makeIssue({ id: "i-2", status: "todo" }),
+                makeIssue({ id: "i-1", status: "Queue" }),
+                makeIssue({ id: "i-2", status: "Queue" }),
               ],
               total: 900,
             }
-          : { issues: [makeIssue({ id: "i-3", status: "todo" })], total: 50_000 },
+          : { issues: [makeIssue({ id: "i-3", status: "Queue" })], total: 50_000 },
       ),
     );
 
@@ -1111,7 +1111,7 @@ describe("useIssueSurfaceController", () => {
     // Asserted synchronously: the reset is render-phase, so not even one
     // frame commits the new membership with the old selection.
     act(() => {
-      store.getState().toggleStatusFilter("todo");
+      store.getState().toggleStatusFilter("Queue");
     });
 
     expect(result.current.selection.selectedIds).toEqual(new Set());
@@ -1169,17 +1169,17 @@ describe("useIssueSurfaceController", () => {
 
     // The fetch layer requests the cancelled status page like any other.
     expect(listIssues).toHaveBeenCalledWith(
-      expect.objectContaining({ status: "cancelled", limit: 50, offset: 0 }),
+      expect.objectContaining({ status: "Cancelled", limit: 50, offset: 0 }),
     );
     // …and with no status filter it is a visible column, ordered last.
-    expect(result.current.visibleStatuses).toContain("cancelled");
-    expect(result.current.visibleStatuses.at(-1)).toBe("cancelled");
+    expect(result.current.visibleStatuses).toContain("Cancelled");
+    expect(result.current.visibleStatuses.at(-1)).toBe("Cancelled");
   });
 
   it("includes cancelled issues in the default surface and visible statuses", async () => {
     mockListByStatus({
-      todo: [makeIssue({ id: "todo-1", status: "todo" })],
-      cancelled: [makeIssue({ id: "cancelled-1", status: "cancelled" })],
+      "Queue": [makeIssue({ id: "todo-1", status: "Queue" })],
+      "Cancelled": [makeIssue({ id: "cancelled-1", status: "Cancelled" })],
     });
 
     const { result } = renderHook(
@@ -1193,7 +1193,7 @@ describe("useIssueSurfaceController", () => {
 
     await waitFor(() => expect(result.current.isLoading).toBe(false));
 
-    expect(result.current.visibleStatuses).toContain("cancelled");
+    expect(result.current.visibleStatuses).toContain("Cancelled");
     const surfaceIds = result.current.surfaceIssues.map((i) => i.id);
     expect(surfaceIds).toContain("todo-1");
     expect(surfaceIds).toContain("cancelled-1");
@@ -1202,12 +1202,12 @@ describe("useIssueSurfaceController", () => {
 
   it("narrows the visible set to the selected statuses, dropping cancelled when it is not selected", async () => {
     mockListByStatus({
-      todo: [makeIssue({ id: "todo-1", status: "todo" })],
-      cancelled: [makeIssue({ id: "cancelled-1", status: "cancelled" })],
+      "Queue": [makeIssue({ id: "todo-1", status: "Queue" })],
+      "Cancelled": [makeIssue({ id: "cancelled-1", status: "Cancelled" })],
     });
 
     const store = getIssueSurfaceViewStore("project:p1");
-    act(() => store.getState().toggleStatusFilter("todo"));
+    act(() => store.getState().toggleStatusFilter("Queue"));
 
     const { result } = renderHook(
       () =>
@@ -1222,21 +1222,21 @@ describe("useIssueSurfaceController", () => {
 
     // The filter narrows the rendered columns and their contents — cancelled
     // is a normal status the filter can exclude, not an unlockable bucket.
-    expect(result.current.visibleStatuses).toEqual(["todo"]);
+    expect(result.current.visibleStatuses).toEqual(["Queue"]);
     expect(result.current.issues.map((i) => i.id)).toEqual(["todo-1"]);
     // cancelled participates in show/hide like the rest — hidden here because
     // the active filter excludes it.
-    expect(result.current.hiddenStatuses).toContain("cancelled");
+    expect(result.current.hiddenStatuses).toContain("Cancelled");
   });
 
   it("treats a cancelled-only filter like any other narrowing status filter", async () => {
     mockListByStatus({
-      todo: [makeIssue({ id: "todo-1", status: "todo" })],
-      cancelled: [makeIssue({ id: "cancelled-1", status: "cancelled" })],
+      "Queue": [makeIssue({ id: "todo-1", status: "Queue" })],
+      "Cancelled": [makeIssue({ id: "cancelled-1", status: "Cancelled" })],
     });
 
     const store = getIssueSurfaceViewStore("project:p1");
-    act(() => store.getState().toggleStatusFilter("cancelled"));
+    act(() => store.getState().toggleStatusFilter("Cancelled"));
 
     const { result } = renderHook(
       () =>
@@ -1250,7 +1250,7 @@ describe("useIssueSurfaceController", () => {
     await waitFor(() => expect(result.current.isLoading).toBe(false));
 
     // Cancelled becomes the sole visible column and the surface narrows to it.
-    expect(result.current.visibleStatuses).toEqual(["cancelled"]);
+    expect(result.current.visibleStatuses).toEqual(["Cancelled"]);
     expect(result.current.issues.map((i) => i.id)).toEqual(["cancelled-1"]);
     expect(result.current.surfaceIssues.map((i) => i.id)).toContain(
       "cancelled-1",
@@ -1266,11 +1266,11 @@ describe("useIssueSurfaceController", () => {
 
   it("sends working issue ids to the server without reconstructing a local scope", async () => {
     mockListByStatus({
-      todo: [
-        makeIssue({ id: "todo-1", status: "todo" }),
-        makeIssue({ id: "todo-2", status: "todo" }),
+      "Queue": [
+        makeIssue({ id: "todo-1", status: "Queue" }),
+        makeIssue({ id: "todo-2", status: "Queue" }),
       ],
-      in_progress: [makeIssue({ id: "prog-1", status: "in_progress" })],
+      "In Progress": [makeIssue({ id: "prog-1", status: "In Progress" })],
     });
     mockWorkingAgents([
       makeWorkingAgent("agent-1", ["todo-1"]),
@@ -1309,9 +1309,9 @@ describe("useIssueSurfaceController", () => {
 
   it("counts the agents a click would leave before the filter is even on", async () => {
     mockListByStatus({
-      todo: [
-        makeIssue({ id: "todo-1", status: "todo" }),
-        makeIssue({ id: "todo-2", status: "todo" }),
+      "Queue": [
+        makeIssue({ id: "todo-1", status: "Queue" }),
+        makeIssue({ id: "todo-2", status: "Queue" }),
       ],
     });
     mockWorkingAgents([
@@ -1345,8 +1345,8 @@ describe("useIssueSurfaceController", () => {
 
   it("combines the status and working predicates in the canonical server query", async () => {
     mockListByStatus({
-      todo: [makeIssue({ id: "todo-1", status: "todo" })],
-      in_progress: [makeIssue({ id: "prog-1", status: "in_progress" })],
+      "Queue": [makeIssue({ id: "todo-1", status: "Queue" })],
+      "In Progress": [makeIssue({ id: "prog-1", status: "In Progress" })],
     });
     mockWorkingAgents([
       makeWorkingAgent("agent-1", ["todo-1"]),
@@ -1356,7 +1356,7 @@ describe("useIssueSurfaceController", () => {
     // ...but the user is only looking at `todo`.
     const store = getIssueSurfaceViewStore("project:p1");
     act(() => {
-      store.getState().toggleStatusFilter("todo");
+      store.getState().toggleStatusFilter("Queue");
       store.getState().toggleAgentRunningFilter();
     });
 
@@ -1371,7 +1371,7 @@ describe("useIssueSurfaceController", () => {
 
     await waitFor(() => expect(result.current.isLoading).toBe(false));
 
-    expect(result.current.tableQuerySpec.filters.statuses).toEqual(["todo"]);
+    expect(result.current.tableQuerySpec.filters.statuses).toEqual(["Queue"]);
     expect(result.current.tableQuerySpec.filters.working_issue_ids).toEqual([
       "todo-1",
       "prog-1",
@@ -1389,9 +1389,9 @@ describe("useIssueSurfaceController", () => {
 
   it("sends the sub-issue display rule to the same server query", async () => {
     mockListByStatus({
-      todo: [
-        makeIssue({ id: "parent-1", status: "todo" }),
-        makeIssue({ id: "child-1", status: "todo", parent_issue_id: "parent-1" }),
+      "Queue": [
+        makeIssue({ id: "parent-1", status: "Queue" }),
+        makeIssue({ id: "child-1", status: "Queue", parent_issue_id: "parent-1" }),
       ],
     });
     mockWorkingAgents([
@@ -1422,9 +1422,9 @@ describe("useIssueSurfaceController", () => {
 
   it("drops an agent whose only working row is a hidden sub-issue", async () => {
     mockListByStatus({
-      todo: [
-        makeIssue({ id: "parent-1", status: "todo" }),
-        makeIssue({ id: "child-1", status: "todo", parent_issue_id: "parent-1" }),
+      "Queue": [
+        makeIssue({ id: "parent-1", status: "Queue" }),
+        makeIssue({ id: "child-1", status: "Queue", parent_issue_id: "parent-1" }),
       ],
     });
     mockWorkingAgents([
@@ -1451,7 +1451,7 @@ describe("useIssueSurfaceController", () => {
 
   it("requests issue working agents so chat/autopilot work stays out of scope", async () => {
     mockListByStatus({
-      todo: [makeIssue({ id: "todo-1", status: "todo" })],
+      "Queue": [makeIssue({ id: "todo-1", status: "Queue" })],
     });
     const { result } = renderHook(
       () =>
@@ -1470,8 +1470,8 @@ describe("useIssueSurfaceController", () => {
 
   it("keeps swimlane chrome bounded while descriptors retain hidden-status counts", async () => {
     mockListByStatus({
-      todo: [makeIssue({ id: "todo-1", status: "todo" })],
-      in_progress: [makeIssue({ id: "prog-1", status: "in_progress" })],
+      "Queue": [makeIssue({ id: "todo-1", status: "Queue" })],
+      "In Progress": [makeIssue({ id: "prog-1", status: "In Progress" })],
     });
     mockWorkingAgents([
       makeWorkingAgent("agent-1", ["todo-1"]),
@@ -1481,7 +1481,7 @@ describe("useIssueSurfaceController", () => {
     const store = getIssueSurfaceViewStore("project:p1");
     act(() => {
       store.getState().setViewMode("swimlane");
-      store.getState().toggleStatusFilter("todo");
+      store.getState().toggleStatusFilter("Queue");
     });
 
     const { result } = renderHook(
@@ -1511,7 +1511,7 @@ describe("useIssueSurfaceController", () => {
         .flatMap((lane) => lane.secondary_groups ?? [])
         .map((cell) => cell.value.kind === "status" ? cell.value.status : "")
         .sort(),
-    ).toEqual(["in_progress", "todo"]);
+    ).toEqual(["In Progress", "Queue"]);
   });
 
   // --- gantt canvas scope ------------------------------------------------
@@ -1532,7 +1532,7 @@ describe("useIssueSurfaceController", () => {
   const ganttFixture = [
     makeIssue({
       id: "gantt-open",
-      status: "in_progress",
+      status: "In Progress",
       assignee_type: "agent",
       assignee_id: "agent-1",
       start_date: "2026-01-01",
@@ -1540,7 +1540,7 @@ describe("useIssueSurfaceController", () => {
     }),
     makeIssue({
       id: "gantt-done",
-      status: "done",
+      status: "Done",
       assignee_type: "agent",
       assignee_id: "agent-2",
       start_date: "2026-01-01",
@@ -1550,7 +1550,7 @@ describe("useIssueSurfaceController", () => {
     // just cleared both dates) — the canvas cannot place it.
     makeIssue({
       id: "gantt-undated",
-      status: "in_progress",
+      status: "In Progress",
       assignee_type: "agent",
       assignee_id: "agent-3",
     }),

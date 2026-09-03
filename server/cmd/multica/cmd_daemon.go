@@ -312,7 +312,10 @@ func requireDaemonAuth(profile string) error {
 }
 
 func runDaemonStart(cmd *cobra.Command, _ []string) error {
-	if err := requireHumanLocalCommand("daemon start"); err != nil {
+	// MULTICA_DAEMON_PORT is also set by the supervisor wrapper. A port alone
+	// is not task context; only explicit task identity or the authenticated task
+	// marker may prohibit a child from starting a sibling daemon.
+	if err := requireHumanLocalDaemonStart(); err != nil {
 		return err
 	}
 	foreground, _ := cmd.Flags().GetBool("foreground")
@@ -1092,6 +1095,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	logPath := daemonLogPathForProfile(profile)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
@@ -1100,23 +1104,45 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
-		return cli.PrintJSON(os.Stdout, health)
+		return cli.PrintJSON(cmd.OutOrStdout(), daemonStatusJSON(profile, logPath, health))
 	}
 
 	label := "Daemon"
 	if profile != "" {
 		label = fmt.Sprintf("Daemon [%s]", profile)
+	} else {
+		label = "Daemon [default]"
 	}
 
 	switch health["status"] {
 	case "running":
-		printDaemonStatusReport(os.Stdout, label, health)
+		printDaemonStatusReport(cmd.OutOrStdout(), label, health, logPath)
 	case "starting":
-		fmt.Fprintf(os.Stdout, "%s: starting (pid %v)\n", label, health["pid"])
+		fmt.Fprintf(cmd.OutOrStdout(), "%s: starting (pid %v)\n", label, health["pid"])
+		fmt.Fprintf(cmd.OutOrStdout(), "Log path: %s\n", logPath)
 	default:
-		fmt.Fprintf(os.Stdout, "%s: stopped\n", label)
+		fmt.Fprintf(cmd.OutOrStdout(), "%s: stopped\n", label)
+		fmt.Fprintf(cmd.OutOrStdout(), "Log path: %s\n", logPath)
 	}
 	return nil
+}
+
+// daemonStatusJSON builds the machine-readable `--output json` payload: the
+// daemon health fields, plus the selected profile (empty string remains the
+// default profile identifier) and the resolved daemon log path for that
+// profile. Preserves every existing health field verbatim.
+func daemonStatusJSON(profile, logPath string, health map[string]any) map[string]any {
+	status := map[string]any{
+		"status":   health["status"],
+		"profile":  profile,
+		"log_path": logPath,
+	}
+	for k, v := range health {
+		if _, seen := status[k]; !seen {
+			status[k] = v
+		}
+	}
+	return status
 }
 
 // daemonStatusHealthPort resolves which daemon `status` should probe. Outside a
@@ -1148,11 +1174,12 @@ func daemonStatusHealthPort(cmd *cobra.Command) (int, error) {
 // printDaemonStatusReport renders a key/value summary of the daemon health
 // response. The value column is aligned to the widest label so the dynamic
 // "Daemon [profile]" row stays in step with the static rows below it.
-func printDaemonStatusReport(w io.Writer, label string, health map[string]any) {
+func printDaemonStatusReport(w io.Writer, label string, health map[string]any, logPath string) {
 	type row struct{ key, value string }
 	rows := []row{
 		{label, fmt.Sprintf("running (pid %v, uptime %v)", health["pid"], health["uptime"])},
 	}
+	rows = append(rows, row{"Log path", logPath})
 	if version, ok := health["cli_version"].(string); ok && version != "" {
 		rows = append(rows, row{"Version", version})
 	}
