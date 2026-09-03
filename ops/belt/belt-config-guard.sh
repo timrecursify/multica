@@ -850,8 +850,16 @@ redact_spec_refly_diagnostic() {
   printf '%s' "$1" | tr '\n' ' ' | sed -E -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' -e 's/((token|password|secret|api[_-]?key)[=:])[[:space:]]*[^[:space:]]+/\1[REDACTED]/Ig' | cut -c1-400
 }
 
-spec_refly_receipt_valid() {
-  jq -e '(.success == true) and (.issue.status == "Spec") and ((.task_id | type) == "string") and (.task_id | length > 0)' >/dev/null 2>&1 <<<"$1"
+spec_refly_receipt_json_valid() {
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$1"
+}
+
+spec_refly_receipt_status_valid() {
+  jq -e '(.success == true) and (.issue.status == "Spec")' >/dev/null 2>&1 <<<"$1"
+}
+
+spec_refly_receipt_task_valid() {
+  jq -e '((.task_id | type) == "string") and (.task_id | length > 0)' >/dev/null 2>&1 <<<"$1"
 }
 
 recover_stranded_spec_flight() {
@@ -873,9 +881,19 @@ recover_stranded_spec_flight() {
     unfixable+=("gsp#${number} stranded-Spec recovery failed phase=relay exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
     return 0
   fi
-  if ! spec_refly_receipt_valid "$relay_output"; then
+  if ! spec_refly_receipt_json_valid "$relay_output"; then
     diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=receipt exit=0 diagnostic=${diagnostic}")
+    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=json exit=0 diagnostic=${diagnostic}")
+    return 0
+  fi
+  if ! spec_refly_receipt_status_valid "$relay_output"; then
+    diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
+    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=status exit=0 diagnostic=${diagnostic}")
+    return 0
+  fi
+  if ! spec_refly_receipt_task_valid "$relay_output"; then
+    diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
+    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=missing-task exit=0 diagnostic=${diagnostic}")
     return 0
   fi
   fixed+=("gsp#${number} had no live scoper task; reset exactly once and re-flown to Spec with a scoper task receipt")

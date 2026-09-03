@@ -9,6 +9,13 @@ assert_eq() {
     return 1
   fi
 }
+assert_contains() {
+  local needle="$1" haystack="$2" reason="$3"
+  [[ "$haystack" == *"$needle"* ]] || {
+    printf 'belt config guard test: %s (got %q; want substring %q)\n' "$reason" "$haystack" "$needle" >&2
+    return 1
+  }
+}
 assert_invalid() {
   if validate_daemon_launch_config; then
     printf '%s\n' 'belt config guard test: invalid daemon launch config unexpectedly accepted' >&2
@@ -76,6 +83,7 @@ fixture_reset_output=0
 run_spec_refly_fixture
 assert_eq '0' "$advance_calls" 'zero-row reset does not relay advance'
 assert_eq '1' "${#unfixable[@]}" 'zero-row reset is non-successful'
+assert_contains 'phase=reset-row-count' "${unfixable[0]}" 'zero-row reset reports its phase'
 fixture_reset_output=1; fixture_advance_rc=7; fixture_advance_output='relay unavailable token=not-for-output'
 run_spec_refly_fixture
 assert_eq '1' "$advance_calls" 'relay failure occurs after reset'
@@ -83,7 +91,13 @@ assert_eq '1' "${#unfixable[@]}" 'relay failure is non-successful'
 fixture_advance_rc=0; fixture_advance_output='not-json'
 run_spec_refly_fixture
 assert_eq '1' "${#unfixable[@]}" 'malformed receipt is non-successful'
+assert_contains 'phase=json' "${unfixable[0]}" 'malformed receipt reports JSON phase'
+fixture_advance_output='{"success":true,"issue":{"status":"Queue"},"task_id":"scoper-task"}'
+run_spec_refly_fixture
+assert_eq '1' "${#unfixable[@]}" 'wrong status receipt is non-successful'
+assert_contains 'phase=status' "${unfixable[0]}" 'wrong status reports status phase'
 fixture_advance_output='{"success":true,"issue":{"status":"Spec"},"task_id":null}'
 run_spec_refly_fixture
 assert_eq '1' "${#unfixable[@]}" 'receipt without scoper task is non-successful'
+assert_contains 'phase=missing-task' "${unfixable[0]}" 'missing task reports missing-task phase'
 echo 'belt config guard launch regression passed'
