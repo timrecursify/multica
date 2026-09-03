@@ -3,15 +3,16 @@ ALTER TABLE agent_task_queue
     ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ;
 
 -- Existing rows may have been written by deployments that did not maintain a
--- task update timestamp. Backfill from the latest lifecycle timestamp before
--- enforcing the invariant.
+-- task update timestamp, or may contain a stale value from a replay. Reconcile
+-- every row (not only NULLs) before enforcing the invariant so migration also
+-- succeeds on databases that already have this column populated.
 UPDATE agent_task_queue
 SET updated_at = GREATEST(
+    COALESCE(updated_at, '-infinity'::timestamptz),
     created_at,
     COALESCE(started_at, '-infinity'::timestamptz),
     COALESCE(completed_at, '-infinity'::timestamptz)
-)
-WHERE updated_at IS NULL;
+);
 
 ALTER TABLE agent_task_queue
     ALTER COLUMN updated_at SET DEFAULT now(),
