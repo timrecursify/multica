@@ -74,6 +74,9 @@ function unrecordedCompletionsSql() {
     WHERE t.status = 'completed' AND t.completed_at > NOW() - ($1::int * interval '1 minute')
       AND t.context->>'to_stage' IS NOT NULL AND t.issue_id IS NOT NULL
       AND NOT EXISTS (SELECT 1 FROM issue_stage_outcome o WHERE o.task_id = t.id)
+      AND t.completed_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
+        WHERE l.issue_id = t.issue_id AND l.to_stage = t.context->>'to_stage'
+          AND l.from_stage <> l.to_stage), '-infinity')
     ORDER BY t.completed_at ASC LIMIT 200`;
 }
 

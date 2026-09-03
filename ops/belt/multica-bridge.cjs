@@ -1261,6 +1261,15 @@ async function relayAdvance(req, res, body) {
       `DELETE FROM issue_stage_outcome WHERE issue_id = $1 AND stage = $2`,
       [issue_id, requestedStage]
     );
+    // Log the arrival so the outcome recorder can tell a task completed before
+    // this visit from one completed during it (2026-09-03 05:10Z: the deleted
+    // ADVANCED row was re-recorded from the old task within 30 s and the
+    // typed-readvance bounced every CI/CD RETURN straight back).
+    await client.query(
+      `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status)
+       VALUES ($1, $2, $3, 'completed')`,
+      [issue_id, issue.status, requestedStage]
+    );
     await client.query("COMMIT");
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, issue: transitionUpdate.rows[0], task_id: null,
