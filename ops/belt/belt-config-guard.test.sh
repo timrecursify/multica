@@ -63,4 +63,18 @@ if wrapper_has_explicit_concurrency_flag "$wrapper_fixture"; then
   echo 'hard-coded daemon concurrency flag unexpectedly accepted' >&2
   exit 1
 fi
+
+# Stranded-Spec relay receipts are accepted only when JSON is valid, the
+# canonical status is Spec, and the relay selected a task identity.
+assert_eq Spec "$(printf '%s' '{"current_status":"Spec","task_id":"task-1"}' | spec_receipt_status)" 'valid Spec receipt status'
+assert_eq task-1 "$(printf '%s' '{"current_status":"Spec","task_id":"task-1"}' | spec_receipt_task_id)" 'valid Spec receipt task id'
+if [[ "$(printf '%s' '{"current_status":"Queue","task_id":"task-1"}' | spec_receipt_status)" == Spec ]]; then
+  echo 'wrong-status receipt unexpectedly accepted' >&2; exit 1
+fi
+if printf '%s' '{"current_status":"Spec"}' | spec_receipt_task_id >/dev/null; then
+  echo 'missing-task receipt unexpectedly accepted' >&2; exit 1
+fi
+if printf '%s' 'not-json' | spec_receipt_status >/dev/null 2>&1; then
+  echo 'malformed receipt unexpectedly accepted' >&2; exit 1
+fi
 echo 'belt config guard launch regression passed'
