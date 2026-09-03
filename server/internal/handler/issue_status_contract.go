@@ -73,18 +73,11 @@ func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, e
 	}
 	terminal := []string{"Done", "Cancelled", "Archived"}
 	display := map[string]string{}
-	switch profile {
-	case IssueStatusProfileLinear:
-		display = map[string]string{
-			"Spec": "todo", "Queue": "backlog", "In Progress": "in_progress", "In Review": "in_review",
-			"Human Review": "blocked", "Done": "done", "Cancelled": "cancelled", "Archived": "cancelled",
-		}
-	case IssueStatusProfilePPP:
-		for _, status := range canonical {
-			display[status] = status
-		}
-	default:
+	if _, ok := BackendStatusVocabulary[profile]; !ok {
 		return nil, fmt.Errorf("invalid issue status profile %q", profile)
+	}
+	for _, status := range canonical {
+		display[status] = BackendStatusVocabulary[profile][status]
 	}
 
 	contract := &IssueStatusContract{
