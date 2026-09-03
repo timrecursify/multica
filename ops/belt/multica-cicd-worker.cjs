@@ -25,6 +25,21 @@ function initializeRuntime() {
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
 const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
+// Retroactive CI (Tim 2026-09-02 16:16Z: admin merge + admin deploy with
+// retroactive CI/CD for speed; risk paths still wait). Repos listed here merge
+// a mergeable PR while its CI is still pending unless the diff touches a risk
+// path; main CI validates after the merge.
+const RETRO_REPOS = new Set((process.env.CICD_RETROACTIVE_REPOS || '').split(',').map(s => s.trim()).filter(Boolean));
+const RISK_PATH = /(^|\/)(migrations?|drizzle)\/|\.env|secret|credential|auth|billing\/.*flag|feature-flag|\.github\/workflows\//i;
+function retroactiveEligible(repo, num) {
+  if (!RETRO_REPOS.has(repo)) return { ok: false, why: 'repo not retroactive' };
+  try {
+    const files = JSON.parse(gh(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]));
+    const risky = files.map(f => f.filename).filter(f => RISK_PATH.test(f));
+    if (risky.length) return { ok: false, why: `risk path ${risky[0]}` };
+    return { ok: true, why: `${files.length} files, no risk path` };
+  } catch (e) { return { ok: false, why: `files lookup failed: ${String(e.message).split('\n')[0].slice(0, 80)}` }; }
+}
 // Merging is the one irreversible action here, so it is opt-in and defaults on
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
@@ -236,8 +251,13 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
     const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=30`]));
     // A run whose name is its file path is GitHub's 'invalid workflow file'
     // marker: it has no jobs and says nothing about this SHA.
-    runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/'));
+    // Cancelled runs (superseded by a newer push, or operator queue trims)
+    // say nothing about the SHA either.
+    const rawCount = (runs.workflow_runs || []).length;
+    runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/') && r.conclusion !== 'cancelled');
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
+    // Only cancelled or invalid runs: CI was attempted, treat as not yet checked.
+    if (rawCount && !(runs.workflow_runs || []).length) return 'no_checks';
     if (!(runs.workflow_runs || []).length) {
       const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
       return Number.isFinite(ageMinutes) && ageMinutes >= CI_ABSENT_MINUTES ? 'absent' : 'no_checks';
@@ -328,9 +348,13 @@ async function sweep() {
       const failures = countCiFailure(issue, pr, info.headRefOid, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
-        const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
-        log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}`);
-        continue;
+        const retro = (ci === 'pending' || ci === 'no_checks') && info.mergeable !== 'CONFLICTING' ? retroactiveEligible(pr.repo, pr.num) : null;
+        if (!retro || !retro.ok) {
+          const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
+          log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}${retro ? ` retro=${retro.why}` : ''}`);
+          continue;
+        }
+        log(`RETRO #${issue.number} ${pr.repo}#${pr.num} ci=${ci} merging ahead of CI (${retro.why})`);
       }
       if (!MERGE_ENABLED) { log(`HOLD #${issue.number} ${pr.repo}#${pr.num} green but merging disabled`); continue; }
       // Operator-owned merge, delegated to the belt (Tim 2026-09-03 01:48Z:
