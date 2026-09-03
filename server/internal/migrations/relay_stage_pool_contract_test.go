@@ -135,4 +135,16 @@ CREATE TABLE agent_invocation_target (id bigserial PRIMARY KEY, agent_id uuid NO
 	if mode != "private" {
 		t.Fatalf("archived permission_mode = %s, want private", mode)
 	}
+	if err := conn.QueryRow(ctx, `SELECT permission_mode FROM agent WHERE id=$1::uuid`, nonMember).Scan(&mode); err != nil {
+		t.Fatalf("read non-member: %v", err)
+	}
+	if mode != "private" {
+		t.Fatalf("non-member permission_mode = %s, want private", mode)
+	}
+	if err := conn.QueryRow(ctx, `SELECT count(*) FROM agent_invocation_target WHERE agent_id=$1::uuid`, nonMember).Scan(&count); err != nil {
+		t.Fatalf("count non-member targets: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("non-member targets = %d, want 0", count)
+	}
 }

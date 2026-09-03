@@ -51,6 +51,36 @@ func TestMemberAllowedToViewAgent_Pure(t *testing.T) {
 	}
 }
 
+// TestCanInvokeAgent_RelayPoolWorkspaceGrant exercises the real invocation
+// authorization predicate against a persisted workspace target. A same-
+// workspace member is accepted while an otherwise identical cross-workspace
+// actor remains denied.
+func TestCanInvokeAgent_RelayPoolWorkspaceGrant(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	agentID := util.MustParseUUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+	ownerID := util.MustParseUUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
+	workspaceID := testWorkspaceID
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO agent_invocation_target (agent_id, target_type, target_id, created_by)
+		VALUES ($1, 'workspace', $2, NULL)
+		ON CONFLICT (agent_id, target_type, target_id) DO NOTHING`, agentID, util.MustParseUUID(workspaceID)); err != nil {
+		t.Fatalf("seed workspace invocation target: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM agent_invocation_target WHERE agent_id=$1`, agentID)
+	})
+	agent := db.Agent{ID: agentID, OwnerID: ownerID, PermissionMode: "public_to"}
+	if !testHandler.canInvokeAgent(ctx, agent, "member", testUserID, "", workspaceID) {
+		t.Fatal("same-workspace member was denied workspace invocation target")
+	}
+	if testHandler.canInvokeAgent(ctx, agent, "member", "cccccccc-cccc-cccc-cccc-cccccccccccc", "", workspaceID) {
+		t.Fatal("cross-workspace actor was granted workspace invocation target")
+	}
+}
+
 // privateAgentTestFixture sets up a private agent owned by a freshly created
 // user, plus a second non-admin member in the workspace. Returns the agent
 // id, the owner's user id, and the unrelated member's user id. The caller's
@@ -116,6 +146,78 @@ func privateAgentTestFixture(t *testing.T) (agentID, ownerID, memberID string) {
 	})
 
 	return agentID, ownerID, memberID
+}
+
+// TestReplaceRelayStagePool_GrantsWorkspaceInvocation verifies the complete
+// persistence path: replacing a configured pool upgrades a private live agent,
+// creates an idempotent workspace target, and the real authorization predicate
+// admits only members of that workspace.
+func TestReplaceRelayStagePool_GrantsWorkspaceInvocation(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+	agentID, _, memberID := privateAgentTestFixture(t)
+	ctx := context.Background()
+
+	var configID int
+	if err := testPool.QueryRow(ctx, `SELECT COALESCE(MAX(id), 0) + 1 FROM relay_stage_config`).Scan(&configID); err != nil {
+		t.Fatalf("next relay config id: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `
+		INSERT INTO relay_stage_config (id, workspace_id, stage_name, next_stage, agent_name)
+		VALUES ($1, $2, 'Queue', 'In Progress', 'Pool acceptance agent')
+	`, configID, testWorkspaceID); err != nil {
+		t.Fatalf("seed relay stage config: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM relay_stage_config WHERE id = $1`, configID)
+		testPool.Exec(context.Background(), `DELETE FROM relay_stage_agent_pool WHERE agent_id = $1`, agentID)
+	})
+
+	replace := func() {
+		t.Helper()
+		req := newRequest(http.MethodPut, "/api/relay/stage-pools/Queue", map[string]any{
+			"enabled": true,
+			"members": []string{agentID},
+		})
+		req = withURLParam(req, "stage", "Queue")
+		rr := httptest.NewRecorder()
+		testHandler.ReplaceRelayStagePool(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("ReplaceRelayStagePool: expected 200, got %d: %s", rr.Code, rr.Body.String())
+		}
+	}
+	replace()
+	replace()
+
+	var mode string
+	if err := testPool.QueryRow(ctx, `SELECT permission_mode FROM agent WHERE id = $1`, agentID).Scan(&mode); err != nil {
+		t.Fatalf("read agent permission mode: %v", err)
+	}
+	if mode != "public_to" {
+		t.Fatalf("permission_mode = %q; want public_to", mode)
+	}
+	var memberships, targets int
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM relay_stage_agent_pool WHERE workspace_id = $1 AND stage_name = 'Queue' AND agent_id = $2`, testWorkspaceID, agentID).Scan(&memberships); err != nil {
+		t.Fatalf("count pool memberships: %v", err)
+	}
+	if err := testPool.QueryRow(ctx, `SELECT count(*) FROM agent_invocation_target WHERE agent_id = $1 AND target_type = 'workspace' AND target_id = $2`, agentID, testWorkspaceID).Scan(&targets); err != nil {
+		t.Fatalf("count workspace targets: %v", err)
+	}
+	if memberships != 1 || targets != 1 {
+		t.Fatalf("persisted memberships=%d targets=%d; want 1/1", memberships, targets)
+	}
+
+	agent, err := db.New(testPool).GetAgent(ctx, util.MustParseUUID(agentID))
+	if err != nil {
+		t.Fatalf("load persisted agent: %v", err)
+	}
+	if !testHandler.canInvokeAgent(ctx, agent, "member", memberID, "", testWorkspaceID) {
+		t.Fatal("same-workspace member was denied persisted pool grant")
+	}
+	if testHandler.canInvokeAgent(ctx, agent, "member", memberID, "", "cccccccc-cccc-cccc-cccc-cccccccccccc") {
+		t.Fatal("cross-workspace actor was granted persisted pool grant")
+	}
 }
 
 func newRequestAs(userID, method, path string, body any) *http.Request {
@@ -587,7 +689,7 @@ func TestShouldEnqueueOnComment_PrivateAgentGate(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-				got := testHandler.shouldEnqueueAssigneeFallback(ctx, issue, tc.actorType, tc.actorID, commentTriggerComputeOptions{})
+			got := testHandler.shouldEnqueueAssigneeFallback(ctx, issue, tc.actorType, tc.actorID, commentTriggerComputeOptions{})
 			if got != tc.want {
 				t.Fatalf("%s\n  actor=%s/%s got=%v want=%v",
 					tc.reason, tc.actorType, tc.actorID, got, tc.want)
