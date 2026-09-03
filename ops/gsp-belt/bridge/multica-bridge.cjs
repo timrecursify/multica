@@ -137,24 +137,24 @@ async function ssoBridge(req, res) {
   try {
     // Read CF Access authenticated user email from header
     const userEmail = req.headers["cf-access-authenticated-user-email"];
-    
+
     if (!userEmail) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Not authenticated via CF Access" }));
       return;
     }
-    
+
     const site = resolveSite(req);
 
     const client = new Client({ connectionString: MULTICA_DB });
     await client.connect();
-    
+
     // Get or create user
     let userResult = await client.query(
       "SELECT id FROM \"user\" WHERE email = $1",
       [userEmail]
     );
-    
+
     let userId;
     if (userResult.rows.length === 0) {
       // Create new user
@@ -163,7 +163,7 @@ async function ssoBridge(req, res) {
         [userEmail.split("@")[0], userEmail]
       );
       userId = createResult.rows[0].id;
-      
+
       // Add to workspace as admin
       await client.query(
         "INSERT INTO member (id, user_id, workspace_id, role, created_at) VALUES (gen_random_uuid(), $1, $2, $3, NOW())",
@@ -184,16 +184,16 @@ async function ssoBridge(req, res) {
         [userId, site.workspaceId]
       );
     }
-    
+
     await client.end();
-    
+
     // Create JWT token
     const token = jwt.sign(
       { sub: userId, email: userEmail, workspace_id: site.workspaceId },
       JWT_SECRET,
       { expiresIn: "7d" }
     );
-    
+
     // Generate CSRF token: nonce.signature where signature = HMAC-SHA256(nonce, authToken)
     // This matches the server's ValidateCSRF expectation: hex(nonce).hex(HMAC-SHA256(nonce, authToken))
     const nonce = crypto.randomBytes(16);
@@ -201,7 +201,7 @@ async function ssoBridge(req, res) {
     mac.update(nonce);
     const sig = mac.digest("hex");
     const csrfToken = nonce.toString("hex") + "." + sig;
-    
+
     // Set secure HttpOnly cookie for auth and CSRF cookie for POST requests
     res.writeHead(302, {
       "Location": `/${site.slug}/issues`,
@@ -222,7 +222,7 @@ async function relayAdvance(req, res, body) {
   let client;
   try {
     let { issue_id, to_stage, agent_token } = body;
-    
+
     // Validate agent token
     if (agent_token !== RELAY_AGENT_SECRET) {
       res.writeHead(401, { "Content-Type": "application/json" });
@@ -237,7 +237,7 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayStage(res, to_stage);
       return;
     }
-    
+
     client = new Client({ connectionString: MULTICA_DB });
     await client.connect();
     await client.query("BEGIN");
