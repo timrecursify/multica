@@ -3,10 +3,12 @@ package handler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -20,20 +22,42 @@ func TestIssueListSurfacesTolerateNullCreatorType(t *testing.T) {
 	}
 
 	ctx := context.Background()
+	marker := fmt.Sprintf("ticket-21077-null-creator-%d", time.Now().UnixNano())
+	nullTitle := marker + "-null"
 	var issueID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
-		VALUES ($1, 'null creator regression row', 'Spec', 'none', NULL, $2, 1)
+		VALUES ($1, $3, 'Spec', 'none', NULL, $2, 1)
 		RETURNING id
-	`, testWorkspaceID, testUserID).Scan(&issueID); err != nil {
+	`, testWorkspaceID, testUserID, nullTitle).Scan(&issueID); err != nil {
 		t.Fatalf("insert null-creator row: %v", err)
 	}
 	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID) })
 
 	list := httptest.NewRecorder()
 	testHandler.ListIssues(list, newRequest(http.MethodGet, "/api/issues?workspace_id="+testWorkspaceID, nil))
-	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "null creator regression row") {
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), nullTitle) {
 		t.Fatalf("ListIssues = %d: %s", list.Code, list.Body.String())
+	}
+
+	// Put a NULL attribution row behind the first page. This catches the
+	// original production failure, where scanning stopped only once pagination
+	// reached a historical NULL row.
+	var precedingID string
+	precedingTitle := marker + "-before"
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, title, status, priority, creator_type, creator_id, number)
+		VALUES ($1, $3, 'Spec', 'none', 'member', $2, 2)
+		RETURNING id
+	`, testWorkspaceID, testUserID, precedingTitle).Scan(&precedingID); err != nil {
+		t.Fatalf("insert preceding row: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, precedingID) })
+	window := httptest.NewRecorder()
+	testHandler.ListIssues(window, newRequest(http.MethodGet,
+		"/api/issues?workspace_id="+testWorkspaceID+"&q="+marker+"&sort=title&limit=1&offset=1", nil))
+	if window.Code != http.StatusOK || !strings.Contains(window.Body.String(), nullTitle) {
+		t.Fatalf("paginated ListIssues = %d: %s", window.Code, window.Body.String())
 	}
 
 	table := httptest.NewRecorder()
@@ -41,7 +65,7 @@ func TestIssueListSurfacesTolerateNullCreatorType(t *testing.T) {
 		"query": map[string]any{"scope": map[string]any{"kind": "workspace"}, "filters": map[string]any{}, "sort": map[string]any{"field": "position", "direction": "asc"}},
 		"group": map[string]any{"kind": "none"}, "hierarchy": map[string]any{"enabled": false}, "page": map[string]any{"limit": 100},
 	}))
-	if table.Code != http.StatusOK || !strings.Contains(table.Body.String(), "null creator regression row") {
+	if table.Code != http.StatusOK || !strings.Contains(table.Body.String(), nullTitle) {
 		t.Fatalf("ListIssueTableRows = %d: %s", table.Code, table.Body.String())
 	}
 }
