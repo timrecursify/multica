@@ -81,12 +81,17 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
       bound_sha: evidence.bound_sha, observed_sha: evidence.observed_sha,
       failure_class: evidence.failure_class, qualifying: evidence.qualifying,
       model: task.agent_model, effort: task.agent_effort,
-      idem_key: `qc-${task.number}-${evidence.bound_sha}-${evidence.verdict}`,
+      // Key per QC task: a re-QC of the same sha by another checker is a new
+      // verdict, not a replay. The old sha-only key returned 409
+      // idempotency_conflict for every re-run and left 55 issues unverdicted.
+      idem_key: `qc-${task.number}-${evidence.bound_sha}-${evidence.verdict}-${String(task.id).slice(0, 8)}`,
       qc_task_id: task.id };
     const result = await postRelay(payload);
     if (result && result.status >= 200 && result.status < 300) {
       converted.add(task.id);
       logger.log(`${logPrefix} [qc-evidence-converted] task=${task.id}`);
+    } else {
+      logger.log(`${logPrefix} [qc-evidence-rejected] task=${task.id} status=${result && result.status} error=${(result && (result.error || result.body)) || 'unknown'}`);
     }
   }
   return converted;
