@@ -183,6 +183,48 @@ function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
   } catch (_) { return false; }
 }
 
+const TERMINAL_DEPLOY_CONCLUSIONS = new Set([
+  'failure', 'cancelled', 'timed_out', 'startup_failure', 'stale', 'action_required',
+]);
+
+function laterSuccessfulDeploy(repo, cancelled, sourceSha) {
+  try {
+    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?status=success&per_page=100`]))
+      .workflow_runs || [];
+    const later = runs.filter(run => run.path === cancelled.path && run.conclusion === 'success'
+      && String(run.created_at || '') > String(cancelled.created_at || '')
+      && /^[0-9a-f]{40}$/i.test(run.head_sha || ''))
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    for (const run of later) {
+      const comparison = JSON.parse(gh(['api', `repos/${repo}/compare/${sourceSha}...${run.head_sha}`]));
+      if (comparison.status === 'behind' || comparison.status === 'identical') return run;
+    }
+  } catch (_) { /* REST errors conservatively leave the cancellation unresolved. */ }
+  return null;
+}
+
+function terminalDeployEvaluation(repo, sha) {
+  try {
+    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]))
+      .workflow_runs || [];
+    const deployRuns = runs.filter(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || ''));
+    if (!deployRuns.length) return null;
+    const superseded = deployRuns.filter(run => run.conclusion === 'cancelled'
+      && laterSuccessfulDeploy(repo, run, sha));
+    const unresolved = deployRuns.filter(run => !superseded.includes(run));
+    if (unresolved.some(run => !TERMINAL_DEPLOY_CONCLUSIONS.has(run.conclusion))) return null;
+    if (unresolved.length) {
+      return { failed: [...new Set(unresolved.map(r =>
+        `${(r.path || '').replace(/^.*\//, '')}=${r.conclusion}`))].sort().join(', '), superseded };
+    }
+    return superseded.length ? { superseded } : null;
+  } catch (_) { return null; }
+}
+
+function terminalFailedDeployRuns(repo, sha) {
+  return terminalDeployEvaluation(repo, sha)?.failed || null;
+}
+
 function mergeDeployEvidence(repo, sha, mergedAt) {
   const receipt = receiptEvidence(sha);
   if (receipt.mismatch) return { mismatch: true };
@@ -195,6 +237,12 @@ function mergeDeployEvidence(repo, sha, mergedAt) {
   }
   if (noDeployRunTriggered(repo, sha, mergedAt)) {
     return { evidence: { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true } };
+  }
+  const terminal = terminalDeployEvaluation(repo, sha);
+  if (terminal?.failed) return { failed: terminal.failed };
+  if (terminal?.superseded?.length) {
+    return { evidence: { kind: 'github_deploy_run_superseded', sha,
+      superseded: terminal.superseded.map(run => ({ workflow: run.path, run: run.id || run.database_id })) } };
   }
   return { pending: true };
 }
@@ -219,6 +267,10 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   const deploy = mergeDeployEvidence(pr.repo, mergedSha, pr.mergedAt);
   if (deploy.mismatch) {
     await humanReview(issue, `${note}; release receipt exists but does not match ${mergedSha}`);
+    return;
+  }
+  if (deploy.failed) {
+    await returnIssueToBuild(issue, `${note}; deploy run failed for ${mergedSha} (${deploy.failed})`);
     return;
   }
   if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return; }
@@ -492,5 +544,5 @@ function setTestDependencies(dependencies) {
 }
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
-  routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered,
+  routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
   setTestDependencies, sweep, watchdogFailure };
