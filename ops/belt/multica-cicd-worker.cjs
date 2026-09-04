@@ -294,12 +294,12 @@ async function retriggerCancelledDeploys(issue, repo, sha, cancelledRuns) {
       gh(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
       deployCancelRetries.set(key, attempts + 1);
       dispatched += 1;
-      try { await pool?.query("update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['deploy_cancel_retries', $2], to_jsonb($3::int), true) WHERE id=$1", [issue.id, key, attempts + 1]); } catch (_) { /* degraded/test DB */ }
+      try { await pool?.query("update issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('deploy_cancel_retries', COALESCE(metadata->'deploy_cancel_retries', '{}'::jsonb) || jsonb_build_object($2, $3::int)) WHERE id=$1", [issue.id, key, attempts + 1]); } catch (_) { /* degraded/test DB */ }
       log(`DEPLOY-RETRIGGER #${issue.number} ${sha} workflow=${workflow} attempt=${attempts + 1}/${DEPLOY_CANCEL_RETRY_LIMIT}`);
     } catch (e) {
       const nextAttempts = attempts + 1;
       deployCancelRetries.set(key, nextAttempts);
-      try { await pool?.query("update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['deploy_cancel_retries', $2], to_jsonb($3::int), true) WHERE id=$1", [issue.id, key, nextAttempts]); } catch (_) { /* degraded/test DB */ }
+      try { await pool?.query("update issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('deploy_cancel_retries', COALESCE(metadata->'deploy_cancel_retries', '{}'::jsonb) || jsonb_build_object($2, $3::int)) WHERE id=$1", [issue.id, key, nextAttempts]); } catch (_) { /* degraded/test DB */ }
       log(`DEPLOY-RETRIGGER-FAIL #${issue.number} ${sha} workflow=${workflow} ${String(e.message).split('\n')[0]}`);
     }
   }

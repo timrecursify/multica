@@ -300,6 +300,30 @@ test('cancelled deploy retry failures consume the bounded cap', async () => {
   assert.equal(capped.capped, 1);
 });
 
+test('cancelled deploy retry count is read from and written into nested metadata', async () => {
+  const persistedSha = 'd'.repeat(40);
+  const key = `persisted-issue:${persistedSha}:deploy-billing-server.yml`;
+  const updates = [];
+  const reruns = [];
+  worker.setTestDependencies({
+    pool: { query: async (sql, params) => {
+      if (/SELECT metadata/.test(sql)) return { rows: [{ metadata: { deploy_cancel_retries: { [key]: 2 } } }] };
+      updates.push({ sql, params });
+      return { rows: [] };
+    } },
+    gh: args => { reruns.push(args); return ''; },
+    log: () => {}
+  });
+  const run = { id: 909, path: '.github/workflows/deploy-billing-server.yml' };
+  const result = await worker.retriggerCancelledDeploys({ id: 'persisted-issue', number: 103 }, 'timrecursify/ppp', persistedSha, [run]);
+  assert.equal(result.dispatched, 1);
+  assert.equal(reruns.length, 1);
+  assert.equal(updates.length, 1);
+  assert.deepEqual(updates[0].params, ['persisted-issue', key, 3]);
+  assert.match(updates[0].sql, /COALESCE\(metadata->'deploy_cancel_retries', '\{\}'::jsonb\)/);
+  worker.setTestDependencies({ log: defaultLog });
+});
+
 test('third return for the same reason escalates once instead of looping', async () => {
   const loopIssue = { id: 'loop-issue', number: 99, workspace_id: 'gsp' };
   const calls = dependencies({ receipt: { source_sha: sha, release: '/r', health: 'ok' } });
