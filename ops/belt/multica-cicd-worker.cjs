@@ -258,22 +258,22 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     if (ci === 'absent' || ['red', 'mixed', 'unknown'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
     } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
-    return;
+    return { status: 'returned' };
   }
   if (latest && latest.verdict !== 'PASS') {
     await returnIssueToBuild(issue, `${note}; latest QC PASS evidence is absent`);
-    return;
+    return { status: 'returned' };
   }
   const deploy = mergeDeployEvidence(pr.repo, mergedSha, pr.mergedAt);
   if (deploy.mismatch) {
     await humanReview(issue, `${note}; release receipt exists but does not match ${mergedSha}`);
-    return;
+    return { status: 'returned' };
   }
   if (deploy.failed) {
     await returnIssueToBuild(issue, `${note}; deploy run failed for ${mergedSha} (${deploy.failed})`);
-    return;
+    return { status: 'returned' };
   }
-  if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return; }
+  if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return { status: 'pending', sha: mergedSha }; }
   const noVerdict = !latest;
   const reviewedSha = noVerdict ? mergedSha : latest.bound_sha || mergedSha;
   const evidence = { ciSuccess: true, mergeDeployReceipt: deploy.evidence, reviewedSha,
@@ -283,6 +283,17 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   await relay(issue.id, 'Done', latest?.work_product_md5 || null, null, null, evidence);
   log(noVerdict ? `NO-VERDICT #${issue.number} accepted merged+green sha=${mergedSha}` :
     `DONE #${issue.number} — ${note}`);
+  return { status: 'done', sha: mergedSha };
+}
+
+async function closureWatchdog(issue, result, sha) {
+  if (!result || result.status !== 'pending') return false;
+  const row = watchdog.observe(issue.id, { sha, outcome: 'closure_pending' });
+  if (!watchdog.stalled(row)) return false;
+  const alerted = watchdog.markAlerted(row, 'closure_stalled');
+  const elapsed = Date.now() - Date.parse(row.first_seen_at);
+  await humanReview(issue, `closure_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed} last_error=${row.last_error || 'deploy pending'} correlation_key=${row.correlation_key}`);
+  return Boolean(alerted);
 }
 
 async function escalateCi(issue, pr, ci) {
@@ -455,11 +466,12 @@ async function sweep() {
           continue;
         }
         const last = merged[0];
-        await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
+        const result = await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
           repo: last.pr.repo, headSha: last.info.headRefOid, createdAt: last.info.createdAt,
           mergedAt: last.info.mergedAt
         });
-        watchdog.clear(issue.id);
+        if (result?.status === 'pending') await closureWatchdog(issue, result, last.info.mergeCommit.oid);
+        else if (result?.status === 'done' || result?.status === 'returned') watchdog.clear(issue.id);
         continue;
       }
       if (openStates.length > 1) {
@@ -545,4 +557,4 @@ function setTestDependencies(dependencies) {
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
   routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
-  setTestDependencies, sweep, watchdogFailure };
+  setTestDependencies, sweep, watchdogFailure, closureWatchdog };
