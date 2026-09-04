@@ -32,3 +32,14 @@ test('stalled alert is emitted once after threshold and backoff is capped', () =
   assert.equal(w.stalled(row), false);
   assert.ok(w.backoffMs({ attempts: 99 }) <= SENTINEL_MS);
 });
+
+test('successful closure clears the correlation state so a later flight starts fresh', () => {
+  const w = createWatchdog();
+  w.observe('issue-3', { sha: 'c'.repeat(40), outcome: 'closure_pending' });
+  assert.ok(w.snapshot()['issue-3:CI/CD & Deploy']);
+  w.clear('issue-3');
+  assert.equal(w.snapshot()['issue-3:CI/CD & Deploy'], undefined);
+  const next = w.observe('issue-3', { sha: 'd'.repeat(40), outcome: 'closure_pending' });
+  assert.equal(next.correlation_key, correlationKey('issue-3', 'd'.repeat(40)));
+  assert.equal(next.attempts, 1);
+});
