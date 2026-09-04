@@ -268,14 +268,11 @@ function terminalDeployEvaluation(repo, sha) {
 }
 
 async function retriggerCancelledDeploys(issue, repo, sha, cancelledRuns) {
-  const runs = [...new Map((cancelledRuns || [])
-    .filter(run => Number.isFinite(Number(run.id)))
-    .map(run => [String(run.id), run])).values()];
+  const workflows = [...new Set((cancelledRuns || []).map(run => run.path).filter(Boolean))];
   let dispatched = 0;
-  for (const run of runs) {
-    const runId = String(run.id);
-    const workflow = (run.path || '').replace(/^.*\//, '') || run.name || runId;
-    const key = `${issue.id}:${sha}:run:${runId}`;
+  for (const workflowPath of workflows) {
+    const workflow = workflowPath.replace(/^.*\//, '');
+    const key = `${issue.id}:${sha}:${workflow}`;
     let attempts = deployCancelRetries.get(key);
     if (attempts === undefined) {
       try {
@@ -288,21 +285,25 @@ async function retriggerCancelledDeploys(issue, repo, sha, cancelledRuns) {
       log(`DEPLOY-CANCEL-CAP #${issue.number} ${sha} workflow=${workflow} attempts=${attempts}`);
       continue;
     }
-    let rerunError;
     try {
-      gh(['run', 'rerun', runId, '--repo', repo]);
+      const run = (cancelledRuns || []).find(candidate => candidate.path === workflowPath);
+      const runId = run?.id || run?.database_id;
+      if (!runId) throw new Error('cancelled deploy run has no id');
+      // Rerun the cancelled run itself. workflow_dispatch --ref accepts only a
+      // branch or tag, not the merge commit SHA, and would therefore fail.
+      gh(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
+      deployCancelRetries.set(key, attempts + 1);
       dispatched += 1;
-    } catch (e) { rerunError = e; }
-    const nextAttempts = attempts + 1;
-    deployCancelRetries.set(key, nextAttempts);
-    try { await pool?.query("update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['deploy_cancel_retries', $2], to_jsonb($3::int), true) WHERE id=$1", [issue.id, key, nextAttempts]); } catch (_) { /* degraded/test DB */ }
-    if (rerunError) {
-      log(`DEPLOY-RETRIGGER-FAIL #${issue.number} ${sha} run=${runId} workflow=${workflow} ${String(rerunError.message).split('\n')[0]}`);
-    } else {
-      log(`DEPLOY-RETRIGGER #${issue.number} ${sha} run=${runId} workflow=${workflow} attempt=${nextAttempts}/${DEPLOY_CANCEL_RETRY_LIMIT}`);
+      try { await pool?.query("update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['deploy_cancel_retries', $2], to_jsonb($3::int), true) WHERE id=$1", [issue.id, key, attempts + 1]); } catch (_) { /* degraded/test DB */ }
+      log(`DEPLOY-RETRIGGER #${issue.number} ${sha} workflow=${workflow} attempt=${attempts + 1}/${DEPLOY_CANCEL_RETRY_LIMIT}`);
+    } catch (e) {
+      const nextAttempts = attempts + 1;
+      deployCancelRetries.set(key, nextAttempts);
+      try { await pool?.query("update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['deploy_cancel_retries', $2], to_jsonb($3::int), true) WHERE id=$1", [issue.id, key, nextAttempts]); } catch (_) { /* degraded/test DB */ }
+      log(`DEPLOY-RETRIGGER-FAIL #${issue.number} ${sha} workflow=${workflow} ${String(e.message).split('\n')[0]}`);
     }
   }
-  return { dispatched, capped: runs.filter(run => (deployCancelRetries.get(`${issue.id}:${sha}:run:${run.id}`) || 0) >= DEPLOY_CANCEL_RETRY_LIMIT).length };
+  return { dispatched, capped: workflows.filter(path => (deployCancelRetries.get(`${issue.id}:${sha}:${path.replace(/^.*\//, '')}`) || 0) >= DEPLOY_CANCEL_RETRY_LIMIT).length };
 }
 
 function terminalFailedDeployRuns(repo, sha) {

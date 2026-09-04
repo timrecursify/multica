@@ -180,6 +180,7 @@ test('cancelled deploy superseded by a later success containing the merge reache
   const superseding = { path: cancelled.path, conclusion: 'success', head_sha: laterSha,
     created_at: '2026-09-04T02:00:00Z', id: 8 };
   let deployLookup = 0;
+  const reruns = [];
   const gh = (args) => {
     const path = args[1] || '';
     if (args[0] === 'api' && path.includes('/actions/runs?head_sha=')) {
@@ -192,12 +193,14 @@ test('cancelled deploy superseded by a later success containing the merge reache
     if (args[0] === 'run') return JSON.stringify([]);
     if (path.includes('/actions/runs?status=success')) return JSON.stringify({ workflow_runs: [superseding] });
     if (path.includes('/compare/')) return JSON.stringify({ status: 'ahead' });
+    if (args[0] === 'api' && args[1] === '-X') { reruns.push(args); return ''; }
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   const calls = dependencies({ receipt: null, gh });
   await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
   assert.equal(calls[0][1], 'Done');
   assert.equal(calls[0][5].mergeDeployReceipt.kind, 'github_deploy_run_superseded');
+  assert.equal(reruns.length, 0);
 });
 
 test('cancelled deploy without qualifying later success is held as undeployed', async () => {
@@ -241,7 +244,7 @@ test('cancelled deploy reruns by run id and caps repeated rerun failures', async
   const capped = await worker.retriggerCancelledDeploys(retryIssue, 'timrecursify/ppp', sha, cancelled);
   assert.equal(capped.capped, 1);
   assert.equal(ghCalls.length, 3);
-  assert.deepEqual(ghCalls[0], ['run', 'rerun', '321', '--repo', 'timrecursify/ppp']);
+  assert.deepEqual(ghCalls[0], ['api', '-X', 'POST', 'repos/timrecursify/ppp/actions/runs/321/rerun']);
   const persisted = updates.filter(params => params.length === 3);
   assert.equal(persisted.length, 3);
   assert.deepEqual(persisted.map(params => params[2]), [1, 2, 3]);
@@ -270,6 +273,31 @@ test('cancelled deploy compare errors remain held as undeployed', async () => {
   const calls = dependencies({ receipt: null, gh });
   await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
   assert.equal(calls.length, 0);
+});
+
+test('cancelled deploy reruns the cancelled run by id', async () => {
+  const reruns = [];
+  const run = { path: '.github/workflows/deploy-billing-server.yml', conclusion: 'cancelled', id: 101 };
+  worker.setTestDependencies({ gh: args => {
+    if (args[0] === 'api' && args[1] === '-X') { reruns.push(args); return ''; }
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  }, pool: { query: async () => ({ rows: [] }) } });
+  const result = await worker.retriggerCancelledDeploys({ id: 'rerun-issue', number: 101 }, 'timrecursify/ppp', sha, [run]);
+  assert.equal(result.dispatched, 1);
+  assert.deepStrictEqual(reruns[0], ['api', '-X', 'POST', 'repos/timrecursify/ppp/actions/runs/101/rerun']);
+});
+
+test('cancelled deploy retry failures consume the bounded cap', async () => {
+  let attempts = 0;
+  worker.setTestDependencies({ gh: () => { attempts += 1; throw new Error('dispatch unavailable'); }, pool: { query: async () => ({ rows: [] }) } });
+  const retryIssue = { id: 'cap-issue', number: 102 };
+  const run = { path: '.github/workflows/deploy-billing-server.yml', conclusion: 'cancelled', id: 102 };
+  await worker.retriggerCancelledDeploys(retryIssue, 'timrecursify/ppp', sha, [run]);
+  await worker.retriggerCancelledDeploys(retryIssue, 'timrecursify/ppp', sha, [run]);
+  await worker.retriggerCancelledDeploys(retryIssue, 'timrecursify/ppp', sha, [run]);
+  const capped = await worker.retriggerCancelledDeploys(retryIssue, 'timrecursify/ppp', sha, [run]);
+  assert.equal(attempts, 3);
+  assert.equal(capped.capped, 1);
 });
 
 test('third return for the same reason escalates once instead of looping', async () => {
