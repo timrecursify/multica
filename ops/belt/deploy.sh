@@ -14,7 +14,7 @@ while (( $# )); do
     --only) only_target="${2:-}"; shift 2 ;;
     --source-commit) source_commit="${2:-}"; shift 2 ;;
     *)
-      printf 'Usage: %s [--dry-run|--apply] [--source-commit SHA] [--only multica-cicd-worker] | %s --rollback YYYYMMDDTHHMMSSZ [--only multica-cicd-worker]\n' "$0" "$0" >&2
+      printf 'Usage: %s [--dry-run|--apply] [--source-commit SHA] [--only TARGET] | %s --rollback YYYYMMDDTHHMMSSZ [--only TARGET]\n' "$0" "$0" >&2
       exit 2
       ;;
   esac
@@ -31,10 +31,6 @@ if [[ -n "$source_commit" ]]; then
   [[ "$actual_commit" == "$source_commit" ]] || { printf 'Source commit mismatch: checkout=%s requested=%s\n' "$actual_commit" "$source_commit" >&2; exit 2; }
 fi
 
-if [[ -n "$only_target" && "$only_target" != multica-cicd-worker ]]; then
-  printf 'Invalid --only target: %s\n' "$only_target" >&2
-  exit 2
-fi
 if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
   printf 'Invalid rollback timestamp: %s\n' "$rollback_timestamp" >&2
   exit 2
@@ -56,6 +52,7 @@ declare -a sources=(
   "$root_dir/multica-archiver.cjs"
   "$root_dir/merged-pr-recovery-sweep.cjs"
   "$root_dir/belt-config-guard.sh"
+  "$root_dir/belt-concurrency.sh"
   "$root_dir/multica-daemon-wrapper.sh"
   "$root_dir/ecosystem.gsp-belt.config.js"
   "$root_dir/multica-bundle.py"
@@ -87,6 +84,7 @@ declare -a targets=(
   "$runtime_root/multica-archiver.cjs"
   "$runtime_root/merged-pr-recovery-sweep.cjs"
   "$runtime_root/tools/belt-config-guard.sh"
+  "$runtime_root/tools/belt-concurrency.sh"
   "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
   "$runtime_root/gsp-multica/fleet/ecosystem.gsp-belt.config.js"
   "$runtime_root/tools/multica-bundle.py"
@@ -106,14 +104,42 @@ declare -a targets=(
 )
 
 selected() {
-  [[ -z "$only_target" || "${sources[$1]##*/}" == "$only_target.cjs" ]]
+  local name="${sources[$1]##*/}"
+  [[ -z "$only_target" || "$name" == "$only_target" || "${name%.cjs}" == "$only_target" ]]
 }
+
+if [[ -n "$only_target" ]]; then
+  found=0
+  for source_file in "${sources[@]}"; do
+    name="${source_file##*/}"
+    if [[ "$name" == "$only_target" || "${name%.cjs}" == "$only_target" ]]; then found=1; break; fi
+  done
+  (( found )) || { printf 'Invalid --only target: %s\n' "$only_target" >&2; exit 2; }
+fi
 
 invalid=0
 declare -a new_targets=()
 declare -A manifest_indexes=()
 for index in "${!sources[@]}"; do
   manifest_indexes["${sources[$index]}"]="$index"
+done
+
+# Validate a wrapper rollout before creating backups or mutating any target.
+for index in "${!sources[@]}"; do
+  [[ "${sources[$index]}" == "$root_dir/multica-daemon-wrapper.sh" ]] || continue
+  selected "$index" || continue
+  if [[ -n "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" ]]; then
+    source "$root_dir/belt-concurrency.sh"
+    cpu_count="$(belt_cpu_count)" || { printf 'Wrapper preflight: unable to determine CPU count\n' >&2; exit 1; }
+    cap="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS}"
+    [[ "$cap" =~ ^[1-9][0-9]*$ ]] || { printf 'Wrapper preflight: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer\n' >&2; exit 1; }
+    (( cap <= cpu_count )) || { printf 'Wrapper preflight: MULTICA_DAEMON_MAX_CONCURRENT_TASKS=%s exceeds CPU count=%s\n' "$cap" "$cpu_count" >&2; exit 1; }
+  fi
+  runtime_wrapper="${targets[$index]}"
+  if [[ -f "$runtime_wrapper" ]] && ! cmp -s "$root_dir/multica-daemon-wrapper.sh" "$runtime_wrapper"; then
+    printf 'Wrapper preflight: source/runtime parity mismatch\n' >&2
+    exit 1
+  fi
 done
 
 # Validate every relative CommonJS require before any backup or copy. This
@@ -161,6 +187,7 @@ for index in "${!sources[@]}"; do
       "${targets[$index]}" == "$runtime_root/cicd-watchdog.cjs" ||
       "${targets[$index]}" == "$runtime_root/merged-pr-recovery-sweep.cjs" ||
       "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
+  [[ "${targets[$index]}" == "$runtime_root/tools/belt-concurrency.sh" ]] && new_targets[$index]=1
   [[ "${targets[$index]}" =~ /(qc-lane|reconciler|stage-outcome|transition-policy|stage-routing|qc-strict-evidence|qc-verdict-policy)\.cjs$ ||
       "${targets[$index]}" == "$runtime_root/gsp-multica/stage-routing.json" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
