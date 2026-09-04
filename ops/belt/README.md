@@ -25,6 +25,23 @@ checks continue. Remove the marker only after the worker may safely resume.
 | `multica-bundle.py` | `/home/newadmin/tools/multica-bundle.py` | No always-running PM2 app or systemd unit; the runbook invokes it with `python3` |
 | `RUNBOOK_SPEC_WORKER.md` | `/home/newadmin/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | No process; this is the operational runbook |
 
+## Guard parity repair
+
+`belt-config-guard.sh` treats the guard and daemon wrapper as one deployment
+unit. Their canonical source paths are `ops/belt/belt-config-guard.sh` and
+`ops/belt/multica-daemon-wrapper.sh`; the runtime copies are
+`/home/newadmin/tools/belt-config-guard.sh` and
+`/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh`. A repair may use
+only an immutable release containing both matching blobs and a readable
+`.gsp-belt-release.json` with a 40-character `source_sha` and 64-character
+`manifest_sha256`. Validation completes before either runtime file is touched.
+
+Operator-visible repair diagnostics are classified as `missing` (source or
+runtime input), `incomplete-release` (release root, blobs, or checksum/ref),
+or `class=permission` (lock, staging, directory, or atomic rename failure).
+Any such diagnostic leaves parity failed, so relay recovery and status writes
+are refused until a subsequent guard run can prove matching digests.
+
 The current process inventory, quoted from `pm2 ls`, includes:
 
 ```text

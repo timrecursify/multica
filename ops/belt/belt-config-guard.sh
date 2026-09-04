@@ -92,17 +92,30 @@ RELAY_PREFLIGHT_DIAGNOSTIC=''
 PARITY_OK=1
 PARITY_DIAGNOSTIC=''
 
+repair_failure() {
+  local diagnostic="$1"
+  PARITY_OK=0
+  PARITY_DIAGNOSTIC="$diagnostic"
+  unfixable+=("belt runtime/source parity repair failed: ${diagnostic}")
+}
+
 # Recover a missing member of the guard/wrapper pair only from a complete,
 # immutable release that contains the exact source blobs.  Validation happens
 # before either destination is touched; installation is protected by a lock
 # and rolls back if the second rename fails.
 repair_source_runtime_parity() {
-  local guard_sha wrapper_sha release candidate_guard candidate_wrapper lock staging old_guard old_wrapper
+  local guard_sha wrapper_sha release candidate_guard candidate_wrapper lock staging old_guard old_wrapper metadata source_sha manifest_sha256
   local guard_present=0 wrapper_present=0 needs_repair=0
   guard_sha=$(sha256sum -- "$GUARD_SOURCE" 2>/dev/null | awk '{print $1}')
   wrapper_sha=$(sha256sum -- "$WRAPPER_SOURCE" 2>/dev/null | awk '{print $1}')
-  [[ "$guard_sha" =~ ^[0-9a-f]{64}$ && "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]] || return 0
-  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || return 0
+  if [[ ! "$guard_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    repair_failure 'phase=repair missing=source-guard'
+    return 0
+  fi
+  if [[ ! "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    repair_failure 'phase=repair missing=source-wrapper'
+    return 0
+  fi
   if [[ -r "$RUNTIME_GUARD" ]]; then
     guard_present=1
     [[ "$(sha256sum -- "$RUNTIME_GUARD" | awk '{print $1}')" == "$guard_sha" ]] || needs_repair=1
@@ -116,6 +129,10 @@ repair_source_runtime_parity() {
     needs_repair=1
   fi
   (( needs_repair )) || return 0
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || {
+    repair_failure 'phase=repair incomplete-release=release-root'
+    return 0
+  }
   release=''
   while IFS= read -r candidate_guard; do
     release="${candidate_guard%/ops/belt/belt-config-guard.sh}"
@@ -124,26 +141,47 @@ repair_source_runtime_parity() {
     [[ -r "$candidate_wrapper" ]] || { release=''; continue; }
     [[ "$(sha256sum -- "$candidate_guard" | awk '{print $1}')" == "$guard_sha" ]] || { release=''; continue; }
     [[ "$(sha256sum -- "$candidate_wrapper" | awk '{print $1}')" == "$wrapper_sha" ]] || { release=''; continue; }
+    metadata="$release/.gsp-belt-release.json"
+    [[ -r "$metadata" ]] || { release=''; continue; }
+    source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
+    manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
+    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ ]] || { release=''; continue; }
     break
   done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
-  [[ -n "$release" ]] || return 0
-  mkdir -p -- "$(dirname -- "$RUNTIME_GUARD")" "$(dirname -- "$RUNTIME_WRAPPER")" || return 0
+  [[ -n "$release" ]] || {
+    repair_failure 'phase=repair incomplete-release=matching-blobs-or-ref'
+    return 0
+  }
+  if ! mkdir -p -- "$(dirname -- "$RUNTIME_GUARD")" "$(dirname -- "$RUNTIME_WRAPPER")"; then
+    repair_failure 'phase=repair class=permission mkdir-failed'
+    return 0
+  fi
   lock="${RUNTIME_ROOT}/.belt-config-parity.lock"
-  exec 8>"$lock"; flock -n 8 || return 0
-  staging="$(mktemp -d "${RUNTIME_ROOT}/.belt-config-parity.XXXXXX")" || return 0
+  if ! exec 8>"$lock" || ! flock -n 8; then
+    repair_failure 'phase=repair class=permission lock-failed'
+    return 0
+  fi
+  staging="$(mktemp -d "${RUNTIME_ROOT}/.belt-config-parity.XXXXXX")" || {
+    repair_failure 'phase=repair class=permission staging-failed'
+    return 0
+  }
   old_guard="$staging/old-guard"; old_wrapper="$staging/old-wrapper"
   if ! cp -- "$release/ops/belt/belt-config-guard.sh" "$staging/guard" ||
      ! cp -- "$release/ops/belt/multica-daemon-wrapper.sh" "$staging/wrapper" ||
      [[ "$(sha256sum -- "$staging/guard" | awk '{print $1}')" != "$guard_sha" ]] ||
      [[ "$(sha256sum -- "$staging/wrapper" | awk '{print $1}')" != "$wrapper_sha" ]]; then
-    rm -rf -- "$staging"; return 0
+    rm -rf -- "$staging"
+    repair_failure 'phase=repair class=permission staging-copy-failed'
+    return 0
   fi
   [[ "$guard_present" == 1 ]] && cp -- "$RUNTIME_GUARD" "$old_guard"
   [[ "$wrapper_present" == 1 ]] && cp -- "$RUNTIME_WRAPPER" "$old_wrapper"
   if ! mv -f -- "$staging/guard" "$RUNTIME_GUARD" || ! mv -f -- "$staging/wrapper" "$RUNTIME_WRAPPER"; then
     if [[ "$guard_present" == 1 ]]; then cp -- "$old_guard" "$RUNTIME_GUARD"; else rm -f -- "$RUNTIME_GUARD"; fi
     if [[ "$wrapper_present" == 1 ]]; then cp -- "$old_wrapper" "$RUNTIME_WRAPPER"; else rm -f -- "$RUNTIME_WRAPPER"; fi
-    rm -rf -- "$staging"; return 0
+    rm -rf -- "$staging"
+    repair_failure 'phase=repair class=permission atomic-rename-failed'
+    return 0
   fi
   rm -rf -- "$staging"
   chmod 0755 -- "$RUNTIME_GUARD" "$RUNTIME_WRAPPER" 2>/dev/null || true

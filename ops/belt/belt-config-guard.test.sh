@@ -214,13 +214,14 @@ rm -rf -- "$parity_root"
 repair_root="$(mktemp -d)"; release_root="$repair_root/releases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; mkdir -p "$release_root/ops/belt" "$repair_root/tools" "$repair_root/gsp-multica/fleet"
 cp "$root_dir/belt-config-guard.sh" "$release_root/ops/belt/belt-config-guard.sh"
 cp "$root_dir/multica-daemon-wrapper.sh" "$release_root/ops/belt/multica-daemon-wrapper.sh"
+printf '%s\n' '{"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' >"$release_root/.gsp-belt-release.json"
 rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
 repair_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; guard_source_runtime_parity; printf "%s|%s|%s" "$PARITY_OK" "${#fixed[@]}" "-f $RUNTIME_WRAPPER"' _ "$root_dir/belt-config-guard.sh")
 assert_eq '1|1|-f '"$repair_root"'/gsp-multica/fleet/multica-daemon-wrapper.sh' "$repair_result" 'missing wrapper repaired from complete release'
 rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
 rm -f "$release_root/ops/belt/multica-daemon-wrapper.sh"
 repair_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; printf "%s|%s" "$PARITY_OK" "-e $RUNTIME_WRAPPER"' _ "$root_dir/belt-config-guard.sh")
-assert_eq '1|-e '"$repair_root"'/gsp-multica/fleet/multica-daemon-wrapper.sh' "$repair_result" 'incomplete release does not mutate runtime'
+assert_eq '0|-e '"$repair_root"'/gsp-multica/fleet/multica-daemon-wrapper.sh' "$repair_result" 'incomplete release does not mutate runtime'
 rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
 cp "$root_dir/multica-daemon-wrapper.sh" "$release_root/ops/belt/multica-daemon-wrapper.sh"
 printf '%s\n' stale-guard >"$repair_root/tools/belt-config-guard.sh"
