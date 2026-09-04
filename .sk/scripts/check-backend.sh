@@ -3,10 +3,10 @@
 set -eu
 
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd -P)
-default_database_url='postgres://multica:multica@localhost:5432/multica?sslmode=disable'
-default_redis_test_url='redis://localhost:6379/1'
-DATABASE_URL=${DATABASE_URL:-$default_database_url}
-REDIS_TEST_URL=${REDIS_TEST_URL:-$default_redis_test_url}
+if [[ -z ${DATABASE_URL:-} || -z ${REDIS_TEST_URL:-} ]]; then
+    printf 'backend: DATABASE_URL and REDIS_TEST_URL must be set (no default is guessed)\n' >&2
+    exit 2
+fi
 export DATABASE_URL REDIS_TEST_URL
 
 loopback_url() {

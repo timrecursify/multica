@@ -32,7 +32,7 @@ EOF
 chmod 755 "$fixture/bin/"*
 
 calls="$fixture/calls"
-PATH="$fixture/bin:$PATH" CALLS="$calls" /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh"
+PATH="$fixture/bin:$PATH" CALLS="$calls" DATABASE_URL='postgres://multica:multica@localhost:5432/multica?sslmode=disable' REDIS_TEST_URL='redis://localhost:6379/1' /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh"
 expected="pg_isready $fixture|-d postgres://multica:multica@localhost:5432/multica?sslmode=disable
 redis-cli $fixture|-u redis://localhost:6379/1 ping
 bash $fixture|scripts/helm-config.test.sh
@@ -43,20 +43,26 @@ bash $fixture|scripts/test-go.sh --race"
 [ "$(cat "$calls")" = "$expected" ] || { cat "$calls" >&2; exit 1; }
 
 set +e
-PATH="$fixture/bin:$PATH" CALLS="$calls" DATABASE_URL='postgres://db.example/multica' /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh" >"$fixture/out" 2>&1
+PATH="$fixture/bin:$PATH" CALLS="$calls" DATABASE_URL='postgres://db.example/multica' REDIS_TEST_URL='redis://localhost:6379/1' /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh" >"$fixture/out" 2>&1
 status=$?
 set -e
 [ "$status" -eq 2 ] && grep -q 'must name a loopback' "$fixture/out"
 
 set +e
-PATH="$fixture/bin:$PATH" CALLS="$calls" FAIL_GO_BUILD=1 /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh" >"$fixture/out" 2>&1
+PATH="$fixture/bin:$PATH" CALLS="$calls" env -u DATABASE_URL -u REDIS_TEST_URL /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh" >"$fixture/out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 2 ] && grep -q 'DATABASE_URL and REDIS_TEST_URL must be set (no default is guessed)' "$fixture/out"
+
+set +e
+PATH="$fixture/bin:$PATH" CALLS="$calls" DATABASE_URL='postgres://multica:multica@localhost:5432/multica?sslmode=disable' REDIS_TEST_URL='redis://localhost:6379/1' FAIL_GO_BUILD=1 /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh" >"$fixture/out" 2>&1
 status=$?
 set -e
 [ "$status" -eq 47 ] && grep -q 'go build failed (exit 47)' "$fixture/out"
 
 set +e
 ln -s /usr/bin/python3 "$fixture/no-prereq/python3"
-PATH="$fixture/no-prereq" CALLS="$calls" /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh" >"$fixture/out" 2>&1
+PATH="$fixture/no-prereq" CALLS="$calls" DATABASE_URL='postgres://multica:multica@localhost:5432/multica?sslmode=disable' REDIS_TEST_URL='redis://localhost:6379/1' /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh" >"$fixture/out" 2>&1
 status=$?
 set -e
 [ "$status" -eq 2 ] && grep -q 'PostgreSQL is unreachable' "$fixture/out"
