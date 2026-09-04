@@ -447,3 +447,86 @@ test('sweep holds an all-cancelled open PR in a non-retroactive repo', async () 
   assert.match(hold, /retro=repo not retroactive/);
   worker.setTestDependencies({ log: defaultLog });
 });
+
+// GSP-2021: a merged PR whose CI is still pending must re-apply the retroactive
+// allowance at the route stage. The merge sweep overrode the CI queue gate on
+// purpose; re-deriving CI from scratch the next sweep must not re-hold the
+// merged ticket forever on that same condition. Eligible + receipt ships Done
+// with ciSuccess 'retroactive'; risk path or missing receipt still holds; red
+// still returns to build.
+test('merged retroactive pending PR with receipt and no risk path ships Done', async () => {
+  let retroChecked = false;
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs?head_sha=')) {
+      return JSON.stringify({ workflow_runs: [
+        { status: 'in_progress', conclusion: null, name: 'CI', path: '.github/workflows/ci.yml' } ] });
+    }
+    if (path.includes('/pulls/9/files')) { retroChecked = true; return JSON.stringify([{ filename: 'src/app.js' }]); }
+    if (args[0] === 'run') return JSON.stringify([{ databaseId: 42, conclusion: 'success', name: 'deploy' }]);
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: { source_sha: sha, release: `/releases/${sha}`, health: 'ok' }, gh });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, num: 9 });
+  assert.ok(retroChecked, 'retroactiveEligible was never consulted');
+  assert.equal(result.status, 'done');
+  assert.equal(calls[0][1], 'Done');
+  assert.equal(calls[0][5].ciSuccess, 'retroactive');
+  assert.equal(calls[0][5].retroactiveMerge, true);
+});
+
+test('merged pending PR with a risk path holds instead of shipping', async () => {
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs?head_sha=')) {
+      return JSON.stringify({ workflow_runs: [
+        { status: 'in_progress', conclusion: null, name: 'CI', path: '.github/workflows/ci.yml' } ] });
+    }
+    if (path.includes('/pulls/10/files')) return JSON.stringify([{ filename: 'backend/drizzle/0001.sql' }]);
+    if (args[0] === 'run') return JSON.stringify([{ databaseId: 42, conclusion: 'success', name: 'deploy' }]);
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const lines = [];
+  worker.setTestDependencies({ log: (...a) => lines.push(a.join(' ')), gh,
+    pool: { query: async () => ({ rows: [pass] }) }, relay: async () => {}, readReceipt: () => ({ source_sha: sha, health: 'ok' }) });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, num: 10 });
+  assert.equal(result.status, 'returned');
+  assert.ok(lines.some(l => l.includes('HOLD #1 merged') && l.includes('retro=risk path')));
+  worker.setTestDependencies({ log: defaultLog });
+});
+
+test('merged pending PR without a deploy receipt holds (deploy.pending path)', async () => {
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs?head_sha=')) {
+      return JSON.stringify({ workflow_runs: [
+        { status: 'in_progress', conclusion: null, name: 'CI', path: '.github/workflows/ci.yml' },
+        { status: 'queued', conclusion: null, name: 'Deploy / billing-server', path: '.github/workflows/deploy-billing-server.yml' } ] });
+    }
+    if (path.includes('/pulls/11/files')) return JSON.stringify([{ filename: 'src/app.js' }]);
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (args[0] === 'run') return JSON.stringify([]);
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: null, gh });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, num: 11, mergedAt: new Date().toISOString() });
+  assert.equal(result.status, 'pending');
+  assert.equal(calls.length, 0, 'nothing may ship without a deploy receipt');
+});
+
+test('merged PR with red CI still returns to build', async () => {
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs?head_sha=')) {
+      return JSON.stringify({ workflow_runs: [
+        { status: 'completed', conclusion: 'failure', name: 'CI', path: '.github/workflows/ci.yml' } ] });
+    }
+    if (args[0] === 'run') return JSON.stringify([{ databaseId: 42, conclusion: 'success', name: 'deploy' }]);
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: { source_sha: sha, release: `/releases/${sha}`, health: 'ok' }, gh });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, pr);
+  assert.equal(result.status, 'returned');
+  assert.equal(calls[0][1], 'In Progress');
+  assert.match(calls[0][5].mergeConflictEvidence, /CI is red/);
+});

@@ -333,8 +333,12 @@ function mergeDeployEvidence(repo, sha, mergedAt) {
   return { pending: true };
 }
 
-async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
-  const latest = await latestVerdict(issue.id);
+// CI gate for a merged PR. Retroactive merging (Tim 2026-09-02 16:16Z) lets a
+// mergeable PR merge ahead of pending CI; that allowance is never persisted,
+// so it is re-applied here rather than re-holding the ticket on the very
+// condition it just overrode. Risk paths and repos outside
+// CICD_RETROACTIVE_REPOS keep the issue held; absent/red/mixed return to build.
+async function mergedCiGate(issue, note, mergedSha, pr = {}) {
   let ci = ciState(pr.repo, pr.headSha || mergedSha, pr.createdAt);
   if (ci === 'absent' && noWorkflowCi(pr.repo, pr.headSha || mergedSha)) {
     ci = 'green';
@@ -343,9 +347,27 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   if (ci !== 'green' && ci !== 'cancelled_only') {
     if (ci === 'absent' || ['red', 'mixed'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
-    } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
+      return { status: 'returned' };
+    }
+    if (ci === 'pending') {
+      const retro = retroactiveEligible(pr.repo, pr.num);
+      if (!retro.ok) {
+        log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci} retro=${retro.why}`);
+        return { status: 'returned' };
+      }
+      log(`RETRO #${issue.number} merged ${pr.repo || 'PR'} ci=${ci} (${retro.why})`);
+      return { status: 'ok', retroactive: true };
+    }
+    log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
     return { status: 'returned' };
   }
+  return { status: 'ok', retroactive: false };
+}
+
+async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
+  const latest = await latestVerdict(issue.id);
+  const gate = await mergedCiGate(issue, note, mergedSha, pr);
+  if (gate.status === 'returned') return { status: 'returned' };
   if (latest && latest.verdict !== 'PASS') {
     await returnIssueToBuild(issue, `${note}; latest QC PASS evidence is absent`);
     return { status: 'returned' };
@@ -371,8 +393,10 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return { status: 'pending', sha: mergedSha }; }
   const noVerdict = !latest;
   const reviewedSha = noVerdict ? mergedSha : latest.bound_sha || mergedSha;
-  const evidence = { ciSuccess: true, mergeDeployReceipt: deploy.evidence, reviewedSha,
-    qualifyingPass: !noVerdict, ...(noVerdict ? { noVerdict: true } : {}) };
+  const evidence = { ciSuccess: gate.retroactive ? 'retroactive' : true,
+    mergeDeployReceipt: deploy.evidence, reviewedSha,
+    qualifyingPass: !noVerdict, ...(noVerdict ? { noVerdict: true } : {}),
+    ...(gate.retroactive ? { retroactiveMerge: true } : {}) };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Done', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Done: ${verdict.code}`);
   await relay(issue.id, 'Done', latest?.work_product_md5 || null, null, null, evidence);
@@ -622,7 +646,7 @@ async function sweep() {
         }
         const last = merged[0];
         const result = await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
-          repo: last.pr.repo, headSha: last.info.headRefOid, createdAt: last.info.createdAt,
+          repo: last.pr.repo, num: last.pr.num, headSha: last.info.headRefOid, createdAt: last.info.createdAt,
           mergedAt: last.info.mergedAt
         });
         if (result?.status === 'pending') await closureWatchdog(issue, result, last.info.mergeCommit.oid);
