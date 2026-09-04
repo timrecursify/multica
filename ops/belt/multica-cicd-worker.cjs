@@ -505,7 +505,7 @@ async function sweep() {
       const failures = countCiFailure(issue, pr, info.headRefOid, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
-        const retro = (ci === 'pending' || ci === 'no_checks') && info.mergeable !== 'CONFLICTING' ? retroactiveEligible(pr.repo, pr.num) : null;
+        const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && info.mergeable !== 'CONFLICTING' ? retroactiveEligible(pr.repo, pr.num) : null;
         if (!retro || !retro.ok) {
           const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
           log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}${retro ? ` retro=${retro.why}` : ''}`);
@@ -539,6 +539,12 @@ async function sweep() {
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
       }
     } catch (e) {
+      // GSP-1973 / upstream multica#465: watchdogFailure escalates via
+      // humanReview -> relay('Human Review'), which the relay refuses with
+      // 409 actor_denied because this worker holds RELAY_AGENT_SECRET while
+      // that transition is operator-only. Thrown from inside this catch, it
+      // escaped the loop and aborted the whole sweep, so every ticket ordered
+      // after the first escalating one was skipped.
       let failure = { stalled: false };
       try {
         failure = await watchdogFailure(issue, e.message);
