@@ -605,13 +605,10 @@ guard_stranded_review() {
     [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
     # Direct status write, then the relay exit that dispatches the reviewer:
     # the review task fires on row 4's In Progress -> In Review exit.
-    "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true); UPDATE issue SET status='In Progress'
-       WHERE number=${number} AND workspace_id ${ws} AND status='In Review';" >/dev/null 2>&1 </dev/null || continue
-    if "$SK" multica advance "$number" --to "In Review" --board "$board" >/dev/null 2>&1 </dev/null; then
+    if "$SK" multica advance "$number" --to "In Progress" --board "$board" >/dev/null 2>&1 </dev/null &&
+       "$SK" multica advance "$number" --to "In Review" --board "$board" >/dev/null 2>&1 </dev/null; then
       fixed+=("${board}#${number} re-driven to a reviewer after being stranded in In Review")
     else
-      "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true); UPDATE issue SET status='In Review'
-         WHERE number=${number} AND workspace_id ${ws} AND status='In Progress';" >/dev/null 2>&1 </dev/null
       unfixable+=("${board}#${number} is stranded in In Review and could not be re-driven")
     fi
   done < <("${PSQL[@]}" -F'|' -c "
@@ -636,20 +633,15 @@ guard_stranded_queue() {
     # leave from Spec. Routing In Progress -> Queue instead fires row 4's QC
     # worker and leaves the flight stranded again; that mistake was made and
     # corrected on 2026-08-31.
-    "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true); UPDATE issue SET status='Spec'
-       WHERE number=${number} AND workspace_id ${ws} AND status='Queue';" >/dev/null 2>&1 </dev/null || continue
-    if "$SK" multica advance "$number" --to "Queue" --board "$board" >/dev/null 2>&1 </dev/null; then
+    if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null &&
+       "$SK" multica advance "$number" --to "Queue" --board "$board" >/dev/null 2>&1 </dev/null; then
       fixed+=("${board}#${number} re-driven to the builder after being stranded in Queue")
     else
       # Usually spec_required: no scoper ever wrote a spec comment. Send it to
       # the scoper instead of leaving it parked.
-      "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true); UPDATE issue SET status='Registered'
-         WHERE number=${number} AND workspace_id ${ws} AND status='Spec';" >/dev/null 2>&1 </dev/null
       if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
         fixed+=("${board}#${number} had no spec; sent to the scoper instead of the builder")
       else
-        "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true); UPDATE issue SET status='Queue'
-           WHERE number=${number} AND workspace_id ${ws} AND status IN ('Spec','Registered');" >/dev/null 2>&1 </dev/null
         unfixable+=("${board}#${number} is stranded in Queue and could not be re-driven")
       fi
     fi
@@ -690,13 +682,10 @@ guard_stranded_inprogress() {
         unfixable+=("${board}#${number} is stranded in In Progress and could not be sent to QC")
       fi
     else
-      "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true); UPDATE issue SET status='Spec'
-         WHERE number=${number} AND workspace_id ${ws} AND status='In Progress';" >/dev/null 2>&1 </dev/null || continue
-      if "$SK" multica advance "$number" --to "Queue" --board "$board" >/dev/null 2>&1 </dev/null; then
+      if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null &&
+         "$SK" multica advance "$number" --to "Queue" --board "$board" >/dev/null 2>&1 </dev/null; then
         fixed+=("${board}#${number} stranded in In Progress with no build; re-driven to the builder")
       else
-        "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true); UPDATE issue SET status='In Progress'
-           WHERE number=${number} AND workspace_id ${ws} AND status='Spec';" >/dev/null 2>&1 </dev/null
         unfixable+=("${board}#${number} is stranded in In Progress and could not be re-driven")
       fi
     fi
@@ -836,12 +825,11 @@ guard_human_review_release() {
   while read -r number; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     board=gsp; [[ "$number" -gt 20000 ]] && board=prod
-    "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true); UPDATE issue SET status='Registered',
-       metadata = coalesce(metadata,'{}'::jsonb) ||
-         jsonb_build_object('hr_releases',
-           (coalesce(metadata->>'hr_releases','0')::int + 1)::text)
-       WHERE number=${number} AND status='Human Review';" >/dev/null 2>&1 </dev/null || continue
-    if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
+    if "$SK" multica advance "$number" --to "Registered" --board "$board" >/dev/null 2>&1 </dev/null &&
+       "${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+         jsonb_build_object('hr_releases', (coalesce(metadata->>'hr_releases','0')::int + 1)::text)
+         WHERE number=${number} AND status='Registered';" >/dev/null 2>&1 </dev/null &&
+       "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
       fixed+=("#${number} released from Human Review for scoping (not a money or structural call)")
     else
       unfixable+=("#${number} could not be released from Human Review")
@@ -892,19 +880,17 @@ guard_stranded_spec() {
 }
 
 spec_refly_reset() {
-  SPEC_REFLOW_OUTPUT=$("${PSQL[@]}" -c "WITH reset AS (
-    UPDATE issue AS i SET status='Registered',
-        metadata = coalesce(metadata,'{}'::jsonb) ||
-          jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
-      FROM (SELECT set_config('multica.relay_authorized','on',true)) AS authority
-      WHERE number=${1} AND workspace_id='${GSP_WS}' AND status='Spec'
-        AND parent_issue_id IS NULL
-        AND coalesce(metadata->>'spec_reflies','0')::int < 3
-        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
-                        WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
-      RETURNING id
-    ) SELECT count(*) FROM reset;" 2>&1 </dev/null)
+  # Status changes go through relay; only the retry counter is written locally.
+  SPEC_REFLOW_OUTPUT=$("$SK" multica advance "$1" --to "Registered" --board gsp 2>&1 </dev/null)
   SPEC_REFLOW_RC=$?
+  if [[ "$SPEC_REFLOW_RC" -eq 0 ]]; then
+    "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
+      UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+        jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
+      WHERE number=${1} AND workspace_id='${GSP_WS}' AND status='Registered'
+        AND parent_issue_id IS NULL AND coalesce(metadata->>'spec_reflies','0')::int < 3
+        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=issue.id AND q.status IN ('queued','running'));" >/dev/null 2>&1 </dev/null || SPEC_REFLOW_RC=$?
+  fi
 }
 
 spec_refly_advance() {
