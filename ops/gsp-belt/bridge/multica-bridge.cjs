@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const JWT_SECRET = process.env.JWT_SECRET;
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
+const ARCHIVER_AGENT_SECRET = process.env.ARCHIVER_AGENT_SECRET;
 const SSO_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID;
 
 // One canonical login (Cloudflare Access) serving several isolated client
@@ -31,7 +32,8 @@ for (const [name, value] of Object.entries({
   JWT_SECRET,
   DATABASE_URL: MULTICA_DB,
   RELAY_AGENT_SECRET,
-  MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID
+  ARCHIVER_AGENT_SECRET,
+  MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID,
 })) {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
 }
@@ -224,7 +226,8 @@ async function relayAdvance(req, res, body) {
     let { issue_id, to_stage, agent_token } = body;
 
     // Validate agent token
-    if (agent_token !== RELAY_AGENT_SECRET) {
+    const archiverRequest = body.actor === 'archiver' && agent_token === ARCHIVER_AGENT_SECRET;
+    if (agent_token !== RELAY_AGENT_SECRET && !archiverRequest) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
