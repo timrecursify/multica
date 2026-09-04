@@ -1,0 +1,25 @@
+[Unit]
+Description=Emit artifact-derived backup-age metrics for every backup lane on this box
+Documentation=file:/etc/gsp/backup-lanes.conf
+After=network-online.target
+Wants=network-online.target
+# Superseded by the gsp-unit-alert@ drop-in: noc2-alert.sh is a no-op (NOC2_ALERTS_ENABLED=0).
+
+[Service]
+Type=oneshot
+# Runs as root: the lane env files are 0600 and split between root-owned
+# (/etc/gsp, /etc/pgbackrest) and newadmin-owned
+# (/home/newadmin/services/infrastructure/backups) paths, and the pgBackRest
+# lane needs runuser -u postgres. Root is the only account that can read all
+# of them without copying a secret into a new file.
+User=root
+Environment=BACKUP_BOX=noc2
+Environment=BACKUP_LANES_CONF=/etc/gsp/backup-lanes.conf
+Environment=OUT_DIR=/var/lib/prometheus/node-exporter
+ExecStart=/usr/local/bin/gsp-backup-age-emitter.sh
+TimeoutStartSec=900
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
