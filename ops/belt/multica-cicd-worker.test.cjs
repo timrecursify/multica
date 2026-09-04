@@ -1,6 +1,12 @@
 #!/usr/bin/env node
 const assert = require('assert');
 const test = require('node:test');
+// RETRO_REPOS and the watchdog state path are read once at module load, so both
+// are set before the require. The watchdog is redirected to a scratch file to
+// keep the suite off the live receipt root.
+process.env.CICD_RETROACTIVE_REPOS = 'timrecursify/multica';
+process.env.CICD_WATCHDOG_STATE = require('path')
+  .join(require('os').tmpdir(), `cicd-watchdog-test-${process.pid}.json`);
 const worker = require('./multica-cicd-worker.cjs');
 const sha = 'a'.repeat(40);
 const issue = { id: 'issue-1', number: 1 };
@@ -202,4 +208,79 @@ test('a just-merged sha stays pending inside the deploy trigger grace window', (
   worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [] }) });
   assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, new Date().toISOString()), false);
   assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, undefined), false);
+});
+
+// Fix A renamed the all-cancelled CI state to 'cancelled_only'. The retroactive
+// merge gate in sweep() must recognise the new name, or an open PR whose runs
+// were all cancelled matches no arm and holds forever with no escalation path:
+// countCiFailure only counts red and mixed, and ci is not 'absent'.
+test('sweep sends an all-cancelled open PR in a retroactive repo down the retro path', async () => {
+  const repo = 'timrecursify/multica';
+  const headSha = 'c'.repeat(40);
+  const lines = [];
+  const ghCalls = [];
+  worker.setTestDependencies({
+    log: (...a) => lines.push(a.join(' ')),
+    pool: { query: async (sql) => (/FROM issue/.test(sql)
+      ? { rows: [{ id: 'issue-retro', number: 4242, title: 't', workspace_id: 'w', metadata: {} }] }
+      : { rows: [{ content: `built in https://github.com/${repo}/pull/77` }] }) },
+    relay: async () => { throw new Error('sweep must not relay on the retro path'); },
+    gh: (args) => {
+      ghCalls.push(args.join(' '));
+      if (args[0] === 'pr' && args[1] === 'view') {
+        return JSON.stringify({ state: 'OPEN', mergeable: 'MERGEABLE', headRefOid: headSha,
+          createdAt: new Date().toISOString(), mergedAt: null, mergeCommit: null });
+      }
+      if (args[0] === 'api' && args[1].includes('/actions/runs?head_sha=')) {
+        return JSON.stringify({ workflow_runs: [
+          { status: 'completed', conclusion: 'cancelled', name: 'CI' },
+          { status: 'completed', conclusion: 'cancelled', name: 'reviewer-gate' },
+        ] });
+      }
+      if (args[0] === 'api' && args[1].includes('/pulls/77/files')) {
+        return JSON.stringify([{ filename: 'ops/belt/multica-cicd-worker.cjs' }]);
+      }
+      if (args[0] === 'pr' && args[1] === 'merge') return '';
+      throw new Error(`unexpected gh ${args.join(' ')}`);
+    }
+  });
+
+  await worker.sweep();
+
+  assert.ok(!lines.some(l => l.startsWith('HOLD ')), `unexpected HOLD: ${lines.join(' | ')}`);
+  const retro = lines.find(l => l.startsWith('RETRO #4242'));
+  assert.ok(retro, `no RETRO line: ${lines.join(' | ')}`);
+  assert.match(retro, /ci=cancelled_only/);
+  assert.ok(ghCalls.some(c => c.startsWith(`pr merge 77 -R ${repo}`)), 'PR was never merged');
+});
+
+// The same state in a repo outside CICD_RETROACTIVE_REPOS must still hold: the
+// retro path is opt-in per repository and must not merge ahead of CI elsewhere.
+test('sweep holds an all-cancelled open PR in a non-retroactive repo', async () => {
+  const repo = 'timrecursify/other';
+  const lines = [];
+  worker.setTestDependencies({
+    log: (...a) => lines.push(a.join(' ')),
+    pool: { query: async (sql) => (/FROM issue/.test(sql)
+      ? { rows: [{ id: 'issue-hold', number: 4243, title: 't', workspace_id: 'w', metadata: {} }] }
+      : { rows: [{ content: `built in https://github.com/${repo}/pull/78` }] }) },
+    relay: async () => { throw new Error('sweep must not relay on the hold path'); },
+    gh: (args) => {
+      if (args[0] === 'pr' && args[1] === 'view') {
+        return JSON.stringify({ state: 'OPEN', mergeable: 'MERGEABLE', headRefOid: 'd'.repeat(40),
+          createdAt: new Date().toISOString(), mergedAt: null, mergeCommit: null });
+      }
+      if (args[0] === 'api' && args[1].includes('/actions/runs?head_sha=')) {
+        return JSON.stringify({ workflow_runs: [{ status: 'completed', conclusion: 'cancelled', name: 'CI' }] });
+      }
+      throw new Error(`unexpected gh ${args.join(' ')}`);
+    }
+  });
+
+  await worker.sweep();
+
+  const hold = lines.find(l => l.startsWith('HOLD #4243'));
+  assert.ok(hold, `no HOLD line: ${lines.join(' | ')}`);
+  assert.match(hold, /ci=cancelled_only/);
+  assert.match(hold, /retro=repo not retroactive/);
 });
