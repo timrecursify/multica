@@ -4,10 +4,11 @@
 -- under a new immutable version instead of rewriting migration history.
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
+UPDATE issue SET status = 'Spec' WHERE status IN ('Parked', 'Rejected');
+
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
-     'Human Review', 'Parked', 'Rejected', 'CI/CD & Deploy', 'Done',
-     'Archived', 'Cancelled'));
+     'Human Review', 'CI/CD & Deploy', 'Done', 'Archived', 'Cancelled'));
 
 -- relay_run_log is an operator-side belt table and is optional in canonical
 -- Multica installs. Reconcile it only where it exists.
