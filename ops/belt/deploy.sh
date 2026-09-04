@@ -124,21 +124,25 @@ for index in "${!sources[@]}"; do
   manifest_indexes["${sources[$index]}"]="$index"
 done
 
-# Validate a wrapper rollout before creating backups or mutating any target.
+# Validate wrapper rollout before creating backups or mutating any target. A
+# drifted runtime wrapper is allowed when this deployment includes the wrapper
+# (it will be repaired); selective deployments that omit it must fail closed.
 for index in "${!sources[@]}"; do
   [[ "${sources[$index]}" == "$root_dir/multica-daemon-wrapper.sh" ]] || continue
-  selected "$index" || continue
+  runtime_wrapper="${targets[$index]}"
+  if ! selected "$index"; then
+    if [[ -f "$runtime_wrapper" ]] && ! cmp -s "$root_dir/multica-daemon-wrapper.sh" "$runtime_wrapper"; then
+      printf 'Wrapper preflight: source/runtime parity mismatch (wrapper not selected)\n' >&2
+      exit 1
+    fi
+    continue
+  fi
   if [[ -n "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" ]]; then
     source "$root_dir/belt-concurrency.sh"
     cpu_count="$(belt_cpu_count)" || { printf 'Wrapper preflight: unable to determine CPU count\n' >&2; exit 1; }
     cap="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS}"
     [[ "$cap" =~ ^[1-9][0-9]*$ ]] || { printf 'Wrapper preflight: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer\n' >&2; exit 1; }
     (( cap <= cpu_count )) || { printf 'Wrapper preflight: MULTICA_DAEMON_MAX_CONCURRENT_TASKS=%s exceeds CPU count=%s\n' "$cap" "$cpu_count" >&2; exit 1; }
-  fi
-  runtime_wrapper="${targets[$index]}"
-  if [[ -f "$runtime_wrapper" ]] && ! cmp -s "$root_dir/multica-daemon-wrapper.sh" "$runtime_wrapper"; then
-    printf 'Wrapper preflight: source/runtime parity mismatch\n' >&2
-    exit 1
   fi
 done
 
@@ -283,6 +287,18 @@ for index in "${!sources[@]}"; do
   cp --preserve=mode -- "$source_file" "$target_file"
   printf 'Copied %s to %s\n' "$source_file" "$target_file"
 done
+
+# Verify the deployed set after copying. Any mismatch is treated as a failed
+# deployment so the existing ERR trap restores every touched target.
+if [[ "$mode" == apply ]]; then
+  for index in "${!sources[@]}"; do
+    selected "$index" || continue
+    if ! cmp -s -- "${sources[$index]}" "${targets[$index]}"; then
+      printf 'Post-deploy parity mismatch: %s != %s\n' "${sources[$index]}" "${targets[$index]}" >&2
+      false
+    fi
+  done
+fi
 
 trap - ERR
 if [[ "$mode" == apply ]]; then
