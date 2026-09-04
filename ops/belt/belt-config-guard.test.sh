@@ -208,4 +208,18 @@ printf '%s\n' 'stale-runtime' >>"$parity_root/gsp-multica/fleet/multica-daemon-w
 parity_drift=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$parity_root" bash -c 'source "$1"; fixed=(); unfixable=(); guard_source_runtime_parity; RELAY_PREFLIGHT_OK=1; relay_transition 1772 Queue gsp >/dev/null 2>&1; printf "%s|%s|%s" "$PARITY_OK" "${#unfixable[@]}" "${RELAY_TRANSITION_CLASS}"' _ "$root_dir/belt-config-guard.sh")
 assert_eq '0|1|configuration' "$parity_drift" 'digest drift is unfixable and blocks status writes'
 rm -rf -- "$parity_root"
+
+# A missing wrapper is repaired only from a complete release containing both
+# exact source blobs; an incomplete release leaves runtime files untouched.
+repair_root="$(mktemp -d)"; release_root="$repair_root/releases/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; mkdir -p "$release_root/ops/belt" "$repair_root/tools" "$repair_root/gsp-multica/fleet"
+cp "$root_dir/belt-config-guard.sh" "$release_root/ops/belt/belt-config-guard.sh"
+cp "$root_dir/multica-daemon-wrapper.sh" "$release_root/ops/belt/multica-daemon-wrapper.sh"
+rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
+repair_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; guard_source_runtime_parity; printf "%s|%s|%s" "$PARITY_OK" "${#fixed[@]}" "-f $RUNTIME_WRAPPER"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '1|1|-f '"$repair_root"'/gsp-multica/fleet/multica-daemon-wrapper.sh' "$repair_result" 'missing wrapper repaired from complete release'
+rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
+rm -f "$release_root/ops/belt/multica-daemon-wrapper.sh"
+repair_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; printf "%s|%s" "$PARITY_OK" "-e $RUNTIME_WRAPPER"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '1|-e '"$repair_root"'/gsp-multica/fleet/multica-daemon-wrapper.sh' "$repair_result" 'incomplete release does not mutate runtime'
+rm -rf -- "$repair_root"
 echo 'belt config guard launch regression passed'
