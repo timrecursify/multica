@@ -559,8 +559,15 @@ guard_relay_config() {
     else
       set_clause="agent_id=(SELECT id FROM agent WHERE name='${expected}'), agent_name='${expected}'"
     fi
+    # psql returns success for an UPDATE that matched zero rows.  Re-read the
+    # row so a missing/duplicate workspace configuration cannot be reported as
+    # repaired (and so a concurrent guard tick remains idempotent).
     if "${PSQL[@]}" -c "UPDATE relay_stage_config SET ${set_clause}
-         WHERE id=${row%%:*} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1; then
+         WHERE id=${row%%:*} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1 &&
+       actual=$("${PSQL[@]}" -c "SELECT coalesce(a.name,'(none)') FROM relay_stage_config r
+         LEFT JOIN agent a ON a.id=r.agent_id
+         WHERE r.id=${row%%:*} AND r.workspace_id='${GSP_WS}'::uuid;" 2>/dev/null) &&
+       [[ "$actual" == "$expected" ]]; then
       fixed+=("relay row ${row%%:*} owner restored to ${expected} (was ${actual:-unset})")
     else
       unfixable+=("relay row ${row%%:*} has owner ${actual:-unset}, expected ${expected}")
@@ -619,7 +626,10 @@ guard_relay_config() {
     [[ "$actual" == "$want" ]] && continue
     if "${PSQL[@]}" -c "UPDATE relay_stage_config
          SET alt_next_stages=CASE WHEN '${want}' = '' THEN NULL ELSE string_to_array('${want}', ',') END
-       WHERE id=${id} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1; then
+       WHERE id=${id} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1 &&
+       actual=$("${PSQL[@]}" -c "SELECT array_to_string(alt_next_stages,',') FROM relay_stage_config
+         WHERE id=${id} AND workspace_id='${GSP_WS}'::uuid;" 2>/dev/null) &&
+       [[ "$actual" == "$want" ]]; then
       fixed+=("relay row ${id} successors restored to [${want}] (was [${actual:-unset}]): ${why}")
     else
       unfixable+=("relay row ${id} has successors [${actual:-unset}], expected [${want}]: ${why}")
