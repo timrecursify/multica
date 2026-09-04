@@ -162,6 +162,18 @@ test('merged PR whose runs are all cancelled returns to build', async () => {
   assert.match(calls[0][3], /merged head CI is cancelled_only/);
 });
 
+test('merged PR whose CI lookup throws is held without returning to build', async () => {
+  const lines = [];
+  const calls = dependencies({ receipt: null, gh: () => { throw new Error('rate limited'); } });
+  worker.setTestDependencies({ log: (...a) => lines.push(a.join(' ')) });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, pr);
+  assert.equal(result.status, 'returned');
+  assert.equal(calls.length, 0);
+  assert.ok(lines.some(line => line.includes('HOLD #1 merged') && line.includes('ci=unknown')));
+  assert.ok(lines.some(line => line.includes('CI-UNKNOWN') && line.includes('rate limited')));
+  worker.setTestDependencies({ log: defaultLog });
+});
+
 test('cancelled deploy superseded by an ancestral later success reaches Done', async () => {
   const laterSha = 'b'.repeat(40);
   const cancelled = { path: '.github/workflows/deploy-billing-server.yml', conclusion: 'cancelled',

@@ -264,7 +264,7 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     log(`CI N/A #${issue.number} ${pr.repo} has no workflows or check suites`);
   }
   if (ci !== 'green') {
-    if (ci === 'absent' || ['red', 'mixed', 'cancelled_only', 'unknown'].includes(ci)) {
+    if (ci === 'absent' || ['red', 'mixed', 'cancelled_only'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
     } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
     return { status: 'returned' };
@@ -404,7 +404,12 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
     if (done.every(r => r.conclusion === 'success')) return 'green';
     if (done.some(r => r.conclusion === 'failure')) return 'red';
     return 'mixed';
-  } catch (e) { return 'unknown'; }
+  } catch (e) {
+    const errorClass = e?.name || e?.constructor?.name || 'Error';
+    const errorMessage = String(e?.message || e).split('\n')[0].slice(0, 160);
+    log(`CI-UNKNOWN ${repo}@${sha}: ${errorClass}: ${errorMessage}`);
+    return 'unknown';
+  }
 }
 
 
