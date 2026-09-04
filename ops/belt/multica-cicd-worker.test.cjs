@@ -139,6 +139,17 @@ test('a deploy run on the merge sha keeps the ticket pending until it succeeds',
   assert.equal(calls.length, 0);
 });
 
+test('merged PR whose runs are all cancelled returns to build', async () => {
+  const calls = dependencies({ receipt: null, gh: () => JSON.stringify({ workflow_runs: [
+    { status: 'completed', conclusion: 'cancelled', name: 'CI', path: '.github/workflows/ci.yml' },
+  ] }) });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, pr);
+  assert.equal(result.status, 'returned');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1], 'In Progress');
+  assert.match(calls[0][3], /merged head CI is cancelled_only/);
+});
+
 test('cancelled deploy superseded by an ancestral later success reaches Done', async () => {
   const laterSha = 'b'.repeat(40);
   const cancelled = { path: '.github/workflows/deploy-billing-server.yml', conclusion: 'cancelled',

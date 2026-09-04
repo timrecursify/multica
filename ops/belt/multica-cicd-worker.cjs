@@ -172,6 +172,7 @@ function successfulDeployRun(repo, sha, workflow) {
 // touched only docs/ and tests/, so none of ppp's 18 deploy-*.yml ever ran).
 // The grace window keeps a just-merged sha pending until GitHub has created its
 // runs, so a real deploy is never mistaken for an absent one.
+// Upstream: timrecursify/multica PR #422.
 const DEPLOY_TRIGGER_GRACE_MINUTES = parseInt(process.env.CICD_DEPLOY_TRIGGER_GRACE_MINUTES || '10', 10);
 
 function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
@@ -183,6 +184,14 @@ function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
   } catch (_) { return false; }
 }
 
+// A deploy workflow run that has reached a terminal, non-success conclusion
+// never becomes successful on its own, so treating it as "still pending" pins
+// the ticket in CI/CD & Deploy forever with no escalation path. Measured
+// 2026-09-04: 23 of the 24 tickets held on `deploy run pending` had only
+// failed/cancelled deploy runs, the oldest stuck 23h. Report the terminal
+// failure so routeFinishedPR returns the ticket to build instead of holding
+// it silently. A run still queued/in_progress (conclusion null), or any
+// success, keeps the old pending behaviour.
 const TERMINAL_DEPLOY_CONCLUSIONS = new Set([
   'failure', 'cancelled', 'timed_out', 'startup_failure', 'stale', 'action_required',
 ]);
@@ -255,7 +264,7 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     log(`CI N/A #${issue.number} ${pr.repo} has no workflows or check suites`);
   }
   if (ci !== 'green') {
-    if (ci === 'absent' || ['red', 'mixed', 'unknown'].includes(ci)) {
+    if (ci === 'absent' || ['red', 'mixed', 'cancelled_only', 'unknown'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
     } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
     return { status: 'returned' };
@@ -385,7 +394,7 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
     runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/') && r.conclusion !== 'cancelled');
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
     // Only cancelled or invalid runs: CI was attempted, treat as not yet checked.
-    if (rawCount && !(runs.workflow_runs || []).length) return 'no_checks';
+    if (rawCount && !(runs.workflow_runs || []).length) return 'cancelled_only';
     if (!(runs.workflow_runs || []).length) {
       const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
       return Number.isFinite(ageMinutes) && ageMinutes >= CI_ABSENT_MINUTES ? 'absent' : 'no_checks';
