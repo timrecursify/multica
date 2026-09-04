@@ -25,12 +25,13 @@ type HealthResponse struct {
 	// lifecycle CLI (`daemon start/stop`) acts on the host process namespace,
 	// so a foreign-OS daemon can't be started/stopped by the app even though
 	// /health is reachable. See #3916.
-	OS         string `json:"os"`
-	Uptime     string `json:"uptime"`
-	DaemonID   string `json:"daemon_id"`
-	DeviceName string `json:"device_name"`
-	ServerURL  string `json:"server_url"`
-	CLIVersion string `json:"cli_version"`
+	OS              string `json:"os"`
+	Uptime          string `json:"uptime"`
+	LastHeartbeatAt string `json:"last_heartbeat_at,omitempty"`
+	DaemonID        string `json:"daemon_id"`
+	DeviceName      string `json:"device_name"`
+	ServerURL       string `json:"server_url"`
+	CLIVersion      string `json:"cli_version"`
 	// ActiveTaskCount remains the compatibility/safety count of every claimed
 	// handleTask lifecycle. The additive counters split actual provider
 	// execution from local-directory parking for throughput and diagnostics.
@@ -53,6 +54,13 @@ type HealthResponse struct {
 	// older consumers see no change. Diagnostic only: nothing keys off it.
 	ReloadPendingReason string            `json:"reload_pending_reason,omitempty"`
 	Workspaces          []healthWorkspace `json:"workspaces"`
+}
+
+func heartbeatTimestamp(n int64) string {
+	if n == 0 {
+		return ""
+	}
+	return time.Unix(0, n).UTC().Format(time.RFC3339Nano)
 }
 
 type healthWorkspace struct {
@@ -117,6 +125,7 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 			PID:                   os.Getpid(),
 			OS:                    runtime.GOOS,
 			Uptime:                time.Since(startedAt).Truncate(time.Second).String(),
+			LastHeartbeatAt:       heartbeatTimestamp(d.lastHeartbeatAt.Load()),
 			DaemonID:              d.cfg.DaemonID,
 			DeviceName:            d.cfg.DeviceName,
 			ServerURL:             d.cfg.ServerBaseURL,

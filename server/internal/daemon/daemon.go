@@ -408,8 +408,9 @@ type Daemon struct {
 	// login-shell probe + version detection instead of one per task (MUL-4486).
 	healGroup singleflight.Group
 
-	wsHBMu      sync.RWMutex         // guards wsHBLastAck
-	wsHBLastAck map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
+	wsHBMu          sync.RWMutex         // guards wsHBLastAck
+	wsHBLastAck     map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
+	lastHeartbeatAt atomic.Int64
 
 	// reconcile fans out a "re-check server state now" signal to subscribers
 	// (watchTaskCancellation, workspaceSyncLoop) so the WS connect/reconnect
@@ -1636,6 +1637,7 @@ func (d *Daemon) recordWSHeartbeatAck(runtimeID string) {
 	d.wsHBMu.Lock()
 	d.wsHBLastAck[runtimeID] = time.Now()
 	d.wsHBMu.Unlock()
+	d.lastHeartbeatAt.Store(time.Now().UnixNano())
 }
 
 // wsHeartbeatRecentlyAcked reports whether the runtime received a WS
@@ -3626,6 +3628,7 @@ func (d *Daemon) runHeartbeatTick(ctx context.Context, rid string) bool {
 		return false
 	}
 	d.handleHeartbeatActions(ctx, rid, resp)
+	d.lastHeartbeatAt.Store(time.Now().UnixNano())
 	return false
 }
 
