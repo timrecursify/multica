@@ -452,7 +452,11 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	// evaluates each term once over workspace-scoped issue/comment relations,
 	// rather than repeatedly probing comments for every outer issue row.
 	var termContainsParams []string
-	if len(terms) > 0 {
+	if len(terms) == 1 {
+		// Reuse the phrase contains parameter so single-term searches retain
+		// the established argument layout (important for numeric-bound paths).
+		termContainsParams = append(termContainsParams, phraseContainsParam)
+	} else if len(terms) > 1 {
 		for _, t := range terms {
 			et := escapeLike(t)
 			termContainsParams = append(termContainsParams, nextArg("%"+et+"%"))
