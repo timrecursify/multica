@@ -74,6 +74,34 @@ test('risk-path pending CI remains held', async () => {
   assert.equal(calls.length, 0);
 });
 
+test('merged cancelled-only risk-path CI proceeds to deploy handling', async () => {
+  const receipt = { source_sha: sha, release: `/releases/${sha}`, health: 'ok' };
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs?head_sha=')) {
+      return JSON.stringify({ workflow_runs: [{ status: 'completed', conclusion: 'cancelled', name: 'CI' }] });
+    }
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt, gh });
+  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, num: '17' });
+  assert.equal(calls[0][1], 'Done');
+  assert.equal(calls[0][5].ciSuccess, 'retroactive');
+});
+
+test('merged no-checks risk-path CI proceeds without retroactive risk approval', async () => {
+  const receipt = { source_sha: sha, release: `/releases/${sha}`, health: 'ok' };
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [] });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt, gh });
+  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, num: '17' });
+  assert.equal(calls[0][1], 'Done');
+  assert.equal(calls[0][5].ciSuccess, 'retroactive');
+});
+
 test('PASS verdict with a null work-product MD5 still reaches Done', async () => {
   const receipt = { source_sha: sha, release: `/releases/${sha}`, health: 'ok' };
   const calls = dependencies({ receipt, verdict: { verdict: 'PASS', work_product_md5: null } });
