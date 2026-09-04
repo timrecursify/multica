@@ -47,7 +47,7 @@ function retroactiveEligible(repo, num) {
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
 const ciFailureCounts = new Map();
-const watchdog = createWatchdog({ file: process.env.CICD_WATCHDOG_STATE || `${RECEIPT_ROOT}/cicd-watchdog.json` });
+let watchdog = createWatchdog({ file: process.env.CICD_WATCHDOG_STATE || `${RECEIPT_ROOT}/cicd-watchdog.json` });
 
 let log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -140,6 +140,13 @@ async function humanReview(issue, reason) {
   log(`HUMAN REVIEW #${issue.number} — ${reason}`);
 }
 
+async function retryEscalation(issue, toStage, reason, evidence = {}) {
+  const retryEvidence = { retry_escalation: true, blocker: reason, ...evidence };
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: toStage, actor: 'system', evidence: retryEvidence });
+  if (!verdict.ok) throw new Error(`transition policy rejected ${toStage}: ${verdict.code}`);
+  await relay(issue.id, toStage, null, reason, null, retryEvidence);
+}
+
 async function watchdogFailure(issue, error, sha = '') {
   const row = watchdog.observe(issue.id, { sha, outcome: 'retrying', error });
   // The sentinel is a wall-clock bound independent of poll count. Sparse or
@@ -166,8 +173,18 @@ function receiptEvidence(sha) {
     if (receipt?.source_sha === sha && receipt.health === 'ok' && typeof receipt.release === 'string') {
       return { receipt, mismatch: false };
     }
-    return { receipt: null, mismatch: true };
+    return { receipt, mismatch: true };
   } catch (_) { return { receipt: null, mismatch: false }; }
+}
+
+function receiptSummary(receipt) {
+  if (!receipt || typeof receipt !== 'object') return { present: false };
+  return {
+    present: true,
+    source_sha: typeof receipt.source_sha === 'string' ? receipt.source_sha : null,
+    release: typeof receipt.release === 'string' ? receipt.release : null,
+    health: typeof receipt.health === 'string' ? receipt.health : null
+  };
 }
 
 function deployWorkflowNames(repo, sha) {
@@ -314,7 +331,7 @@ function terminalFailedDeployRuns(repo, sha) {
 
 function mergeDeployEvidence(repo, sha, mergedAt) {
   const receipt = receiptEvidence(sha);
-  if (receipt.mismatch) return { mismatch: true };
+  if (receipt.mismatch) return { mismatch: true, receipt: receipt.receipt };
   if (receipt.receipt) return { evidence: receipt.receipt };
   const workflows = deployWorkflowNames(repo, sha);
   if (!workflows.length) return { evidence: { kind: 'merge_is_deploy', sha } };
@@ -362,7 +379,11 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   }
   const deploy = mergeDeployEvidence(pr.repo, mergedSha, pr.mergedAt);
   if (deploy.mismatch) {
-    await humanReview(issue, `${note}; release receipt exists but does not match ${mergedSha}`);
+    const reason = `retry_escalation:release_receipt_mismatch issue=${issue.id} merged_sha=${mergedSha}`;
+    await retryEscalation(issue, 'Parked', reason, {
+      anomaly: 'release_receipt_mismatch', merged_sha: mergedSha,
+      receipt: receiptSummary(deploy.receipt)
+    });
     return { status: 'returned' };
   }
   if (deploy.failed) {
@@ -399,7 +420,11 @@ async function closureWatchdog(issue, result, sha) {
   if (!watchdog.stalled(row)) return false;
   const alerted = watchdog.markAlerted(row, 'closure_stalled');
   const elapsed = Date.now() - Date.parse(row.first_seen_at);
-  await humanReview(issue, `closure_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed} last_error=${row.last_error || 'deploy pending'} correlation_key=${row.correlation_key}`);
+  const reason = `retry_escalation:closure_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed} last_error=${row.last_error || 'deploy pending'} correlation_key=${row.correlation_key}`;
+  await retryEscalation(issue, 'Spec', reason, {
+    trigger_reason: 'closure_stalled', stage: row.stage, elapsed_ms: elapsed,
+    last_error: row.last_error || 'deploy pending', correlation_key: row.correlation_key
+  });
   return Boolean(alerted);
 }
 
@@ -736,8 +761,9 @@ function setTestDependencies(dependencies) {
   if (dependencies.gh) gh = dependencies.gh;
   if (dependencies.readReceipt) readReceipt = dependencies.readReceipt;
   if (dependencies.log) log = dependencies.log;
+  if (dependencies.watchdog) watchdog = dependencies.watchdog;
 }
 
-module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
+module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview, retryEscalation,
   routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
   terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, setTestDependencies, sweep, watchdogFailure, closureWatchdog };

@@ -125,11 +125,40 @@ test('return relay carries return evidence', async () => {
   assert.match(calls[0][5].mergeConflictEvidence, /CI is red/);
 });
 
-test('receipt mismatch is the only Human Review receipt path', async () => {
+test('receipt mismatch parks with system retry-escalation evidence', async () => {
   const calls = dependencies({ receipt: { source_sha: 'c'.repeat(40), release: '/bad', health: 'ok' } });
   await worker.routeFinishedPR(issue, 'merged', sha, pr);
-  assert.equal(calls[0][1], 'Human Review');
-  assert.equal(calls[0][5].namedBlocker, true);
+  assert.equal(calls[0][1], 'Parked');
+  assert.equal(calls[0][5].retry_escalation, true);
+  assert.equal(calls[0][5].anomaly, 'release_receipt_mismatch');
+  assert.equal(calls[0][5].merged_sha, sha);
+  assert.deepStrictEqual(calls[0][5].receipt, {
+    present: true, source_sha: 'c'.repeat(40), release: '/bad', health: 'ok'
+  });
+  assert.match(calls[0][3], /^retry_escalation:release_receipt_mismatch/);
+});
+
+test('closure stall returns to Spec with system retry-escalation evidence', async () => {
+  const calls = [];
+  worker.setTestDependencies({
+    watchdog: {
+      observe: () => ({ stage: 'CI/CD & Deploy', first_seen_at: new Date(0).toISOString(),
+        last_error: 'deploy pending', correlation_key: 'corr-1' }),
+      stalled: () => true,
+      markAlerted: row => row
+    },
+    relay: async (...args) => calls.push(args)
+  });
+  const alerted = await worker.closureWatchdog(issue, { status: 'pending' }, sha);
+  assert.equal(alerted, true);
+  assert.equal(calls[0][1], 'Spec');
+  assert.equal(calls[0][5].retry_escalation, true);
+  assert.equal(calls[0][5].trigger_reason, 'closure_stalled');
+  assert.equal(calls[0][5].correlation_key, 'corr-1');
+  assert.match(calls[0][3], /^retry_escalation:closure_stalled/);
+  worker.setTestDependencies({ watchdog: require('./cicd-watchdog.cjs').createWatchdog({
+    file: require('path').join(require('os').tmpdir(), `cicd-watchdog-test-${process.pid}.json`)
+  }), relay: async (...args) => calls.push(args) });
 });
 
 test('worker retains no self-deploy or direct database writes', () => {
