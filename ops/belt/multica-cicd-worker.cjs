@@ -26,6 +26,8 @@ function initializeRuntime() {
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
 const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
+const DEPLOY_CANCEL_RETRY_LIMIT = parseInt(process.env.CICD_DEPLOY_CANCEL_RETRY_LIMIT || '3', 10);
+const deployCancelRetries = new Map();
 // Retroactive CI (Tim 2026-09-02 16:16Z: admin merge + admin deploy with
 // retroactive CI/CD for speed; risk paths still wait). Repos listed here merge
 // a mergeable PR while its CI is still pending unless the diff touches a risk
@@ -257,11 +259,51 @@ function terminalDeployEvaluation(repo, sha) {
           `${(r.path || '').replace(/^.*\//, '')}=${r.conclusion}`))].sort().join(', ') } : {}),
         ...(cancelled.length ? { cancelled: [...new Set(cancelled.map(r =>
           `${(r.path || '').replace(/^.*\//, '')}=cancelled`))].sort().join(', ') } : {}),
+        ...(cancelled.length ? { cancelledRuns: cancelled } : {}),
         superseded
       };
     }
     return superseded.length ? { superseded } : null;
   } catch (_) { return null; }
+}
+
+async function retriggerCancelledDeploys(issue, repo, sha, cancelledRuns) {
+  const workflows = [...new Set((cancelledRuns || []).map(run => run.path).filter(Boolean))];
+  let dispatched = 0;
+  for (const workflowPath of workflows) {
+    const workflow = workflowPath.replace(/^.*\//, '');
+    const key = `${issue.id}:${sha}:${workflow}`;
+    let attempts = deployCancelRetries.get(key);
+    if (attempts === undefined) {
+      try {
+        const row = (await pool?.query('SELECT metadata FROM issue WHERE id=$1', [issue.id]))?.rows?.[0];
+        attempts = Number(row?.metadata?.deploy_cancel_retries?.[key]) || 0;
+      } catch (_) { attempts = 0; }
+      deployCancelRetries.set(key, attempts);
+    }
+    if (attempts >= DEPLOY_CANCEL_RETRY_LIMIT) {
+      log(`DEPLOY-CANCEL-CAP #${issue.number} ${sha} workflow=${workflow} attempts=${attempts}`);
+      continue;
+    }
+    try {
+      const run = (cancelledRuns || []).find(candidate => candidate.path === workflowPath);
+      const runId = run?.id || run?.database_id;
+      if (!runId) throw new Error('cancelled deploy run has no id');
+      // Rerun the cancelled run itself. workflow_dispatch --ref accepts only a
+      // branch or tag, not the merge commit SHA, and would therefore fail.
+      gh(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
+      deployCancelRetries.set(key, attempts + 1);
+      dispatched += 1;
+      try { await pool?.query("update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['deploy_cancel_retries', $2], to_jsonb($3::int), true) WHERE id=$1", [issue.id, key, attempts + 1]); } catch (_) { /* degraded/test DB */ }
+      log(`DEPLOY-RETRIGGER #${issue.number} ${sha} workflow=${workflow} attempt=${attempts + 1}/${DEPLOY_CANCEL_RETRY_LIMIT}`);
+    } catch (e) {
+      const nextAttempts = attempts + 1;
+      deployCancelRetries.set(key, nextAttempts);
+      try { await pool?.query("update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['deploy_cancel_retries', $2], to_jsonb($3::int), true) WHERE id=$1", [issue.id, key, nextAttempts]); } catch (_) { /* degraded/test DB */ }
+      log(`DEPLOY-RETRIGGER-FAIL #${issue.number} ${sha} workflow=${workflow} ${String(e.message).split('\n')[0]}`);
+    }
+  }
+  return { dispatched, capped: workflows.filter(path => (deployCancelRetries.get(`${issue.id}:${sha}:${path.replace(/^.*\//, '')}`) || 0) >= DEPLOY_CANCEL_RETRY_LIMIT).length };
 }
 
 function terminalFailedDeployRuns(repo, sha) {
@@ -318,6 +360,11 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     return { status: 'returned' };
   }
   if (deploy.cancelled) {
+    const retry = await retriggerCancelledDeploys(issue, pr.repo, mergedSha, deploy.cancelledRuns);
+    if (!retry.dispatched && retry.capped) {
+      await returnIssueToBuild(issue, `${note}; deploy cancelled retry cap reached for ${mergedSha} (${deploy.cancelled})`);
+      return { status: 'returned', sha: mergedSha };
+    }
     log(`DEPLOY-CANCELLED #${issue.number} ${mergedSha} (${deploy.cancelled}); deploy was cancelled and is undeployed`);
     return { status: 'pending', sha: mergedSha };
   }
@@ -352,7 +399,12 @@ async function returnIssueToBuild(issue, reason) {
   const recorded = await recordReturn(issue, reason);
   if (recorded.count >= 3) {
     if (recorded.firstEscalation) {
-      await humanReview(issue, `return_loop issue=${issue.id} reason=${normalizeReturnReason(reason)} count=${recorded.count}`);
+      const detail = `return_loop issue=${issue.id} reason=${normalizeReturnReason(reason)} count=${recorded.count}`;
+      const sourceSha = issue.source_sha || (String(reason).match(/[0-9a-f]{40}/i) || [])[0] || null;
+      const evidence = { retry_escalation: true, source_sha: sourceSha, blocker: detail };
+      const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Parked', actor: 'system', evidence });
+      if (!verdict.ok) throw new Error(`transition policy rejected Parked: ${verdict.code}`);
+      await relay(issue.id, 'Parked', null, detail, { trigger: 'cicd_return_loop', intendedStage: 'Queue', attempts: recorded.count, reason: detail, source_sha: sourceSha }, evidence);
       log(`HOLD #${issue.number} return loop escalated reason=${normalizeReturnReason(reason)} count=${recorded.count}`);
     } else log(`HOLD #${issue.number} return loop already escalated reason=${normalizeReturnReason(reason)} count=${recorded.count}`);
     return { escalated: true };
@@ -676,4 +728,4 @@ function setTestDependencies(dependencies) {
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
   routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
-  terminalDeployEvaluation, normalizeReturnReason, setTestDependencies, sweep, watchdogFailure, closureWatchdog };
+  terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, setTestDependencies, sweep, watchdogFailure, closureWatchdog };
