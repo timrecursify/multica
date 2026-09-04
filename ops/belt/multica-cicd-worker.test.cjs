@@ -96,6 +96,12 @@ test('return relay carries return evidence', async () => {
   assert.match(calls[0][5].mergeConflictEvidence, /CI is red/);
 });
 
+test('merged PR with unknown CI state is held when the GitHub call throws', async () => {
+  const calls = dependencies({ receipt: null, gh: () => { throw new Error('403 rate limit exceeded'); } });
+  await worker.routeFinishedPR(issue, 'merged', sha, pr);
+  assert.equal(calls.length, 0);
+});
+
 test('receipt mismatch is the only Human Review receipt path', async () => {
   const calls = dependencies({ receipt: { source_sha: 'c'.repeat(40), release: '/bad', health: 'ok' } });
   await worker.routeFinishedPR(issue, 'merged', sha, pr);

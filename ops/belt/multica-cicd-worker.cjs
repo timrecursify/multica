@@ -348,7 +348,7 @@ function countCiFailure(issue, pr, sha, ci) {
   const key = `${issue.id}:${pr.repo}#${pr.num}:${sha}`;
   // Pending and unknown are not failures: a queued run on a saturated runner
   // pool (ppp: 5 runners, ~20 jobs per PR) must wait, not return the ticket.
-  if (!['red', 'mixed'].includes(ci)) {
+  if (!['red', 'mixed', 'unknown'].includes(ci)) {
     ciFailureCounts.delete(key);
     return 0;
   }
