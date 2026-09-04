@@ -5,6 +5,9 @@ const test = require('node:test');
 // are set before the require. The watchdog is redirected to a scratch file to
 // keep the suite off the live receipt root.
 process.env.CICD_RETROACTIVE_REPOS = 'timrecursify/multica';
+// Pinned so an operator shell exporting CICD_MERGE_ENABLED=0 cannot turn the
+// retro test's merge assertion into a 'green but merging disabled' hold.
+process.env.CICD_MERGE_ENABLED = '1';
 process.env.CICD_WATCHDOG_STATE = require('path')
   .join(require('os').tmpdir(), `cicd-watchdog-test-${process.pid}.json`);
 const worker = require('./multica-cicd-worker.cjs');
@@ -12,6 +15,9 @@ const sha = 'a'.repeat(40);
 const issue = { id: 'issue-1', number: 1 };
 const pass = { verdict: 'PASS', work_product_md5: 'b'.repeat(32), bound_sha: sha };
 const pr = { repo: 'timrecursify/multica', headSha: sha, createdAt: new Date().toISOString() };
+// setTestDependencies replaces the module-global log; the sweep tests restore
+// this so a test appended after them does not log into a dead array.
+const defaultLog = (...a) => console.log(new Date().toISOString(), ...a);
 
 function greenGh(args) {
   if (args[0] === 'api') return JSON.stringify({ workflow_runs: [{ status: 'completed', conclusion: 'success' }] });
@@ -252,6 +258,7 @@ test('sweep sends an all-cancelled open PR in a retroactive repo down the retro 
   assert.ok(retro, `no RETRO line: ${lines.join(' | ')}`);
   assert.match(retro, /ci=cancelled_only/);
   assert.ok(ghCalls.some(c => c.startsWith(`pr merge 77 -R ${repo}`)), 'PR was never merged');
+  worker.setTestDependencies({ log: defaultLog });
 });
 
 // The same state in a repo outside CICD_RETROACTIVE_REPOS must still hold: the
@@ -283,4 +290,5 @@ test('sweep holds an all-cancelled open PR in a non-retroactive repo', async () 
   assert.ok(hold, `no HOLD line: ${lines.join(' | ')}`);
   assert.match(hold, /ci=cancelled_only/);
   assert.match(hold, /retro=repo not retroactive/);
+  worker.setTestDependencies({ log: defaultLog });
 });
