@@ -15,6 +15,7 @@ set -uo pipefail
 readonly PM2=/home/newadmin/.npm-global/bin/pm2
 readonly SK=/home/newadmin/bin/sk
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
+readonly RELAY_ENV_FILE="${BELT_RELAY_ENV_FILE:-/home/newadmin/gsp-multica/.env}"
 readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
@@ -78,6 +79,39 @@ readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-/home/newadmin/.local/state/multi
 readonly PSQL=(docker exec -i gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At)
 
 fixed=(); unfixable=()
+RELAY_PREFLIGHT_OK=1
+RELAY_PREFLIGHT_DIAGNOSTIC=''
+
+# Status writes are relay-owned.  Check the relay contract before attempting
+# any recovery so a missing/invalid secret cannot look like a successful repair.
+# Diagnostics deliberately report names and failure phases only; secret values
+# and connection strings never enter the guard output or the P0 ticket.
+guard_relay_preflight() {
+  local missing=() key value agent operator workspace
+  if [[ ! -r "$RELAY_ENV_FILE" ]]; then
+    RELAY_PREFLIGHT_OK=0
+    RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight config=unreadable"
+    unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+    return 0
+  fi
+  for key in RELAY_AGENT_SECRET RELAY_OPERATOR_SECRET GSP_WORKSPACE_ID MULTICA_WORKSPACE_ID; do
+    value=$(sed -n "s/^${key}=//p" "$RELAY_ENV_FILE" | tail -1)
+    [[ -n "$value" ]] || missing+=("$key")
+  done
+  agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
+  operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
+  workspace=$(sed -n 's/^GSP_WORKSPACE_ID=//p' "$RELAY_ENV_FILE" | tail -1)
+  if (( ${#missing[@]} > 0 )); then
+    RELAY_PREFLIGHT_OK=0
+    RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight missing=${missing[*]}"
+  elif [[ "$agent" == "$operator" || ! "$workspace" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+    RELAY_PREFLIGHT_OK=0
+    RELAY_PREFLIGHT_DIAGNOSTIC='phase=preflight invalid=relay-credentials-or-workspace'
+  fi
+  if (( RELAY_PREFLIGHT_OK == 0 )); then
+    unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+  fi
+}
 
 ai_hold_active() {
   [[ -f "$AI_HOLD_FILE" ]]
@@ -723,8 +757,9 @@ increment_reflight_metadata() {
 # The child is dispositioned, not built: it never had a specification of its own.
 relay_cancel_child() {
   local child_id="$1" parent_number="$2" agent operator body
-  agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' /home/newadmin/gsp-multica/.env | tail -1)
-  operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' /home/newadmin/gsp-multica/.env | tail -1)
+  [[ "${RELAY_PREFLIGHT_OK:-1}" == 1 ]] || return 1
+  agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
+  operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
   [[ -z "$agent" || -z "$operator" ]] && return 1
   body=$(printf '{"issue_id":"%s","to_stage":"Cancelled","agent_token":"%s","reason":"Folded into mega flight gsp#%s (Done), which carried the specification and the change for this report.","evidence":{"boardOwnerAuthority":"belt-config-guard bundled-child rule","reason":"child of completed mega gsp#%s"}}' \
     "$child_id" "$agent" "$parent_number" "$parent_number")
@@ -874,6 +909,11 @@ spec_receipt_task_id() {
 # distinguish a relay refusal from a successful, idempotent no-op.
 relay_transition() {
   local number="$1" target="$2" board="${3:-gsp}" md5="${4:-}"
+  if [[ "${RELAY_PREFLIGHT_OK:-1}" != 1 ]]; then
+    RELAY_TRANSITION_OUTPUT="relay preflight refused: ${RELAY_PREFLIGHT_DIAGNOSTIC:-invalid configuration}"
+    RELAY_TRANSITION_RC=78
+    return "$RELAY_TRANSITION_RC"
+  fi
   local -a args=(multica advance "$number" --to "$target" --board "$board")
   [[ -n "$md5" ]] && args+=(--current-work-product-md5 "$md5")
   RELAY_TRANSITION_OUTPUT=$("$SK" "${args[@]}" 2>&1 </dev/null)
@@ -1107,7 +1147,7 @@ guard_unshipped_closures() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_relay_preflight; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 for f in "${fixed[@]:-}";     do [[ -n "$f" ]] && echo "belt-config-guard: FIXED $f"; done
 for u in "${unfixable[@]:-}"; do [[ -n "$u" ]] && echo "belt-config-guard: UNFIXABLE $u" >&2; done
