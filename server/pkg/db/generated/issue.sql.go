@@ -343,7 +343,7 @@ func (q *Queries) CreateIssueWithOrigin(ctx context.Context, arg CreateIssueWith
 const createRelayRunLog = `-- name: CreateRelayRunLog :one
 INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, issue_id, from_stage, to_stage, agent_id, task_id, status, created_at
+RETURNING id, issue_id, from_stage, to_stage, agent_id, task_id, status, created_at, reason
 `
 
 type CreateRelayRunLogParams struct {
@@ -377,6 +377,7 @@ func (q *Queries) CreateRelayRunLog(ctx context.Context, arg CreateRelayRunLogPa
 		&i.TaskID,
 		&i.Status,
 		&i.CreatedAt,
+		&i.Reason,
 	)
 	return i, err
 }
