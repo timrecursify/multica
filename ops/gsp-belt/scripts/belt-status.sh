@@ -6,13 +6,15 @@ set -euo pipefail
 PM2="${PM2:-pm2}"
 release_dir=""
 baseline=""
+worker_baseline=""
 relay_baseline=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release) release_dir="$2"; shift 2;;
     --baseline-unstable-restarts) baseline="$2"; shift 2;;
+    --baseline-worker-unstable-restarts) worker_baseline="$2"; shift 2;;
     --baseline-relay-unstable-restarts) relay_baseline="$2"; shift 2;;
-    -h|--help) echo "usage: belt-status.sh --release DIR [--baseline-unstable-restarts N] [--baseline-relay-unstable-restarts N]"; exit 0;;
+    -h|--help) echo "usage: belt-status.sh --release DIR [--baseline-unstable-restarts N] [--baseline-worker-unstable-restarts N] [--baseline-relay-unstable-restarts N]"; exit 0;;
     *) echo "unknown arg: $1" >&2; exit 2;;
   esac
 done
@@ -44,6 +46,17 @@ PY
   if [[ "$app" == gsp-multica-bridge && -n "$baseline" && "$unstable" =~ ^[0-9]+$ && "$unstable" -gt "$baseline" ]]; then
     echo "status: bridge unstable_restarts increased from $baseline to $unstable (exit_code=${exit_code:-unknown} exit_signal=${exit_signal:-unknown} log=${err_path:-unknown})" >&2
     fail=1
+  fi
+  if [[ "$app" == gsp-multica-worker && -n "$worker_baseline" ]]; then
+    if [[ "$worker_baseline" =~ ^[0-9]+$ && "$unstable" =~ ^[0-9]+$ ]]; then
+      if [[ "$unstable" -gt "$worker_baseline" ]]; then
+        echo "status: worker unstable_restarts increased from $worker_baseline to $unstable (exit_code=${exit_code:-unknown} exit_signal=${exit_signal:-unknown} log=${err_path:-unknown})" >&2
+        fail=1
+      fi
+    else
+      echo "status: worker unstable_restarts unknown (expected baseline $worker_baseline; exit_code=${exit_code:-unknown} exit_signal=${exit_signal:-unknown} log=${err_path:-unknown})" >&2
+      fail=1
+    fi
   fi
   if [[ "$app" == multica-relay-advance && -n "$relay_baseline" && "$unstable" =~ ^[0-9]+$ && "$unstable" -gt "$relay_baseline" ]]; then
     echo "status: relay unstable_restarts increased from $relay_baseline to $unstable (exit_code=${exit_code:-unknown} exit_signal=${exit_signal:-unknown} log=${err_path:-unknown})" >&2

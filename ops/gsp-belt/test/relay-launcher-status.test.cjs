@@ -31,10 +31,16 @@ fs.writeFileSync(path.join(release, '.gsp-belt-release.json'), JSON.stringify({ 
 const pm2 = path.join(tmp, 'pm2');
 fs.writeFileSync(pm2, '#!/bin/sh\nprintf %s "$PM2_FIXTURE"\n');
 fs.chmodSync(pm2, 0o755);
-const fixture = JSON.stringify(['gsp-multica-bridge','gsp-multica-worker','multica-cicd-worker','multica-archiver','multica-relay-advance'].map(name => ({ name, pm2_env: { pm_exec_path: `${release}/ops/belt/${name}`, status: 'online', unstable_restarts: name === 'multica-relay-advance' ? 3 : 0, restart_time: 0, pm_err_log_path: '/var/log/relay.err', exit_code: 1, exit_signal: 'SIGTERM' } })));
+const fixture = JSON.stringify(['gsp-multica-bridge','gsp-multica-worker','multica-cicd-worker','multica-archiver','multica-relay-advance'].map(name => ({ name, pm2_env: { pm_exec_path: `${release}/ops/belt/${name}`, status: 'online', unstable_restarts: name === 'multica-relay-advance' ? 3 : name === 'gsp-multica-worker' ? 2 : 0, restart_time: 0, pm_err_log_path: '/var/log/relay.err', exit_code: 1, exit_signal: 'SIGTERM' } })));
 const statusEnv = { ...process.env, PM2: pm2, PM2_FIXTURE: fixture };
 const healthy = spawnSync('bash', [path.join(root, 'ops/gsp-belt/scripts/belt-status.sh'), '--release', release, '--baseline-relay-unstable-restarts', '3'], { env: statusEnv, encoding: 'utf8' });
 assert.equal(healthy.status, 0, healthy.stderr);
+const workerHealthy = spawnSync('bash', [path.join(root, 'ops/gsp-belt/scripts/belt-status.sh'), '--release', release, '--baseline-worker-unstable-restarts', '2'], { env: statusEnv, encoding: 'utf8' });
+assert.equal(workerHealthy.status, 0, workerHealthy.stderr);
+const workerUnhealthy = spawnSync('bash', [path.join(root, 'ops/gsp-belt/scripts/belt-status.sh'), '--release', release, '--baseline-worker-unstable-restarts', '1'], { env: statusEnv, encoding: 'utf8' });
+assert.equal(workerUnhealthy.status, 1);
+assert.match(workerUnhealthy.stderr, /worker unstable_restarts increased from 1 to 2/);
+assert.match(workerUnhealthy.stderr, /exit_code=1.*exit_signal=SIGTERM.*log=\/var\/log\/relay.err/);
 const unhealthy = spawnSync('bash', [path.join(root, 'ops/gsp-belt/scripts/belt-status.sh'), '--release', release, '--baseline-relay-unstable-restarts', '2'], { env: statusEnv, encoding: 'utf8' });
 assert.equal(unhealthy.status, 1);
 assert.match(unhealthy.stderr, /relay unstable_restarts increased from 2 to 3/);
