@@ -100,6 +100,25 @@ assert_eq '1' "${#unfixable[@]}" 'malformed receipt is non-successful'
 fixture_queue_output='{"success":true,"issue":{"status":"Queue"},"task_id":null}'
 run_spec_refly_fixture
 assert_eq '1' "${#unfixable[@]}" 'receipt without scoper task is non-successful'
+
+# PASS shipping requires at least one referenced PR and every referenced PR to
+# be merged; one open PR must prevent a false FIXED entry.
+gh() {
+  case "$*" in
+    *'pr view 101 -R timrecursify/multica '*) printf '%s\n' MERGED ;;
+    *'pr view 102 -R timrecursify/multica '*) printf '%s\n' OPEN ;;
+    *) printf '%s\n' OPEN ;;
+  esac
+}
+if ! all_referenced_prs_merged 'https://github.com/timrecursify/multica/pull/101'; then
+  echo 'merged PR unexpectedly rejected' >&2; exit 1
+fi
+if all_referenced_prs_merged 'https://github.com/timrecursify/multica/pull/101,https://github.com/timrecursify/multica/pull/102'; then
+  echo 'open PR in multi-PR PASS unexpectedly accepted' >&2; exit 1
+fi
+if all_referenced_prs_merged ''; then
+  echo 'PASS without a referenced PR unexpectedly accepted' >&2; exit 1
+fi
 # Status recovery is protected by the relay-authority trigger in migration 297;
 # the stranded-Spec path must use the supported Spec -> Queue edge.
 spec_refly_source=$(sed -n '/^spec_refly_queue()/,/^redact_spec_refly_diagnostic()/p' "$root_dir/belt-config-guard.sh")

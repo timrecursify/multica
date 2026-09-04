@@ -1009,6 +1009,21 @@ done_receipt_valid() {
   jq -e '(.success == true) and ((.issue.status // .current_status // .status) == "Done")' >/dev/null 2>&1 <<<"$1"
 }
 
+# A PASS can mention more than one pull request.  Do not ship a flight with no
+# parseable PR, and do not ship until every referenced PR is actually merged.
+all_referenced_prs_merged() {
+  local urls="$1" repo num state found=0 u
+  for u in ${urls//,/ }; do
+    [[ "$u" =~ ^https://github\.com/[^/[:space:]]+/[^/[:space:]]+/pull/[0-9]+$ ]] || return 1
+    repo=$(printf '%s' "$u" | sed -E 's|https://github.com/([^/]+/[^/]+)/pull/[0-9]+|\1|')
+    num=$(printf '%s' "$u" | sed -E 's|.*/pull/([0-9]+)|\1|')
+    state=$(gh pr view "$num" -R "$repo" --json state -q .state 2>/dev/null </dev/null)
+    [[ "$state" == MERGED ]] || return 1
+    found=1
+  done
+  (( found ))
+}
+
 recover_stranded_spec_flight() {
   local number="$1" board="${2:-gsp}" relay_output diagnostic
   spec_refly_queue "$number" "$board"; relay_output="$SPEC_REFLOW_OUTPUT"
@@ -1037,7 +1052,7 @@ recover_stranded_spec_flight() {
 # pull request is actually MERGED. A flight whose PR is still open is left alone;
 # guard_unshipped_closures already handles that direction.
 guard_ship_passed() {
-  local number board md5 urls url repo num state unmerged
+  local number board md5 urls url
   # Every PR the flight references must be merged, not just the most recently
   # mentioned one. gsp#83 cites sk-cli#316 (merged) and #498 (open): checking a
   # single URL shipped it to Done, guard_unshipped_closures dragged it back on
@@ -1045,17 +1060,8 @@ guard_ship_passed() {
   while IFS='|' read -r number board md5 urls; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     [[ "$md5" =~ ^[0-9a-f]{32}$ ]] || continue
-    unmerged=0
-    url=""
-    for u in ${urls//,/ }; do
-      [[ -n "$u" ]] || continue
-      repo=$(printf '%s' "$u" | sed -E 's|https://github.com/([^/]+/[^/]+)/pull/[0-9]+|\1|')
-      num=$(printf '%s' "$u" | sed -E 's|.*/pull/([0-9]+)|\1|')
-      state=$(gh pr view "$num" -R "$repo" --json state -q .state 2>/dev/null </dev/null)
-      [[ "$state" == MERGED ]] || { unmerged=1; break; }
-      url="$u"
-    done
-    (( unmerged )) && continue
+    all_referenced_prs_merged "$urls" || continue
+    url="${urls##*,}"
     relay_transition "$number" Done "$board" "$md5" >/dev/null 2>&1
     if [[ "$RELAY_TRANSITION_RC" -eq 0 ]] && done_receipt_valid "$RELAY_TRANSITION_OUTPUT"; then
       fixed+=("${board}#${number} shipped to Done on its PASS verdict${url:+ after ${url##*/} merged}")
@@ -1162,7 +1168,9 @@ guard_unshipped_closures() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_relay_preflight; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+# Validate relay authority before any guard can attempt a status mutation.
+guard_relay_preflight
+guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 # Several guards can observe the same flight in one tick. Emit each exact
 # finding once so the P0 is stable and one-run idempotent.
