@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -106,6 +107,8 @@ type Config struct {
 	GCArtifactTTL                  time.Duration         // when a task has been completed for at least this long but its issue is still open, drop regenerable artifacts (default: 12h, set 0 to disable)
 	GCArtifactPatterns             []string              // basename patterns whose subtrees are removed during artifact cleanup (default: node_modules, .next, .turbo)
 	GCRepoTTL                      time.Duration         // evict a cached bare repo under .repos once no task has created a worktree from it for this long, it has no worktrees left, and it is no longer attached to any watched workspace (default: 30d, set 0 to disable)
+	GCFreeSpaceFloor               uint64                // reclaim completed tasks when filesystem free bytes fall below this floor (0 = disabled)
+	GCFreeSpaceTarget              uint64                // pressure cleanup target; defaults to floor
 	GCCodexSessionTTL              time.Duration         // reclaim a per-issue Codex session store (~/.codex/multica-sessions/<agent>/<issue>) untouched for at least this long, so a done/abandoned issue's conversation history does not accumulate forever (default: 14d, set 0 to disable)
 	GCHermesMemoryTTL              time.Duration         // reclaim a per-agent Hermes memory store (<profile dir>/hermes-state/<agent>/<profile>) untouched for at least this long, so a deleted agent's memory does not sit on disk forever (default: 90d, set 0 to disable)
 	TaskTempOrphanTTL              time.Duration         // reclaim interrupted task temp directories older than this age (default: 2h)
@@ -432,6 +435,14 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	gcFreeSpaceFloor, err := uint64FromEnv("MULTICA_GC_FREE_SPACE_FLOOR", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	gcFreeSpaceTarget, err := uint64FromEnv("MULTICA_GC_FREE_SPACE_TARGET", gcFreeSpaceFloor)
+	if err != nil {
+		return Config{}, err
+	}
 	taskTempOrphanTTL, err := durationFromEnv("MULTICA_TASK_TEMP_ORPHAN_TTL", DefaultTaskTempOrphanTTL)
 	if err != nil {
 		return Config{}, err
@@ -487,6 +498,8 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		GCArtifactTTL:                  gcArtifactTTL,
 		GCArtifactPatterns:             gcArtifactPatterns,
 		GCRepoTTL:                      gcRepoTTL,
+		GCFreeSpaceFloor:               gcFreeSpaceFloor,
+		GCFreeSpaceTarget:              gcFreeSpaceTarget,
 		TaskTempOrphanTTL:              taskTempOrphanTTL,
 		GCCodexSessionTTL:              gcCodexSessionTTL,
 		GCHermesMemoryTTL:              gcHermesMemoryTTL,
@@ -622,6 +635,18 @@ func patternsFromEnv(name string, defaults []string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+func uint64FromEnv(name string, fallback uint64) (uint64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", name, raw, err)
+	}
+	return v, nil
 }
 
 func shellArgsFromEnv(name string) ([]string, error) {

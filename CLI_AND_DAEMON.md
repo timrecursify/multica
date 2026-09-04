@@ -218,6 +218,8 @@ Daemon behavior is configured via flags or environment variables:
 | GC scan interval | — | `MULTICA_GC_INTERVAL` | `2h` |
 | GC TTL (done/cancelled issues) | — | `MULTICA_GC_TTL` | `24h` |
 | GC orphan TTL (no `.gc_meta.json`) | — | `MULTICA_GC_ORPHAN_TTL` | `72h` |
+| GC free-space floor (bytes) | — | `MULTICA_GC_FREE_SPACE_FLOOR` | `0` (disabled) |
+| GC free-space target (bytes) | — | `MULTICA_GC_FREE_SPACE_TARGET` | floor |
 | GC artifact TTL (open issues) | — | `MULTICA_GC_ARTIFACT_TTL` | `12h` (set `0` to disable) |
 | GC artifact patterns | — | `MULTICA_GC_ARTIFACT_PATTERNS` | `node_modules,.next,.turbo` |
 | GC repo cache TTL (`.repos`) | — | `MULTICA_GC_REPO_TTL` | `720h` (30d; set `0` to disable) |
@@ -226,6 +228,10 @@ Daemon behavior is configured via flags or environment variables:
 #### Workspace garbage collection
 
 The daemon periodically scans `MULTICA_WORKSPACES_ROOT` and reclaims disk space in four modes:
+
+When `MULTICA_GC_FREE_SPACE_FLOOR` is set and filesystem free space falls below it,
+the daemon immediately reclaims locally completed task directories, oldest completion
+first, until the target is restored. This pressure pass is independent of issue status.
 
 - **Full task cleanup** — when an issue's status is `done` or `cancelled` and has been idle for `MULTICA_GC_TTL`, the entire task directory is removed.
 - **Orphan cleanup** — task directories with no `.gc_meta.json` (e.g. left over from a daemon crash) are removed once they exceed `MULTICA_GC_ORPHAN_TTL`.
