@@ -299,6 +299,10 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
     }
+    // Preserve the admission made against the locked source stage. Once the
+    // UPDATE commits, a fresh read would see the destination and could
+    // incorrectly report transition_denied for this successful request.
+    const admittedTransition = { fromStage: issue.status, toStage: to_stage };
 
     // A QC FAIL sends the ticket back to the builder, and nothing counted how
     // often. Each bounce is a fresh task at attempt 1, so max_attempts never
@@ -502,6 +506,7 @@ async function relayAdvance(req, res, body) {
     res.end(JSON.stringify({
       success: true,
       issue: result.rows[0],
+      transition: admittedTransition,
       task_id: taskId,
       relay_log_id: relayLogId
     }));

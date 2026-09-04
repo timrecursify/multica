@@ -809,6 +809,20 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
   }));
 }
 
+// Admit a transition against the stage that was locked at the start of the
+// request.  Keep this decision as a value: callers must not re-evaluate after
+// updating the issue, when a read would naturally see the destination stage
+// and turn a committed transition into a false `transition_denied` response.
+function admitConfiguredTransition({ fromStage, toStage, expectedStage, altStages = [],
+  exceptional = false }) {
+  const allowed = [expectedStage, ...altStages].filter(Boolean);
+  return {
+    fromStage,
+    toStage,
+    ok: exceptional || allowed.includes(toStage)
+  };
+}
+
 function isCicdReturn(fromStage, toStage, reason) {
   return fromStage === "CI/CD & Deploy" && toStage === "In Progress" &&
     typeof reason === "string" &&
@@ -1628,9 +1642,16 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
-    if (!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&
-        !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) && !evidenceTransition &&
-        !dispositionStages.has(to_stage)) {
+    const transitionAdmission = admitConfiguredTransition({
+      fromStage: issue.status,
+      toStage: to_stage,
+      expectedStage,
+      altStages,
+      exceptional: retryEscalation || parkedRelease || parkedEvidenceQcRelease ||
+        parkedDiagnosisDone || noArtifactRescope || evidenceTransition ||
+        dispositionStages.has(to_stage)
+    });
+    if (!transitionAdmission.ok) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
@@ -2239,6 +2260,7 @@ async function relayAdvance(req, res, body) {
     res.end(JSON.stringify({
       success: true,
       issue: result.rows[0],
+      transition: { fromStage: transitionAdmission.fromStage, toStage: transitionAdmission.toStage },
       task_id: taskId,
       relay_log_id: relayLogId
     }));
@@ -2417,6 +2439,7 @@ module.exports = {
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
+  admitConfiguredTransition,
   relayOperatorRespec,
   operatorRespec,
   setTestClientFactory(factory) { testClientFactory = factory; },
