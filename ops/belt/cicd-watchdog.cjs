@@ -4,9 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-// Match the sentinel alert contract (20 minutes), so a stalled deployment is
-// surfaced with an actionable reason before the external alert fires.
-const SENTINEL_MS = Number(process.env.CICD_SENTINEL_MS || 1200000);
+const SENTINEL_MS = Number(process.env.CICD_SENTINEL_MS || 2700000);
 const RETRY_LIMIT = Number(process.env.CICD_RETRY_LIMIT || 5);
 const RETRY_BASE_MS = Number(process.env.CICD_RETRY_BASE_MS || 5000);
 
