@@ -785,11 +785,17 @@ guard_stranded_inprogress() {
 increment_reflight_metadata() {
   local number="$1" board="${2:-gsp}" key="${3:-spec_reflies}"
   [[ "$key" =~ ^[a-z_]+$ ]] || return 1
-  "${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+  local updated
+  # psql exits zero when an UPDATE matches no rows.  Require the RETURNING
+  # receipt so a concurrent guard or an exhausted retry budget is reported as
+  # unfixable instead of claiming a re-flight that was never recorded.
+  updated=$("${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
     jsonb_build_object('${key}', (coalesce(metadata->>'${key}','0')::int + 1)::text)
     WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END
       AND coalesce(metadata->>'${key}','0')::int < 3
-      AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=issue.id AND q.status IN ('queued','running'));" >/dev/null 2>&1 </dev/null
+      AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=issue.id AND q.status IN ('queued','running'))
+    RETURNING number;" 2>/dev/null </dev/null) || return 1
+  [[ "$(printf '%s' "$updated" | tr -d '[:space:]')" == "$number" ]]
 }
 
 # A bundled child is closed by its mega flight's change, but nothing moves the
