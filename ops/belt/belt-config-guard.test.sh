@@ -125,4 +125,11 @@ if grep -En '\$SK.*multica advance' "$root_dir/belt-config-guard.sh" >/dev/null;
   echo 'belt guard contains a direct stage advance outside relay_transition' >&2
   exit 1
 fi
+# Workspace routing must come from the issue workspace, never a ticket-number
+# threshold (prod numbers can overlap as numbering evolves).
+if grep -En '\-gt 20000' "$root_dir/belt-config-guard.sh" >/dev/null; then
+  echo 'belt guard routes workspace from an unsafe number heuristic' >&2
+  exit 1
+fi
+grep -q 'coalesce(metadata->>.*< 3' "$root_dir/belt-config-guard.sh"
 echo 'belt config guard launch regression passed'
