@@ -1974,10 +1974,36 @@ async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
     const returned = [];
     for (const row of result.rows) {
       const cause = `QC FAIL ${row.work_product_md5 || 'no-md5'} at ${new Date(row.verdict_at).toISOString()}; rework required`;
+      // Count durable relay bounces before each return.  The bridge applies the
+      // same limit, but enforcing it here prevents this daemon from repeatedly
+      // enqueueing a fresh builder task when a relay request is rejected.
+      const bounce = await client.query(
+        `SELECT count(*)::int AS n FROM relay_run_log
+          WHERE issue_id = $1::uuid AND from_stage = 'In Review' AND to_stage = 'In Progress'`,
+        [row.issue_id]);
+      const count = Number(bounce.rows[0]?.n || 0);
+      if (count >= STAGE_CYCLE_LIMIT) {
+        const response = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
+          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+          reason: `QC bounce ceiling reached (${count}/${STAGE_CYCLE_LIMIT}); human review required`,
+          evidence: { implementationFail: cause, qcBounceCeiling: { count, ceiling: STAGE_CYCLE_LIMIT } },
+          parked_audit: { reason: 'qc_bounce_ceiling', bounce_count: count, ceiling: STAGE_CYCLE_LIMIT,
+            issue_id: row.issue_id, disposition: 'Human Review' } });
+        if (response.ok) {
+          await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = 'human'
+            WHERE issue_id = $1::uuid AND stage = 'In Review'`, [row.issue_id]);
+          returned.push(row.issue_id);
+          logger.log(`${LOG_PREFIX} [qc-fail-return] capped issue=${row.issue_id} bounces=${count}/${STAGE_CYCLE_LIMIT}`);
+        } else {
+          logger.log(`${LOG_PREFIX} [qc-fail-return] cap denied issue=${row.issue_id} status=${response.status}; error=${response.error || response.body || 'unknown'}`);
+        }
+        continue;
+      }
       const response = await postRelay({ issue_id: row.issue_id, to_stage: 'In Progress',
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
         reason: `RETURN:In Progress — ${cause}`,
-        evidence: { implementationFail: cause, retryRemaining: true } });
+        evidence: { implementationFail: cause, retryRemaining: true,
+          qcBounceCount: count, qcBounceCeiling: STAGE_CYCLE_LIMIT } });
       if (response.ok) {
         await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = NULL
           WHERE issue_id = $1::uuid AND stage = 'In Review'`, [row.issue_id]);

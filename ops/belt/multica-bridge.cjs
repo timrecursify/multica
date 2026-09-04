@@ -1688,26 +1688,43 @@ async function relayAdvance(req, res, body) {
             client, issue, body.relay_source_task_id
           );
           if (!sourceTaskId) {
-            await client.query("ROLLBACK");
-            res.writeHead(409, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
-              reason: "qc_bounce_ceiling" }));
-            return;
+            // A capped QC return must be terminally bounded even when the
+            // original task has already been consumed. Requiring a source task
+            // here caused the daemon to retry the same 409 forever.
+            retryEscalation = null;
+            to_stage = "Human Review";
+            parkedAudit = {
+              ...(parkedAudit || {}),
+              reason: "qc_bounce_ceiling",
+              bounce_count: n,
+              ceiling,
+              disposition: "Human Review",
+              issue_id: issue.id
+            };
+            console.warn(JSON.stringify({
+              event: "qc_bounce_ceiling",
+              issue_id,
+              bounces: n,
+              ceiling,
+              redirected_to: "Human Review",
+              source_task_id: null
+            }));
+          } else {
+            retryEscalation = {
+              reason: "qc_bounce_ceiling", trigger_stage: issue.status,
+              attempts: n, ceiling, source_task_id: sourceTaskId,
+              deadline: escalationDeadline()
+            };
+            to_stage = "Spec";
+            console.warn(JSON.stringify({
+              event: "qc_bounce_ceiling",
+              issue_id,
+              bounces: n,
+              ceiling,
+              redirected_to: "Spec",
+              source_task_id: sourceTaskId
+            }));
           }
-          retryEscalation = {
-            reason: "qc_bounce_ceiling", trigger_stage: issue.status,
-            attempts: n, ceiling, source_task_id: sourceTaskId,
-            deadline: escalationDeadline()
-          };
-          to_stage = "Spec";
-          console.warn(JSON.stringify({
-            event: "qc_bounce_ceiling",
-            issue_id,
-            bounces: n,
-            ceiling,
-            redirected_to: "Spec",
-            source_task_id: sourceTaskId
-          }));
         }
       }
     }
