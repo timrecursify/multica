@@ -16,6 +16,11 @@ const EXPLICIT_OUTCOMES = new Map([
 ]);
 
 const RESULT_MARKERS = [
+  // A completed task whose result reports a missing executable/file is a
+  // runtime failure, even when the agent did not emit an explicit FAIL line.
+  // Keep the `: not found` form bounded so ordinary prose mentioning a
+  // resource that was not found is not treated as a task failure.
+  [/(?:^|:\s*)not found\b|\bcommand not found\b|\bENOENT\b/im, 'completion_failed'],
   [/^\s*QC[- ]BLOCKED\b(?:\s*[:—-]|\s*$)/im, 'completion_qc_blocked'],
   [/^\s*(?:SPEC|BUILD)[- ]BLOCKED\b(?:\s*[:—-]|\s*$)/im, 'completion_blocked'],
   [/^\s*BLOCKED(?:\s+ON\s+VERIFICATION)?\b(?:\s*[:—-]|\s*$)/im, 'completion_blocked'],
