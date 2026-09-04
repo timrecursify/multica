@@ -672,12 +672,9 @@ guard_stranded_inprogress() {
   while IFS='|' read -r number board last; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
-    "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
-         UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
-         jsonb_build_object('ip_reflies', (coalesce(metadata->>'ip_reflies','0')::int + 1)::text)
-       WHERE number=${number} AND workspace_id ${ws};" >/dev/null 2>&1 </dev/null
     if [[ "$last" == completed ]]; then
       if relay_transition "$number" "In Review" "$board" >/dev/null 2>&1; then
+        increment_reflight_metadata "$number" "$board" ip_reflies
         fixed+=("${board}#${number} stranded in In Progress with a completed build; sent forward to QC")
       else
         unfixable+=("${board}#${number} is stranded in In Progress and could not be sent to QC")
@@ -685,6 +682,7 @@ guard_stranded_inprogress() {
     elif [[ "$last" == failed ]]; then
       if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
          relay_transition "$number" "Queue" "$board" >/dev/null 2>&1; then
+        increment_reflight_metadata "$number" "$board" ip_reflies
         fixed+=("${board}#${number} stranded in In Progress with no build; re-driven to the builder")
       else
         unfixable+=("${board}#${number} is stranded in In Progress and could not be re-driven")
@@ -704,6 +702,19 @@ guard_stranded_inprogress() {
        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
                         WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
      ORDER BY i.updated_at ASC LIMIT 15;" 2>/dev/null)
+}
+
+# Retry counters are guarded in the same statement that writes them.  The
+# workspace predicate and active-task check make this idempotent when two guard
+# ticks overlap, while the cap prevents an endlessly expiring flight loop.
+increment_reflight_metadata() {
+  local number="$1" board="${2:-gsp}" key="${3:-spec_reflies}"
+  [[ "$key" =~ ^[a-z_]+$ ]] || return 1
+  "${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+    jsonb_build_object('${key}', (coalesce(metadata->>'${key}','0')::int + 1)::text)
+    WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END
+      AND coalesce(metadata->>'${key}','0')::int < 3
+      AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=issue.id AND q.status IN ('queued','running'));" >/dev/null 2>&1 </dev/null
 }
 
 # A bundled child is closed by its mega flight's change, but nothing moves the
@@ -751,9 +762,8 @@ guard_bundled_children() {
 # NO_OP build, which is cheaper than a stranded ticket.
 guard_freed_children() {
   local child_id number parent_number parent_status board
-  while IFS='|' read -r child_id number parent_number parent_status; do
+  while IFS='|' read -r child_id number parent_number parent_status board; do
     [[ -z "$child_id" ]] && continue
-    board=gsp; [[ "$number" -gt 20000 ]] && board=prod
     if "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
          UPDATE issue SET parent_issue_id=NULL, updated_at=NOW() WHERE id='${child_id}'::uuid;" >/dev/null 2>&1; then
       "$SK" multica comment --board "$board" --number "$number" --body \
@@ -763,7 +773,8 @@ guard_freed_children() {
     else
       unfixable+=("#${number} is a child of ${parent_status} rollup #${parent_number} and could not be detached")
     fi
-  done < <("${PSQL[@]}" -F'|' -c "SELECT c.id, c.number, p.number, p.status
+  done < <("${PSQL[@]}" -F'|' -c "SELECT c.id, c.number, p.number, p.status,
+       CASE WHEN c.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END
      FROM issue c JOIN issue p ON p.id = c.parent_issue_id
     WHERE c.status NOT IN ('Done','Archived','Cancelled')
       AND (p.status = 'Cancelled'
@@ -799,17 +810,17 @@ guard_stranded_registered() {
     return 0
   fi
   local number board
-  while read -r number; do
+  while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    board=gsp; [[ "$number" -gt 20000 ]] && board=prod
     if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1; then
       fixed+=("#${number} was parked in Registered with nothing to advance it; sent to Spec for scoping")
     else
       unfixable+=("#${number} is stuck in Registered and could not be advanced to Spec")
     fi
   done < <("${PSQL[@]}" -c "
-    SELECT i.number FROM issue i
+    SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END FROM issue i
      WHERE i.status='Registered'
+       AND i.workspace_id IN ('${GSP_WS}','da3c5c5c-a123-4567-b999-c3ed1820da00')
        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
                         WHERE q.issue_id=i.id AND q.status IN ('queued','running','dispatched'))
      ORDER BY i.created_at LIMIT 40;" 2>/dev/null)
@@ -825,9 +836,8 @@ guard_stranded_registered() {
 # is anything whose latest comment says a human must decide.
 guard_human_review_release() {
   local number board
-  while read -r number; do
+  while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    board=gsp; [[ "$number" -gt 20000 ]] && board=prod
     if relay_transition "$number" "Registered" "$board" >/dev/null 2>&1 &&
        "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
          UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
@@ -839,10 +849,11 @@ guard_human_review_release() {
       unfixable+=("#${number} could not be released from Human Review")
     fi
   done < <("${PSQL[@]}" -c "
-    SELECT i.number FROM issue i
+    SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END FROM issue i
     LEFT JOIN LATERAL (SELECT content FROM comment
                         WHERE issue_id=i.id ORDER BY created_at DESC LIMIT 1) c ON true
      WHERE i.status='Human Review'
+       AND i.workspace_id IN ('${GSP_WS}','da3c5c5c-a123-4567-b999-c3ed1820da00')
        AND coalesce(i.metadata->>'hr_releases','0')::int < 2
        AND i.title !~* 'money|billing|payment|invoice|charge|spend|cost|refund|zelle|stripe'
        AND coalesce(c.content,'') !~* 'human approval required|Tim to |Tim must|money authorization|requires Tim'
