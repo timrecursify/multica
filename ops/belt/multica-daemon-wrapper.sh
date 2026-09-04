@@ -28,8 +28,8 @@ cpu_count="$(belt_cpu_count)" || exit 64
 cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}"
 root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
 help_timeout="${MULTICA_DAEMON_HELP_TIMEOUT_SECONDS:-5}"
-if [[ -n "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS+x}" && ! "$cap_raw" =~ ^[1-9][0-9]*$ ]]; then
-  echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a positive integer" >&2
+if [[ -n "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS+x}" && ! "$cap_raw" =~ ^[0-9]+$ ]]; then
+  echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a non-negative integer" >&2
   exit 64
 fi
 if [[ -z "$cap_raw" ]]; then cap_raw="$(belt_resolve_concurrency)" || exit 64; fi
