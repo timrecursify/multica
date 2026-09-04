@@ -25,13 +25,16 @@ type HealthResponse struct {
 	// lifecycle CLI (`daemon start/stop`) acts on the host process namespace,
 	// so a foreign-OS daemon can't be started/stopped by the app even though
 	// /health is reachable. See #3916.
-	OS              string `json:"os"`
-	Uptime          string `json:"uptime"`
-	LastHeartbeatAt string `json:"last_heartbeat_at,omitempty"`
-	DaemonID        string `json:"daemon_id"`
-	DeviceName      string `json:"device_name"`
-	ServerURL       string `json:"server_url"`
-	CLIVersion      string `json:"cli_version"`
+	OS                  string `json:"os"`
+	Uptime              string `json:"uptime"`
+	LastHeartbeatAt     string `json:"last_heartbeat_at,omitempty"`
+	LastTickCompletedAt string `json:"last_tick_completed_at,omitempty"`
+	TickCount           uint64 `json:"tick_count"`
+	LastTickOutcome     string `json:"last_tick_outcome,omitempty"`
+	DaemonID            string `json:"daemon_id"`
+	DeviceName          string `json:"device_name"`
+	ServerURL           string `json:"server_url"`
+	CLIVersion          string `json:"cli_version"`
 	// ActiveTaskCount remains the compatibility/safety count of every claimed
 	// handleTask lifecycle. The additive counters split actual provider
 	// execution from local-directory parking for throughput and diagnostics.
@@ -61,6 +64,12 @@ func heartbeatTimestamp(n int64) string {
 		return ""
 	}
 	return time.Unix(0, n).UTC().Format(time.RFC3339Nano)
+}
+
+func (d *Daemon) recordTick(outcome string) {
+	d.lastTickCompletedAt.Store(time.Now().UnixNano())
+	d.tickCount.Add(1)
+	d.lastTickOutcome.Store(&outcome)
 }
 
 type healthWorkspace struct {
@@ -126,6 +135,8 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 			OS:                    runtime.GOOS,
 			Uptime:                time.Since(startedAt).Truncate(time.Second).String(),
 			LastHeartbeatAt:       heartbeatTimestamp(d.lastHeartbeatAt.Load()),
+			LastTickCompletedAt:   heartbeatTimestamp(d.lastTickCompletedAt.Load()),
+			TickCount:             d.tickCount.Load(),
 			DaemonID:              d.cfg.DaemonID,
 			DeviceName:            d.cfg.DeviceName,
 			ServerURL:             d.cfg.ServerBaseURL,
@@ -138,6 +149,9 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 
 			ReloadPendingReason: d.reloadPending(),
 			Workspaces:          wsList,
+		}
+		if outcome := d.lastTickOutcome.Load(); outcome != nil {
+			resp.LastTickOutcome = *outcome
 		}
 
 		w.Header().Set("Content-Type", "application/json")

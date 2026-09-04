@@ -130,6 +130,16 @@ code/signal, correct the operator environment or deployment, then rerun status.
 
 `RECONCILE_MAX_CREATE_PER_CYCLE` limits tasks created per cycle; set it to `0` to halt task creation. `RECONCILE_DISPATCH_HOLD=1` is the supported way to stop dispatch, holding the reconcile cycle before any database access.
 
+## Fleet health watchdog
+
+`/health` includes `last_tick_completed_at`, `tick_count`, and
+`last_tick_outcome` alongside the existing heartbeat fields. `scripts/fleet-health.sh`
+uses independent defaults of 90 seconds for `MULTICA_HEARTBEAT_MAX_AGE_SECONDS`
+and 120 seconds for `MULTICA_TICK_MAX_AGE_SECONDS`. `--repair` restarts PM2 only
+when a selected predicate fails and verifies recovery. Exit 0 is healthy, exit 1
+identifies unavailable/stale/wedged conditions, and exit 2 means invalid arguments.
+Missing or malformed telemetry is unhealthy.
+
 ## Tests
 
 ```bash
