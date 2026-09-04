@@ -37,6 +37,7 @@ jobs:
           mkdir -p dist
           (cd server && CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "-X main.version=$SHA -X main.commit=$SHA" -o ../dist/multica ./cmd/multica)
           chmod +x dist/multica
+          cp ops/noc2/multica-scratch.conf dist/multica-scratch.conf
           ops/noc2/publish-provenance.sh --sha "$SHA" --image '${{ steps.image.outputs.digest }}' --binary dist/multica --workflow-run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --output dist/noc2-provenance.json
       - uses: actions/upload-artifact@v4
         with: { name: "noc2-${{ inputs.commit_sha }}", path: dist/, if-no-files-found: error }
