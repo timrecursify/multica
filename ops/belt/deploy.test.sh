@@ -117,4 +117,19 @@ fi
 selective_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-cicd-worker$/\1/p' "$tmp_dir/selective.log")"
 [[ "$selective_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$selective_receipt" --only multica-cicd-worker >/dev/null
+
+# A selected wrapper is repaired even when runtime drifted; omitting it keeps
+# the fail-closed parity guard.
+printf '\nwrapper-drift\n' >> "$tmp_dir/gsp-multica/fleet/multica-daemon-wrapper.sh"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$tmp_dir/wrapper-drift.log"
+cmp -s -- "$root_dir/multica-daemon-wrapper.sh" "$tmp_dir/gsp-multica/fleet/multica-daemon-wrapper.sh"
+wrapper_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$tmp_dir/wrapper-drift.log")"
+[[ "$wrapper_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$wrapper_receipt" >/dev/null
+printf '\nwrapper-drift-again\n' >> "$tmp_dir/gsp-multica/fleet/multica-daemon-wrapper.sh"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$tmp_dir/wrapper-selective.log" 2>&1; then
+  echo 'expected drifted unselected wrapper rejection' >&2
+  exit 1
+fi
+grep -q 'Wrapper preflight: source/runtime parity mismatch (wrapper not selected)' "$tmp_dir/wrapper-selective.log"
 echo 'deploy rollback test passed'
