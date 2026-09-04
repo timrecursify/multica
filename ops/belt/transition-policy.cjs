@@ -40,6 +40,7 @@ const TRANSITIONS = Object.freeze([
   ['CI/CD & Deploy', 'In Progress', ['system'], 'return'],
   ['CI/CD & Deploy', 'Parked', ['system'], 'retryEscalation'],
   ['CI/CD & Deploy', 'Spec', ['system'], 'retryEscalation'],
+  ['Queue', 'Spec', ['system'], 'retryEscalation'],
   ['Spec', 'Human Review', ['operator'], 'review'],
   ['Queue', 'Human Review', ['operator'], 'review'],
   ['In Progress', 'Human Review', ['operator'], 'review'],

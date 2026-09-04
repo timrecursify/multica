@@ -34,6 +34,13 @@ test('requires evidence and never accepts request booleans as authority', () => 
     evidence: { recordedDecision: true, isOperator: true } }).code, 'request_boolean_authority_denied');
 });
 
+test('allows system retryEscalation from Queue to Spec, denies non-system actors', () => {
+  assert.equal(evaluate({ from: 'Queue', to: 'Spec', actor: 'system',
+    evidence: { retry_escalation: true } }).ok, true);
+  assert.equal(evaluate({ from: 'Queue', to: 'Spec', actor: 'worker',
+    evidence: { retry_escalation: true } }).code, 'actor_denied');
+});
+
 test('permits Human Review only when an operator records a blocker', () => {
   assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system', evidence: {} }).ok, false);
   for (const from of ['Spec', 'Queue', 'In Progress', 'In Review', 'CI/CD & Deploy']) {
