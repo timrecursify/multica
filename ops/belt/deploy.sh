@@ -191,6 +191,11 @@ for index in "${!sources[@]}"; do
       "${targets[$index]}" == "$runtime_root/cicd-watchdog.cjs" ||
       "${targets[$index]}" == "$runtime_root/merged-pr-recovery-sweep.cjs" ||
       "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
+  # The wrapper is part of the runtime/source parity contract.  A previous
+  # deployment may have left it absent (for example after a partial rollout),
+  # so allow this deployment to create the named target instead of rejecting
+  # the release before the parity repair can run.
+  [[ "${targets[$index]}" == "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh" ]] && new_targets[$index]=1
   [[ "${targets[$index]}" == "$runtime_root/tools/belt-concurrency.sh" ]] && new_targets[$index]=1
   [[ "${targets[$index]}" =~ /(qc-lane|reconciler|stage-outcome|transition-policy|stage-routing|qc-strict-evidence|qc-verdict-policy)\.cjs$ ||
       "${targets[$index]}" == "$runtime_root/gsp-multica/stage-routing.json" ]] && new_targets[$index]=1
