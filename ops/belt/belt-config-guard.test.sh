@@ -221,5 +221,14 @@ rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
 rm -f "$release_root/ops/belt/multica-daemon-wrapper.sh"
 repair_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; printf "%s|%s" "$PARITY_OK" "-e $RUNTIME_WRAPPER"' _ "$root_dir/belt-config-guard.sh")
 assert_eq '1|-e '"$repair_root"'/gsp-multica/fleet/multica-daemon-wrapper.sh' "$repair_result" 'incomplete release does not mutate runtime'
+rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
+cp "$root_dir/multica-daemon-wrapper.sh" "$release_root/ops/belt/multica-daemon-wrapper.sh"
+printf '%s\n' stale-guard >"$repair_root/tools/belt-config-guard.sh"
+stale_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; guard_source_runtime_parity; printf "%s|%s" "$PARITY_OK" "${#fixed[@]}"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '1|1' "$stale_result" 'stale runtime member repaired'
+printf '%s\n' original-guard >"$repair_root/tools/belt-config-guard.sh"
+printf '%s\n' original-wrapper >"$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
+rollback_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'mv() { [[ "${@: -1}" == "$RUNTIME_WRAPPER" ]] && return 1; command mv "$@"; }; source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; printf "%s|%s|%s" "$(cat "$RUNTIME_GUARD")" "$(cat "$RUNTIME_WRAPPER")" "${#fixed[@]}"' _ "$root_dir/belt-config-guard.sh")
+assert_eq 'original-guard|original-wrapper|0' "$rollback_result" 'pair install failure rolls back atomically'
 rm -rf -- "$repair_root"
 echo 'belt config guard launch regression passed'
