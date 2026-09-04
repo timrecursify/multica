@@ -78,24 +78,30 @@ if printf '%s' 'not-json' | spec_receipt_status >/dev/null 2>&1; then
 fi
 
 reset_calls=0; advance_calls=0
-fixture_reset_rc=0; fixture_reset_output=1
+fixture_reset_rc=0; fixture_reset_output='{"success":true,"issue":{"status":"Registered"}}'
 fixture_advance_rc=0
 fixture_advance_output='{"success":true,"issue":{"status":"Spec"},"task_id":"scoper-task"}'
 spec_refly_reset() { reset_calls=$((reset_calls + 1)); SPEC_REFLOW_RC=$fixture_reset_rc; SPEC_REFLOW_OUTPUT=$fixture_reset_output; }
 spec_refly_advance() { advance_calls=$((advance_calls + 1)); SPEC_REFLOW_RC=$fixture_advance_rc; SPEC_REFLOW_OUTPUT=$fixture_advance_output; }
+spec_refly_increment_metadata() { return "${fixture_metadata_rc:-0}"; }
 run_spec_refly_fixture() { fixed=(); unfixable=(); reset_calls=0; advance_calls=0; recover_stranded_spec_flight 1772; }
 run_spec_refly_fixture
 assert_eq '1' "$reset_calls" 'successful stranded-Spec recovery resets once'
 assert_eq '1' "$advance_calls" 'successful stranded-Spec recovery advances after reset'
 assert_eq '1' "${#fixed[@]}" 'successful stranded-Spec recovery is fixed'
-fixture_reset_output=0
+fixture_reset_output='{"success":true,"issue":{"status":"Registered"}}'
 run_spec_refly_fixture
-assert_eq '0' "$advance_calls" 'zero-row reset does not relay advance'
-assert_eq '1' "${#unfixable[@]}" 'zero-row reset is non-successful'
-fixture_reset_output=1; fixture_advance_rc=7; fixture_advance_output='relay unavailable token=not-for-output'
+assert_eq '1' "$advance_calls" 'successful reset relays advance'
+assert_eq '0' "${#unfixable[@]}" 'valid reset receipt is successful'
+fixture_reset_output='relay unavailable token=not-for-output'; fixture_reset_rc=7; fixture_advance_rc=7; fixture_advance_output='relay unavailable token=not-for-output'
 run_spec_refly_fixture
-assert_eq '1' "$advance_calls" 'relay failure occurs after reset'
+assert_eq '0' "$advance_calls" 'reset relay failure stops before advance'
 assert_eq '1' "${#unfixable[@]}" 'relay failure is non-successful'
+fixture_reset_rc=0; fixture_reset_output='{"success":true,"issue":{"status":"Registered"}}'; fixture_metadata_rc=1; fixture_advance_rc=0
+run_spec_refly_fixture
+assert_eq '0' "$advance_calls" 'metadata refusal stops before Spec advance'
+assert_eq '1' "${#unfixable[@]}" 'metadata refusal is non-successful'
+fixture_metadata_rc=0
 fixture_advance_rc=0; fixture_advance_output='not-json'
 run_spec_refly_fixture
 assert_eq '1' "${#unfixable[@]}" 'malformed receipt is non-successful'
@@ -103,10 +109,14 @@ fixture_advance_output='{"success":true,"issue":{"status":"Spec"},"task_id":null
 run_spec_refly_fixture
 assert_eq '1' "${#unfixable[@]}" 'receipt without scoper task is non-successful'
 # Status recovery is protected by the relay-authority trigger in migration 297;
-# keep the pump's reset on that same transaction-local authority path.
+# reset must use the shared relay entry point and metadata must remain guarded.
 spec_refly_source=$(sed -n '/^spec_refly_reset()/,/^spec_refly_advance()/p' "$root_dir/belt-config-guard.sh")
-if [[ "$spec_refly_source" != *"set_config('multica.relay_authorized','on',true)"* ]]; then
-  echo 'stranded-Spec reset does not set relay authority' >&2
+if [[ "$spec_refly_source" != *'relay_transition "$number" "Registered" "$board"'* ]]; then
+  echo 'stranded-Spec reset does not use relay authority' >&2
+  exit 1
+fi
+if ! rg -n 'spec_refly_increment_metadata|UPDATE issue SET metadata' "$root_dir/belt-config-guard.sh" >/dev/null; then
+  echo 'stranded-Spec retry metadata update missing' >&2
   exit 1
 fi
 # Every stage mutation must pass through the shared relay helper; a direct CLI

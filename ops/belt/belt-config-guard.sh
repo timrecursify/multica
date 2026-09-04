@@ -897,18 +897,12 @@ guard_stranded_spec() {
 }
 
 spec_refly_reset() {
-  # Status changes go through relay; only the retry counter is written locally.
+  # Status changes go through relay.  Keep the relay receipt intact so the
+  # caller can distinguish an authority/transport refusal from a successful
+  # transition; metadata is applied only after that receipt is validated.
   local number="$1" board="${2:-gsp}"
   relay_transition "$number" "Registered" "$board"; SPEC_REFLOW_RC=$?
   SPEC_REFLOW_OUTPUT="$RELAY_TRANSITION_OUTPUT"
-  if [[ "$SPEC_REFLOW_RC" -eq 0 ]]; then
-    "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
-      UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
-        jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
-      WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END AND status='Registered'
-        AND parent_issue_id IS NULL AND coalesce(metadata->>'spec_reflies','0')::int < 3
-        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=issue.id AND q.status IN ('queued','running'));" >/dev/null 2>&1 </dev/null || SPEC_REFLOW_RC=$?
-  fi
 }
 
 spec_refly_advance() {
@@ -920,8 +914,33 @@ redact_spec_refly_diagnostic() {
   printf '%s' "$1" | tr '\n' ' ' | sed -E -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' -e 's/((token|password|secret|api[_-]?key)[=:])[[:space:]]*[^[:space:]]+/\1[REDACTED]/Ig' | cut -c1-400
 }
 
+spec_refly_failure_class() {
+  local message
+  message=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$message" in
+    *relay\ authority*|*relay_authorized*|*authority*|*permission*|*forbidden*|*unauthori*) printf 'relay-authority' ;;
+    *credential*|*bearer*|*api[_-]key*|*token*) printf 'credential' ;;
+    *malformed*|*not-json*|*parse*) printf 'malformed-receipt' ;;
+    *transport*|*timeout*|*connection*|*unavailable*|*relay\ post*) printf 'transport' ;;
+    *) printf 'relay' ;;
+  esac
+}
+
 spec_refly_receipt_valid() {
   jq -e '(.success == true) and (.issue.status == "Spec") and ((.task_id | type) == "string") and (.task_id | length > 0)' >/dev/null 2>&1 <<<"$1"
+}
+
+spec_refly_reset_receipt_valid() {
+  jq -e '(.success == true) and ((.issue.status // .current_status // .status) == "Registered")' >/dev/null 2>&1 <<<"$1"
+}
+
+spec_refly_increment_metadata() {
+  local number="$1" board="${2:-gsp}"
+  "${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+    jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
+    WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END AND status='Registered'
+      AND parent_issue_id IS NULL AND coalesce(metadata->>'spec_reflies','0')::int < 3
+      AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=issue.id AND q.status IN ('queued','running'));" >/dev/null 2>&1 </dev/null
 }
 
 done_receipt_valid() {
@@ -935,18 +954,22 @@ recover_stranded_spec_flight() {
   spec_refly_reset "$number" "$board"; reset_output="$SPEC_REFLOW_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
     diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
-    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=reset exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=reset class=$(spec_refly_failure_class "$reset_output") exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
     return 0
   fi
-  if [[ "$(tr -d '[:space:]' <<<"$reset_output")" != "1" ]]; then
+  if ! spec_refly_reset_receipt_valid "$reset_output"; then
     diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
-    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=reset-row-count exit=0 diagnostic=${diagnostic}")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=reset-receipt exit=0 diagnostic=${diagnostic}")
+    return 0
+  fi
+  if ! spec_refly_increment_metadata "$number" "$board"; then
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=metadata exit=1 diagnostic=retry counter update refused; issue left in Registered")
     return 0
   fi
   spec_refly_advance "$number" "$board"; relay_output="$SPEC_REFLOW_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
     diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
-    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=relay exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=relay class=$(spec_refly_failure_class "$relay_output") exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
     return 0
   fi
   if ! spec_refly_receipt_valid "$relay_output"; then
