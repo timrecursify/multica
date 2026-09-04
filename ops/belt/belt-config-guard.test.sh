@@ -109,4 +109,10 @@ if [[ "$spec_refly_source" != *"set_config('multica.relay_authorized','on',true)
   echo 'stranded-Spec reset does not set relay authority' >&2
   exit 1
 fi
+# Every stage mutation must pass through the shared relay helper; a direct CLI
+# advance can bypass the migration-297 transaction-local authority guard.
+if rg -n '\$SK.*multica advance' "$root_dir/belt-config-guard.sh" >/dev/null; then
+  echo 'belt guard contains a direct stage advance outside relay_transition' >&2
+  exit 1
+fi
 echo 'belt config guard launch regression passed'

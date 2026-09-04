@@ -603,10 +603,10 @@ guard_stranded_review() {
   while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
-    # Direct status write, then the relay exit that dispatches the reviewer:
-    # the review task fires on row 4's In Progress -> In Review exit.
-    if "$SK" multica advance "$number" --to "In Progress" --board "$board" >/dev/null 2>&1 </dev/null &&
-       "$SK" multica advance "$number" --to "In Review" --board "$board" >/dev/null 2>&1 </dev/null; then
+    # Both stage changes use the shared relay helper; the review task fires on
+    # row 4's In Progress -> In Review exit.
+    if relay_transition "$number" "In Progress" "$board" >/dev/null 2>&1 &&
+       relay_transition "$number" "In Review" "$board" >/dev/null 2>&1; then
       fixed+=("${board}#${number} re-driven to a reviewer after being stranded in In Review")
     else
       unfixable+=("${board}#${number} is stranded in In Review and could not be re-driven")
@@ -633,13 +633,13 @@ guard_stranded_queue() {
     # leave from Spec. Routing In Progress -> Queue instead fires row 4's QC
     # worker and leaves the flight stranded again; that mistake was made and
     # corrected on 2026-08-31.
-    if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null &&
-       "$SK" multica advance "$number" --to "Queue" --board "$board" >/dev/null 2>&1 </dev/null; then
+    if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
+       relay_transition "$number" "Queue" "$board" >/dev/null 2>&1; then
       fixed+=("${board}#${number} re-driven to the builder after being stranded in Queue")
     else
       # Usually spec_required: no scoper ever wrote a spec comment. Send it to
       # the scoper instead of leaving it parked.
-      if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
+      if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1; then
         fixed+=("${board}#${number} had no spec; sent to the scoper instead of the builder")
       else
         unfixable+=("${board}#${number} is stranded in Queue and could not be re-driven")
@@ -672,7 +672,8 @@ guard_stranded_inprogress() {
   while IFS='|' read -r number board last; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
-    "${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+    "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
+         UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
          jsonb_build_object('ip_reflies', (coalesce(metadata->>'ip_reflies','0')::int + 1)::text)
        WHERE number=${number} AND workspace_id ${ws};" >/dev/null 2>&1 </dev/null
     if [[ "$last" == completed ]]; then
@@ -782,8 +783,8 @@ guard_freed_children() {
 # (107 found on 2026-08-31, arriving at ~25/hour). GSP-836 fixes the CLI; this
 # keeps the board draining until that lands.
 # Routing the flight out of Spec any other way would fire row 2's PAID builder,
-# so the status is written directly and the relay is then used for the exit that
-# dispatches the scoper. That exit is free: row 1's source stage is Registered.
+# so both stage changes use the relay helper and preserve the free row-1 scoper
+# dispatch from Registered -> Spec.
 # Nothing advances a flight out of Registered. The relay dispatches the agent of
 # the row a flight LEAVES, and row 1 is Registered -> Spec, so a flight parked in
 # Registered has no agent, no task and no timer: it waits forever for a push that
@@ -801,7 +802,7 @@ guard_stranded_registered() {
   while read -r number; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     board=gsp; [[ "$number" -gt 20000 ]] && board=prod
-    if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
+    if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1; then
       fixed+=("#${number} was parked in Registered with nothing to advance it; sent to Spec for scoping")
     else
       unfixable+=("#${number} is stuck in Registered and could not be advanced to Spec")
@@ -827,11 +828,12 @@ guard_human_review_release() {
   while read -r number; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     board=gsp; [[ "$number" -gt 20000 ]] && board=prod
-    if "$SK" multica advance "$number" --to "Registered" --board "$board" >/dev/null 2>&1 </dev/null &&
-       "${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+    if relay_transition "$number" "Registered" "$board" >/dev/null 2>&1 &&
+       "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
+         UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
          jsonb_build_object('hr_releases', (coalesce(metadata->>'hr_releases','0')::int + 1)::text)
          WHERE number=${number} AND status='Registered';" >/dev/null 2>&1 </dev/null &&
-       "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
+       relay_transition "$number" "Spec" "$board" >/dev/null 2>&1; then
       fixed+=("#${number} released from Human Review for scoping (not a money or structural call)")
     else
       unfixable+=("#${number} could not be released from Human Review")
@@ -933,26 +935,26 @@ recover_stranded_spec_flight() {
   spec_refly_reset "$number" "$board"; reset_output="$SPEC_REFLOW_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
     diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=reset exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=reset exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
     return 0
   fi
   if [[ "$(tr -d '[:space:]' <<<"$reset_output")" != "1" ]]; then
     diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=reset-row-count exit=0 diagnostic=${diagnostic}")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=reset-row-count exit=0 diagnostic=${diagnostic}")
     return 0
   fi
   spec_refly_advance "$number" "$board"; relay_output="$SPEC_REFLOW_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
     diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=relay exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=relay exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
     return 0
   fi
   if ! spec_refly_receipt_valid "$relay_output"; then
     diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=receipt exit=0 diagnostic=${diagnostic}")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=receipt exit=0 diagnostic=${diagnostic}")
     return 0
   fi
-  fixed+=("gsp#${number} had no live scoper task; reset exactly once and re-flown to Spec with a scoper task receipt")
+  fixed+=("${board}#${number} had no live scoper task; reset exactly once and re-flown to Spec with a scoper task receipt")
 }
 
 # Row 7 (CI/CD & Deploy -> Done) has NO agent, so nothing ever performs the last
@@ -1077,7 +1079,7 @@ guard_unshipped_closures() {
     num=$(printf '%s' "$url" | sed -E 's|.*/pull/([0-9]+)|\1|')
     state=$(gh pr view "$num" -R "$repo" --json state -q .state 2>/dev/null </dev/null)
     [[ "$state" != OPEN ]] && continue
-    if "$SK" multica advance "$number" --to "CI/CD & Deploy" --board gsp >/dev/null 2>&1 </dev/null; then
+    if relay_transition "$number" "CI/CD & Deploy" gsp >/dev/null 2>&1; then
       fixed+=("gsp#${number} was ${status} while ${repo}#${num} is still open; returned to CI/CD & Deploy")
       moved=$(( moved + 1 ))
     else
