@@ -12,10 +12,12 @@ PY
 now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; printf '{"status":"running","pid":1,"last_heartbeat_at":"%s","last_tick_completed_at":"%s","tick_count":1,"last_tick_outcome":"success"}\n' "$now" "$now" > "$tmp/health.json"
 python3 "$tmp/server.py" "$tmp/health.json" 29381 & server_pid=$!; trap 'kill "$server_pid" 2>/dev/null || true; rm -rf "$tmp"' EXIT
 "$root/scripts/fleet-health.sh" --port 29381 --max-age 90 >/dev/null
-printf '{"status":"running","pid":1,"last_heartbeat_at":"%s","last_tick_completed_at":"2020-01-01T00:00:00Z","tick_count":1,"last_tick_outcome":"success"}\n' "$now" > "$tmp/health.json"
+printf '{"status":"running","pid":1,"last_heartbeat_at":"2020-01-01T00:00:00Z","last_tick_completed_at":"%s","tick_count":1,"last_tick_outcome":"success"}\n' "$now" > "$tmp/health.json"
 if "$root/scripts/fleet-health.sh" --port 29381 --max-age 90 >/dev/null 2>&1; then echo stale heartbeat accepted >&2; exit 1; fi
 printf '{"status":"running","pid":1,"last_heartbeat_at":"%s","last_tick_completed_at":"2020-01-01T00:00:00Z","tick_count":1,"last_tick_outcome":"success"}\n' "$now" > "$tmp/health.json"
 if "$root/scripts/fleet-health.sh" --port 29381 --max-age 90 --tick-max-age 120 >/dev/null 2>&1; then echo wedged tick accepted >&2; exit 1; fi
+printf '{"status":"stopped","pid":1,"last_heartbeat_at":"%s","last_tick_completed_at":"%s","tick_count":1,"last_tick_outcome":"success"}\n' "$now" "$now" > "$tmp/health.json"
+if "$root/scripts/fleet-health.sh" --port 29381 >/dev/null 2>&1; then echo stopped daemon accepted >&2; exit 1; fi
 printf '{"status":"running","pid":1,"last_heartbeat_at":"%s"}\n' "$now" > "$tmp/health.json"
 if "$root/scripts/fleet-health.sh" --port 29381 >/dev/null 2>&1; then echo missing telemetry accepted >&2; exit 1; fi
 echo 'fleet health regression passed'

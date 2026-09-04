@@ -93,6 +93,32 @@ func TestHealthHandlerReportsCLIVersionAndTaskCounts(t *testing.T) {
 	}
 }
 
+func TestHealthHandlerReportsCompletedTickTelemetry(t *testing.T) {
+	t.Parallel()
+
+	d := &Daemon{workspaces: map[string]*workspaceState{}, logger: slog.Default()}
+	handler := d.healthHandler(time.Now())
+	read := func() HealthResponse {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+		var got HealthResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode health: %v", err)
+		}
+		return got
+	}
+
+	initial := read()
+	if initial.TickCount != 0 || initial.LastTickCompletedAt != "" || initial.LastTickOutcome != "" {
+		t.Fatalf("initial tick telemetry = %#v, want zero values", initial)
+	}
+	d.recordTick("error")
+	got := read()
+	if got.TickCount != 1 || got.LastTickCompletedAt == "" || got.LastTickOutcome != "error" {
+		t.Fatalf("completed tick telemetry = %#v, want count=1 timestamp and error outcome", got)
+	}
+}
+
 // TestHealthHandlerReportsDeferredReload covers the "while waiting to restart,
 // the reason and state are visible" criterion. When trySelfReload has confirmed
 // a multica version change but the daemon was busy at the barrier check, the
