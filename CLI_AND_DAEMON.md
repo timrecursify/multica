@@ -247,6 +247,8 @@ Configured patterns are basename-only — entries containing `/` or `\` are sile
 
 `multica daemon disk-usage` reports the `.repos` footprint on its own line rather than folding it into the per-task totals — every task in a workspace checks out from that shared cache, so attributing it to individual task directories would double-count it. Note that the repo cache is reclaimed on the schedule above and not by any per-issue status change, so it is normal for it to persist after every task directory is gone.
 
+When reproducing disk-GC from a daemon-managed task, the task-local safety boundary rejects profile, all-profile, and root overrides by default. Use the explicit diagnostic escape `multica daemon disk-usage --allow-in-task --workspaces-root /absolute/root`; the root is required and profile/all-profile enumeration remains disabled. The command identifies the env variable or `.multica/daemon_task_context.json` marker that triggered the contextual restriction. The systemd daemon itself runs with `cwd=/`, so service-side scans do not require this escape.
+
 Agent-specific overrides:
 
 | Variable | Description |
