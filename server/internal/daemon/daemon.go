@@ -408,9 +408,12 @@ type Daemon struct {
 	// login-shell probe + version detection instead of one per task (MUL-4486).
 	healGroup singleflight.Group
 
-	wsHBMu          sync.RWMutex         // guards wsHBLastAck
-	wsHBLastAck     map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
-	lastHeartbeatAt atomic.Int64
+	wsHBMu              sync.RWMutex         // guards wsHBLastAck
+	wsHBLastAck         map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
+	lastHeartbeatAt     atomic.Int64
+	lastTickCompletedAt atomic.Int64
+	tickCount           atomic.Uint64
+	lastTickOutcome     atomic.Pointer[string]
 
 	// reconcile fans out a "re-check server state now" signal to subscribers
 	// (watchTaskCancellation, workspaceSyncLoop) so the WS connect/reconnect
@@ -4439,6 +4442,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 
 		runtimeIDs := d.allRuntimeIDs()
 		if len(runtimeIDs) == 0 {
+			d.recordTick("idle")
 			if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
 				return
 			}
@@ -4474,6 +4478,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 
 		tasks, err := d.ClaimTasksWSFirst(pollerCtx, d.cfg.DaemonID, runtimeIDs, len(slots))
 		if err != nil {
+			d.recordTick("error")
 			d.exitClaim()
 			releaseSlots(slots)
 			if pollerCtx.Err() == nil {
@@ -4484,6 +4489,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			}
 			continue
 		}
+		d.recordTick("success")
 
 		// Dispatch each claimed task into a slot. activeTasks is incremented for
 		// every dispatched task BEFORE exitClaim so the auto-update barrier never
