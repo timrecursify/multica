@@ -109,13 +109,28 @@ let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reaso
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);
-        res.on('end', () => res.statusCode >= 400 ? reject(new Error(`${res.statusCode} ${d.slice(0,140)}`)) : resolve(d));
+        res.on('end', () => {
+          if (res.statusCode >= 400) return reject(new Error(`${res.statusCode} ${d.slice(0,140)}`));
+          try { resolve(parseRelayResponse(d, toStage)); }
+          catch (error) { reject(error); }
+        });
       });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('relay timeout')); });
     req.write(body); req.end();
   });
 };
+
+function parseRelayResponse(raw, toStage) {
+  let body;
+  try { body = JSON.parse(raw); } catch (_) {
+    throw new Error('relay malformed response');
+  }
+  if (body?.success !== true) {
+    throw new Error(`relay rejected ${toStage}: ${body?.error || 'unsuccessful response'}`);
+  }
+  return body;
+}
 
 async function latestVerdict(issueId) {
   const result = await pool.query(
@@ -776,4 +791,5 @@ function setTestDependencies(dependencies) {
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview, retryEscalation,
   routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
-  terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, setTestDependencies, sweep, watchdogFailure, closureWatchdog };
+  terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, parseRelayResponse,
+  setTestDependencies, sweep, watchdogFailure, closureWatchdog };
