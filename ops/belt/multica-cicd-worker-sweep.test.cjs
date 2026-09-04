@@ -6,6 +6,12 @@ const test = require('node:test');
 // irreversible merge action while exercising sweep continuity.
 process.env.CICD_SENTINEL_MS = '0';
 process.env.CICD_MERGE_ENABLED = '0';
+// Without an override, the watchdog persists to the real receipt root and a
+// prior run's alerted state leaks into the next: a re-run then sees
+// `alerted: true` and skips straight to the retry-exhausted branch. Redirect
+// to a scratch file, matching multica-cicd-worker.test.cjs.
+process.env.CICD_WATCHDOG_STATE = require('path')
+  .join(require('os').tmpdir(), `cicd-watchdog-sweep-test-${process.pid}.json`);
 const worker = require('./multica-cicd-worker.cjs');
 
 test('an escalation failure is isolated so later tickets are still processed', async () => {
@@ -40,4 +46,26 @@ test('an escalation failure is isolated so later tickets are still processed', a
   assert.ok(logs.some(line => line.includes('ERR #1: forced PR lookup failure')));
   assert.ok(logs.some(line => line.includes('HOLD #2') && line.includes('merging disabled')));
   assert.ok(!logs.some(line => line.includes('[sweep] error:')));
+});
+
+test('a stalled deploy escalates directly to Spec as system, not Human Review', async () => {
+  const issue = { id: 'issue-watchdog-spec', number: 99 };
+  const sha = 'c'.repeat(40);
+  const calls = [];
+  worker.setTestDependencies({ relay: async (...args) => { calls.push(args); return '{}'; }, log: () => {} });
+
+  const result = await worker.watchdogFailure(issue, 'deploy timed out', sha);
+
+  assert.equal(result.stalled, true);
+  assert.equal(calls.length, 1);
+  const [issueId, toStage, workProductMd5, reason, parkedAudit, evidence] = calls[0];
+  assert.equal(issueId, issue.id);
+  assert.equal(toStage, 'Spec');
+  assert.equal(workProductMd5, null);
+  assert.equal(parkedAudit, null);
+  assert.equal(evidence.retry_escalation, true);
+  assert.ok(reason.startsWith(`deploy_stalled issue=${issue.id} stage=CI/CD & Deploy`));
+  assert.match(reason, /correlation_key=([0-9a-f]{32})/);
+  const correlationKey = reason.match(/correlation_key=([0-9a-f]{32})/)[1];
+  assert.equal(result.audit.correlation_key, correlationKey);
 });

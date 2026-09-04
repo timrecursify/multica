@@ -154,13 +154,21 @@ async function watchdogFailure(issue, error, sha = '') {
   if (watchdog.stalled(row)) {
     const stalled = watchdog.markAlerted(row);
     const detail = `deploy_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
-    await humanReview(issue, detail);
+    const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
+    const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
+    if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
+    await relay(issue.id, 'Spec', null, detail, null, evidence);
+    log(`ESCALATE #${issue.number} — ${detail}`);
     return { stalled: true, audit: stalled };
   }
   if (!watchdog.retryAllowed(row)) {
     const detail = `deploy_retry_exhausted issue=${issue.id} stage=${row.stage} attempts=${row.attempts} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
     log(`TERMINAL #${issue.number} retry limit exhausted before sentinel; escalating correlation_key=${row.correlation_key}`);
-    await humanReview(issue, detail);
+    const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
+    const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
+    if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
+    await relay(issue.id, 'Spec', null, detail, null, evidence);
+    log(`ESCALATE #${issue.number} — ${detail}`);
     return { stalled: true, audit: row };
   }
   log(`RETRY #${issue.number} attempt=${row.attempts}/${RETRY_LIMIT} backoff_ms=${watchdog.backoffMs(row)} correlation_key=${row.correlation_key}`);
