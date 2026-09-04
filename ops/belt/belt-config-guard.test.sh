@@ -225,6 +225,12 @@ printf '%s\n' '{"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifes
 rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
 repair_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_SOURCE_WRAPPER="$repair_root/missing-source-wrapper.sh" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; guard_source_runtime_parity; printf "%s|%s|%s" "$PARITY_OK" "${#fixed[@]}" "-f $RUNTIME_WRAPPER"' _ "$root_dir/belt-config-guard.sh")
 assert_eq '1|1|-f '"$repair_root"'/gsp-multica/fleet/multica-daemon-wrapper.sh' "$repair_result" 'missing wrapper repaired from complete release'
+printf '%s\n' original-guard >"$repair_root/tools/belt-config-guard.sh"
+printf '%s\n' original-wrapper >"$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
+printf '%s\n' '{"source_sha":"cccccccccccccccccccccccccccccccccccccccc","manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' >"$release_root/.gsp-belt-release.json"
+metadata_mismatch=$(BELT_SOURCE_ROOT="$root_dir" BELT_SOURCE_WRAPPER="$repair_root/missing-source-wrapper.sh" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; printf "%s|%s|%s" "$PARITY_OK" "$(cat "$RUNTIME_GUARD")" "$(cat "$RUNTIME_WRAPPER")"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '0|original-guard|original-wrapper' "$metadata_mismatch" 'release metadata source identity mismatch leaves runtime untouched'
+printf '%s\n' '{"source_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","manifest_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}' >"$release_root/.gsp-belt-release.json"
 rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
 rm -f "$release_root/ops/belt/multica-daemon-wrapper.sh"
 repair_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; printf "%s|%s" "$PARITY_OK" "-e $RUNTIME_WRAPPER"' _ "$root_dir/belt-config-guard.sh")
