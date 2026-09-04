@@ -18,6 +18,12 @@ readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 readonly RELAY_ENV_FILE="${BELT_RELAY_ENV_FILE:-/home/newadmin/gsp-multica/.env}"
 readonly RELAY_HEALTH_URL="${BELT_RELAY_HEALTH_URL:-}"
 readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
+readonly SOURCE_ROOT="${BELT_SOURCE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+readonly GUARD_SOURCE="${BELT_SOURCE_GUARD:-${SOURCE_ROOT}/belt-config-guard.sh}"
+readonly WRAPPER_SOURCE="${BELT_SOURCE_WRAPPER:-${SOURCE_ROOT}/multica-daemon-wrapper.sh}"
+readonly RUNTIME_ROOT="${BELT_RUNTIME_ROOT:-/home/newadmin}"
+readonly RUNTIME_GUARD="${RUNTIME_ROOT}/tools/belt-config-guard.sh"
+readonly RUNTIME_WRAPPER="${RUNTIME_ROOT}/gsp-multica/fleet/multica-daemon-wrapper.sh"
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
 WANT_CONCURRENCY="$(belt_resolve_concurrency)"
@@ -82,6 +88,37 @@ readonly PSQL=(docker exec -i gsp-multica-v2-postgres-1 psql -U gsp_multica -d g
 fixed=(); unfixable=()
 RELAY_PREFLIGHT_OK=1
 RELAY_PREFLIGHT_DIAGNOSTIC=''
+PARITY_OK=1
+PARITY_DIAGNOSTIC=''
+
+# The guard and its daemon wrapper are deployed as a pair.  A stale runtime
+# copy can execute an obsolete direct-status recovery path, so fail closed
+# before any relay transition when either digest differs.  Paths are fixed to
+# the source tree and the two expected runtime locations; no broad filesystem
+# search is performed.
+guard_source_runtime_parity() {
+  local source_file runtime_file source_sha runtime_sha label
+  for label in guard wrapper; do
+    if [[ "$label" == guard ]]; then
+      source_file="$GUARD_SOURCE"; runtime_file="$RUNTIME_GUARD"
+    else
+      source_file="$WRAPPER_SOURCE"; runtime_file="$RUNTIME_WRAPPER"
+    fi
+    if [[ ! -r "$source_file" || ! -r "$runtime_file" ]]; then
+      PARITY_OK=0
+      PARITY_DIAGNOSTIC="phase=parity ${label}=missing"
+      unfixable+=("belt runtime/source digest drift: ${PARITY_DIAGNOSTIC}")
+      continue
+    fi
+    source_sha=$(sha256sum -- "$source_file" 2>/dev/null | awk '{print $1}')
+    runtime_sha=$(sha256sum -- "$runtime_file" 2>/dev/null | awk '{print $1}')
+    if [[ ! "$source_sha" =~ ^[0-9a-f]{64}$ || "$source_sha" != "$runtime_sha" ]]; then
+      PARITY_OK=0
+      PARITY_DIAGNOSTIC="phase=parity ${label}=digest-mismatch"
+      unfixable+=("belt runtime/source digest drift: ${PARITY_DIAGNOSTIC}")
+    fi
+  done
+}
 
 # Status writes are relay-owned.  Check the relay contract before attempting
 # any recovery so a missing/invalid secret cannot look like a successful repair.
@@ -992,6 +1029,11 @@ relay_transition() {
     RELAY_TRANSITION_RC=78; RELAY_TRANSITION_CLASS=configuration
     return "$RELAY_TRANSITION_RC"
   fi
+  if [[ "${PARITY_OK:-1}" != 1 ]]; then
+    RELAY_TRANSITION_OUTPUT="runtime/source parity refused: ${PARITY_DIAGNOSTIC:-digest mismatch}"
+    RELAY_TRANSITION_RC=78; RELAY_TRANSITION_CLASS=configuration
+    return "$RELAY_TRANSITION_RC"
+  fi
   local -a args=(multica advance "$number" --to "$target" --board "$board")
   [[ -n "$md5" ]] && args+=(--current-work-product-md5 "$md5")
   RELAY_TRANSITION_OUTPUT=$("$SK" "${args[@]}" 2>&1 </dev/null)
@@ -1259,6 +1301,7 @@ guard_unshipped_closures() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # Validate relay authority before any guard can attempt a status mutation.
 guard_relay_preflight
+guard_source_runtime_parity
 guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 # Several guards can observe the same flight in one tick. Emit each exact
