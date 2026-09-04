@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 const assert = require('assert');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const test = require('node:test');
 const worker = require('./multica-cicd-worker.cjs');
 const sha = 'a'.repeat(40);
@@ -191,4 +194,47 @@ test('a just-merged sha stays pending inside the deploy trigger grace window', (
   worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [] }) });
   assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, new Date().toISOString()), false);
   assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, undefined), false);
+});
+
+test('sweep continues when Human Review escalation is denied', async () => {
+  const receiptRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'multica-cicd-worker-'));
+  const oldSentinel = process.env.CICD_SENTINEL_MS;
+  const oldReceiptRoot = process.env.MULTICA_RECEIPT_ROOT;
+  try {
+    process.env.CICD_SENTINEL_MS = '0';
+    process.env.MULTICA_RECEIPT_ROOT = receiptRoot;
+    delete require.cache[require.resolve('./cicd-watchdog.cjs')];
+    delete require.cache[require.resolve('./multica-cicd-worker.cjs')];
+    const sweepWorker = require('./multica-cicd-worker.cjs');
+    const viewed = [];
+    const relayed = [];
+    sweepWorker.setTestDependencies({
+      pool: { query: async (sql, params) => {
+        if (sql.startsWith('SELECT id, number')) return { rows: [
+          { id: 'issue-escalation', number: 1 }, { id: 'issue-later', number: 2 }
+        ] };
+        return { rows: [{ content: `https://github.com/timrecursify/multica/pull/${params[0] === 'issue-escalation' ? 1 : 2}` }] };
+      } },
+      gh: (args) => {
+        const number = args[2];
+        viewed.push(number);
+        if (number === '1') throw new Error('original ticket failure');
+        return JSON.stringify({ state: 'CLOSED', mergeable: 'MERGEABLE' });
+      },
+      relay: async (_id, stage) => {
+        if (stage === 'Human Review') throw new Error('409 {"error":"actor_denied"}');
+        relayed.push(stage);
+      }
+    });
+
+    await sweepWorker.sweep();
+    assert.deepStrictEqual(viewed, ['1', '2']);
+    assert.deepStrictEqual(relayed, ['In Progress']);
+  } finally {
+    if (oldSentinel === undefined) delete process.env.CICD_SENTINEL_MS;
+    else process.env.CICD_SENTINEL_MS = oldSentinel;
+    if (oldReceiptRoot === undefined) delete process.env.MULTICA_RECEIPT_ROOT;
+    else process.env.MULTICA_RECEIPT_ROOT = oldReceiptRoot;
+    fs.rmSync(receiptRoot, { recursive: true, force: true });
+  }
 });

@@ -525,7 +525,12 @@ async function sweep() {
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
       }
     } catch (e) {
-      const failure = await watchdogFailure(issue, e.message);
+      let failure = { stalled: false };
+      try {
+        failure = await watchdogFailure(issue, e.message);
+      } catch (escalationError) {
+        log(`ESCALATE-FAIL #${issue.number}: ${String(escalationError.message).split('\n')[0].slice(0, 160)}`);
+      }
       log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}${failure.stalled ? ' (Human Review)' : ''}`);
     }
   }
