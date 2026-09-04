@@ -22,7 +22,7 @@ const guardrails = {
 // Env names the bridge/relay/cicd processes require. Preflight refuses to run
 // when any of these is unset; names only — values stay in operator .env/secret
 // files and are never committed.
-const REQUIRED_ENV = ['DATABASE_URL', 'RELAY_AGENT_SECRET', 'GSP_WORKSPACE_ID', 'MULTICA_WORKSPACE_ID'];
+const REQUIRED_ENV = ['DATABASE_URL', 'RELAY_AGENT_SECRET', 'ARCHIVER_AGENT_SECRET', 'GSP_WORKSPACE_ID', 'MULTICA_WORKSPACE_ID'];
 
 module.exports = {
   required_env: REQUIRED_ENV,

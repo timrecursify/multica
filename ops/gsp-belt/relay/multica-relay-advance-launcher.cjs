@@ -18,7 +18,7 @@ function loadConfig(configPath) {
     const delimiter = line.indexOf('=');
     config[line.slice(0, delimiter)] = line.slice(delimiter + 1);
   }
-  for (const key of ['DATABASE_URL', 'RELAY_AGENT_SECRET', 'GSP_WORKSPACE_ID']) {
+  for (const key of ['DATABASE_URL', 'RELAY_AGENT_SECRET', 'ARCHIVER_AGENT_SECRET', 'GSP_WORKSPACE_ID']) {
     if (!config[key]) throw new Error(`${key} is missing from ${configPath}`);
   }
   return config;

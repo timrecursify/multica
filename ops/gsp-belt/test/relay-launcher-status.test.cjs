@@ -8,7 +8,7 @@ const root = path.resolve(__dirname, '../../..');
 const launcher = require('../relay/multica-relay-advance-launcher.cjs');
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'relay-test-'));
 const envFile = path.join(tmp, 'operator.env');
-fs.writeFileSync(envFile, 'DATABASE_URL=postgres://redacted\nRELAY_AGENT_SECRET=secret-value\nGSP_WORKSPACE_ID=workspace\n');
+fs.writeFileSync(envFile, 'DATABASE_URL=postgres://redacted\nRELAY_AGENT_SECRET=secret-value\nARCHIVER_AGENT_SECRET=archiver-secret\nGSP_WORKSPACE_ID=workspace\n');
 const calls = [];
 const fakeChild = { on(event, callback) { assert.equal(event, 'exit'); callback(0, null); } };
 launcher.startDaemon({ env: { GSP_BELT_ENV_FILE: envFile }, daemonPath: '/fake/daemon.cjs', spawnImpl: (...args) => { calls.push(args); return fakeChild; } });

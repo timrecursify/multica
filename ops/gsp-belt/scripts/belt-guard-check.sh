@@ -91,7 +91,7 @@ secret_hits=$(grep -riInE --include='*.cjs' --include='*.js' --include='*.sh' --
 if [[ -n "$secret_hits" ]]; then echo "guard[secret-embedded]:$secret_hits"; fail=1; fi
 
 # 5. Required env names are present (deploy preflight compatibility).
-REQUIRED="DATABASE_URL RELAY_AGENT_SECRET GSP_WORKSPACE_ID MULTICA_WORKSPACE_ID"
+REQUIRED="DATABASE_URL RELAY_AGENT_SECRET ARCHIVER_AGENT_SECRET GSP_WORKSPACE_ID MULTICA_WORKSPACE_ID"
 for name in $REQUIRED; do
   if [[ -z "${!name:-}" ]]; then echo "guard[env-missing]: $name"; fail=1; fi
 done
