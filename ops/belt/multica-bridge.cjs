@@ -1479,6 +1479,21 @@ async function relayAdvance(req, res, body) {
       res.end(JSON.stringify({ error: "retry_escalation_evidence_required" }));
       return;
     }
+    // Spec is already the re-scoping lane. Treat a retry escalation emitted
+    // for a Spec task as handled in place instead of requesting Spec -> Spec.
+    // The caller receives an explicit result and can close its failed relay
+    // row without creating another execution task.
+    if (retryEscalation && issue.status === "Spec") {
+      await client.query("COMMIT");
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        success: true,
+        issue: { id: issue.id, status: issue.status },
+        transition: "retry_escalation_handled",
+        handled: "already_in_spec"
+      }));
+      return;
+    }
     if (retryEscalation && retryEscalationLoop(issue, retryEscalation.trigger_stage)) {
       escalationLoop = true;
       parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",

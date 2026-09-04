@@ -1243,6 +1243,18 @@ test('quota pause flips are timestamped and stale unbudgeted pauses self-clear',
   assert.match(source, /scheduleEvery\(reconcileQuotaPauses, 60000, 'reconcileQuotaPauses'\)/);
 });
 
+test('retry escalation handles Spec in place without posting a self-transition', async () => {
+  const { requestRetryEscalation } = require('./multica-relay-advance-daemon.cjs');
+  let posted = false;
+  const result = await requestRetryEscalation(
+    { issue_id: 'issue-1', to_stage: 'Spec', task_id: 'task-1' },
+    'completion_failed',
+    async () => { posted = true; return { ok: true, status: 200 }; }
+  );
+  assert.deepEqual(result, { ok: true, status: 200, handled: 'already_in_spec' });
+  assert.equal(posted, false);
+});
+
 // --- GitHub reads run on REST, not GraphQL (relay rate-limit migration) -----
 
 const { github: githubRest, restPrView } = require('./multica-relay-advance-daemon.cjs');

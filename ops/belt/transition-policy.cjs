@@ -29,6 +29,7 @@ const TRANSITIONS = Object.freeze([
   ['Registered', 'Spec', ['system', 'operator'], 'registered'],
   ['Spec', 'Queue', ['worker', 'operator'], 'scoped'],
   ['Queue', 'In Progress', ['system'], 'queued'],
+  ['Queue', 'Spec', ['system'], 'retryEscalation'],
   ['In Progress', 'In Review', ['worker', 'system'], 'reviewed'],
   ['In Progress', 'CI/CD & Deploy', ['worker', 'system'], 'deploy'],
   ['In Progress', 'Done', ['worker', 'system'], 'complete'],

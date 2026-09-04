@@ -1088,6 +1088,12 @@ function postToPath(path, payload) {
 function requestRetryEscalation(row, reason, relay = postToRelay) {
   const taskId = row.task_id || row.dead_task_id;
   const triggerStage = row.to_stage || row.stage;
+  // Spec is already the re-scoping lane.  Do not emit a meaningless
+  // Spec -> Spec request that the relay cannot execute; report an explicit
+  // handled result so the failed source row can be closed by the caller.
+  if (triggerStage === 'Spec') {
+    return Promise.resolve({ ok: true, status: 200, handled: 'already_in_spec' });
+  }
   return relay({
     issue_id: row.issue_id,
     to_stage: 'Spec',
@@ -2056,7 +2062,7 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
+module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestRetryEscalation,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
