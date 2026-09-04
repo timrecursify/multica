@@ -55,6 +55,8 @@ migration-provenance table lets you verify the import is the running bridge.
 | `GSP_BELT_SECRETS_DIR` | `/home/newadmin/.secrets` | daemon/fleet wrappers source `deepseek.env`, `openrouter.env` |
 | `GSP_BELT_SECRETS_ENV_FILE` | `/home/newadmin/.secrets/multica-remote/remote-bridge.env` | cicd worker |
 | `GSP_BELT_PG_MODULE` | `/home/newadmin/node_modules/pg` | cicd worker `pg` module path |
+| `CICD_RATE_LIMIT_BASE_MS` | `30000` | cicd worker initial rate-limit backoff |
+| `CICD_RATE_LIMIT_MAX_MS` | `900000` | cicd worker maximum rate-limit cooldown |
 | `GSP_BELT_CODEX_BIN` | `/home/newadmin/tools/codex-native` | daemon wrapper codex binary |
 | `MULTICA_DAEMON_DIR` | `/home/newadmin/multica-daemon` | daemon/fleet server binary + workdir |
 | `GSP_WORKSPACES_ROOT` | `/home/newadmin/multica-workspaces-gsp` | daemon `--workspaces-root` |
