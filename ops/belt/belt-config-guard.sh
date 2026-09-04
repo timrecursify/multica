@@ -24,6 +24,7 @@ readonly WRAPPER_SOURCE="${BELT_SOURCE_WRAPPER:-${SOURCE_ROOT}/multica-daemon-wr
 readonly RUNTIME_ROOT="${BELT_RUNTIME_ROOT:-/home/newadmin}"
 readonly RUNTIME_GUARD="${RUNTIME_ROOT}/tools/belt-config-guard.sh"
 readonly RUNTIME_WRAPPER="${RUNTIME_ROOT}/gsp-multica/fleet/multica-daemon-wrapper.sh"
+readonly RELEASE_ROOT="${BELT_RELEASE_ROOT:-/home/newadmin/gsp-multica-runtime/releases}"
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
 WANT_CONCURRENCY="$(belt_resolve_concurrency)"
@@ -90,6 +91,53 @@ RELAY_PREFLIGHT_OK=1
 RELAY_PREFLIGHT_DIAGNOSTIC=''
 PARITY_OK=1
 PARITY_DIAGNOSTIC=''
+
+# Recover a missing member of the guard/wrapper pair only from a complete,
+# immutable release that contains the exact source blobs.  Validation happens
+# before either destination is touched; installation is protected by a lock
+# and rolls back if the second rename fails.
+repair_source_runtime_parity() {
+  local guard_sha wrapper_sha release candidate_guard candidate_wrapper tmp_guard tmp_wrapper lock installed_guard=0
+  guard_sha=$(sha256sum -- "$GUARD_SOURCE" 2>/dev/null | awk '{print $1}')
+  wrapper_sha=$(sha256sum -- "$WRAPPER_SOURCE" 2>/dev/null | awk '{print $1}')
+  [[ "$guard_sha" =~ ^[0-9a-f]{64}$ && "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]] || return 0
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || return 0
+  [[ -r "$RUNTIME_GUARD" && -r "$RUNTIME_WRAPPER" ]] && return 0
+  release=''
+  while IFS= read -r candidate_guard; do
+    release="${candidate_guard%/ops/belt/belt-config-guard.sh}"
+    [[ -d "$release" && ! -L "$release" ]] || { release=''; continue; }
+    candidate_wrapper="$release/ops/belt/multica-daemon-wrapper.sh"
+    [[ -r "$candidate_wrapper" ]] || { release=''; continue; }
+    [[ "$(sha256sum -- "$candidate_guard" | awk '{print $1}')" == "$guard_sha" ]] || { release=''; continue; }
+    [[ "$(sha256sum -- "$candidate_wrapper" | awk '{print $1}')" == "$wrapper_sha" ]] || { release=''; continue; }
+    break
+  done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
+  [[ -n "$release" ]] || return 0
+  mkdir -p -- "$(dirname -- "$RUNTIME_GUARD")" "$(dirname -- "$RUNTIME_WRAPPER")" || return 0
+  lock="${RUNTIME_ROOT}/.belt-config-parity.lock"
+  exec 8>"$lock"; flock -n 8 || return 0
+  tmp_guard="$(mktemp "$(dirname -- "$RUNTIME_GUARD")/.guard.XXXXXX")"
+  tmp_wrapper="$(mktemp "$(dirname -- "$RUNTIME_WRAPPER")/.wrapper.XXXXXX")"
+  if ! cp -- "$release/ops/belt/belt-config-guard.sh" "$tmp_guard" ||
+     ! cp -- "$release/ops/belt/multica-daemon-wrapper.sh" "$tmp_wrapper" ||
+     [[ "$(sha256sum -- "$tmp_guard" | awk '{print $1}')" != "$guard_sha" ]] ||
+     [[ "$(sha256sum -- "$tmp_wrapper" | awk '{print $1}')" != "$wrapper_sha" ]]; then
+    rm -f -- "$tmp_guard" "$tmp_wrapper"; return 0
+  fi
+  if [[ ! -e "$RUNTIME_GUARD" ]]; then
+    mv -f -- "$tmp_guard" "$RUNTIME_GUARD" || { rm -f -- "$tmp_guard" "$tmp_wrapper"; return 0; }
+    installed_guard=1
+  else rm -f -- "$tmp_guard"; fi
+  if [[ ! -e "$RUNTIME_WRAPPER" ]]; then
+    if ! mv -f -- "$tmp_wrapper" "$RUNTIME_WRAPPER"; then
+      (( installed_guard )) && rm -f -- "$RUNTIME_GUARD"
+      rm -f -- "$tmp_wrapper"; return 0
+    fi
+  else rm -f -- "$tmp_wrapper"; fi
+  chmod 0755 -- "$RUNTIME_GUARD" "$RUNTIME_WRAPPER" 2>/dev/null || true
+  fixed+=("belt runtime/source parity repaired from release")
+}
 
 # The guard and its daemon wrapper are deployed as a pair.  A stale runtime
 # copy can execute an obsolete direct-status recovery path, so fail closed
@@ -1301,6 +1349,7 @@ guard_unshipped_closures() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # Validate relay authority before any guard can attempt a status mutation.
 guard_relay_preflight
+repair_source_runtime_parity
 guard_source_runtime_parity
 guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
