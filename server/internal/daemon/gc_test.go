@@ -583,6 +583,25 @@ func TestShouldCleanTaskDir_OpenIssueArtifactCleanup(t *testing.T) {
 	}
 }
 
+func TestShouldCleanTaskDir_OpenIssueFullCleanupIndependentOfArtifactTTL(t *testing.T) {
+	t.Parallel()
+	issueID := "88888888-8888-8888-8888-88888888888d"
+	mux := http.NewServeMux()
+	mux.HandleFunc(fmt.Sprintf("/api/daemon/issues/%s/gc-check", issueID), func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{"status": "in_progress", "updated_at": time.Now()})
+	})
+	d := newGCTestDaemon(t, mux)
+	d.cfg.GCArtifactTTL = 0
+	d.cfg.GCTTL = 6 * time.Hour
+	taskDir := createTaskDir(t, d.cfg.WorkspacesRoot, "ws1", "open-old", &execenv.GCMeta{
+		IssueID: issueID, WorkspaceID: "ws1", CompletedAt: time.Now().Add(-7 * time.Hour),
+	})
+	if action := d.shouldCleanTaskDir(context.Background(), taskDir); action != gcActionClean {
+		t.Fatalf("expected full cleanup independent of artifact TTL, got %d", action)
+	}
+}
+
 func TestShouldCleanTaskDir_OpenIssueRecentTaskSkipped(t *testing.T) {
 	t.Parallel()
 	issueID := "88888888-8888-8888-8888-888888888889"
@@ -748,7 +767,7 @@ func TestShouldCleanTaskDir_ActiveEnvRootSkipsNoMetaOrphan(t *testing.T) {
 	}
 }
 
-func TestShouldCleanTaskDir_ArtifactTTLDisabled(t *testing.T) {
+func TestShouldCleanTaskDir_ArtifactTTLDisabledStillFullCleans(t *testing.T) {
 	t.Parallel()
 	issueID := "88888888-8888-8888-8888-88888888888b"
 
@@ -769,8 +788,8 @@ func TestShouldCleanTaskDir_ArtifactTTLDisabled(t *testing.T) {
 		CompletedAt: time.Now().Add(-100 * 24 * time.Hour),
 	})
 
-	if action := d.shouldCleanTaskDir(context.Background(), taskDir); action != gcActionSkip {
-		t.Fatalf("expected gcActionSkip when artifact GC disabled, got %d", action)
+	if action := d.shouldCleanTaskDir(context.Background(), taskDir); action != gcActionClean {
+		t.Fatalf("expected full cleanup when artifact GC disabled, got %d", action)
 	}
 }
 

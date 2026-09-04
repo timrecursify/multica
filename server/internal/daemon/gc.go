@@ -59,6 +59,10 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 
 // gcStats accumulates byte counts and per-pattern hit counts for one GC cycle.
 type gcStats struct {
+	eligible        int // candidates meeting a configured cleanup rule
+	skippedLive     int // candidates excluded because a task/process is active
+	skippedRecent   int // candidates retained because their completion is recent
+	removed         int // whole task directories removed
 	cleaned         int // whole task dirs removed (issue done/cancelled)
 	orphaned        int // whole task dirs removed (no meta / unreachable issue)
 	skipped         int // task dirs left untouched
@@ -128,6 +132,10 @@ func (d *Daemon) runGC(ctx context.Context) {
 
 	if stats.pressureTriggered || stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 {
 		d.logger.Info("gc: cycle complete",
+			"eligible", stats.eligible,
+			"skipped_live", stats.skippedLive,
+			"skipped_recent", stats.skippedRecent,
+			"removed", stats.removed,
 			"cleaned", stats.cleaned,
 			"orphaned", stats.orphaned,
 			"skipped", stats.skipped,
@@ -226,6 +234,7 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 			taskDir := filepath.Join(wsDir, entry.Name())
 			if d.isActiveEnvRoot(taskDir) {
 				stats.skipped++
+				stats.skippedLive++
 				continue
 			}
 			meta, metaErr := execenv.ReadGCMeta(taskDir)
@@ -316,6 +325,9 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 		}
 		action := d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
 		action = d.applyLocalDirectoryGCOverride(candidate.meta, action)
+		if action == gcActionSkip && !candidate.meta.CompletedAt.IsZero() && time.Since(candidate.meta.CompletedAt) <= d.cfg.GCTTL {
+			stats.skippedRecent++
+		}
 		cleaned += d.applyGCAction(candidate.taskDir, action, stats)
 	}
 	return cleaned
@@ -326,6 +338,7 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 // reconciliation request is in flight.
 func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) int {
 	if action != gcActionSkip {
+		stats.eligible++
 		release, ok := d.reserveEnvRootForGC(taskDir)
 		if !ok {
 			stats.skipped++
@@ -342,6 +355,7 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		bytes := dirSize(taskDir)
 		d.cleanTaskDir(taskDir)
 		stats.cleaned++
+		stats.removed++
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionOrphan:
@@ -352,6 +366,7 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		bytes := dirSize(taskDir)
 		d.cleanTaskDir(taskDir)
 		stats.orphaned++
+		stats.removed++
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionCleanArtifacts:
@@ -563,8 +578,10 @@ func (d *Daemon) gcDecisionIssue(ctx context.Context, taskDir string, meta *exec
 
 func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, result IssueGCCheckResult) gcAction {
 	// Completion is a local lifecycle fact. Do not retain a finished task solely
-	// because its server-side issue remains open.
-	if d.cfg.GCArtifactTTL > 0 && !meta.CompletedAt.IsZero() && time.Since(meta.CompletedAt) > d.cfg.GCTTL {
+	// because its server-side issue remains open. This full-cleanup clock is
+	// independent of GCArtifactTTL: disabling artifact cleanup must not disable
+	// reclamation of completed task directories.
+	if !meta.CompletedAt.IsZero() && time.Since(meta.CompletedAt) > d.cfg.GCTTL {
 		d.logger.Info("gc: eligible for cleanup", "dir", filepath.Base(taskDir), "kind", "issue", "issue", meta.IssueID, "reason", "local completion")
 		return gcActionClean
 	}
