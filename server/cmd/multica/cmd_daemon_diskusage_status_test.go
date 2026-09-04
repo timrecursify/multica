@@ -30,6 +30,7 @@ func newDiskUsageTestCmd(t *testing.T) *cobra.Command {
 	f.String("output", "table", "")
 	f.String("workspaces-root", "", "")
 	f.Bool("all-profiles", false, "")
+	f.Bool("allow-in-task", false, "")
 	f.String("profile", "", "")
 	f.String("server-url", "", "")
 	return cmd
@@ -451,6 +452,36 @@ func TestRunDaemonDiskUsageTaskContextRejectsWideningFlags(t *testing.T) {
 				t.Fatalf("--%s error = %v, want a task-scope rejection", flag.key, err)
 			}
 		})
+	}
+}
+
+func TestRunDaemonDiskUsageTaskContextAllowsExplicitRootWithOverride(t *testing.T) {
+	pinHumanCLIContext(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(t.TempDir(), "diagnostic-root")
+	if err := os.MkdirAll(filepath.Join(root, "ws", "task", "workdir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "ws", "task", "workdir", "main.go"), []byte("package main"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("MULTICA_AGENT_ID", "agent-test")
+	t.Setenv("MULTICA_TASK_ID", "task-test")
+	t.Setenv(daemon.TaskWorkspacesRootEnv, filepath.Join(t.TempDir(), "injected"))
+	cmd := newDiskUsageTestCmd(t)
+	if err := cmd.Flags().Set("workspaces-root", root); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Flags().Set("allow-in-task", "true"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(t, func() error { return runDaemonDiskUsage(cmd, nil) })
+	if err != nil {
+		t.Fatalf("override run: %v", err)
+	}
+	if !strings.Contains(out, root) {
+		t.Fatalf("output did not scan explicit root %q: %s", root, out)
 	}
 }
 
