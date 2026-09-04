@@ -151,15 +151,13 @@ test('a deploy run on the merge sha keeps the ticket pending until it succeeds',
   assert.equal(calls.length, 0);
 });
 
-test('merged PR whose runs are all cancelled returns to build', async () => {
+test('merged PR whose runs are all cancelled continues through deploy evidence', async () => {
   const calls = dependencies({ receipt: null, gh: () => JSON.stringify({ workflow_runs: [
     { status: 'completed', conclusion: 'cancelled', name: 'CI', path: '.github/workflows/ci.yml' },
   ] }) });
   const result = await worker.routeFinishedPR(issue, 'merged', sha, pr);
-  assert.equal(result.status, 'returned');
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][1], 'In Progress');
-  assert.match(calls[0][3], /merged head CI is cancelled_only/);
+  assert.equal(result.status, 'done');
+  assert.equal(calls[0][1], 'Done');
 });
 
 test('merged PR whose CI lookup throws is held without returning to build', async () => {
@@ -201,7 +199,7 @@ test('cancelled deploy superseded by a later success containing the merge reache
   assert.equal(calls[0][5].mergeDeployReceipt.kind, 'github_deploy_run_superseded');
 });
 
-test('cancelled deploy without qualifying later success returns to build', async () => {
+test('cancelled deploy without qualifying later success is held as undeployed', async () => {
   let deployLookup = 0;
   const gh = (args) => {
     const path = args[1] || '';
@@ -222,11 +220,10 @@ test('cancelled deploy without qualifying later success returns to build', async
   };
   const calls = dependencies({ receipt: null, gh });
   await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
-  assert.equal(calls[0][1], 'In Progress');
-  assert.match(calls[0][3], /deploy run failed/);
+  assert.equal(calls.length, 0);
 });
 
-test('cancelled deploy compare errors remain unresolved', async () => {
+test('cancelled deploy compare errors remain held as undeployed', async () => {
   let deployLookup = 0;
   const gh = (args) => {
     const path = args[1] || '';
@@ -247,8 +244,16 @@ test('cancelled deploy compare errors remain unresolved', async () => {
   };
   const calls = dependencies({ receipt: null, gh });
   await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
-  assert.equal(calls[0][1], 'In Progress');
-  assert.match(calls[0][3], /deploy run failed/);
+  assert.equal(calls.length, 0);
+});
+
+test('third return for the same reason escalates once instead of looping', async () => {
+  const loopIssue = { id: 'loop-issue', number: 99, workspace_id: 'gsp' };
+  const calls = dependencies({ receipt: { source_sha: sha, release: '/r', health: 'ok' } });
+  await worker.returnToBuild(loopIssue, { repo: 'timrecursify/multica', num: 1 }, 'deploy run failed for sha (deploy.yml=failure)');
+  await worker.returnToBuild(loopIssue, { repo: 'timrecursify/multica', num: 1 }, 'deploy run failed for sha (deploy.yml=failure)');
+  await worker.returnToBuild(loopIssue, { repo: 'timrecursify/multica', num: 1 }, 'deploy run failed for sha (deploy.yml=failure)');
+  assert.deepEqual(calls.map(call => call[1]), ['In Progress', 'In Progress', 'Human Review']);
 });
 
 test('a just-merged sha stays pending inside the deploy trigger grace window', () => {
