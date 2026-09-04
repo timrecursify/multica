@@ -89,11 +89,10 @@ file_p0() {
   if [[ $rc -eq 0 ]]; then
     return 0
   fi
-  # sk refuses a second open ticket with the same title (active_duplicate_issue).
-  # That is the escalation ALREADY being filed, not a failure to escalate, but it
-  # was logged as FAILED on every run, so the guard's only error line was noise
-  # and stopped meaning anything. Report it as what it is.
-  if [[ "$out" == *active_duplicate_issue* ]]; then
+  # Equivalent duplicate responses have had several API spellings.  They all
+  # mean an equivalent open P0 already exists; auth and transport failures do
+  # not match and remain actionable errors.
+  if [[ "$out" =~ active_duplicate_issue|duplicate_issue|already[[:space:]_-]+exists|canonical_duplicate|equivalent[[:space:]_-]+open ]]; then
     echo "belt-config-guard: P0 already open for: $title" >&2
     return 0
   fi
@@ -674,16 +673,22 @@ guard_stranded_inprogress() {
     [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
     if [[ "$last" == completed ]]; then
       if relay_transition "$number" "In Review" "$board" >/dev/null 2>&1; then
-        increment_reflight_metadata "$number" "$board" ip_reflies
-        fixed+=("${board}#${number} stranded in In Progress with a completed build; sent forward to QC")
+        if increment_reflight_metadata "$number" "$board" ip_reflies; then
+          fixed+=("${board}#${number} stranded in In Progress with a completed build; sent forward to QC")
+        else
+          unfixable+=("${board}#${number} reached In Review but retry metadata could not be recorded")
+        fi
       else
         unfixable+=("${board}#${number} is stranded in In Progress and could not be sent to QC")
       fi
     elif [[ "$last" == failed ]]; then
       if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
          relay_transition "$number" "Queue" "$board" >/dev/null 2>&1; then
-        increment_reflight_metadata "$number" "$board" ip_reflies
-        fixed+=("${board}#${number} stranded in In Progress with no build; re-driven to the builder")
+        if increment_reflight_metadata "$number" "$board" ip_reflies; then
+          fixed+=("${board}#${number} stranded in In Progress with no build; re-driven to the builder")
+        else
+          unfixable+=("${board}#${number} reached Queue but retry metadata could not be recorded")
+        fi
       else
         unfixable+=("${board}#${number} is stranded in In Progress and could not be re-driven")
       fi
@@ -722,14 +727,16 @@ increment_reflight_metadata() {
 # the same "nothing ever closes" failure the bundling rule exists to prevent.
 # The child is dispositioned, not built: it never had a specification of its own.
 relay_cancel_child() {
-  local child_id="$1" parent_number="$2" agent operator body
+  local child_id="$1" parent_number="$2" agent operator body receipt
   agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' /home/newadmin/gsp-multica/.env | tail -1)
   operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' /home/newadmin/gsp-multica/.env | tail -1)
   [[ -z "$agent" || -z "$operator" ]] && return 1
   body=$(printf '{"issue_id":"%s","to_stage":"Cancelled","agent_token":"%s","reason":"Folded into mega flight gsp#%s (Done), which carried the specification and the change for this report.","evidence":{"boardOwnerAuthority":"belt-config-guard bundled-child rule","reason":"child of completed mega gsp#%s"}}' \
     "$child_id" "$agent" "$parent_number" "$parent_number")
-  curl -s -X POST http://127.0.0.1:5005/relay/advance -H 'content-type: application/json' \
-    -H "x-relay-operator-secret: $operator" -d "$body" | grep -q '"success":true'
+  receipt=$(curl -sS -X POST http://127.0.0.1:5005/relay/advance -H 'content-type: application/json' \
+    -H "x-relay-operator-secret: $operator" -d "$body" 2>&1) || return 1
+  jq -e '(.success == true) and ((.issue.status // .current_status // .status) == "Cancelled")' \
+    >/dev/null 2>&1 <<<"$receipt"
 }
 
 guard_bundled_children() {
@@ -1103,18 +1110,28 @@ guard_unshipped_closures() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
-for f in "${fixed[@]:-}";     do [[ -n "$f" ]] && echo "belt-config-guard: FIXED $f"; done
-for u in "${unfixable[@]:-}"; do [[ -n "$u" ]] && echo "belt-config-guard: UNFIXABLE $u" >&2; done
+# Several guards can observe the same flight in one tick (for example a
+# failed relay hop followed by an aggregate sweep).  Emit each exact finding
+# once so the P0 is stable and one-run idempotent.
+declare -A _seen_fixed=() _seen_unfixable=()
+for f in "${fixed[@]:-}"; do
+  [[ -n "$f" && -z "${_seen_fixed[$f]+x}" ]] || continue
+  _seen_fixed[$f]=1; echo "belt-config-guard: FIXED $f"
+done
+for u in "${unfixable[@]:-}"; do
+  [[ -n "$u" && -z "${_seen_unfixable[$u]+x}" ]] || continue
+  _seen_unfixable[$u]=1; echo "belt-config-guard: UNFIXABLE $u" >&2
+done
 
 if (( ${#unfixable[@]} > 0 )) && [[ -n "${unfixable[0]:-}" ]]; then
   file_p0 "belt config drift the guard could not repair" \
 "Automated by belt-config-guard.sh on gsp-noc2 at $(date -Is).
 
 Could not repair:
-$(printf '  - %s\n' "${unfixable[@]}")
+$(printf '%s\n' "${!_seen_unfixable[@]}" | sort | sed 's/^/  - /')
 
 Repaired automatically this run:
-$(printf '  - %s\n' "${fixed[@]:-none}")"
+$(if ((${#_seen_fixed[@]})); then printf '%s\n' "${!_seen_fixed[@]}" | sort | sed 's/^/  - /'; else printf '  - none\n'; fi)"
 fi
 echo "belt-config-guard: fixed=${#fixed[@]} unfixable=${#unfixable[@]}"
 fi
