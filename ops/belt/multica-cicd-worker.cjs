@@ -151,8 +151,10 @@ async function watchdogFailure(issue, error, sha = '') {
     return { stalled: true, audit: stalled };
   }
   if (!watchdog.retryAllowed(row)) {
-    log(`HOLD #${issue.number} retry limit reached; awaiting sentinel threshold correlation_key=${row.correlation_key}`);
-    return { stalled: false, audit: row };
+    const detail = `deploy_retry_exhausted issue=${issue.id} stage=${row.stage} attempts=${row.attempts} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
+    log(`TERMINAL #${issue.number} retry limit exhausted before sentinel; escalating correlation_key=${row.correlation_key}`);
+    await humanReview(issue, detail);
+    return { stalled: true, audit: row };
   }
   log(`RETRY #${issue.number} attempt=${row.attempts}/${RETRY_LIMIT} backoff_ms=${watchdog.backoffMs(row)} correlation_key=${row.correlation_key}`);
   return { stalled: false, audit: row };

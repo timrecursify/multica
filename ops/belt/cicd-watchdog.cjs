@@ -31,6 +31,18 @@ function createWatchdog({ file, now = () => Date.now() } = {}) {
     const key = keyFor(issueId, stage); const t = now();
     const row = state[key] || { issue_id: issueId, stage, first_seen_at: new Date(t).toISOString(), attempts: 0,
       correlation_key: correlationKey(issueId, sha), alerted: false };
+    // A new commit is a new deployment attempt-set.  Keep the durable row key,
+    // but discard the old clock/backoff and latched alert so a repaired ticket
+    // can be driven again.
+    if (sha && row.commit_sha && row.commit_sha !== sha) {
+      row.first_seen_at = new Date(t).toISOString();
+      row.attempts = 0;
+      row.alerted = false;
+      row.correlation_key = correlationKey(issueId, sha);
+      delete row.alerted_at;
+      delete row.outcome;
+      delete row.last_error;
+    }
     row.last_attempt_at = new Date(t).toISOString(); row.last_seen_at = row.last_attempt_at;
     row.attempts += 1; if (sha) row.commit_sha = sha; if (outcome) row.outcome = outcome;
     if (error) row.last_error = String(error).slice(0, 500);
