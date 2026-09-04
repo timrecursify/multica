@@ -33,6 +33,11 @@ type Options struct {
 	// TickTimeout bounds a complete scheduler tick, including database
 	// reads and job handlers. Zero uses the safe default of one minute.
 	TickTimeout time.Duration
+
+	// DBNow returns the canonical database time used for plan and lease
+	// decisions. It is injectable for deterministic scheduler tests; when
+	// unset, the production database clock is used.
+	DBNow func(context.Context, *pgxpool.Pool) (time.Time, error)
 }
 
 // TickMetrics is a small, durable in-process freshness signal. The Unix
@@ -85,6 +90,9 @@ func NewManager(pool *pgxpool.Pool, opts Options) *Manager {
 	}
 	if opts.TickTimeout <= 0 {
 		opts.TickTimeout = time.Minute
+	}
+	if opts.DBNow == nil {
+		opts.DBNow = dbNow
 	}
 	return &Manager{
 		pool:   pool,
@@ -208,7 +216,7 @@ func tickOutcome(err error) string {
 }
 
 func (m *Manager) runOnce(ctx context.Context) error {
-	now, err := dbNow(ctx, m.pool)
+	now, err := m.opts.DBNow(ctx, m.pool)
 	if err != nil {
 		return err
 	}
