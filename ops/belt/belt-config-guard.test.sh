@@ -137,6 +137,14 @@ if [[ "$spec_metadata_source" != *'RETURNING number;'* || "$spec_metadata_source
   echo 'stranded-Spec retry metadata update does not reject zero-row/concurrent updates' >&2
   exit 1
 fi
+# In-Progress re-flights use the shared retry helper too; it must reject a
+# zero-row UPDATE rather than reporting success after an exhausted/concurrent
+# counter gate.
+reflight_metadata_source=$(sed -n '/^increment_reflight_metadata()/,/^# A bundled child/p' "$root_dir/belt-config-guard.sh")
+if [[ "$reflight_metadata_source" != *'RETURNING number;'* || "$reflight_metadata_source" != *'== "$number"'* ]]; then
+  echo 'In-Progress retry metadata update does not reject zero-row/concurrent updates' >&2
+  exit 1
+fi
 # Every stage mutation must pass through the shared relay helper; a direct CLI
 # advance can bypass the migration-297 transaction-local authority guard.
 if grep -En '\$SK.*multica advance' "$root_dir/belt-config-guard.sh" >/dev/null; then
