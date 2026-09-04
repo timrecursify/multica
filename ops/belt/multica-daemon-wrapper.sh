@@ -2,6 +2,14 @@
 # shellcheck disable=SC1091
 set -euo pipefail
 
+# A belt task that restarts this worker leaks its own task context into pm2's
+# saved process definition. The daemon then refuses every start with
+# "daemon start is not available inside a daemon-managed task", and pm2
+# re-injects the same environment on every retry, so the worker can never
+# recover on its own. This process is the supervisor, never a task.
+unset MULTICA_TASK_ID MULTICA_TASK_SLOT MULTICA_TASK_CONFIG_ROOT \
+      MULTICA_TASK_WORKSPACES_ROOT MULTICA_AGENT_ID
+
 # Paid lane remains explicitly opt-in.
 export MULTICA_ALLOW_PAID_LANE="${MULTICA_ALLOW_PAID_LANE:-0}"
 requested_codex_bin="${CODEX_BIN:-/home/newadmin/tools/codex-native}"
