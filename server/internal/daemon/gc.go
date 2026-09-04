@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/daemon/execenv"
@@ -203,14 +202,6 @@ func (d *Daemon) reclaimUnderPressure(ctx context.Context, root string, stats *g
 		}
 	}
 	d.logger.Info("gc: pressure pass", "triggered", true, "free_bytes", free, "floor_bytes", d.cfg.GCFreeSpaceFloor, "target_bytes", target, "candidates", len(candidates))
-}
-
-func filesystemFreeBytes(path string) (uint64, bool) {
-	var stat syscall.Statfs_t
-	if err := syscall.Statfs(path, &stat); err != nil {
-		return 0, false
-	}
-	return stat.Bavail * uint64(stat.Bsize), true
 }
 
 // gcWorkspace scans task directories inside a single workspace directory.
