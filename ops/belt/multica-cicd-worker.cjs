@@ -340,7 +340,15 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     ci = 'green';
     log(`CI N/A #${issue.number} ${pr.repo} has no workflows or check suites`);
   }
-  if (ci !== 'green' && ci !== 'cancelled_only') {
+  // A merge may have been authorized retroactively while CI was still queued.
+  // Re-check that authorization here, then continue to the deploy-evidence
+  // gate; CI queue state alone must not strand an already deployed ticket.
+  const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && pr.num != null
+    ? retroactiveEligible(pr.repo, pr.num) : null;
+  // Preserve the historical cancelled-only path for callers that do not have
+  // a PR number (the sweep always supplies one and enforces eligibility).
+  const retroactiveMerge = Boolean(retro?.ok) || (ci === 'cancelled_only' && pr.num == null);
+  if (ci !== 'green' && !retroactiveMerge) {
     if (ci === 'absent' || ['red', 'mixed'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
     } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
@@ -371,7 +379,9 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return { status: 'pending', sha: mergedSha }; }
   const noVerdict = !latest;
   const reviewedSha = noVerdict ? mergedSha : latest.bound_sha || mergedSha;
-  const evidence = { ciSuccess: true, mergeDeployReceipt: deploy.evidence, reviewedSha,
+  const evidence = { ciSuccess: retroactiveMerge ? 'retroactive' : true,
+    ...(retroactiveMerge ? { retroactiveMerge: true } : {}),
+    mergeDeployReceipt: deploy.evidence, reviewedSha,
     qualifyingPass: !noVerdict, ...(noVerdict ? { noVerdict: true } : {}) };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Done', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Done: ${verdict.code}`);
@@ -622,7 +632,7 @@ async function sweep() {
         }
         const last = merged[0];
         const result = await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
-          repo: last.pr.repo, headSha: last.info.headRefOid, createdAt: last.info.createdAt,
+          repo: last.pr.repo, num: last.pr.num, headSha: last.info.headRefOid, createdAt: last.info.createdAt,
           mergedAt: last.info.mergedAt
         });
         if (result?.status === 'pending') await closureWatchdog(issue, result, last.info.mergeCommit.oid);

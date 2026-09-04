@@ -46,6 +46,34 @@ test('Done relay carries the locally evaluated shipped evidence', async () => {
   assert.equal(calls[0][5].reviewedSha, sha);
 });
 
+test('eligible pending CI reaches Done with truthful retroactive evidence', async () => {
+  const receipt = { source_sha: sha, release: `/releases/${sha}`, health: 'ok' };
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{ status: 'queued', conclusion: null }] });
+    if (path.includes('/pulls/17/files')) return JSON.stringify([{ filename: 'src/worker.js' }]);
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt, gh });
+  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, num: '17' });
+  assert.equal(calls[0][1], 'Done');
+  assert.equal(calls[0][5].ciSuccess, 'retroactive');
+  assert.equal(calls[0][5].retroactiveMerge, true);
+});
+
+test('risk-path pending CI remains held', async () => {
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{ status: 'queued', conclusion: null }] });
+    if (path.includes('/pulls/17/files')) return JSON.stringify([{ filename: 'migrations/001.sql' }]);
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: null, gh });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, num: '17' });
+  assert.equal(result.status, 'returned');
+  assert.equal(calls.length, 0);
+});
+
 test('PASS verdict with a null work-product MD5 still reaches Done', async () => {
   const receipt = { source_sha: sha, release: `/releases/${sha}`, health: 'ok' };
   const calls = dependencies({ receipt, verdict: { verdict: 'PASS', work_product_md5: null } });
