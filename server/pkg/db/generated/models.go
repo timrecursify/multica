@@ -937,6 +937,7 @@ type RelayRunLog struct {
 	TaskID    pgtype.UUID        `json:"task_id"`
 	Status    string             `json:"status"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	Reason    pgtype.Text        `json:"reason"`
 }
 
 type RelayStageAgentPool struct {
