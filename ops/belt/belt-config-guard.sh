@@ -108,12 +108,17 @@ validated_release_wrapper() {
     release="${candidate_guard%/ops/belt/belt-config-guard.sh}"
     candidate_wrapper="$release/ops/belt/multica-daemon-wrapper.sh"
     [[ -d "$release" && ! -L "$release" && -r "$candidate_wrapper" ]] || continue
+    # A release is identified by its immutable commit directory.  Merely
+    # finding two matching blobs is insufficient: a copied/misnamed release
+    # could otherwise supply an unreviewed wrapper.
+    [[ "$(basename -- "$release")" =~ ^[0-9a-f]{40}$ ]] || continue
     [[ "$(sha256sum -- "$candidate_guard" 2>/dev/null | awk '{print $1}')" == "$guard_sha" ]] || continue
     metadata="$release/.gsp-belt-release.json"
     [[ -r "$metadata" ]] || continue
     source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
     manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
-    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ ]] || continue
+    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ &&
+       "${source_sha,,}" == "$(basename -- "$release")" ]] || continue
     printf '%s\n' "$candidate_wrapper"
     return 0
   done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
@@ -163,6 +168,7 @@ repair_source_runtime_parity() {
   while IFS= read -r candidate_guard; do
     release="${candidate_guard%/ops/belt/belt-config-guard.sh}"
     [[ -d "$release" && ! -L "$release" ]] || { release=''; continue; }
+    [[ "$(basename -- "$release")" =~ ^[0-9a-f]{40}$ ]] || { release=''; continue; }
     candidate_wrapper="$release/ops/belt/multica-daemon-wrapper.sh"
     [[ -r "$candidate_wrapper" ]] || { release=''; continue; }
     [[ "$(sha256sum -- "$candidate_guard" | awk '{print $1}')" == "$guard_sha" ]] || { release=''; continue; }
@@ -171,7 +177,8 @@ repair_source_runtime_parity() {
     [[ -r "$metadata" ]] || { release=''; continue; }
     source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
     manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
-    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ ]] || { release=''; continue; }
+    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ &&
+       "${source_sha,,}" == "$(basename -- "$release")" ]] || { release=''; continue; }
     break
   done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
   [[ -n "$release" ]] || {
