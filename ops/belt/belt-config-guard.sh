@@ -938,10 +938,16 @@ spec_refly_receipt_valid() {
 
 spec_refly_increment_metadata() {
   local number="$1" board="${2:-gsp}"
-  "${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+  local updated
+  # Treat an exhausted/concurrent retry gate as a refusal.  psql exits zero
+  # for UPDATE 0, which previously made a second guard run claim a repair even
+  # though no counter changed (and made the success report non-idempotent).
+  updated=$("${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
     jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
     WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END AND status='Queue'
-      AND parent_issue_id IS NULL AND coalesce(metadata->>'spec_reflies','0')::int < 3;" >/dev/null 2>&1 </dev/null
+      AND parent_issue_id IS NULL AND coalesce(metadata->>'spec_reflies','0')::int < 3
+    RETURNING number;" 2>/dev/null </dev/null) || return 1
+  [[ "$(printf '%s' "$updated" | tr -d '[:space:]')" == "$number" ]]
 }
 
 done_receipt_valid() {
