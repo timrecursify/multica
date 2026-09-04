@@ -47,7 +47,7 @@ const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
 const ciFailureCounts = new Map();
 const watchdog = createWatchdog({ file: process.env.CICD_WATCHDOG_STATE || `${RECEIPT_ROOT}/cicd-watchdog.json` });
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+let log = (...a) => console.log(new Date().toISOString(), ...a);
 
 let gh = function github(args) {
   // GraphQL (gh pr view/merge) shares one per-user quota with every operator
@@ -518,7 +518,12 @@ async function sweep() {
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
       }
     } catch (e) {
-      const failure = await watchdogFailure(issue, e.message);
+      let failure = { stalled: false };
+      try {
+        failure = await watchdogFailure(issue, e.message);
+      } catch (escalationError) {
+        log(`ESCALATE-FAIL #${issue.number}: ${String(escalationError.message).split('\n')[0].slice(0, 160)}`);
+      }
       log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}${failure.stalled ? ' (Human Review)' : ''}`);
     }
   }
@@ -541,6 +546,7 @@ function setTestDependencies(dependencies) {
   if (dependencies.relay) relay = dependencies.relay;
   if (dependencies.gh) gh = dependencies.gh;
   if (dependencies.readReceipt) readReceipt = dependencies.readReceipt;
+  if (dependencies.log) log = dependencies.log;
 }
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
