@@ -1,0 +1,13 @@
+[Unit]
+Description=Emit backup lane age metrics
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gsp-backup-age-emitter.sh
+StandardOutput=journal
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
