@@ -115,6 +115,25 @@ func TestBuildSearchQuery_MultiTermUsesMaterializedCandidateIntersection(t *test
 	}
 }
 
+func TestBuildSearchQuery_SingleTermUsesWorkspaceScopedCandidates(t *testing.T) {
+	query, _ := buildSearchQuery(linearTestContract, "vendor", []string{"vendor"}, 0, false, false)
+
+	if !strings.Contains(query, "WITH matching_issue_ids AS MATERIALIZED") {
+		t.Fatalf("single-term search must narrow candidates before ranking: %s", query)
+	}
+	if !strings.Contains(query, "SELECT c.issue_id FROM comment c") || !strings.Contains(query, "c.workspace_id = $4") {
+		t.Fatalf("single-term candidate lookup is not workspace-scoped: %s", query)
+	}
+	whereStart := strings.LastIndex(query, "\n\tWHERE i.workspace_id = ")
+	orderStart := strings.LastIndex(query, "ORDER BY ")
+	if whereStart == -1 || orderStart <= whereStart {
+		t.Fatalf("query does not contain a bounded outer WHERE clause: %s", query)
+	}
+	if strings.Contains(query[whereStart:orderStart], "EXISTS (SELECT 1 FROM comment") {
+		t.Fatalf("outer WHERE still performs a correlated comment scan: %s", query[whereStart:orderStart])
+	}
+}
+
 func TestBuildSearchQuery_WithNumber(t *testing.T) {
 	query, args := buildSearchQuery(linearTestContract, "MUL-42", []string{"MUL-42"}, 42, true, false)
 
