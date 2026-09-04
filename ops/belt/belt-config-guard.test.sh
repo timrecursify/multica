@@ -197,7 +197,7 @@ if [[ "$redacted_diag" == *super-secret* || "$redacted_diag" == *abc123* ]]; the
   echo 'relay diagnostic leaked a secret' >&2; exit 1
 fi
 # Source/runtime parity is checked against only the deployed guard and wrapper
-# locations, and drift must fail closed before a relay status write.
+# locations; readable source drift is repaired atomically.
 parity_root="$(mktemp -d)"
 mkdir -p "$parity_root/tools" "$parity_root/gsp-multica/fleet"
 cp "$root_dir/belt-config-guard.sh" "$parity_root/tools/belt-config-guard.sh"
@@ -205,9 +205,16 @@ cp "$root_dir/multica-daemon-wrapper.sh" "$parity_root/gsp-multica/fleet/multica
 parity_ok=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$parity_root" bash -c 'source "$1"; fixed=(); unfixable=(); guard_source_runtime_parity; printf "%s|%s" "$PARITY_OK" "${#unfixable[@]}"' _ "$root_dir/belt-config-guard.sh")
 assert_eq '1|0' "$parity_ok" 'matching source/runtime digests'
 printf '%s\n' 'stale-runtime' >>"$parity_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
-parity_drift=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$parity_root" bash -c 'source "$1"; fixed=(); unfixable=(); guard_source_runtime_parity; RELAY_PREFLIGHT_OK=1; relay_transition 1772 Queue gsp >/dev/null 2>&1; printf "%s|%s|%s" "$PARITY_OK" "${#unfixable[@]}" "${RELAY_TRANSITION_CLASS}"' _ "$root_dir/belt-config-guard.sh")
-assert_eq '0|1|configuration' "$parity_drift" 'digest drift is unfixable and blocks status writes'
+parity_drift=$(BELT_SOURCE_ROOT="$root_dir" BELT_RUNTIME_ROOT="$parity_root" bash -c 'source "$1"; fixed=(); unfixable=(); guard_source_runtime_parity; printf "%s|%s|%s|%s" "$PARITY_OK" "${#unfixable[@]}" "${#fixed[@]}" "$(stat -c %a "$RUNTIME_WRAPPER")"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '1|0|1|755' "$parity_drift" 'digest drift is repaired from readable source'
 rm -rf -- "$parity_root"
+
+unreadable_root="$(mktemp -d)"; mkdir -p "$unreadable_root/tools" "$unreadable_root/gsp-multica/fleet"
+cp "$root_dir/belt-config-guard.sh" "$unreadable_root/tools/belt-config-guard.sh"
+printf '%s\n' runtime-wrapper >"$unreadable_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
+unreadable_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_SOURCE_WRAPPER="$unreadable_root/missing-wrapper.sh" BELT_RUNTIME_ROOT="$unreadable_root" bash -c 'source "$1"; fixed=(); unfixable=(); guard_source_runtime_parity; printf "%s|%s|%s" "$PARITY_OK" "${#unfixable[@]}" "$(cat "$RUNTIME_WRAPPER")"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '0|1|runtime-wrapper' "$unreadable_result" 'unreadable source remains fail-closed and untouched'
+rm -rf -- "$unreadable_root"
 
 # A missing wrapper is repaired only from a complete release containing both
 # exact source blobs; an incomplete release leaves runtime files untouched.
