@@ -8,7 +8,7 @@ set -euo pipefail
 # re-injects the same environment on every retry, so the worker can never
 # recover on its own. This process is the supervisor, never a task.
 unset MULTICA_TASK_ID MULTICA_TASK_SLOT MULTICA_TASK_CONFIG_ROOT \
-      MULTICA_TASK_WORKSPACES_ROOT
+      MULTICA_TASK_WORKSPACES_ROOT MULTICA_AGENT_ID
 
 # Paid lane remains explicitly opt-in.
 export MULTICA_ALLOW_PAID_LANE="${MULTICA_ALLOW_PAID_LANE:-0}"
