@@ -194,14 +194,14 @@ repair_source_runtime_parity() {
 # the source tree and the two expected runtime locations; no broad filesystem
 # search is performed.
 guard_source_runtime_parity() {
-  local source_file runtime_file source_sha runtime_sha label
+  local source_file runtime_file source_sha runtime_sha label runtime_dir staging
   for label in guard wrapper; do
     if [[ "$label" == guard ]]; then
       source_file="$GUARD_SOURCE"; runtime_file="$RUNTIME_GUARD"
     else
       source_file="$WRAPPER_SOURCE"; runtime_file="$RUNTIME_WRAPPER"
     fi
-    if [[ ! -r "$source_file" || ! -r "$runtime_file" ]]; then
+    if [[ ! -r "$source_file" ]]; then
       PARITY_OK=0
       PARITY_DIAGNOSTIC="phase=parity ${label}=missing"
       unfixable+=("belt runtime/source digest drift: ${PARITY_DIAGNOSTIC}")
@@ -209,7 +209,27 @@ guard_source_runtime_parity() {
     fi
     source_sha=$(sha256sum -- "$source_file" 2>/dev/null | awk '{print $1}')
     runtime_sha=$(sha256sum -- "$runtime_file" 2>/dev/null | awk '{print $1}')
-    if [[ ! "$source_sha" =~ ^[0-9a-f]{64}$ || "$source_sha" != "$runtime_sha" ]]; then
+    if [[ "$source_sha" =~ ^[0-9a-f]{64}$ && "$source_sha" != "$runtime_sha" ]]; then
+      # Runtime copies are disposable deployment artifacts. Repair a missing
+      # or stale member directly from the readable source, using a temporary
+      # file in the runtime directory so readers never observe a partial copy.
+      runtime_dir=$(dirname -- "$runtime_file")
+      staging=''
+      if mkdir -p -- "$runtime_dir" 2>/dev/null &&
+         staging=$(mktemp "${runtime_dir}/.parity.XXXXXX" 2>/dev/null) &&
+         cp -- "$source_file" "$staging" 2>/dev/null &&
+         chmod 0755 -- "$staging" 2>/dev/null &&
+         mv -f -- "$staging" "$runtime_file" 2>/dev/null &&
+         runtime_sha=$(sha256sum -- "$runtime_file" 2>/dev/null | awk '{print $1}') &&
+         [[ "$runtime_sha" == "$source_sha" ]]; then
+        fixed+=("belt runtime/source parity repaired from source")
+        continue
+      fi
+      [[ -z "$staging" ]] || rm -f -- "$staging"
+      PARITY_OK=0
+      PARITY_DIAGNOSTIC="phase=parity ${label}=digest-mismatch"
+      unfixable+=("belt runtime/source digest drift: ${PARITY_DIAGNOSTIC}")
+    elif [[ ! "$source_sha" =~ ^[0-9a-f]{64}$ || "$source_sha" != "$runtime_sha" ]]; then
       PARITY_OK=0
       PARITY_DIAGNOSTIC="phase=parity ${label}=digest-mismatch"
       unfixable+=("belt runtime/source digest drift: ${PARITY_DIAGNOSTIC}")
