@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 
@@ -36,19 +37,38 @@ func (h *Handler) RelayReconcileStale(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rows, err := h.DB.Query(r.Context(), `SELECT i.id FROM issue i WHERE i.workspace_id=$1 AND i.status IN ('In Review','CI/CD & Deploy') AND i.updated_at < now() - interval '60 minutes' AND NOT EXISTS (SELECT 1 FROM relay_run_log l WHERE l.issue_id=i.id AND l.status='completed')`, ws)
+	rows, err := h.DB.Query(r.Context(), `
+		SELECT i.id
+		FROM issue i
+		JOIN relay_stage_config edge ON edge.workspace_id = i.workspace_id
+			AND edge.stage_name = i.status
+		WHERE i.workspace_id = $1
+		  AND i.updated_at < now() - interval '60 minutes'
+		  AND (edge.next_stage = 'Done' OR 'Done' = ANY(edge.alt_next_stages))
+		  AND NOT EXISTS (
+			SELECT 1 FROM relay_run_log l
+			WHERE l.issue_id = i.id AND l.status = 'completed'
+		  )
+		ORDER BY i.id`, ws)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to scan stale relays")
 		return
 	}
-	defer rows.Close()
 	result := relayReconcileResult{}
+	var staleIDs []pgtype.UUID
 	for rows.Next() {
 		var id pgtype.UUID
 		if err := rows.Scan(&id); err != nil {
 			result.Failed++
 			continue
 		}
+		staleIDs = append(staleIDs, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		result.Failed++
+	}
+	for _, id := range staleIDs {
 		result.Scanned++
 		body, _ := json.Marshal(RelayAdvanceStageRequest{IssueID: uuidToString(id), ToStage: "Done"})
 		rec := &bufferResponseWriter{header: make(http.Header)}
@@ -59,16 +79,24 @@ func (h *Handler) RelayReconcileStale(w http.ResponseWriter, r *http.Request) {
 			result.Recovered++
 		} else if rec.status == http.StatusConflict || rec.status == http.StatusBadRequest {
 			result.Rejected++
-			_ = h.recordRelayReconcileFailure(r.Context(), id, rec.statusText())
+			_ = h.recordRelayReconcileFailure(r.Context(), id, relayFailureReason(rec.statusText()))
 		} else {
 			result.Failed++
 		}
 	}
-	if err := rows.Err(); err != nil {
-		result.Failed++
-	}
 	slog.Info("relay stale reconciliation completed", "workspace_id", req.WorkspaceID, "scanned", result.Scanned, "recovered", result.Recovered, "rejected", result.Rejected, "failed", result.Failed)
 	writeJSON(w, http.StatusOK, result)
+}
+
+func relayFailureReason(body string) string {
+	var e relayError
+	if json.Unmarshal([]byte(body), &e) == nil && e.Error != "" {
+		if e.Message != "" {
+			return fmt.Sprintf("%s: %s", e.Error, e.Message)
+		}
+		return e.Error
+	}
+	return body
 }
 
 func (h *Handler) recordRelayReconcileFailure(ctx context.Context, id pgtype.UUID, reason string) error {
