@@ -472,6 +472,31 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	// semantics for multi-word queries, while the single-term CTE is simply the
 	// union of title, description, and comment matches.
 	ctePrefix := ""
+	commentJoin := ""
+	// Materialize the latest matching comment once per issue.  The previous
+	// ranking and snippet expressions each ran a correlated scan over comment
+	// for every candidate issue, which made broad workspaces hit the statement
+	// timeout even after candidate narrowing.  Keep the workspace predicate in
+	// the CTE so the planner can use the workspace/content indexes.
+	if len(termContainsParams) > 0 {
+		commentMatch := fmt.Sprintf("LOWER(c.content) LIKE %s", phraseContainsParam)
+		allTerms := "false"
+		if len(termContainsParams) > 1 {
+			var parts []string
+			for _, tp := range termContainsParams {
+				parts = append(parts, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
+			}
+			allTerms = "(" + strings.Join(parts, " AND ") + ")"
+			commentMatch += " OR " + allTerms
+		}
+		commentJoin = " LEFT JOIN matching_comments mc ON mc.issue_id = i.id"
+		ctePrefix = fmt.Sprintf(`WITH matching_comments AS MATERIALIZED (
+			SELECT DISTINCT ON (c.issue_id) c.issue_id, c.content, %s AS matches_all_terms
+			FROM comment c
+			WHERE c.workspace_id = %s AND (%s)
+			ORDER BY c.issue_id, c.created_at DESC
+		), matching_issue_ids AS MATERIALIZED (`, allTerms, wsParam, commentMatch)
+	}
 	if len(termContainsParams) > 0 {
 		var termCandidates []string
 		for _, tp := range termContainsParams {
@@ -484,7 +509,10 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 				WHERE c.workspace_id = %s AND LOWER(c.content) LIKE %s
 			) AS term_candidates`, wsParam, tp, tp, wsParam, tp))
 		}
-		ctePrefix = "WITH matching_issue_ids AS MATERIALIZED (" + strings.Join(termCandidates, " INTERSECT ") + ") "
+		if ctePrefix == "" {
+			ctePrefix = "WITH matching_issue_ids AS MATERIALIZED ("
+		}
+		ctePrefix += strings.Join(termCandidates, " INTERSECT ") + ") "
 		whereParts = append(whereParts, "i.id IN (SELECT id FROM matching_issue_ids)")
 	}
 
@@ -542,15 +570,11 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 
 	// Tier 7: Comment contains phrase. Same workspace_id-in-subquery
 	// contract as the WHERE clause; see the phraseMatch comment above.
-	rankCases = append(rankCases, fmt.Sprintf("WHEN EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s) THEN 7", wsParam, phraseContainsParam))
+	rankCases = append(rankCases, "WHEN mc.issue_id IS NOT NULL THEN 7")
 
 	// Tier 8: Comment matches all words (multi-word only)
 	if len(termContainsParams) > 1 {
-		var commentTerms []string
-		for _, tp := range termContainsParams {
-			commentTerms = append(commentTerms, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
-		}
-		rankCases = append(rankCases, fmt.Sprintf("WHEN EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND (%s)) THEN 8", wsParam, strings.Join(commentTerms, " AND ")))
+		rankCases = append(rankCases, "WHEN mc.matches_all_terms THEN 8")
 	}
 
 	rankExpr := "CASE " + strings.Join(rankCases, " ") + " ELSE 9 END"
@@ -621,25 +645,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	// The c.workspace_id filter mirrors the WHERE clause: without it,
 	// the planner can pick a global comment scan that ignores workspace
 	// scoping.
-	commentSubquery := fmt.Sprintf(`COALESCE(
-		(SELECT c.content FROM comment c
-		 WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s
-		 ORDER BY c.created_at DESC LIMIT 1),
-		''
-	)`, wsParam, phraseContainsParam)
-
-	if len(termContainsParams) > 1 {
-		var commentTerms []string
-		for _, tp := range termContainsParams {
-			commentTerms = append(commentTerms, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
-		}
-		commentSubquery = fmt.Sprintf(`COALESCE(
-			(SELECT c.content FROM comment c
-			 WHERE c.issue_id = i.id AND c.workspace_id = %s AND (LOWER(c.content) LIKE %s OR (%s))
-			 ORDER BY c.created_at DESC LIMIT 1),
-			''
-		)`, wsParam, phraseContainsParam, strings.Join(commentTerms, " AND "))
-	}
+	commentSubquery := "COALESCE(mc.content, '')"
 
 	limitParam := nextArg(nil)  // placeholder
 	offsetParam := nextArg(nil) // placeholder
@@ -666,6 +672,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 		limitParam,
 		offsetParam,
 	)
+	query = strings.Replace(query, "FROM issue i\n\tWHERE", "FROM issue i"+commentJoin+"\n\tWHERE", 1)
 
 	return query, args
 }
