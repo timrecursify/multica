@@ -8,6 +8,7 @@ process.env.CICD_RETROACTIVE_REPOS = 'timrecursify/multica';
 // Pinned so an operator shell exporting CICD_MERGE_ENABLED=0 cannot turn the
 // retro test's merge assertion into a 'green but merging disabled' hold.
 process.env.CICD_MERGE_ENABLED = '1';
+process.env.CICD_DEPLOY_CANCEL_RETRY_LIMIT = '3';
 process.env.CICD_WATCHDOG_STATE = require('path')
   .join(require('os').tmpdir(), `cicd-watchdog-test-${process.pid}.json`);
 const worker = require('./multica-cicd-worker.cjs');
@@ -221,6 +222,30 @@ test('cancelled deploy without qualifying later success is held as undeployed', 
   const calls = dependencies({ receipt: null, gh });
   await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
   assert.equal(calls.length, 0);
+});
+
+test('cancelled deploy reruns by run id and caps repeated rerun failures', async () => {
+  const retryIssue = { id: 'retry-issue', number: 77 };
+  const updates = [];
+  const ghCalls = [];
+  worker.setTestDependencies({
+    pool: { query: async (_sql, params) => { updates.push(params); return { rows: [] }; } },
+    gh: (args) => { ghCalls.push(args); throw new Error('rerun unavailable'); },
+    log: () => {}
+  });
+  const cancelled = [{ id: 321, path: '.github/workflows/deploy-billing-server.yml' }];
+  for (let i = 0; i < 3; i += 1) {
+    const result = await worker.retriggerCancelledDeploys(retryIssue, 'timrecursify/ppp', sha, cancelled);
+    assert.equal(result.capped, i === 2 ? 1 : 0);
+  }
+  const capped = await worker.retriggerCancelledDeploys(retryIssue, 'timrecursify/ppp', sha, cancelled);
+  assert.equal(capped.capped, 1);
+  assert.equal(ghCalls.length, 3);
+  assert.deepEqual(ghCalls[0], ['run', 'rerun', '321', '--repo', 'timrecursify/ppp']);
+  const persisted = updates.filter(params => params.length === 3);
+  assert.equal(persisted.length, 3);
+  assert.deepEqual(persisted.map(params => params[2]), [1, 2, 3]);
+  worker.setTestDependencies({ log: defaultLog });
 });
 
 test('cancelled deploy compare errors remain held as undeployed', async () => {
