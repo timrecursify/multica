@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -28,16 +29,45 @@ type Options struct {
 	// Logger is used for structured logs. nil defaults to
 	// slog.Default().
 	Logger *slog.Logger
+
+	// TickTimeout bounds a complete scheduler tick, including database
+	// reads and job handlers. Zero uses the safe default of one minute.
+	TickTimeout time.Duration
+}
+
+// TickMetrics is a small, durable in-process freshness signal. The Unix
+// timestamps are updated atomically so health/metrics readers never block a
+// scheduler tick.
+type TickMetrics struct {
+	started, completed        atomic.Int64
+	total, failures, timeouts atomic.Uint64
+}
+
+// ErrTickInProgress indicates that a previous tick has not returned yet.
+var ErrTickInProgress = errors.New("scheduler: tick already in progress")
+
+func (m *TickMetrics) StartedAt() time.Time   { return unixTime(m.started.Load()) }
+func (m *TickMetrics) CompletedAt() time.Time { return unixTime(m.completed.Load()) }
+func (m *TickMetrics) Total() uint64          { return m.total.Load() }
+func (m *TickMetrics) Failures() uint64       { return m.failures.Load() }
+func (m *TickMetrics) Timeouts() uint64       { return m.timeouts.Load() }
+func unixTime(v int64) time.Time {
+	if v == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, v)
 }
 
 // Manager is the per-process scheduler. Register one or more jobs and
 // call Run with a cancellable context.
 type Manager struct {
-	pool   *pgxpool.Pool
-	opts   Options
-	jobs   map[string]*JobSpec
-	mu     sync.RWMutex
-	logger *slog.Logger
+	pool        *pgxpool.Pool
+	opts        Options
+	jobs        map[string]*JobSpec
+	mu          sync.RWMutex
+	logger      *slog.Logger
+	tickMetrics TickMetrics
+	tickRunning atomic.Bool
 }
 
 // NewManager constructs a Manager. The pool MUST point at the database
@@ -53,6 +83,9 @@ func NewManager(pool *pgxpool.Pool, opts Options) *Manager {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	if opts.TickTimeout <= 0 {
+		opts.TickTimeout = time.Minute
+	}
 	return &Manager{
 		pool:   pool,
 		opts:   opts,
@@ -60,6 +93,9 @@ func NewManager(pool *pgxpool.Pool, opts Options) *Manager {
 		logger: opts.Logger.With("component", "scheduler", "runner_id", opts.RunnerID),
 	}
 }
+
+// Metrics returns the manager's tick freshness and outcome counters.
+func (m *Manager) Metrics() *TickMetrics { return &m.tickMetrics }
 
 // Register adds a job to the manager. Must be called before Run; later
 // registrations are also accepted but the new job will not tick until
@@ -122,17 +158,74 @@ func (m *Manager) Run(ctx context.Context) error {
 // for tests, one-shot CLIs, and any caller that wants to drive the
 // scheduler without owning a goroutine.
 func (m *Manager) RunOnce(ctx context.Context) error {
+	// RunOnce is deliberately serialized for callers that drive ticks from
+	// multiple goroutines. A timed child context ensures a wedged handler cannot
+	// prevent the ticker loop from recovering on its next tick.
+	if !m.tickRunning.CompareAndSwap(false, true) {
+		m.tickMetrics.failures.Add(1)
+		return ErrTickInProgress
+	}
+	start := time.Now()
+	m.tickMetrics.started.Store(start.UnixNano())
+	m.tickMetrics.total.Add(1)
+	tickCtx, cancel := context.WithTimeout(ctx, m.opts.TickTimeout)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		defer m.tickRunning.Store(false)
+		result <- m.runOnce(tickCtx)
+	}()
+	var err error
+	select {
+	case err = <-result:
+	case <-tickCtx.Done():
+		err = tickCtx.Err()
+	}
+	dur := time.Since(start)
+	if errors.Is(err, context.DeadlineExceeded) {
+		m.tickMetrics.timeouts.Add(1)
+	} else if err != nil && !errors.Is(err, context.Canceled) {
+		m.tickMetrics.failures.Add(1)
+	}
+	if err == nil {
+		m.tickMetrics.completed.Store(time.Now().UnixNano())
+	}
+	m.logger.Info("scheduler tick finished", "duration", dur.String(), "outcome", tickOutcome(err))
+	return err
+}
+
+func tickOutcome(err error) string {
+	if err == nil {
+		return "success"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
+	return "error"
+}
+
+func (m *Manager) runOnce(ctx context.Context) error {
 	now, err := dbNow(ctx, m.pool)
 	if err != nil {
 		return err
 	}
+	var firstErr error
 	for _, job := range m.snapshot() {
 		if err := m.runJob(ctx, job, now); err != nil {
 			m.logger.Warn("job tick error",
 				"job", job.Name, "error", err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				break
+			}
 		}
 	}
-	return nil
+	return firstErr
 }
 
 // runJob iterates the scopes for a single job and processes each due
