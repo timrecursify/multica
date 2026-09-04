@@ -87,26 +87,34 @@ RELAY_PREFLIGHT_DIAGNOSTIC=''
 # Diagnostics deliberately report names and failure phases only; secret values
 # and connection strings never enter the guard output or the P0 ticket.
 guard_relay_preflight() {
-  local missing=() key value agent operator workspace
+  local missing=() key value agent operator workspace sso database
   if [[ ! -r "$RELAY_ENV_FILE" ]]; then
     RELAY_PREFLIGHT_OK=0
     RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight config=unreadable"
     unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
     return 0
   fi
-  for key in RELAY_AGENT_SECRET RELAY_OPERATOR_SECRET GSP_WORKSPACE_ID MULTICA_WORKSPACE_ID; do
+  # Keep this list in lockstep with the relay launcher/fleet manifest.  The
+  # guard must reject a file that can start the bridge but cannot authenticate
+  # the relay daemon, before it attempts any stage mutation.
+  for key in DATABASE_URL RELAY_AGENT_SECRET RELAY_OPERATOR_SECRET GSP_WORKSPACE_ID MULTICA_WORKSPACE_ID; do
     value=$(sed -n "s/^${key}=//p" "$RELAY_ENV_FILE" | tail -1)
     [[ -n "$value" ]] || missing+=("$key")
   done
   agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
   operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
   workspace=$(sed -n 's/^GSP_WORKSPACE_ID=//p' "$RELAY_ENV_FILE" | tail -1)
+  sso=$(sed -n 's/^MULTICA_WORKSPACE_ID=//p' "$RELAY_ENV_FILE" | tail -1)
+  database=$(sed -n 's/^DATABASE_URL=//p' "$RELAY_ENV_FILE" | tail -1)
   if (( ${#missing[@]} > 0 )); then
     RELAY_PREFLIGHT_OK=0
     RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight missing=${missing[*]}"
-  elif [[ "$agent" == "$operator" || ! "$workspace" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+  elif [[ "$agent" == "$operator" || "$agent" =~ [[:space:]] || "$operator" =~ [[:space:]] ||
+          "$agent" == CHANGE_ME* || "$operator" == CHANGE_ME* ||
+          ! "$workspace" =~ ^[0-9a-fA-F-]{36}$ || "$workspace" != "$GSP_WS" ||
+          "$sso" != "$GSP_WS" || ! "$database" =~ ^(postgres|postgresql)://[^[:space:]]+$ ]]; then
     RELAY_PREFLIGHT_OK=0
-    RELAY_PREFLIGHT_DIAGNOSTIC='phase=preflight invalid=relay-credentials-or-workspace'
+    RELAY_PREFLIGHT_DIAGNOSTIC='phase=preflight invalid=relay-credentials-workspace-or-database'
   fi
   if (( RELAY_PREFLIGHT_OK == 0 )); then
     unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
