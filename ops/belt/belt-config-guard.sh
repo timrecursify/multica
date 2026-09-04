@@ -958,16 +958,61 @@ spec_receipt_task_id() {
 # distinguish a relay refusal from a successful, idempotent no-op.
 relay_transition() {
   local number="$1" target="$2" board="${3:-gsp}" md5="${4:-}"
+  # Keep this boundary deliberately strict: callers must not be able to turn
+  # a recovery row into an arbitrary board/transition (or inject CLI flags).
+  [[ "$number" =~ ^[0-9]+$ ]] || {
+    RELAY_TRANSITION_OUTPUT='invalid ticket number'; RELAY_TRANSITION_RC=64
+    RELAY_TRANSITION_CLASS=configuration; return 64
+  }
+  [[ "$board" == gsp || "$board" == prod ]] || {
+    RELAY_TRANSITION_OUTPUT='invalid board'; RELAY_TRANSITION_RC=64
+    RELAY_TRANSITION_CLASS=configuration; return 64
+  }
+  case "$target" in
+    Spec|Queue|In\ Progress|In\ Review|Registered|Human\ Review|CI/CD\ \&\ Deploy|Done|Cancelled|Archived) ;;
+    *) RELAY_TRANSITION_OUTPUT='invalid target stage'; RELAY_TRANSITION_RC=64
+       RELAY_TRANSITION_CLASS=configuration; return 64 ;;
+  esac
+  if [[ -n "$md5" && ! "$md5" =~ ^[0-9a-fA-F]{32}$ ]]; then
+    RELAY_TRANSITION_OUTPUT='invalid work-product digest'; RELAY_TRANSITION_RC=64
+    RELAY_TRANSITION_CLASS=configuration; return 64
+  fi
   if [[ "${RELAY_PREFLIGHT_OK:-1}" != 1 ]]; then
     RELAY_TRANSITION_OUTPUT="relay preflight refused: ${RELAY_PREFLIGHT_DIAGNOSTIC:-invalid configuration}"
-    RELAY_TRANSITION_RC=78
+    RELAY_TRANSITION_RC=78; RELAY_TRANSITION_CLASS=configuration
     return "$RELAY_TRANSITION_RC"
   fi
   local -a args=(multica advance "$number" --to "$target" --board "$board")
   [[ -n "$md5" ]] && args+=(--current-work-product-md5 "$md5")
   RELAY_TRANSITION_OUTPUT=$("$SK" "${args[@]}" 2>&1 </dev/null)
   RELAY_TRANSITION_RC=$?
+  RELAY_TRANSITION_CLASS=$(relay_failure_class "$RELAY_TRANSITION_OUTPUT" "$RELAY_TRANSITION_RC")
   return "$RELAY_TRANSITION_RC"
+}
+
+# Classify only bounded, redacted text.  This is used for operator diagnostics
+# and never changes retry behavior: authority/configuration and transport
+# failures remain fail-closed, while ordinary transition refusals are distinct.
+relay_failure_class() {
+  local message
+  message=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  if [[ "$message" =~ (malformed|not-json|parse|invalid[[:space:]]+json) ]]; then
+    printf 'malformed-receipt'
+  elif [[ "$2" == 64 || "$2" == 78 || "$message" =~ (authority|permission|forbidden|unauthori|credential|secret|workspace|configuration|invalid) ]]; then
+    printf 'authority/configuration'
+  elif [[ "$message" =~ (transport|timeout|connection|unavailable|relay[[:space:]]+post|network) ]]; then
+    printf 'transport'
+  else
+    printf 'transition-refusal'
+  fi
+}
+
+relay_transition_diagnostic() {
+  local output="${1:-${RELAY_TRANSITION_OUTPUT:-}}"
+  printf '%s' "$output" | tr '\n' ' ' \
+    | sed -E -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+             -e 's/((token|password|secret|api[_-]?key)[=:])[[:space:]]*[^[:space:]]+/\1[REDACTED]/Ig' \
+    | cut -c1-400
 }
 
 guard_stranded_spec() {
@@ -1062,8 +1107,8 @@ recover_stranded_spec_flight() {
   local number="$1" board="${2:-gsp}" relay_output diagnostic
   spec_refly_queue "$number" "$board"; relay_output="$SPEC_REFLOW_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
-    diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
-    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=relay class=$(spec_refly_failure_class "$relay_output") exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
+    diagnostic=$(relay_transition_diagnostic "$relay_output")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=relay class=${RELAY_TRANSITION_CLASS:-$(spec_refly_failure_class "$relay_output")} exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
     return 0
   fi
   if ! spec_refly_receipt_valid "$relay_output"; then

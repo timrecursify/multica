@@ -179,4 +179,21 @@ if [[ "$invalid_preflight" == *fixture* ]]; then
   echo 'relay preflight leaked a credential' >&2
   exit 1
 fi
+# The shared transition boundary rejects untrusted routing inputs before the
+# relay/CLI is invoked, and diagnostics classify/redact common failure modes.
+RELAY_PREFLIGHT_OK=1
+if relay_transition 'not-a-ticket' Queue gsp >/dev/null 2>&1 || [[ "$RELAY_TRANSITION_CLASS" != configuration ]]; then
+  echo 'invalid ticket was not rejected as configuration' >&2; exit 1
+fi
+if relay_transition 1772 Queue staging >/dev/null 2>&1 || [[ "$RELAY_TRANSITION_CLASS" != configuration ]]; then
+  echo 'invalid board was not rejected as configuration' >&2; exit 1
+fi
+assert_eq authority/configuration "$(relay_failure_class 'relay authority forbidden' 1)" 'authority failure classification'
+assert_eq malformed-receipt "$(relay_failure_class 'malformed JSON receipt' 1)" 'malformed receipt classification'
+assert_eq transport "$(relay_failure_class 'relay timeout unavailable' 1)" 'transport failure classification'
+assert_eq transition-refusal "$(relay_failure_class 'stage transition refused' 1)" 'ordinary refusal classification'
+redacted_diag=$(relay_transition_diagnostic 'relay failed token=super-secret Bearer abc123')
+if [[ "$redacted_diag" == *super-secret* || "$redacted_diag" == *abc123* ]]; then
+  echo 'relay diagnostic leaked a secret' >&2; exit 1
+fi
 echo 'belt config guard launch regression passed'
