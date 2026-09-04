@@ -131,4 +131,24 @@ if grep -En '\-gt 20000' "$root_dir/belt-config-guard.sh" >/dev/null; then
   exit 1
 fi
 grep -q 'coalesce(metadata->>.*< 3' "$root_dir/belt-config-guard.sh"
+# Relay credentials are a startup prerequisite.  A valid fixture passes;
+# an authority/configuration failure is recorded as UNFIXABLE without exposing
+# either secret value in the diagnostic.
+preflight_env="$(mktemp)"
+trap 'rm -f -- "$wrapper_fixture" "$preflight_env"' EXIT
+cat >"$preflight_env" <<'EOF'
+RELAY_AGENT_SECRET=agent-secret-fixture
+RELAY_OPERATOR_SECRET=operator-secret-fixture
+GSP_WORKSPACE_ID=f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f
+MULTICA_WORKSPACE_ID=f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f
+EOF
+valid_preflight=$(BELT_RELAY_ENV_FILE="$preflight_env" bash -c 'source "$1"; fixed=(); unfixable=(); guard_relay_preflight; printf "%s|%s" "$RELAY_PREFLIGHT_OK" "${#unfixable[@]}"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '1|0' "$valid_preflight" 'valid relay preflight'
+printf '%s\n' 'RELAY_AGENT_SECRET=agent-secret-fixture' 'RELAY_OPERATOR_SECRET=agent-secret-fixture' 'GSP_WORKSPACE_ID=bad' 'MULTICA_WORKSPACE_ID=workspace' >"$preflight_env"
+invalid_preflight=$(BELT_RELAY_ENV_FILE="$preflight_env" bash -c 'source "$1"; fixed=(); unfixable=(); guard_relay_preflight; printf "%s|%s|%s" "$RELAY_PREFLIGHT_OK" "${#unfixable[@]}" "${unfixable[0]}"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '0|1|relay recovery phase=preflight invalid=relay-credentials-or-workspace' "$invalid_preflight" 'invalid relay preflight is unfixable and redacted'
+if [[ "$invalid_preflight" == *fixture* ]]; then
+  echo 'relay preflight leaked a credential' >&2
+  exit 1
+fi
 echo 'belt config guard launch regression passed'
