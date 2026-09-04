@@ -4459,6 +4459,12 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			if woke {
 				continue
 			}
+			// A full semaphore is a completed poll attempt that could not
+			// claim work. Keep the reason in the daemon log so a fresh
+			// heartbeat cannot hide a wedged dispatcher; this branch emits
+			// once for this tick and names the resource that blocked it.
+			d.logger.Warn("poll tick blocked", "reason", "task capacity exhausted",
+				"resource", "task_slots", "max_concurrent_tasks", d.cfg.MaxConcurrentTasks)
 			if err := sleepWithContextOrWakeup(pollerCtx, capacityBackoff(d.cfg.PollInterval), wakeup); err != nil {
 				return
 			}
@@ -4470,6 +4476,8 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		// the process (paired with the re-check in tryAutoUpdate).
 		if !d.tryEnterClaim() {
 			releaseSlots(slots)
+			d.logger.Warn("poll tick blocked", "reason", "auto-update barrier",
+				"resource", "claim_barrier", "ticket", "none")
 			if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
 				return
 			}
