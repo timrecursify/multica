@@ -676,18 +676,20 @@ guard_stranded_inprogress() {
          jsonb_build_object('ip_reflies', (coalesce(metadata->>'ip_reflies','0')::int + 1)::text)
        WHERE number=${number} AND workspace_id ${ws};" >/dev/null 2>&1 </dev/null
     if [[ "$last" == completed ]]; then
-      if "$SK" multica advance "$number" --to "In Review" --board "$board" >/dev/null 2>&1 </dev/null; then
+      if relay_transition "$number" "In Review" "$board" >/dev/null 2>&1; then
         fixed+=("${board}#${number} stranded in In Progress with a completed build; sent forward to QC")
       else
         unfixable+=("${board}#${number} is stranded in In Progress and could not be sent to QC")
       fi
-    else
-      if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null &&
-         "$SK" multica advance "$number" --to "Queue" --board "$board" >/dev/null 2>&1 </dev/null; then
+    elif [[ "$last" == failed ]]; then
+      if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
+         relay_transition "$number" "Queue" "$board" >/dev/null 2>&1; then
         fixed+=("${board}#${number} stranded in In Progress with no build; re-driven to the builder")
       else
         unfixable+=("${board}#${number} is stranded in In Progress and could not be re-driven")
       fi
+    else
+      unfixable+=("${board}#${number} is stranded in In Progress with unknown task history; left unchanged")
     fi
   done < <("${PSQL[@]}" -F'|' -c "
     SELECT i.number,
@@ -853,6 +855,19 @@ spec_receipt_task_id() {
   jq -e -r '.task_id // .pending_task_id // .selected_task_id // .task.id // .task.task_id // .result.task_id // .result.pending_task_id // empty' 2>/dev/null
 }
 
+# All recovery status changes go through this single relay entry point.  Keeping
+# the board and target together prevents a gsp number from being accidentally
+# advanced on prod (and vice versa), while the captured receipt lets callers
+# distinguish a relay refusal from a successful, idempotent no-op.
+relay_transition() {
+  local number="$1" target="$2" board="${3:-gsp}" md5="${4:-}"
+  local -a args=(multica advance "$number" --to "$target" --board "$board")
+  [[ -n "$md5" ]] && args+=(--current-work-product-md5 "$md5")
+  RELAY_TRANSITION_OUTPUT=$("$SK" "${args[@]}" 2>&1 </dev/null)
+  RELAY_TRANSITION_RC=$?
+  return "$RELAY_TRANSITION_RC"
+}
+
 guard_stranded_spec() {
 
   if queue_backed_up; then
@@ -865,13 +880,13 @@ guard_stranded_spec() {
   # original guard only caught tickets with ZERO tasks ever, so every expiry
   # victim was invisible to it. Catch "no ACTIVE task" instead, and cap re-flies
   # at 3 per ticket so a ticket that keeps expiring cannot become a paid loop.
-  local number
-  while read -r number; do
+  local number board
+  while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    recover_stranded_spec_flight "$number"
-  done < <("${PSQL[@]}" -c "
-    SELECT i.number FROM issue i
-    WHERE i.status='Spec' AND i.workspace_id='${GSP_WS}'
+    recover_stranded_spec_flight "$number" "$board"
+  done < <("${PSQL[@]}" -F'|' -c "
+    SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END FROM issue i
+    WHERE i.status='Spec' AND i.workspace_id IN ('${GSP_WS}','da3c5c5c-a123-4567-b999-c3ed1820da00')
       AND i.parent_issue_id IS NULL
       AND coalesce(i.metadata->>'spec_reflies','0')::int < 3
       AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
@@ -881,21 +896,22 @@ guard_stranded_spec() {
 
 spec_refly_reset() {
   # Status changes go through relay; only the retry counter is written locally.
-  SPEC_REFLOW_OUTPUT=$("$SK" multica advance "$1" --to "Registered" --board gsp 2>&1 </dev/null)
-  SPEC_REFLOW_RC=$?
+  local number="$1" board="${2:-gsp}"
+  relay_transition "$number" "Registered" "$board"; SPEC_REFLOW_RC=$?
+  SPEC_REFLOW_OUTPUT="$RELAY_TRANSITION_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -eq 0 ]]; then
     "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
       UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
         jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
-      WHERE number=${1} AND workspace_id='${GSP_WS}' AND status='Registered'
+      WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END AND status='Registered'
         AND parent_issue_id IS NULL AND coalesce(metadata->>'spec_reflies','0')::int < 3
         AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=issue.id AND q.status IN ('queued','running'));" >/dev/null 2>&1 </dev/null || SPEC_REFLOW_RC=$?
   fi
 }
 
 spec_refly_advance() {
-  SPEC_REFLOW_OUTPUT=$("$SK" multica advance "$1" --to "Spec" --board gsp 2>&1 </dev/null)
-  SPEC_REFLOW_RC=$?
+  relay_transition "$1" "Spec" "${2:-gsp}"; SPEC_REFLOW_RC=$?
+  SPEC_REFLOW_OUTPUT="$RELAY_TRANSITION_OUTPUT"
 }
 
 redact_spec_refly_diagnostic() {
@@ -906,9 +922,15 @@ spec_refly_receipt_valid() {
   jq -e '(.success == true) and (.issue.status == "Spec") and ((.task_id | type) == "string") and (.task_id | length > 0)' >/dev/null 2>&1 <<<"$1"
 }
 
+done_receipt_valid() {
+  jq -e '(.success == true) and ((.issue.status // .current_status // .status) == "Done")' >/dev/null 2>&1 <<<"$1"
+}
+
 recover_stranded_spec_flight() {
-  local number="$1" reset_output relay_output diagnostic
-  spec_refly_reset "$number"; reset_output="$SPEC_REFLOW_OUTPUT"
+  local number="$1" board="${2:-gsp}" reset_output relay_output diagnostic
+  # The reset is itself relay-authorized; spec_refly_reset is retained as a
+  # seam for fixtures and for deployments that provide a receipt-aware reset.
+  spec_refly_reset "$number" "$board"; reset_output="$SPEC_REFLOW_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
     diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
     unfixable+=("gsp#${number} stranded-Spec recovery failed phase=reset exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
@@ -919,7 +941,7 @@ recover_stranded_spec_flight() {
     unfixable+=("gsp#${number} stranded-Spec recovery failed phase=reset-row-count exit=0 diagnostic=${diagnostic}")
     return 0
   fi
-  spec_refly_advance "$number"; relay_output="$SPEC_REFLOW_OUTPUT"
+  spec_refly_advance "$number" "$board"; relay_output="$SPEC_REFLOW_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
     diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
     unfixable+=("gsp#${number} stranded-Spec recovery failed phase=relay exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
@@ -960,8 +982,8 @@ guard_ship_passed() {
       url="$u"
     done
     (( unmerged )) && continue
-    if "$SK" multica advance "$number" --to Done \
-         --current-work-product-md5 "$md5" --board "$board" >/dev/null 2>&1 </dev/null; then
+    relay_transition "$number" Done "$board" "$md5" >/dev/null 2>&1
+    if [[ "$RELAY_TRANSITION_RC" -eq 0 ]] && done_receipt_valid "$RELAY_TRANSITION_OUTPUT"; then
       fixed+=("${board}#${number} shipped to Done on its PASS verdict${url:+ after ${url##*/} merged}")
     else
       unfixable+=("${board}#${number} passed QC and its work is merged but it would not advance to Done")
