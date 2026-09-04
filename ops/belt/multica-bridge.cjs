@@ -2379,8 +2379,15 @@ const server = http.createServer(async (req, res) => {
   } else if (req.method === "GET" && req.url === "/sso/bridge") {
     ssoBridge(req, res);
   } else if (req.url === "/health") {
-    res.writeHead(200);
-    res.end("OK");
+    // Keep health useful to the belt guard without exposing credentials.  A
+    // ready authority requires both distinct relay credentials and the
+    // startup-validated database/workspace configuration.
+    const authority = RELAY_AGENT_SECRET && RELAY_OPERATOR_SECRET &&
+      RELAY_AGENT_SECRET !== RELAY_OPERATOR_SECRET && MULTICA_DB && SSO_WORKSPACE_ID
+      ? "ready" : "unavailable";
+    res.writeHead(authority === "ready" ? 200 : 503, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: authority === "ready" ? "ok" : "unavailable",
+      workspace_id: SSO_WORKSPACE_ID || null, authority }));
   } else {
     res.writeHead(404);
     res.end("Not found");
