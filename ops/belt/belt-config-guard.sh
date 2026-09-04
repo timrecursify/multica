@@ -16,6 +16,7 @@ readonly PM2=/home/newadmin/.npm-global/bin/pm2
 readonly SK=/home/newadmin/bin/sk
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 readonly RELAY_ENV_FILE="${BELT_RELAY_ENV_FILE:-/home/newadmin/gsp-multica/.env}"
+readonly RELAY_HEALTH_URL="${BELT_RELAY_HEALTH_URL:-}"
 readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
@@ -87,7 +88,7 @@ RELAY_PREFLIGHT_DIAGNOSTIC=''
 # Diagnostics deliberately report names and failure phases only; secret values
 # and connection strings never enter the guard output or the P0 ticket.
 guard_relay_preflight() {
-  local missing=() key value agent operator workspace sso database
+  local missing=() duplicate=() key value agent operator workspace sso database count
   if [[ ! -r "$RELAY_ENV_FILE" ]]; then
     RELAY_PREFLIGHT_OK=0
     RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight config=unreadable"
@@ -98,6 +99,8 @@ guard_relay_preflight() {
   # guard must reject a file that can start the bridge but cannot authenticate
   # the relay daemon, before it attempts any stage mutation.
   for key in DATABASE_URL RELAY_AGENT_SECRET RELAY_OPERATOR_SECRET GSP_WORKSPACE_ID MULTICA_WORKSPACE_ID; do
+    count=$(grep -Ec "^[[:space:]]*${key}=" "$RELAY_ENV_FILE" 2>/dev/null || true)
+    [[ "$count" == 1 ]] || duplicate+=("$key")
     value=$(sed -n "s/^${key}=//p" "$RELAY_ENV_FILE" | tail -1)
     [[ -n "$value" ]] || missing+=("$key")
   done
@@ -109,6 +112,9 @@ guard_relay_preflight() {
   if (( ${#missing[@]} > 0 )); then
     RELAY_PREFLIGHT_OK=0
     RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight missing=${missing[*]}"
+  elif (( ${#duplicate[@]} > 0 )); then
+    RELAY_PREFLIGHT_OK=0
+    RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight duplicate=${duplicate[*]}"
   elif [[ "$agent" == "$operator" || "$agent" =~ [[:space:]] || "$operator" =~ [[:space:]] ||
           "$agent" == CHANGE_ME* || "$operator" == CHANGE_ME* ||
           ! "$workspace" =~ ^[0-9a-fA-F-]{36}$ || "$workspace" != "$GSP_WS" ||
@@ -118,6 +124,28 @@ guard_relay_preflight() {
   fi
   if (( RELAY_PREFLIGHT_OK == 0 )); then
     unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+    return 0
+  fi
+  # When configured, verify the live bridge before any transition.  The probe
+  # is deliberately opt-in for offline fixture runs; production sets the URL
+  # in the guard service environment.  Only bounded, redacted fields are
+  # accepted from the health endpoint.
+  if [[ -n "$RELAY_HEALTH_URL" ]]; then
+    local health
+    health=$(curl --fail --silent --show-error --max-time 3 \
+      -H "X-Relay-Agent-Secret: ${agent}" "$RELAY_HEALTH_URL" 2>&1) || {
+      RELAY_PREFLIGHT_OK=0
+      RELAY_PREFLIGHT_DIAGNOSTIC='phase=health transport=unavailable'
+      unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+      return 0
+    }
+    if ! jq -e --arg ws "$GSP_WS" \
+      '(.status == "ok" or .status == "healthy") and (.workspace_id == $ws) and (.authority == "ready")' \
+      >/dev/null 2>&1 <<<"$health"; then
+      RELAY_PREFLIGHT_OK=0
+      RELAY_PREFLIGHT_DIAGNOSTIC='phase=health invalid=workspace-or-authority'
+      unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+    fi
   fi
 }
 

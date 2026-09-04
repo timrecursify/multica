@@ -4,6 +4,7 @@ set -Eeuo pipefail
 mode="dry-run"
 rollback_timestamp=""
 only_target=""
+source_commit=""
 
 while (( $# )); do
   case "$1" in
@@ -11,12 +12,24 @@ while (( $# )); do
     --apply) mode="apply"; shift ;;
     --rollback) mode="rollback"; rollback_timestamp="${2:-}"; shift 2 ;;
     --only) only_target="${2:-}"; shift 2 ;;
+    --source-commit) source_commit="${2:-}"; shift 2 ;;
     *)
-      printf 'Usage: %s [--dry-run|--apply] [--only multica-cicd-worker] | %s --rollback YYYYMMDDTHHMMSSZ [--only multica-cicd-worker]\n' "$0" "$0" >&2
+      printf 'Usage: %s [--dry-run|--apply] [--source-commit SHA] [--only multica-cicd-worker] | %s --rollback YYYYMMDDTHHMMSSZ [--only multica-cicd-worker]\n' "$0" "$0" >&2
       exit 2
       ;;
   esac
 done
+
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+if [[ -n "$source_commit" && ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+  printf 'Invalid source commit: %s\n' "$source_commit" >&2
+  exit 2
+fi
+if [[ -n "$source_commit" ]]; then
+  actual_commit="$(git -C "$root_dir/../.." rev-parse HEAD 2>/dev/null || true)"
+  [[ "$actual_commit" == "$source_commit" ]] || { printf 'Source commit mismatch: checkout=%s requested=%s\n' "$actual_commit" "$source_commit" >&2; exit 2; }
+fi
 
 if [[ -n "$only_target" && "$only_target" != multica-cicd-worker ]]; then
   printf 'Invalid --only target: %s\n' "$only_target" >&2
@@ -27,7 +40,6 @@ if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]];
   exit 2
 fi
 
-root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/home/newadmin}"
 
@@ -250,8 +262,9 @@ if [[ "$mode" == apply ]]; then
   receipt_dir="$runtime_root/gsp-multica/deploy-receipts"
   mkdir -p -- "$receipt_dir"
   source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
+  manifest_sha256="$(sha256sum "${sources[@]}" | sha256sum | awk '{print $1}')"
   receipt="$receipt_dir/belt-${timestamp}.json"
-  printf '{"repo":"timrecursify/multica","source_sha":"%s"}\n' "$source_sha" > "$receipt"
+  printf '{"repo":"timrecursify/multica","source_sha":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"]}\n' "$source_sha" "$manifest_sha256" > "$receipt"
   printf 'Receipt: %s\n' "$receipt"
 fi
 printf 'No processes were restarted.\n'
