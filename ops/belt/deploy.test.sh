@@ -55,6 +55,13 @@ grep -q 'Would copy .*/parity/relay-dead-rows.cjs to .*/gsp-multica/parity/relay
 grep -q 'parity/relay-dead-rows.cjs' "$root_dir/verify.sh"
 grep -q 'Would copy .*/cicd-deploy-evidence.cjs to .*/cicd-deploy-evidence.cjs' "$dry_log"
 
+# A partial rollout can leave the wrapper absent.  The wrapper is a named
+# parity target and must be recreated by a selective deployment.
+rm -f -- "$tmp_dir/gsp-multica/fleet/multica-daemon-wrapper.sh"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-daemon-wrapper.sh >"$tmp_dir/missing-wrapper.log"
+cmp -s -- "$root_dir/multica-daemon-wrapper.sh" "$tmp_dir/gsp-multica/fleet/multica-daemon-wrapper.sh"
+grep -q 'Copied .*/multica-daemon-wrapper.sh to .*/gsp-multica/fleet/multica-daemon-wrapper.sh' "$tmp_dir/missing-wrapper.log"
+
 # Remove the dependency from a disposable manifest copy. Validation must fail
 # before copy, proving the deploy cannot restart with an incomplete runtime.
 manifest_dir="$tmp_dir/manifest"
