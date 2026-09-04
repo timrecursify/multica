@@ -50,12 +50,13 @@ const watchdog = createWatchdog({ file: process.env.CICD_WATCHDOG_STATE || `${RE
 let log = (...a) => console.log(new Date().toISOString(), ...a);
 
 let gh = function github(args) {
+  if (ghBackoffUntil > Date.now()) { const e = new Error('GitHub API rate limit backoff'); e.rateLimited = true; throw e; }
   // GraphQL (gh pr view/merge) shares one per-user quota with every operator
   // session and was exhausted at 02:19Z on 2026-09-03; route both through REST.
   if (args[0] === 'pr' && args[1] === 'view' && args[3] === '-R') {
-    const raw = execFileSync('gh', ['api', `repos/${args[4]}/pulls/${args[2]}`],
+    const raw = execFileSync('gh', ['api', '-i', `repos/${args[4]}/pulls/${args[2]}`],
       { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 });
-    const pr = JSON.parse(raw);
+    const pr = JSON.parse(rateLimitBody(raw));
     return JSON.stringify({
       state: pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase(),
       mergeable: pr.mergeable === true ? 'MERGEABLE' : pr.mergeable === false ? 'CONFLICTING' : 'UNKNOWN',
@@ -64,11 +65,37 @@ let gh = function github(args) {
     });
   }
   if (args[0] === 'pr' && args[1] === 'merge' && args[3] === '-R') {
-    return execFileSync('gh', ['api', '-X', 'PUT', `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'],
-      { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
+    try {
+      const raw = execFileSync('gh', ['api', '-i', '-X', 'PUT', `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'],
+        { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 });
+      return rateLimitBody(raw).trim();
+    } catch (e) {
+      const text = `${e.stdout || ''}\n${e.stderr || ''}`;
+      if (/API rate limit exceeded/i.test(text) || /x-ratelimit-remaining:\s*0/i.test(text)) { ghBackoffUntil = rateLimitReset(text); e.rateLimited = true; }
+      throw e;
+    }
   }
-  return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
+  try {
+    const command = args[0] === 'api' && !args.includes('-i') ? ['api', '-i', ...args.slice(1)] : args;
+    const raw = execFileSync('gh', command, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 });
+    return args[0] === 'api' ? rateLimitBody(raw).trim() : raw.trim();
+  } catch (e) {
+    const text = `${e.stdout || ''}\n${e.stderr || ''}`;
+    if (/API rate limit exceeded/i.test(text) || /x-ratelimit-remaining:\s*0/i.test(text)) {
+      ghBackoffUntil = rateLimitReset(text); e.rateLimited = true;
+    }
+    throw e;
+  }
 };
+let ghBackoffUntil = 0;
+function rateLimitReset(raw) {
+  const m = raw.match(/x-ratelimit-reset:\s*(\d+)/i); return m ? Number(m[1]) * 1000 : Date.now() + 3600000;
+}
+function rateLimitBody(raw) {
+  const split = raw.split(/\r?\n\r?\n/); const headers = split.slice(0, -1).join('\n');
+  if (/x-ratelimit-remaining:\s*0/i.test(headers)) ghBackoffUntil = rateLimitReset(headers);
+  return split[split.length - 1];
+}
 
 let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence) {
   return new Promise((resolve, reject) => {
@@ -469,11 +496,13 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
 
 
 async function sweep() {
+  const prCache = new Map();
   const { rows } = await pool.query(
     `SELECT id, number, title, workspace_id, metadata FROM issue WHERE status='CI/CD & Deploy' ORDER BY number`);
   if (!rows.length) { log('[poll] CI/CD & Deploy is empty'); return; }
   log(`[poll] ${rows.length} ticket(s) in CI/CD & Deploy`);
-  for (const issue of rows) {
+  for (let issueIndex = 0; issueIndex < rows.length; issueIndex++) {
+    const issue = rows[issueIndex];
     try {
       watchdog.observe(issue.id);
       // Read the thread, not just its last line. The pull request is announced by
@@ -507,8 +536,13 @@ async function sweep() {
       // Resolve every referenced PR first, then decide once.
       const states = [];
       for (const cand of prs) {
-        states.push({ pr: cand,
-          info: JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit'])) });
+        const key = `${cand.repo}#${cand.num}`;
+        let info = prCache.get(key);
+        if (!info) {
+          info = JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit']));
+          prCache.set(key, info);
+        }
+        states.push({ pr: cand, info });
       }
       // A closed, unmerged pull request is a dead end only when nothing
       // replaced it. gsp#1577 cited sk-cli#986 (closed) and its replacement
@@ -599,6 +633,10 @@ async function sweep() {
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
       }
     } catch (e) {
+      if (e.rateLimited || ghBackoffUntil > Date.now()) {
+        log(`RATE-LIMIT sweep skipped=${rows.length - issueIndex} reset=${new Date(ghBackoffUntil).toISOString()}`);
+        return;
+      }
       // GSP-1973 / upstream multica#465: watchdogFailure escalates via
       // humanReview -> relay('Human Review'), which the relay refuses with
       // 409 actor_denied because this worker holds RELAY_AGENT_SECRET while
