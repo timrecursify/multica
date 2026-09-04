@@ -139,6 +139,54 @@ test('a deploy run on the merge sha keeps the ticket pending until it succeeds',
   assert.equal(calls.length, 0);
 });
 
+test('cancelled deploy superseded by an ancestral later success reaches Done', async () => {
+  const laterSha = 'b'.repeat(40);
+  const cancelled = { path: '.github/workflows/deploy-billing-server.yml', conclusion: 'cancelled',
+    created_at: '2026-09-04T01:00:00Z', id: 7 };
+  const superseding = { path: cancelled.path, conclusion: 'success', head_sha: laterSha,
+    created_at: '2026-09-04T02:00:00Z', id: 8 };
+  let deployLookup = 0;
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (args[0] === 'api' && path.includes('/actions/runs?head_sha=')) {
+      deployLookup += 1;
+      return deployLookup === 1
+        ? JSON.stringify({ workflow_runs: [{ status: 'completed', conclusion: 'success', name: 'CI' }] })
+        : JSON.stringify({ workflow_runs: [cancelled] });
+    }
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (args[0] === 'run') return JSON.stringify([]);
+    if (path.includes('/actions/runs?status=success')) return JSON.stringify({ workflow_runs: [superseding] });
+    if (path.includes('/compare/')) return JSON.stringify({ status: 'behind' });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: null, gh });
+  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
+  assert.equal(calls[0][1], 'Done');
+  assert.equal(calls[0][5].mergeDeployReceipt.kind, 'github_deploy_run_superseded');
+});
+
+test('cancelled deploy without qualifying later success returns to build', async () => {
+  let deployLookup = 0;
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (args[0] === 'api' && path.includes('/actions/runs?head_sha=')) {
+      deployLookup += 1;
+      return deployLookup === 1
+        ? JSON.stringify({ workflow_runs: [{ status: 'completed', conclusion: 'success', name: 'CI' }] })
+        : JSON.stringify({ workflow_runs: [{ path: '.github/workflows/deploy-billing-server.yml', conclusion: 'cancelled', created_at: '2026-09-04T01:00:00Z' }] });
+    }
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (args[0] === 'run') return JSON.stringify([]);
+    if (path.includes('/actions/runs?status=success')) return JSON.stringify({ workflow_runs: [] });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: null, gh });
+  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
+  assert.equal(calls[0][1], 'In Progress');
+  assert.match(calls[0][3], /deploy run failed/);
+});
+
 test('a just-merged sha stays pending inside the deploy trigger grace window', () => {
   worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [] }) });
   assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, new Date().toISOString()), false);
