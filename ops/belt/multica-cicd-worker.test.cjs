@@ -253,7 +253,7 @@ test('third return for the same reason escalates once instead of looping', async
   await worker.returnToBuild(loopIssue, { repo: 'timrecursify/multica', num: 1 }, 'deploy run failed for sha (deploy.yml=failure)');
   await worker.returnToBuild(loopIssue, { repo: 'timrecursify/multica', num: 1 }, 'deploy run failed for sha (deploy.yml=failure)');
   await worker.returnToBuild(loopIssue, { repo: 'timrecursify/multica', num: 1 }, 'deploy run failed for sha (deploy.yml=failure)');
-  assert.deepEqual(calls.map(call => call[1]), ['In Progress', 'In Progress', 'Human Review']);
+  assert.deepEqual(calls.map(call => call[1]), ['In Progress', 'In Progress', 'Parked']);
 });
 
 test('a just-merged sha stays pending inside the deploy trigger grace window', () => {
