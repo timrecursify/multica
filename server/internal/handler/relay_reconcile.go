@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -66,6 +67,7 @@ func (h *Handler) RelayReconcileStale(w http.ResponseWriter, r *http.Request) {
 	if err := rows.Err(); err != nil {
 		result.Failed++
 	}
+	slog.Info("relay stale reconciliation completed", "workspace_id", req.WorkspaceID, "scanned", result.Scanned, "recovered", result.Recovered, "rejected", result.Rejected, "failed", result.Failed)
 	writeJSON(w, http.StatusOK, result)
 }
 
