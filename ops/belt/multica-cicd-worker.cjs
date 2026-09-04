@@ -325,7 +325,7 @@ function mergeDeployEvidence(repo, sha, mergedAt) {
   }
   const terminal = terminalDeployEvaluation(repo, sha);
   if (terminal?.failed) return { failed: terminal.failed };
-  if (terminal?.cancelled) return { cancelled: terminal.cancelled };
+  if (terminal?.cancelled) return { cancelled: terminal.cancelled, cancelledRuns: terminal.cancelledRuns };
   if (terminal?.superseded?.length) {
     return { evidence: { kind: 'github_deploy_run_superseded', sha,
       superseded: terminal.superseded.map(run => ({ workflow: run.path, run: run.id || run.database_id })) } };

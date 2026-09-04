@@ -227,6 +227,38 @@ test('cancelled deploy without qualifying later success is held as undeployed', 
   assert.equal(calls.length, 0);
 });
 
+// Regression: mergeDeployEvidence used to return only { cancelled }, dropping
+// terminalDeployEvaluation's cancelledRuns. retriggerCancelledDeploys then saw an
+// empty run list, dispatched nothing, and routeFinishedPR logged DEPLOY-CANCELLED
+// forever. The direct retriggerCancelledDeploys tests below could not catch that,
+// because they hand the run list in themselves. This one drives the real path.
+test('routeFinishedPR reruns a cancelled deploy through mergeDeployEvidence', async () => {
+  let deployLookup = 0;
+  const reruns = [];
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (args[0] === 'api' && args[1] === '-X') { reruns.push(args); return ''; }
+    if (args[0] === 'api' && path.includes('/actions/runs?head_sha=')) {
+      deployLookup += 1;
+      return deployLookup === 1
+        ? JSON.stringify({ workflow_runs: [{ status: 'completed', conclusion: 'success', name: 'CI' }] })
+        : JSON.stringify({ workflow_runs: [{ id: 555, path: '.github/workflows/deploy-billing-server.yml', conclusion: 'cancelled', created_at: '2026-09-04T01:00:00Z' }] });
+    }
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (args[0] === 'run') return JSON.stringify([]);
+    if (path.includes('/actions/runs?status=success')) return JSON.stringify({ workflow_runs: [] });
+    if (path.includes('/compare/')) return JSON.stringify({ status: 'behind' });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  const calls = dependencies({ receipt: null, gh });
+  const result = await worker.routeFinishedPR({ id: 'passthrough-issue', number: 555 }, 'merged', sha,
+    { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
+  assert.equal(result.status, 'pending');
+  assert.equal(calls.length, 0);
+  assert.equal(reruns.length, 1, 'cancelled deploy run must be re-run through the real path');
+  assert.deepStrictEqual(reruns[0], ['api', '-X', 'POST', 'repos/timrecursify/multica/actions/runs/555/rerun']);
+});
+
 test('cancelled deploy reruns by run id and caps repeated rerun failures', async () => {
   const retryIssue = { id: 'retry-issue', number: 77 };
   const updates = [];
