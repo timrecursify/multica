@@ -193,7 +193,7 @@ function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
 // it silently. A run still queued/in_progress (conclusion null), or any
 // success, keeps the old pending behaviour.
 const TERMINAL_DEPLOY_CONCLUSIONS = new Set([
-  'failure', 'cancelled', 'timed_out', 'startup_failure', 'stale', 'action_required',
+  'failure', 'timed_out', 'startup_failure', 'stale', 'action_required',
 ]);
 
 function laterSuccessfulDeploy(repo, cancelled, sourceSha) {
@@ -221,10 +221,17 @@ function terminalDeployEvaluation(repo, sha) {
     const superseded = deployRuns.filter(run => run.conclusion === 'cancelled'
       && laterSuccessfulDeploy(repo, run, sha));
     const unresolved = deployRuns.filter(run => !superseded.includes(run));
-    if (unresolved.some(run => !TERMINAL_DEPLOY_CONCLUSIONS.has(run.conclusion))) return null;
+    if (unresolved.some(run => run.conclusion !== 'cancelled' && !TERMINAL_DEPLOY_CONCLUSIONS.has(run.conclusion))) return null;
     if (unresolved.length) {
-      return { failed: [...new Set(unresolved.map(r =>
-        `${(r.path || '').replace(/^.*\//, '')}=${r.conclusion}`))].sort().join(', '), superseded };
+      const cancelled = unresolved.filter(run => run.conclusion === 'cancelled');
+      const failed = unresolved.filter(run => run.conclusion !== 'cancelled');
+      return {
+        ...(failed.length ? { failed: [...new Set(failed.map(r =>
+          `${(r.path || '').replace(/^.*\//, '')}=${r.conclusion}`))].sort().join(', ') } : {}),
+        ...(cancelled.length ? { cancelled: [...new Set(cancelled.map(r =>
+          `${(r.path || '').replace(/^.*\//, '')}=cancelled`))].sort().join(', ') } : {}),
+        superseded
+      };
     }
     return superseded.length ? { superseded } : null;
   } catch (_) { return null; }
@@ -249,6 +256,7 @@ function mergeDeployEvidence(repo, sha, mergedAt) {
   }
   const terminal = terminalDeployEvaluation(repo, sha);
   if (terminal?.failed) return { failed: terminal.failed };
+  if (terminal?.cancelled) return { cancelled: terminal.cancelled };
   if (terminal?.superseded?.length) {
     return { evidence: { kind: 'github_deploy_run_superseded', sha,
       superseded: terminal.superseded.map(run => ({ workflow: run.path, run: run.id || run.database_id })) } };
@@ -263,8 +271,8 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     ci = 'green';
     log(`CI N/A #${issue.number} ${pr.repo} has no workflows or check suites`);
   }
-  if (ci !== 'green') {
-    if (ci === 'absent' || ['red', 'mixed', 'cancelled_only'].includes(ci)) {
+  if (ci !== 'green' && ci !== 'cancelled_only') {
+    if (ci === 'absent' || ['red', 'mixed'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
     } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
     return { status: 'returned' };
@@ -281,6 +289,10 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   if (deploy.failed) {
     await returnIssueToBuild(issue, `${note}; deploy run failed for ${mergedSha} (${deploy.failed})`);
     return { status: 'returned' };
+  }
+  if (deploy.cancelled) {
+    log(`DEPLOY-CANCELLED #${issue.number} ${mergedSha} (${deploy.cancelled}); deploy was cancelled and is undeployed`);
+    return { status: 'pending', sha: mergedSha };
   }
   if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return { status: 'pending', sha: mergedSha }; }
   const noVerdict = !latest;
@@ -310,12 +322,55 @@ async function escalateCi(issue, pr, ci) {
 }
 
 async function returnIssueToBuild(issue, reason) {
+  const recorded = await recordReturn(issue, reason);
+  if (recorded.count >= 3) {
+    if (recorded.firstEscalation) {
+      await humanReview(issue, `return_loop issue=${issue.id} reason=${normalizeReturnReason(reason)} count=${recorded.count}`);
+      log(`HOLD #${issue.number} return loop escalated reason=${normalizeReturnReason(reason)} count=${recorded.count}`);
+    } else log(`HOLD #${issue.number} return loop already escalated reason=${normalizeReturnReason(reason)} count=${recorded.count}`);
+    return { escalated: true };
+  }
   const evidence = { ciFailureOrAbsent: true, mergeConflictEvidence: reason };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'In Progress', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected In Progress: ${verdict.code}`);
   await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${reason}`, null, evidence);
   noteReturn(issue, reason);
   log(`RETURN #${issue.number} ${reason}`);
+}
+
+function normalizeReturnReason(reason) {
+  const text = String(reason || '').toLowerCase();
+  if (text.includes('cancelled_only')) return 'merged_ci_cancelled_only';
+  if (text.includes('deploy run failed')) return 'deploy_failure';
+  if (text.includes('merge conflict')) return 'merge_conflict';
+  if (text.includes('no ci runs')) return 'ci_absent';
+  if (text.includes('ci=')) return 'ci_failure';
+  return text.replace(/https?:\/\/\S+/g, 'pr').replace(/\d+/g, '#').slice(0, 120);
+}
+
+async function recordReturn(issue, reason) {
+  const key = normalizeReturnReason(reason);
+  try {
+    const result = await pool.query(
+      `update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['return_counts', $2],
+        to_jsonb((COALESCE(metadata->'return_counts'->>$2, '0')::int + 1)), true)
+       WHERE id=$1 RETURNING metadata`, [issue.id, key]);
+    const metadata = result.rows?.[0]?.metadata;
+    const count = Number(metadata?.return_counts?.[key]);
+    if (Number.isFinite(count) && count > 0) {
+      const firstEscalation = count >= 3 && !metadata?.return_escalations?.[key];
+      if (firstEscalation) await pool.query(
+        `update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['return_escalations', $2], 'true'::jsonb, true) WHERE id=$1`, [issue.id, key]);
+      return { count, firstEscalation };
+    }
+  } catch (_) { /* tests and degraded DBs retain the in-process guard below */ }
+  issue.__returnCounts = issue.__returnCounts || {};
+  issue.__returnCounts[key] = (issue.__returnCounts[key] || 0) + 1;
+  const count = issue.__returnCounts[key];
+  issue.__returnEscalations = issue.__returnEscalations || {};
+  const firstEscalation = count >= 3 && !issue.__returnEscalations[key];
+  if (firstEscalation) issue.__returnEscalations[key] = true;
+  return { count, firstEscalation };
 }
 
 // The reconciled build task carries no return reason (context is only
@@ -583,4 +638,4 @@ function setTestDependencies(dependencies) {
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
   routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
-  setTestDependencies, sweep, watchdogFailure, closureWatchdog };
+  terminalDeployEvaluation, normalizeReturnReason, setTestDependencies, sweep, watchdogFailure, closureWatchdog };
