@@ -253,13 +253,13 @@ func main() {
 	logger.Init()
 
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run ./cmd/migrate <up|down>")
+		fmt.Println("Usage: go run ./cmd/migrate <up|down|audit>")
 		os.Exit(1)
 	}
 
 	direction := os.Args[1]
-	if direction != "up" && direction != "down" {
-		fmt.Println("Usage: go run ./cmd/migrate <up|down>")
+	if direction != "up" && direction != "down" && direction != "audit" {
+		fmt.Println("Usage: go run ./cmd/migrate <up|down|audit>")
 		os.Exit(1)
 	}
 
@@ -279,6 +279,9 @@ func main() {
 	if err := pool.Ping(ctx); err != nil {
 		slog.Error("unable to ping database", "error", err)
 		os.Exit(1)
+	}
+	if direction == "audit" {
+		os.Exit(runAudit(ctx, pool))
 	}
 
 	files, err := migrations.Files(direction)
