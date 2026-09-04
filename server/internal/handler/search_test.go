@@ -99,7 +99,7 @@ func TestBuildSearchQuery_MultiTermDoesNotRepeatPhrasePredicate(t *testing.T) {
 func TestBuildSearchQuery_MultiTermUsesMaterializedCandidateIntersection(t *testing.T) {
 	query, _ := buildSearchQuery(linearTestContract, "no active lease", []string{"no", "active", "lease"}, 0, false, false)
 
-	if !strings.Contains(query, "WITH matching_issue_ids AS MATERIALIZED") {
+	if !strings.Contains(query, "matching_issue_ids AS MATERIALIZED") {
 		t.Fatalf("multi-word search must narrow candidate IDs before ranking: %s", query)
 	}
 	if got := strings.Count(query, "INTERSECT"); got != 2 {
@@ -118,7 +118,7 @@ func TestBuildSearchQuery_MultiTermUsesMaterializedCandidateIntersection(t *test
 func TestBuildSearchQuery_SingleTermUsesWorkspaceScopedCandidates(t *testing.T) {
 	query, _ := buildSearchQuery(linearTestContract, "vendor", []string{"vendor"}, 0, false, false)
 
-	if !strings.Contains(query, "WITH matching_issue_ids AS MATERIALIZED") {
+	if !strings.Contains(query, "matching_issue_ids AS MATERIALIZED") {
 		t.Fatalf("single-term search must narrow candidates before ranking: %s", query)
 	}
 	if !strings.Contains(query, "SELECT c.issue_id FROM comment c") || !strings.Contains(query, "c.workspace_id = $4") {
