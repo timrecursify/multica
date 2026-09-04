@@ -448,9 +448,11 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 
 	wsParam := nextArg(nil) // $4 — workspace_id, will be filled by caller position
 
-	// Build per-term LIKE conditions only for multi-word search.
+	// Build per-term LIKE conditions for text searches. The candidate CTE below
+	// evaluates each term once over workspace-scoped issue/comment relations,
+	// rather than repeatedly probing comments for every outer issue row.
 	var termContainsParams []string
-	if len(terms) > 1 {
+	if len(terms) > 0 {
 		for _, t := range terms {
 			et := escapeLike(t)
 			termContainsParams = append(termContainsParams, nextArg("%"+et+"%"))
@@ -460,42 +462,13 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	// --- WHERE clause ---
 	var whereParts []string
 
-	// Full phrase match: title, description, or comment.
-	//
-	// The comment EXISTS subquery is deliberately correlated on BOTH
-	// c.issue_id = i.id AND c.workspace_id = wsParam. The workspace_id
-	// filter is not strictly necessary for correctness (comment.workspace_id
-	// is FK-consistent with its issue's workspace), but it is critical for
-	// the planner. Without it, Postgres rewrites the correlated EXISTS
-	// into a hashed subplan that materializes every comment in the entire
-	// `comment` table matching the LIKE — for common tokens like "search"
-	// this can be hundreds of thousands of rows, blowing out work_mem into
-	// a lossy bitmap and taking 30+ seconds. With the workspace_id
-	// constant duplicated into the subquery, the hashed set collapses to
-	// this workspace's comments and the plan uses the supporting
-	// idx_comment_workspace (migration 135). See MUL-4059 EXPLAIN reports.
-	phraseMatch := fmt.Sprintf(
-		"(LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s OR EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s))",
-		phraseContainsParam, phraseContainsParam, wsParam, phraseContainsParam,
-	)
-	// For multi-word queries the all-terms predicate below logically includes
-	// a full-phrase match: a phrase containing every term necessarily satisfies
-	// every per-term condition. Keeping both predicates makes Postgres execute
-	// one additional correlated comment search across the workspace without
-	// changing the result set. Retain the phrase predicate only for the
-	// single-term path; phrase relevance is still preserved in ORDER BY.
-	if len(termContainsParams) <= 1 {
-		whereParts = append(whereParts, phraseMatch)
-	}
-
-	// Multi-word AND match (each term must appear somewhere). Do not express
-	// this as a correlated EXISTS for every issue row: a short/common word
-	// makes that form repeatedly scan the workspace's comments before the
-	// intersection can reject the row. The MATERIALIZED CTE below selects the
-	// (indexable) issue IDs for each term first, then intersects those small
-	// sets. Ranking subqueries consequently run only for real candidates.
+	// Select candidate issue IDs before ranking. This applies to both single- and
+	// multi-word searches: common free-text terms must not trigger a correlated
+	// comment scan for every issue in the workspace. INTERSECT preserves AND
+	// semantics for multi-word queries, while the single-term CTE is simply the
+	// union of title, description, and comment matches.
 	ctePrefix := ""
-	if len(termContainsParams) > 1 {
+	if len(termContainsParams) > 0 {
 		var termCandidates []string
 		for _, tp := range termContainsParams {
 			termCandidates = append(termCandidates, fmt.Sprintf(`SELECT id FROM (
