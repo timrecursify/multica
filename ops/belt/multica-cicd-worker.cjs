@@ -347,13 +347,15 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   // gate; CI queue state alone must not strand an already deployed ticket.
   const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && pr.num != null
     ? retroactiveEligible(pr.repo, pr.num) : null;
-  // Preserve the historical cancelled-only path for callers that do not have
-  // a PR number (the sweep always supplies one and enforces eligibility).
-  const retroactiveMerge = Boolean(retro?.ok) || (ci === 'cancelled_only' && pr.num == null);
+  // A merged PR with no checks or only cancelled checks is already terminal:
+  // retroactive eligibility authorizes a merge, but cannot veto one that
+  // happened. Keep the risk-path veto for pending, pre-merge authorization.
+  const terminalMergedCi = ci === 'no_checks' || ci === 'cancelled_only';
+  const retroactiveMerge = terminalMergedCi || Boolean(retro?.ok);
   if (ci !== 'green' && !retroactiveMerge) {
     if (ci === 'absent' || ['red', 'mixed'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
-    } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
+    } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}${retro?.why ? ` retro=${retro.why}` : ''}`);
     return { status: 'returned' };
   }
   if (latest && latest.verdict !== 'PASS') {
