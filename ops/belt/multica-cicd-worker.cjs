@@ -206,7 +206,7 @@ function laterSuccessfulDeploy(repo, cancelled, sourceSha) {
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
     for (const run of later) {
       const comparison = JSON.parse(gh(['api', `repos/${repo}/compare/${sourceSha}...${run.head_sha}`]));
-      if (comparison.status === 'behind' || comparison.status === 'identical') return run;
+      if (comparison.status === 'ahead' || comparison.status === 'identical') return run;
     }
   } catch (_) { /* REST errors conservatively leave the cancellation unresolved. */ }
   return null;
