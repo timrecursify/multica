@@ -36,6 +36,14 @@ function dependencies({ receipt, verdict = pass, gh = greenGh }) {
   return calls;
 }
 
+test('relay closure requires an explicit successful response', () => {
+  assert.deepStrictEqual(worker.parseRelayResponse('{"success":true,"relay_log_id":7}', 'Done'),
+    { success: true, relay_log_id: 7 });
+  assert.throws(() => worker.parseRelayResponse('{"error":"evidence_missing"}', 'Done'),
+    /relay rejected Done: evidence_missing/);
+  assert.throws(() => worker.parseRelayResponse('not-json', 'Done'), /relay malformed response/);
+});
+
 test('Done relay carries the locally evaluated shipped evidence', async () => {
   const receipt = { source_sha: sha, release: `/releases/${sha}`, health: 'ok' };
   const calls = dependencies({ receipt });
