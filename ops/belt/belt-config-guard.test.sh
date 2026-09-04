@@ -111,6 +111,13 @@ if ! grep -En 'spec_refly_increment_metadata|UPDATE issue SET metadata' "$root_d
   echo 'stranded-Spec retry metadata update missing' >&2
   exit 1
 fi
+# UPDATE 0 is a successful psql command, so the retry gate must require the
+# expected ticket number from RETURNING before reporting a repair.
+spec_metadata_source=$(sed -n '/^spec_refly_increment_metadata()/,/^done_receipt_valid()/p' "$root_dir/belt-config-guard.sh")
+if [[ "$spec_metadata_source" != *'RETURNING number;'* || "$spec_metadata_source" != *'== "$number"'* ]]; then
+  echo 'stranded-Spec retry metadata update does not reject zero-row/concurrent updates' >&2
+  exit 1
+fi
 # Every stage mutation must pass through the shared relay helper; a direct CLI
 # advance can bypass the migration-297 transaction-local authority guard.
 if grep -En '\$SK.*multica advance' "$root_dir/belt-config-guard.sh" >/dev/null; then
