@@ -43,6 +43,7 @@ const {
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
+  admitConfiguredTransition,
   setTestClientFactory,
   isCicdReturn,
   consumeCicdReturnAuthorization,
@@ -71,6 +72,17 @@ const {
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
+
+test('relay transition admission is a single pre-mutation decision', () => {
+  const admitted = admitConfiguredTransition({ fromStage: 'Human Review', toStage: 'Queue',
+    expectedStage: 'Queue' });
+  assert.equal(admitted.ok, true);
+  // A later read of the committed issue sees Queue; it must not be used to
+  // overwrite the original authorization result.
+  assert.deepEqual(admitted, { fromStage: 'Human Review', toStage: 'Queue', ok: true });
+  assert.equal(admitConfiguredTransition({ fromStage: 'Queue', toStage: 'Archived',
+    expectedStage: 'In Progress' }).ok, false);
+});
 
 test('operator respec validates requests and replays the same receipt', async () => {
   const issueId = '123e4567-e89b-42d3-a456-426614174000';
