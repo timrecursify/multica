@@ -25,6 +25,33 @@ if [[ -n "$release_dir" && ! -d "$release_dir" ]]; then echo "release dir missin
 B_ROOT="$checkout_root/ops/gsp-belt"
 fail=0
 
+# Expand the first column of every manifest row.  Globs (currently the SQL
+# provenance entry) are expanded against the selected checkout, never against
+# the caller's current directory.  Reject absolute/parent paths so a manifest
+# cannot silently make the guard inspect a different tree.
+manifest_paths() {
+  local raw rel match found=0
+  while IFS='|' read -r _ raw _; do
+    rel="$(echo "$raw" | sed 's/[ `]//g')"
+    [[ "$rel" == ops/* ]] || continue
+    if [[ "$rel" = /* || "$rel" == *..* ]]; then
+      echo "guard[manifest-path]: unsafe path: $rel"
+      fail=1
+      continue
+    fi
+    if [[ "$rel" == *'*'* || "$rel" == *'?'* || "$rel" == *'['* ]]; then
+      found=0
+      while IFS= read -r match; do
+        found=1
+        printf '%s\n' "${match#"$checkout_root/"}"
+      done < <(compgen -G "$checkout_root/$rel" || true)
+      [[ $found -eq 1 ]] || { echo "guard[untracked/missing]: $rel"; fail=1; }
+    else
+      printf '%s\n' "$rel"
+    fi
+  done < "$MANIFEST"
+}
+
 # 0. Manifest present.
 MANIFEST="$B_ROOT/MANIFEST.md"
 [[ -f "$MANIFEST" ]] || { echo "guard: MANIFEST missing: $MANIFEST"; fail=1; }
@@ -34,7 +61,7 @@ if [[ -f "$MANIFEST" ]]; then
   while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
     if [[ ! -f "$checkout_root/$rel" ]]; then echo "guard[untracked/missing]: $rel"; fail=1; fi
-  done < <(sed -nE 's/^\| `([^`]*)` .*/\1/p' "$MANIFEST" | sort -u)
+  done < <(manifest_paths | sort -u)
 fi
 
 # 1b. Migration provenance must describe the exact tracked bytes.  The
@@ -55,13 +82,12 @@ fi
 
 # 2. Deployed release matches source (drift), if a release is supplied.
 if [[ -n "$release_dir" && -f "$MANIFEST" ]]; then
-  sed -nE 's/^\| `([^`]*)` .*/\1/p' "$MANIFEST" | sort -u | while IFS= read -r rel; do
+  while IFS= read -r rel; do
     [[ -n "$rel" ]] || continue
-    src="$checkout_root/$rel"; dep="$release_dir/ops/gsp-belt/${rel#ops/gsp-belt/}"
-    if [[ ! -f "$dep" ]]; then echo "guard[drift]: deployed missing $rel"; return 1; fi
-    if ! cmp -s "$src" "$dep"; then echo "guard[drift]: $rel deployed differs from source"; return 1; fi
-  done
-  [[ $? -eq 0 ]] || fail=1
+    src="$checkout_root/$rel"; dep="$release_dir/$rel"
+    if [[ ! -f "$dep" ]]; then echo "guard[drift]: deployed missing $rel"; fail=1; continue; fi
+    if ! cmp -s "$src" "$dep"; then echo "guard[drift]: $rel deployed differs from source"; fail=1; fi
+  done < <(manifest_paths | sort -u)
 fi
 
 # 3. Ecosystem must not reference an unmanaged home-directory script.
