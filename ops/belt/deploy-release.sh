@@ -25,7 +25,7 @@ manifest=(ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs ops/belt/parked-di
 health() { "$pm2_bin" jlist | node -e 'let s="";process.stdin.on("data",x=>s+=x);process.stdin.on("end",()=>{let a=JSON.parse(s),n=["gsp-multica-bridge","multica-relay-advance","multica-archiver"];if(process.argv[2]==="1")n.push("gsp-multica-worker");if(process.argv[3]!=="1")n.push("multica-cicd-worker");process.exit(n.every(x=>{let p=a.find(y=>y.name===x);return p&&p.pm2_env.status==="online"&&p.pm2_env.pm_cwd===process.argv[1]})?0:1)})' "$release" "$include_worker" "$skip_cicd_worker"; }
 require_graph() { local tree="$1" src dep rel; for src in "${manifest[@]}"; do [[ "$src" == *.cjs ]] || continue; while IFS= read -r dep; do [[ "$dep" == ./* || "$dep" == ../* ]] || continue; rel="$(realpath -m --relative-to="$tree" "$tree/$(dirname "$src")/$dep")"; [[ -f "$tree/$rel" ]] || rel+='.cjs'; [[ -f "$tree/$rel" ]] || { echo "Missing manifest runtime dependency: $src requires $rel" >&2; return 65; }; done < <(grep -oE "require\\([[:space:]]*[\"'][^\"']+[\"'][[:space:]]*\\)" "$tree/$src" | sed -E "s/^require\\([[:space:]]*[\"']([^\"']+)[\"'][[:space:]]*\\)$/\\1/"); done; }
 manifest_checksum() { local tree="$1"; (cd "$tree" && sha256sum "${manifest[@]}" | sha256sum | awk '{print $1}'); }
-preflight() { local tree="$1"; [[ -x "$tree/ops/belt/build-daemon-artifact.sh" ]] || { echo 'required belt files missing' >&2; exit 65; }; for file in "${manifest[@]}"; do [[ -f "$tree/$file" ]] || { echo "missing release manifest file: $file" >&2; exit 65; }; done; require_graph "$tree"; node --input-type=module -e 'let a=(await import(process.argv[1])).default.apps;if(a.length!==5||a.some(x=>!x.script.startsWith(process.argv[2])))process.exit(1)' "file://$tree/ops/belt/ecosystem.gsp-belt.config.js" "$tree"; }
+preflight() { local tree="$1"; [[ -x "$tree/ops/belt/build-daemon-artifact.sh" ]] || { echo 'required belt files missing' >&2; exit 65; }; for file in "${manifest[@]}"; do [[ -f "$tree/$file" ]] || { echo "missing release manifest file: $file" >&2; exit 65; }; done; require_graph "$tree"; node -e 'const fs=require("fs");const s=fs.readFileSync(process.argv[1],"utf8");if((s.match(/script:/g)||[]).length!==5)process.exit(1)' "$tree/ops/belt/ecosystem.gsp-belt.config.js"; }
 if [[ "$mode" == --rollback ]]; then
   [[ -f "$ecosystem" ]] || { echo "release missing: $release" >&2; exit 66; }
   MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env
@@ -41,7 +41,7 @@ preflight "$release"
 manifest_sha256="$(manifest_checksum "$release")"
 printf '{"source_sha":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"]}\n' "$requested_sha" "$manifest_sha256" > "$release/.gsp-belt-release.json"
 "$release/ops/belt/build-daemon-artifact.sh" "artifacts"
-chmod -R a-w "$release"
+"$checkout/ops/belt/normalize-release-permissions.sh" "$release"
 if ! MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env || ! health; then
   prior_sha="${MULTICA_PRIOR_SHA:-}"
   if [[ "$prior_sha" =~ ^[0-9a-f]{40}$ && -f "$release_root/$prior_sha/ops/belt/ecosystem.gsp-belt.config.js" ]]; then

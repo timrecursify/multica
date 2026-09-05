@@ -4,6 +4,24 @@ This directory mirrors the current GSP belt runtime. The runtime paths below
 are authoritative today. Editing a repository copy does not change running
 behavior until it is deployed with `./deploy.sh --apply`.
 
+## Release permissions
+
+`deploy-release.sh` runs `normalize-release-permissions.sh` after building a
+release. It grants read/execute access to release directories and read access
+to non-credential files, removes all write bits, and preserves the existing
+read scope of credential material (`.env*`, `*secret*`, `*credential*`, and
+private-key formats). For the already-deployed NOC2 intercom tree, an operator
+with root access can remediate the permission regression with:
+
+```sh
+sudo find /var/lib/codex-consiglieri/intercom-v2/dist -type d -exec chmod a+rx,a-w -- {} +
+sudo find /var/lib/codex-consiglieri/intercom-v2/dist -type f -exec chmod a+r,a-w -- {} +
+```
+
+Run the one-time remediation only after confirming that the tree contains no
+credential files requiring owner-only reads; apply the deployment helper for
+future releases.
+
 Explicit terminal exits require `RELAY_OPERATOR_SECRET` in the bridge
 environment and the matching `X-Relay-Operator-Secret` request header. If the
 environment variable is unset, those exceptional exits are refused.
