@@ -83,6 +83,7 @@ function settingsFor(options = {}) {
     defaultMaxAttempts: positive(options.defaultMaxAttempts ?? process.env.RECONCILE_DEFAULT_MAX_ATTEMPTS, 2),
     issueCooldownMinutes: positive(options.issueCooldownMinutes ?? process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
     completedStageCooldownMinutes: positive(options.completedStageCooldownMinutes ?? process.env.RECONCILE_COMPLETED_STAGE_COOLDOWN_MINUTES, 720),
+    failedTtlMinutes: positive(options.failedTtlMinutes ?? process.env.MULTICA_FAILED_TTL_MINUTES, 15),
     typedOutcomes: options.typedOutcomes ?? process.env.RECONCILE_TYPED_OUTCOMES === "1",
     humanReviewRouting: options.humanReviewRouting ?? process.env.RECONCILE_HUMAN_REVIEW_ROUTING !== "0",
     maxHumanReviewPerCycle: positive(options.maxHumanReviewPerCycle ?? process.env.RECONCILE_MAX_HUMAN_REVIEW_PER_CYCLE, 5),
@@ -315,7 +316,11 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     if (options.typedOutcomes) {
       // GSP-1826: a recorded outcome for this stage with unchanged inputs is final until the inputs change.
-      const eligibility = await stageEligibility(client, issue.id, issue.status);
+      const eligibility = await stageEligibility(client, issue.id, issue.status, {
+        failedTtlMinutes: options.failedTtlMinutes,
+        attempt,
+        maxAttempts
+      });
       if (!eligibility.eligible) {
         // Nothing left to observe means nothing will ever re-open this stage, so the
         // issue leaves the belt for a human instead of resting invisibly in Queue.

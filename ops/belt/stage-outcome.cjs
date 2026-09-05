@@ -114,11 +114,21 @@ async function recordStageOutcomes(client, { windowMinutes = 180, logger = conso
 
 // Reconciler eligibility: dispatch only when nothing is recorded for this stage or
 // the inputs changed since. BLOCKED/human never re-opens without a hash change.
-async function stageEligibility(client, issueId, stage) {
+// FAILED is retryable after a bounded TTL; callers may pass a clock/config for tests.
+async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Number.parseInt(process.env.MULTICA_FAILED_TTL_MINUTES || "15", 10), now = Date.now(), attempt, maxAttempts } = {}) {
   const prior = (await client.query(outcomeForStageSql(), [issueId, stage])).rows[0];
   if (!prior) return { eligible: true, reason: "no_outcome" };
   const current = (await client.query(stageInputHashSql(), [issueId])).rows[0]?.input_hash || null;
   if (current && prior.input_hash && current !== prior.input_hash) return { eligible: true, reason: "input_changed", prior };
+  if (Number.isInteger(attempt) && Number.isInteger(maxAttempts) && attempt >= maxAttempts) {
+    return { eligible: false, reason: "attempt_budget_exhausted", prior };
+  }
+  const ttl = Number(failedTtlMinutes);
+  const outcomeAt = Date.parse(prior.outcome_at);
+  if (prior.outcome === "FAILED" && Number.isFinite(ttl) && ttl > 0 && Number.isFinite(outcomeAt) &&
+      Number(now) - outcomeAt >= ttl * 60 * 1000) {
+    return { eligible: true, reason: "failed_ttl_expired", prior };
+  }
   return { eligible: false, reason: `outcome_unchanged:${prior.outcome}${prior.blocked_on ? "/" + prior.blocked_on : ""}`, prior };
 }
 
