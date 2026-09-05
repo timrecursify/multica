@@ -526,7 +526,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	whereClause := "(" + strings.Join(whereParts, " OR ") + ")"
 
 	if !includeClosed {
-		whereClause += " AND i.status NOT IN ('Done', 'Cancelled', 'Archived')"
+		whereClause += " AND i.status NOT IN ('Done', 'Cancelled', 'Archived', 'Blocked (human)')"
 	}
 
 	// --- ORDER BY clause ---

@@ -221,7 +221,7 @@ func (c *IssueStatusContract) orderCASE(statusExpr string) string {
 // float to the top of a search. It maps every canonical status to a rank so a
 // canonical spelling never collapses into the fallback.
 func (c *IssueStatusContract) activityRankCASE(statusExpr string) string {
-	rank := []string{"In Progress", "In Review", "Registered", "Spec", "Queue", "Human Review", "CI/CD & Deploy", "Done", "Cancelled", "Archived"}
+	rank := []string{"In Progress", "In Review", "Registered", "Spec", "Queue", "Human Review", "CI/CD & Deploy", "Done", "Blocked (human)", "Cancelled", "Archived"}
 	var b strings.Builder
 	b.WriteString("CASE ")
 	b.WriteString(statusExpr)
