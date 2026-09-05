@@ -7175,6 +7175,95 @@ func (q *Queries) RestoreAgent(ctx context.Context, id pgtype.UUID) (Agent, erro
 	return i, err
 }
 
+const selectRelayStageRerunAgent = `-- name: SelectRelayStageRerunAgent :one
+WITH candidate AS (
+    SELECT p.agent_id
+    FROM relay_stage_agent_pool p
+    JOIN relay_stage_pool pool
+      ON pool.workspace_id = p.workspace_id
+     AND pool.stage_name = p.stage_name
+    JOIN agent a ON a.id = p.agent_id
+                AND a.workspace_id = p.workspace_id
+    WHERE p.workspace_id = $1
+      AND p.stage_name = $2
+      AND p.enabled
+      AND pool.enabled
+      AND a.archived_at IS NULL
+      AND a.kind = 'user'
+      AND (a.permission_mode = 'public_to' OR EXISTS (
+          SELECT 1 FROM agent_invocation_target t
+           WHERE t.agent_id = a.id
+             AND t.target_type = 'workspace'
+             AND t.target_id = p.workspace_id
+      ))
+    ORDER BY p.last_selected_at NULLS FIRST,
+             (SELECT count(*) FROM agent_task_queue q
+               WHERE q.agent_id = a.id
+                 AND q.status IN ('queued', 'dispatched', 'running')) ASC,
+             a.created_at ASC,
+             a.id ASC
+    LIMIT 1
+    FOR UPDATE OF p
+), selected AS (
+    UPDATE relay_stage_agent_pool p
+       SET last_selected_at = now()
+      FROM candidate c
+     WHERE p.workspace_id = $1
+       AND p.stage_name = $2
+       AND p.agent_id = c.agent_id
+    RETURNING p.agent_id
+)
+SELECT a.id, a.workspace_id, a.name, a.avatar_url, a.runtime_mode, a.runtime_config, a.visibility, a.status, a.max_concurrent_tasks, a.owner_id, a.created_at, a.updated_at, a.description, a.runtime_id, a.instructions, a.archived_at, a.archived_by, a.custom_env, a.custom_args, a.mcp_config, a.model, a.thinking_level, a.composio_toolkit_allowlist, a.permission_mode, a.kind, a.system_key, a.disabled_runtime_skills, a.service_tier
+  FROM selected s
+  JOIN agent a ON a.id = s.agent_id
+`
+
+type SelectRelayStageRerunAgentParams struct {
+	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	StageName   string      `json:"stage_name"`
+}
+
+// Pick a live member of the issue's workspace/stage pool for an unassigned
+// manual rerun.  last_selected_at provides stable round-robin behavior while
+// the active-task count keeps a busy member from being selected ahead of an
+// otherwise idle member.  The pool row is locked and stamped in the same
+// statement so concurrent reruns cannot choose the same slot indefinitely.
+func (q *Queries) SelectRelayStageRerunAgent(ctx context.Context, arg SelectRelayStageRerunAgentParams) (Agent, error) {
+	row := q.db.QueryRow(ctx, selectRelayStageRerunAgent, arg.WorkspaceID, arg.StageName)
+	var i Agent
+	err := row.Scan(
+		&i.ID,
+		&i.WorkspaceID,
+		&i.Name,
+		&i.AvatarUrl,
+		&i.RuntimeMode,
+		&i.RuntimeConfig,
+		&i.Visibility,
+		&i.Status,
+		&i.MaxConcurrentTasks,
+		&i.OwnerID,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.Description,
+		&i.RuntimeID,
+		&i.Instructions,
+		&i.ArchivedAt,
+		&i.ArchivedBy,
+		&i.CustomEnv,
+		&i.CustomArgs,
+		&i.McpConfig,
+		&i.Model,
+		&i.ThinkingLevel,
+		&i.ComposioToolkitAllowlist,
+		&i.PermissionMode,
+		&i.Kind,
+		&i.SystemKey,
+		&i.DisabledRuntimeSkills,
+		&i.ServiceTier,
+	)
+	return i, err
+}
+
 const setDeferredChannelIssueTaskRuntimeOverlay = `-- name: SetDeferredChannelIssueTaskRuntimeOverlay :execrows
 UPDATE agent_task_queue
 SET runtime_mcp_overlay = $1,

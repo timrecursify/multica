@@ -2000,6 +2000,53 @@ WHERE rsc.stage_name = $1
 ORDER BY (rsc.workspace_id IS NOT NULL) DESC, rsc.id
 LIMIT 1;
 
+-- name: SelectRelayStageRerunAgent :one
+-- Pick a live member of the issue's workspace/stage pool for an unassigned
+-- manual rerun.  last_selected_at provides stable round-robin behavior while
+-- the active-task count keeps a busy member from being selected ahead of an
+-- otherwise idle member.  The pool row is locked and stamped in the same
+-- statement so concurrent reruns cannot choose the same slot indefinitely.
+WITH candidate AS (
+    SELECT p.agent_id
+    FROM relay_stage_agent_pool p
+    JOIN relay_stage_pool pool
+      ON pool.workspace_id = p.workspace_id
+     AND pool.stage_name = p.stage_name
+    JOIN agent a ON a.id = p.agent_id
+                AND a.workspace_id = p.workspace_id
+    WHERE p.workspace_id = $1
+      AND p.stage_name = $2
+      AND p.enabled
+      AND pool.enabled
+      AND a.archived_at IS NULL
+      AND a.kind = 'user'
+      AND (a.permission_mode = 'public_to' OR EXISTS (
+          SELECT 1 FROM agent_invocation_target t
+           WHERE t.agent_id = a.id
+             AND t.target_type = 'workspace'
+             AND t.target_id = p.workspace_id
+      ))
+    ORDER BY p.last_selected_at NULLS FIRST,
+             (SELECT count(*) FROM agent_task_queue q
+               WHERE q.agent_id = a.id
+                 AND q.status IN ('queued', 'dispatched', 'running')) ASC,
+             a.created_at ASC,
+             a.id ASC
+    LIMIT 1
+    FOR UPDATE OF p
+), selected AS (
+    UPDATE relay_stage_agent_pool p
+       SET last_selected_at = now()
+      FROM candidate c
+     WHERE p.workspace_id = $1
+       AND p.stage_name = $2
+       AND p.agent_id = c.agent_id
+    RETURNING p.agent_id
+)
+SELECT a.*
+  FROM selected s
+  JOIN agent a ON a.id = s.agent_id;
+
 
 -- name: CreateRelayStageTask :one
 -- Idempotent successor-task insert for the relay issue-stage advancement
