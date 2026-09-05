@@ -135,6 +135,34 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
   }));
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// A capped QC return must carry the task that paid for the failed build.  The
+// lookup is deliberately locked with the issue row, so a replay cannot create
+// a second Sol-low handoff for the same source task.
+async function retryEscalationSourceTask(client, issue, requestedTaskId = null) {
+  if (requestedTaskId != null && !UUID_RE.test(String(requestedTaskId))) return null;
+  const source = await client.query(
+    `SELECT t.id
+       FROM agent_task_queue t
+      WHERE t.issue_id = $1
+        AND ($2::uuid IS NULL OR t.id = $2::uuid)
+        AND (t.context->>'to_stage' = 'In Progress'
+          OR EXISTS (SELECT 1 FROM relay_run_log r
+                       WHERE r.task_id = t.id AND r.issue_id = t.issue_id
+                         AND r.to_stage = 'In Progress'))
+      ORDER BY t.created_at DESC, t.id DESC
+      LIMIT 1 FOR UPDATE OF t`,
+    [issue.id, requestedTaskId || null]
+  );
+  return source.rows.length === 1 ? source.rows[0].id : null;
+}
+
+function escalationDeadline() {
+  const minutes = Number.parseInt(process.env.RELAY_RETRY_ESCALATION_DEADLINE_MINUTES || "20", 10);
+  return new Date(Date.now() + (Number.isFinite(minutes) && minutes > 0 ? minutes : 20) * 60 * 1000).toISOString();
+}
+
 async function ssoBridge(req, res) {
   try {
     // Read CF Access authenticated user email from header
@@ -223,7 +251,7 @@ async function ssoBridge(req, res) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token } = body;
+    let { issue_id, to_stage, agent_token, relay_source_task_id } = body;
 
     // Validate agent token
     const archiverRequest = body.actor === 'archiver' && agent_token === ARCHIVER_AGENT_SECRET;
@@ -313,7 +341,8 @@ async function relayAdvance(req, res, body) {
     // and the review lane on every lap. GSP #151 ran 67 laps.
     // The ceiling is agent_task_queue.max_attempts (default 2) -- the belt's own
     // declared retry limit, applied to stage re-entry instead of to one task.
-    // Past it the ticket is a human's problem, not another paid rebuild.
+    // Past it the ticket changes hands to one controlled Sol-low Spec task.
+    let retryEscalation = null;
     if (issue.status === "In Review" && to_stage === "In Progress" &&
         altStages.includes("Human Review")) {
       const bounced = await client.query(
@@ -328,14 +357,28 @@ async function relayAdvance(req, res, body) {
       );
       const { n, ceiling } = bounced.rows[0];
       if (n >= ceiling) {
+        const sourceTaskId = await retryEscalationSourceTask(client, issue, relay_source_task_id);
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required", reason: "qc_bounce_ceiling" }));
+          return;
+        }
+        retryEscalation = {
+          reason: "qc_bounce_ceiling", trigger_stage: issue.status,
+          attempts: n, ceiling, source_task_id: sourceTaskId,
+          deadline: escalationDeadline()
+        };
+        to_stage = "Spec";
         console.warn(JSON.stringify({
           event: "qc_bounce_ceiling",
           issue_id,
           bounces: n,
           ceiling,
-          redirected_to: "Human Review"
+          redirected_to: "Spec",
+          source_task_id: sourceTaskId
         }));
-        to_stage = "Human Review";
+        admittedTransition.toStage = to_stage;
       }
     }
 
@@ -418,7 +461,32 @@ async function relayAdvance(req, res, body) {
       throw new Error(`Missing relay configuration for stage: ${to_stage}`);
     }
 
-    const stage = stageResult.rows[0];
+    let stage = stageResult.rows[0];
+    if (retryEscalation) {
+      const specOwner = await client.query(
+        `SELECT rsc.agent_id, rsc.agent_name, a.runtime_id, a.archived_at,
+                COALESCE(a.model, a.runtime_config->>'model') AS model,
+                COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') AS thinking_level,
+                COALESCE(a.runtime_id, (
+                  SELECT ar.id FROM agent_runtime ar
+                   WHERE ar.workspace_id = $1 AND ar.provider = 'codex' AND ar.status = 'online'
+                   ORDER BY ar.updated_at DESC LIMIT 1
+                )) AS selected_runtime_id
+           FROM relay_stage_config rsc
+           LEFT JOIN agent a ON a.id = rsc.agent_id
+          WHERE rsc.workspace_id = $1 AND rsc.stage_name = 'Spec'`,
+        [issue.workspace_id]
+      );
+      const owner = specOwner.rows[0];
+      if (!owner || !owner.agent_id || owner.archived_at ||
+          owner.model !== "gpt-5.6-sol" || owner.thinking_level !== "low" || !owner.selected_runtime_id) {
+        await client.query("ROLLBACK");
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "sol_low_spec_owner_unavailable" }));
+        return;
+      }
+      stage = owner;
+    }
     if (stage.agent_id && stage.archived_at) {
       throw new Error(`Relay owner is archived: ${stage.agent_name} (${stage.agent_id}) for ${issue.status} -> ${to_stage}`);
     }
@@ -464,7 +532,14 @@ async function relayAdvance(req, res, body) {
         agent_name: stage.agent_name,
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
-        ...(bindingSpec ? { spec: bindingSpec } : {})
+        ...(bindingSpec ? { spec: bindingSpec } : {}),
+        ...(retryEscalation ? {
+          kind: "retry_escalation",
+          escalation_reason: retryEscalation.reason,
+          escalation_owner: stage.agent_name,
+          escalation_deadline: retryEscalation.deadline,
+          escalation_source_task_id: retryEscalation.source_task_id
+        } : {})
       });
       // A pending task will pick the issue up at its current stage, so a second
       // task is redundant; the stage transition must not be sacrificed to it.
@@ -483,7 +558,9 @@ async function relayAdvance(req, res, body) {
           issue_id,
           stage.selected_runtime_id,
           context,
-          `Relay stage transition: ${issue.status} -> ${to_stage}`
+          retryEscalation
+            ? `Sol-low re-spec escalation: ${retryEscalation.reason}`
+            : `Relay stage transition: ${issue.status} -> ${to_stage}`
         ]
       );
       if (taskResult.rows.length === 0) {
@@ -501,6 +578,15 @@ async function relayAdvance(req, res, body) {
         );
         relayLogId = logResult.rows[0].id;
       }
+    }
+
+    if (retryEscalation) {
+      await client.query(
+        `UPDATE "issue" SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+          jsonb_build_object('retry_escalation', $2::jsonb), updated_at = NOW()
+         WHERE id = $1`,
+        [issue.id, JSON.stringify(retryEscalation)]
+      );
     }
 
     await client.query("COMMIT");
