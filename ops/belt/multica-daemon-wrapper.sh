@@ -66,7 +66,19 @@ if [[ -z "$daemon_cwd" || "$daemon_cwd" != /* || ! -d "$daemon_cwd" ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_CWD must be an existing absolute directory" >&2
   exit 64
 fi
-export MULTICA_DAEMON_PORT="${MULTICA_DAEMON_PORT:-20464}"
+requested_daemon_port="${MULTICA_DAEMON_PORT-}"
+requested_health_port="${MULTICA_HEALTH_PORT-}"
+if [[ -n "$requested_daemon_port" && -n "$requested_health_port" && "$requested_daemon_port" != "$requested_health_port" ]]; then
+  echo "multica-daemon-wrapper: MULTICA_DAEMON_PORT ($requested_daemon_port) disagrees with MULTICA_HEALTH_PORT ($requested_health_port)" >&2
+  exit 64
+fi
+effective_health_port="${requested_daemon_port:-${requested_health_port:-20464}}"
+if [[ ! "$effective_health_port" =~ ^[1-9][0-9]*$ || "$effective_health_port" -gt 65535 ]]; then
+  echo "multica-daemon-wrapper: effective health port must be an integer from 1 to 65535" >&2
+  exit 64
+fi
+export MULTICA_DAEMON_PORT="$effective_health_port"
+export MULTICA_HEALTH_PORT="$effective_health_port"
 cd -- "$daemon_cwd"
 set +e
 daemon_help="$(timeout --kill-after=1s "${help_timeout}s" "$daemon_bin" daemon start --help 2>&1)"

@@ -24,6 +24,7 @@ func TestHealthHandlerReportsCLIVersionAndTaskCounts(t *testing.T) {
 			DaemonID:      "daemon-test",
 			DeviceName:    "dev",
 			ServerBaseURL: "http://localhost:8080",
+			HealthPort:    20464,
 		},
 		workspaces: map[string]*workspaceState{},
 		logger:     slog.Default(),
@@ -65,6 +66,9 @@ func TestHealthHandlerReportsCLIVersionAndTaskCounts(t *testing.T) {
 	}
 	if got, want := raw["status"], "running"; got != want {
 		t.Errorf("status key: got %v, want %q", got, want)
+	}
+	if got, want := raw["health_port"], float64(20464); got != want {
+		t.Errorf("health_port key: got %v, want %v", got, want)
 	}
 	// The desktop relies on the `os` key (runtime.GOOS) to detect a daemon it
 	// can't manage (e.g. Linux-in-WSL behind a Windows desktop). A rename or

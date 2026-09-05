@@ -17,8 +17,9 @@ import (
 
 // HealthResponse is returned by the daemon's local health endpoint.
 type HealthResponse struct {
-	Status string `json:"status"`
-	PID    int    `json:"pid"`
+	Status     string `json:"status"`
+	PID        int    `json:"pid"`
+	HealthPort int    `json:"health_port"`
 	// OS is the daemon's runtime.GOOS. The desktop app compares it against its
 	// own host OS to detect a daemon it cannot manage — e.g. a Windows desktop
 	// reaching a Linux daemon inside WSL2 over localhost forwarding. The
@@ -132,6 +133,7 @@ func (d *Daemon) healthHandler(startedAt time.Time) http.HandlerFunc {
 		resp := HealthResponse{
 			Status:                status,
 			PID:                   os.Getpid(),
+			HealthPort:            d.cfg.HealthPort,
 			OS:                    runtime.GOOS,
 			Uptime:                time.Since(startedAt).Truncate(time.Second).String(),
 			LastHeartbeatAt:       heartbeatTimestamp(d.lastHeartbeatAt.Load()),
