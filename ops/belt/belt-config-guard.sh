@@ -26,6 +26,24 @@ readonly RUNTIME_GUARD="${RUNTIME_ROOT}/tools/belt-config-guard.sh"
 readonly RUNTIME_WRAPPER="${RUNTIME_ROOT}/gsp-multica/fleet/multica-daemon-wrapper.sh"
 readonly RELEASE_ROOT="${BELT_RELEASE_ROOT:-/home/newadmin/gsp-multica-runtime/releases}"
 readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
+# Keep release identity validation aligned with deploy-release.sh.  The
+# metadata digest is meaningful only when it covers the complete runtime
+# manifest, including both members of the parity pair.
+readonly RELEASE_MANIFEST=(
+  ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs
+  ops/belt/parked-diagnosis.cjs ops/belt/parked-entry-audit.cjs
+  ops/belt/parity/multica-relay-advance-daemon.cjs
+  ops/belt/parity/relay-dead-rows.cjs ops/belt/multica-cicd-worker.cjs
+  ops/belt/cicd-watchdog.cjs ops/belt/cicd-deploy-evidence.cjs
+  ops/belt/multica-archiver.cjs ops/belt/reconciler.cjs
+  ops/belt/stage-outcome.cjs ops/belt/transition-policy.cjs
+  ops/belt/stage-routing.cjs ops/belt/qc-strict-evidence.cjs
+  ops/belt/qc-verdict-policy.cjs ops/belt/belt-config-guard.sh
+  ops/belt/multica-daemon-wrapper.sh ops/belt/ecosystem.gsp-belt.config.js
+  ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md
+  ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md
+  ops/belt/WORKER_COMMON.md ops/belt/relay-completion-admission.cjs
+)
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
 WANT_CONCURRENCY="$(belt_resolve_concurrency)"
 readonly WANT_CONCURRENCY
@@ -99,6 +117,14 @@ repair_failure() {
   unfixable+=("belt runtime/source parity repair failed: ${diagnostic}")
 }
 
+release_manifest_checksum() {
+  local release="$1" file
+  for file in "${RELEASE_MANIFEST[@]}"; do
+    [[ -f "$release/$file" ]] || return 1
+  done
+  (cd -- "$release" && sha256sum "${RELEASE_MANIFEST[@]}" | sha256sum | awk '{print $1}')
+}
+
 # A deployed guard can live outside the source tree, so recover the paired
 # wrapper from a complete release when the source wrapper is not installed.
 validated_release_wrapper() {
@@ -118,7 +144,8 @@ validated_release_wrapper() {
     source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
     manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
     [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ &&
-       "${source_sha,,}" == "$(basename -- "$release")" ]] || continue
+       "${source_sha,,}" == "$(basename -- "$release")" &&
+       "$manifest_sha256" == "$(release_manifest_checksum "$release")" ]] || continue
     printf '%s\n' "$candidate_wrapper"
     return 0
   done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
@@ -178,7 +205,8 @@ repair_source_runtime_parity() {
     source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
     manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
     [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ &&
-       "${source_sha,,}" == "$(basename -- "$release")" ]] || { release=''; continue; }
+       "${source_sha,,}" == "$(basename -- "$release")" &&
+       "$manifest_sha256" == "$(release_manifest_checksum "$release")" ]] || { release=''; continue; }
     break
   done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
   [[ -n "$release" ]] || {
