@@ -228,8 +228,9 @@ function noWorkflowCi(repo, sha) {
 function successfulDeployRun(repo, sha, workflow) {
   try {
     const runs = JSON.parse(gh(['run', 'list', '--repo', repo, '--commit', sha, '--workflow', workflow,
-      '--status', 'success', '--json', 'databaseId,conclusion,name']));
-    const run = runs.find(candidate => candidate.conclusion === 'success');
+      '--status', 'success', '--json', 'databaseId,conclusion,name,event,path']));
+    const run = runs.find(candidate => candidate.conclusion === 'success'
+      && (candidate.event === undefined || candidate.event === 'workflow_dispatch'));
     return run ? { kind: 'github_deploy_run', sha, workflow, run } : null;
   } catch (_) { return null; }
 }
@@ -251,7 +252,8 @@ function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
   if (!Number.isFinite(ageMinutes) || ageMinutes < DEPLOY_TRIGGER_GRACE_MINUTES) return false;
   try {
     const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]));
-    return !(runs.workflow_runs || []).some(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || ''));
+    return !(runs.workflow_runs || []).some(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || '')
+      && (r.event === undefined || r.event === 'workflow_dispatch'));
   } catch (_) { return false; }
 }
 
@@ -287,11 +289,38 @@ function terminalDeployEvaluation(repo, sha) {
   try {
     const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]))
       .workflow_runs || [];
-    const deployRuns = runs.filter(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || ''));
+    const deployRuns = runs.filter(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || '')
+      && (r.event === undefined || r.event === 'workflow_dispatch'));
     if (!deployRuns.length) return null;
-    const superseded = deployRuns.filter(run => run.conclusion === 'cancelled'
+    const attempted = [];
+    const failedGates = [];
+    for (const run of deployRuns) {
+      let jobs = null;
+      try {
+        if (run.id || run.database_id) {
+          const payload = JSON.parse(gh(['api', `repos/${repo}/actions/runs/${run.id || run.database_id}/jobs?per_page=100`]));
+          jobs = payload.jobs || [];
+        }
+      } catch (_) { jobs = null; }
+      if (Array.isArray(jobs) && jobs.length === 0) continue;
+      if (Array.isArray(jobs)) {
+        const deployJob = jobs.find(job => /^(?:deploy\b)|\/\s*deploy\b/i.test(job.name || job.id || ''));
+        const failed = jobs.filter(job => job !== deployJob && job.conclusion === 'failure');
+        if (deployJob?.conclusion === 'skipped' && failed.length) {
+          failedGates.push(...failed.map(job => job.name || job.id || 'unknown gate'));
+          continue;
+        }
+      }
+      attempted.push(run);
+    }
+    if (failedGates.length) {
+      return { failed: [...new Set(failedGates)].sort().map(name =>
+        `blocked_on=ci failing_gate=${name}`).join(', ') };
+    }
+    if (!attempted.length) return { noAttempt: true };
+    const superseded = attempted.filter(run => run.conclusion === 'cancelled'
       && laterSuccessfulDeploy(repo, run, sha));
-    const unresolved = deployRuns.filter(run => !superseded.includes(run));
+    const unresolved = attempted.filter(run => !superseded.includes(run));
     if (unresolved.some(run => run.conclusion !== 'cancelled' && !TERMINAL_DEPLOY_CONCLUSIONS.has(run.conclusion))) return null;
     if (unresolved.length) {
       const cancelled = unresolved.filter(run => run.conclusion === 'cancelled');
@@ -366,6 +395,9 @@ function mergeDeployEvidence(repo, sha, mergedAt) {
     return { evidence: { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true } };
   }
   const terminal = terminalDeployEvaluation(repo, sha);
+  if (terminal?.noAttempt) {
+    return { evidence: { kind: 'github_deploy_run_no_attempt', sha } };
+  }
   if (terminal?.failed) return { failed: terminal.failed };
   if (terminal?.cancelled) return { cancelled: terminal.cancelled, cancelledRuns: terminal.cancelledRuns };
   if (terminal?.superseded?.length) {

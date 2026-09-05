@@ -464,6 +464,54 @@ test('a just-merged sha stays pending inside the deploy trigger grace window', (
   assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, undefined), false);
 });
 
+test('push-triggered deploy workflow runs are ignored for deploy verdicts', () => {
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{
+      id: 41, path: '.github/workflows/deploy-billing-server.yml', event: 'push', conclusion: 'cancelled'
+    }] });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
+  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, '2020-01-01T00:00:00Z');
+  assert.deepEqual(result.evidence, { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true });
+  worker.setTestDependencies({ log: defaultLog });
+});
+
+test('dispatch deploy run with zero jobs is treated as no deployment attempt', () => {
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{
+      id: 42, path: '.github/workflows/deploy-billing-server.yml', event: 'workflow_dispatch', conclusion: 'cancelled'
+    }] });
+    if (path.includes('/actions/runs/42/jobs')) return JSON.stringify({ jobs: [] });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
+  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, '2020-01-01T00:00:00Z');
+  assert.deepEqual(result.evidence, { kind: 'github_deploy_run_no_attempt', sha });
+});
+
+test('skipped dispatch deploy reports the failing gate as a CI blocker', () => {
+  const gh = (args) => {
+    const path = args[1] || '';
+    if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
+    if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{
+      id: 43, path: '.github/workflows/deploy-billing-server.yml', event: 'workflow_dispatch', conclusion: 'success'
+    }] });
+    if (path.includes('/actions/runs/43/jobs')) return JSON.stringify({ jobs: [
+      { name: 'test / billing-server (deploy gate)', conclusion: 'failure' },
+      { name: 'deploy / billing-server', conclusion: 'skipped' }
+    ] });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  };
+  worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
+  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, '2020-01-01T00:00:00Z');
+  assert.match(result.failed, /blocked_on=ci failing_gate=test \/ billing-server \(deploy gate\)/);
+});
+
 // Fix A renamed the all-cancelled CI state to 'cancelled_only'. The retroactive
 // merge gate in sweep() must recognise the new name, or an open PR whose runs
 // were all cancelled matches no arm and holds forever with no escalation path:
