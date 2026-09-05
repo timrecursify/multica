@@ -206,6 +206,18 @@ if [[ "$redacted_diag" == *super-secret* || "$redacted_diag" == *abc123* ]]; the
 fi
 # Source/runtime parity is checked against only the deployed guard and wrapper
 # locations; readable source drift is repaired atomically.
+review_source=$(sed -n '/^guard_stranded_review()/,/^guard_stranded_queue()/p' "$root_dir/belt-config-guard.sh")
+[[ "$review_source" == *'queue_backed_up'* && "$review_source" == *"review_reflies"* && "$review_source" == *'increment_reflight_metadata'* ]] || {
+  echo 'stranded In Review recovery is missing backlog/retry accounting' >&2; exit 1;
+}
+queue_source=$(sed -n '/^guard_stranded_queue()/,/^guard_stranded_inprogress()/p' "$root_dir/belt-config-guard.sh")
+[[ "$queue_source" == *'queue_backed_up'* && "$queue_source" == *"queue_reflies"* && "$queue_source" == *'increment_reflight_metadata'* ]] || {
+  echo 'stranded Queue recovery is missing backlog/retry accounting' >&2; exit 1;
+}
+retry_source=$(sed -n '/^increment_reflight_metadata()/,/^# A bundled child/p' "$root_dir/belt-config-guard.sh")
+[[ "$retry_source" == *'RETURNING number;'* && "$retry_source" != *'status IN ('"'"'queued'"'"','"'"'running'"'"')'* ]] || {
+  echo 'retry accounting rejects transitions that already created a task' >&2; exit 1;
+}
 parity_root="$(mktemp -d)"
 mkdir -p "$parity_root/tools" "$parity_root/gsp-multica/fleet"
 cp "$root_dir/belt-config-guard.sh" "$parity_root/tools/belt-config-guard.sh"

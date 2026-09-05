@@ -956,21 +956,26 @@ guard_workspace_repos() {
 # costs nothing until a slot frees. Every stranded flight
 # is work Tim asked to see finished, so the correct batch size is "all of them".
 guard_stranded_review() {
-  local number board ws
+  if queue_backed_up; then
+    unfixable+=("guard_stranded_review skipped: queue already backed up past half the 120-minute TTL; re-driving now would only create expiry victims")
+    return 0
+  fi
+  local number board
   while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
     # Both stage changes use the shared relay helper; the review task fires on
     # row 4's In Progress -> In Review exit.
     if relay_transition "$number" "In Progress" "$board" >/dev/null 2>&1 &&
-       relay_transition "$number" "In Review" "$board" >/dev/null 2>&1; then
+       relay_transition "$number" "In Review" "$board" >/dev/null 2>&1 &&
+       increment_reflight_metadata "$number" "$board" review_reflies; then
       fixed+=("${board}#${number} re-driven to a reviewer after being stranded in In Review")
     else
-      unfixable+=("${board}#${number} is stranded in In Review and could not be re-driven")
+      unfixable+=("${board}#${number} is stranded in In Review and could not be re-driven (retry state was not recorded)")
     fi
   done < <("${PSQL[@]}" -F'|' -c "
     SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END
       FROM issue i WHERE i.status='In Review'
+       AND coalesce(i.metadata->>'review_reflies','0')::int < 3
        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
                         WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
      ORDER BY i.updated_at ASC;" 2>/dev/null)
@@ -982,21 +987,26 @@ guard_stranded_review() {
 # Re-drive it through the normal path so QC judges the work; QC returns it if the
 # build is not real. Bounded by the same headroom as guard_stranded_review.
 guard_stranded_queue() {
-  local number board ws
+  if queue_backed_up; then
+    unfixable+=("guard_stranded_queue skipped: queue already backed up past half the 120-minute TTL; re-driving now would only create expiry victims")
+    return 0
+  fi
+  local number board
   while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
     # The BUILDER is dispatched on row 2's Spec -> Queue exit, so a rework must
     # leave from Spec. Routing In Progress -> Queue instead fires row 4's QC
     # worker and leaves the flight stranded again; that mistake was made and
     # corrected on 2026-08-31.
     if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
-       relay_transition "$number" "Queue" "$board" >/dev/null 2>&1; then
+       relay_transition "$number" "Queue" "$board" >/dev/null 2>&1 &&
+       increment_reflight_metadata "$number" "$board" queue_reflies; then
       fixed+=("${board}#${number} re-driven to the builder after being stranded in Queue")
     else
       # Usually spec_required: no scoper ever wrote a spec comment. Send it to
       # the scoper instead of leaving it parked.
-      if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1; then
+      if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
+         increment_reflight_metadata "$number" "$board" queue_reflies; then
         fixed+=("${board}#${number} had no spec; sent to the scoper instead of the builder")
       else
         unfixable+=("${board}#${number} is stranded in Queue and could not be re-driven")
@@ -1005,6 +1015,7 @@ guard_stranded_queue() {
   done < <("${PSQL[@]}" -F'|' -c "
     SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END
       FROM issue i WHERE i.status='Queue'
+       AND coalesce(i.metadata->>'queue_reflies','0')::int < 3
        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
                         WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
      ORDER BY i.updated_at ASC;" 2>/dev/null)
@@ -1068,8 +1079,10 @@ guard_stranded_inprogress() {
 }
 
 # Retry counters are guarded in the same statement that writes them.  The
-# workspace predicate and active-task check make this idempotent when two guard
-# ticks overlap, while the cap prevents an endlessly expiring flight loop.
+# workspace predicate and RETURNING receipt make this idempotent when two guard
+# ticks overlap, while the cap prevents an endlessly expiring flight loop. The
+# caller updates the counter after a relay transition, so an active task is
+# expected and must not make the accounting update fail.
 increment_reflight_metadata() {
   local number="$1" board="${2:-gsp}" key="${3:-spec_reflies}"
   [[ "$key" =~ ^[a-z_]+$ ]] || return 1
@@ -1081,7 +1094,6 @@ increment_reflight_metadata() {
     jsonb_build_object('${key}', (coalesce(metadata->>'${key}','0')::int + 1)::text)
     WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END
       AND coalesce(metadata->>'${key}','0')::int < 3
-      AND NOT EXISTS (SELECT 1 FROM agent_task_queue q WHERE q.issue_id=issue.id AND q.status IN ('queued','running'))
     RETURNING number;" 2>/dev/null </dev/null) || return 1
   [[ "$(printf '%s' "$updated" | tr -d '[:space:]')" == "$number" ]]
 }
