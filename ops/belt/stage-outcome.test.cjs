@@ -84,6 +84,35 @@ test("stageEligibility retries FAILED after TTL but not before or at the attempt
   assert.deepEqual({ eligible: capped.eligible, reason: capped.reason }, { eligible: false, reason: "attempt_budget_exhausted" });
 });
 
+test("stageEligibility re-arms an aged unchanged ADVANCED outcome only while still in that stage", async () => {
+  const previous = process.env.MULTICA_ADVANCED_STALL_TTL_MINUTES;
+  process.env.MULTICA_ADVANCED_STALL_TTL_MINUTES = "15";
+  const old = new Date(Date.now() - 16 * 60 * 1000).toISOString();
+  try {
+    let c = fakeClient([[{ outcome: "ADVANCED", blocked_on: null, input_hash: "h1", outcome_at: old }],
+      [{ input_hash: "h1", issue_status: "In Progress" }]]);
+    assert.equal((await so.stageEligibility(c, "i3", "In Progress")).reason, "advanced_stall");
+    c = fakeClient([[{ outcome: "ADVANCED", blocked_on: null, input_hash: "h1", outcome_at: old }],
+      [{ input_hash: "h1", issue_status: "In Review" }]]);
+    assert.equal((await so.stageEligibility(c, "i3", "In Progress")).eligible, false);
+  } finally {
+    if (previous === undefined) delete process.env.MULTICA_ADVANCED_STALL_TTL_MINUTES;
+    else process.env.MULTICA_ADVANCED_STALL_TTL_MINUTES = previous;
+  }
+});
+
+test("recordStageOutcomes rejects an In Progress ADVANCED result without PR evidence", async () => {
+  const logs = [];
+  const c = fakeClient([
+    [{ id: "t3", issue_id: "i3", stage: "In Progress", output: "OUTCOME: ADVANCED" }],
+    [{ has_review_evidence: false }],
+    [{ input_hash: "h1" }], []
+  ]);
+  await so.recordStageOutcomes(c, { logger: { log: (line) => logs.push(line) } });
+  assert.equal(c.calls[3].params[2], "FAILED");
+  assert.match(logs[0], /missing review evidence/);
+});
+
 test("input hash ignores belt output and keys operator comments by content", () => {
   const sql = so.stageInputHashSql();
   // A builder's own comment must never re-open the stage it just reported on.
