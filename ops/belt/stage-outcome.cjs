@@ -4,7 +4,7 @@
 // stage only when no outcome exists or the input hash changed.
 
 const OUTCOMES = new Set(["ADVANCED", "BLOCKED", "NO_OP", "FAILED"]);
-const BLOCKED_ON = new Set(["ci", "human", "sha", "dependency", "quota"]);
+const BLOCKED_ON = new Set(["ci", "human", "sha", "dependency", "quota", "checkout"]);
 const LINE = /^\s*OUTCOME:\s*(ADVANCED|BLOCKED|NO_OP|FAILED)(?:\s+blocked_on=([a-z]+))?\s*$/i;
 
 // Contract: the last non-empty output line is `OUTCOME: <kind>[ blocked_on=<why>]`.
@@ -17,7 +17,12 @@ function parseOutcome(output) {
     if (m) {
       const outcome = m[1].toUpperCase();
       const blockedOn = m[2] ? m[2].toLowerCase() : null;
-      return { outcome, blockedOn: outcome === "BLOCKED" && BLOCKED_ON.has(blockedOn) ? blockedOn : null, typed: true };
+      // A checkout timeout is an infrastructure blocker, never an inter-ticket
+      // dependency. Correct the common worker mistake at the parsing boundary
+      // so it cannot strand a flight under the wrong terminal reason.
+      const checkoutTimeout = /checkout[\s_-]*(?:wait|tim(?:e|ed)[\s_-]*out)|(?:wait|tim(?:e|ed)[\s_-]*out)[\s_-]*checkout/i.test(text);
+      const normalized = outcome === "BLOCKED" && checkoutTimeout && blockedOn === "dependency" ? "checkout" : blockedOn;
+      return { outcome, blockedOn: outcome === "BLOCKED" && BLOCKED_ON.has(normalized) ? normalized : null, typed: true };
     }
   }
   return { ...legacyOutcome(text), typed: false };
@@ -29,6 +34,7 @@ function legacyOutcome(text) {
   if (/QC-BLOCKED NO-SHA|no implementation (pull request|commit)/i.test(text)) return { outcome: "BLOCKED", blockedOn: "sha" };
   if (/blocked by (queued|pending|running) CI|waiting (on|for) CI/i.test(text)) return { outcome: "BLOCKED", blockedOn: "ci" };
   if (/usage limit|provider_quota_limit/i.test(text)) return { outcome: "BLOCKED", blockedOn: "quota" };
+  if (/checkout[\s_-]*(?:wait|tim(?:e|ed)[\s_-]*out)|(?:wait|tim(?:e|ed)[\s_-]*out)[\s_-]*checkout/i.test(text)) return { outcome: "BLOCKED", blockedOn: "checkout" };
   if (/already[- ]merged|already deployed|nothing to do/i.test(text)) return { outcome: "NO_OP", blockedOn: null };
   if (/https:\/\/github\.com\/[^\s]+\/pull\/\d+/.test(text)) return { outcome: "ADVANCED", blockedOn: null };
   if (/^\s*(Blocked|Unable|Cannot|Could not|Failed|Error)\b/i.test(text) || /\bblocked\b.*\b(fail-closed|checkout|session expired|filesystem)/i.test(text)) return { outcome: "FAILED", blockedOn: null };

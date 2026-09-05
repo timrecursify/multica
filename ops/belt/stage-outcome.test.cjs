@@ -7,6 +7,8 @@ test("typed OUTCOME line wins and validates blocked_on", () => {
   assert.deepEqual(so.parseOutcome("work\nOUTCOME: BLOCKED blocked_on=ci\n"), { outcome: "BLOCKED", blockedOn: "ci", typed: true });
   assert.deepEqual(so.parseOutcome("outcome: no_op"), { outcome: "NO_OP", blockedOn: null, typed: true });
   assert.equal(so.parseOutcome("OUTCOME: BLOCKED blocked_on=weird").blockedOn, null);
+  assert.equal(so.parseOutcome("checkout timed out\nOUTCOME: BLOCKED blocked_on=checkout").blockedOn, "checkout");
+  assert.equal(so.parseOutcome("checkout timed out\nOUTCOME: BLOCKED blocked_on=dependency").blockedOn, "checkout");
   assert.equal(so.parseOutcome("OUTCOME: ADVANCED blocked_on=ci").blockedOn, null);
 });
 
@@ -15,6 +17,7 @@ test("legacy heuristics map known outputs; unknown is FAILED", () => {
   assert.equal(so.parseOutcome("QC-BLOCKED NO-SHA: x").blockedOn, "sha");
   assert.equal(so.parseOutcome('{"verdict":"FAIL","qualifying":true}').outcome, "ADVANCED");
   assert.equal(so.parseOutcome("release blocked by queued CI").blockedOn, "ci");
+  assert.deepEqual(so.parseOutcome("managed checkout timeout after 300s"), { outcome: "BLOCKED", blockedOn: "checkout", typed: false });
   assert.equal(so.parseOutcome("validated the already-merged implementation").outcome, "NO_OP");
   assert.equal(so.parseOutcome("relay transition Queue -> In Progress denied (409 transition_denied)").outcome, "ADVANCED");
   assert.equal(so.parseOutcome("relay rejected In Progress -> In Review evidence_missing").outcome, "ADVANCED");
