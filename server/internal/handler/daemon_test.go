@@ -2781,9 +2781,23 @@ func TestClaimTaskByRuntime_TaskWorkspaceMismatch_CancelsAndRejects(t *testing.T
 
 	// Construct the inconsistent task: runtime_id belongs to testWorkspace,
 	// but issue_id is in foreignWorkspace. This is the data shape a routing
-	// bug would produce.
+	// bug would produce. The production trigger rejects this shape, so seed it
+	// as a legacy poisoned row by bypassing that trigger for this fixture.
+	fixtureConn, err := testPool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("setup: acquire fixture connection: %v", err)
+	}
+	defer fixtureConn.Release()
+	if _, err := fixtureConn.Exec(ctx, `ALTER TABLE agent_task_queue DISABLE TRIGGER agent_task_queue_enforce_workspace_trigger`); err != nil {
+		t.Fatalf("setup: disable workspace trigger: %v", err)
+	}
+	defer func() {
+		if _, err := fixtureConn.Exec(context.Background(), `ALTER TABLE agent_task_queue ENABLE TRIGGER agent_task_queue_enforce_workspace_trigger`); err != nil {
+			t.Errorf("cleanup: re-enable workspace trigger: %v", err)
+		}
+	}()
 	var taskID string
-	if err := testPool.QueryRow(ctx, `
+	if err := fixtureConn.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
 		VALUES ($1, $2, $3, 'queued', 2)
 		RETURNING id

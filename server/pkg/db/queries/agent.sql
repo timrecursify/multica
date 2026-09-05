@@ -327,14 +327,14 @@ RETURNING *;
 -- issue task up front for crash safety, but keep it inert until attachment
 -- binding settles or the fire_at fallback is promoted by the normal sweeper.
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     coalesced_comment_ids, trigger_summary, force_fresh_session, is_leader_task, handoff_note,
     squad_id, context, originator_user_id, accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, delegated_from_task_id, rule_version_id, rerun_of_task_id,
     trigger_evidence_kind, trigger_evidence_ref_id, fire_at
 )
 VALUES (
-    $1, $2, $3, 'deferred', $4, sqlc.narg(trigger_comment_id),
+    $1, $2, $3, (SELECT workspace_id FROM agent WHERE id = $1), 'deferred', $4, sqlc.narg(trigger_comment_id),
     COALESCE(sqlc.narg(coalesced_comment_ids)::uuid[], '{}'),
     sqlc.narg(trigger_summary),
     COALESCE(sqlc.narg('force_fresh_session')::boolean, FALSE),
@@ -388,12 +388,12 @@ WHERE id = @id
 -- and accountable; attribution provenance is stamped so this path is not a
 -- NULL-source enqueue bypass (MUL-4302 §2).
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, context, originator_user_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, context, originator_user_id,
     accountable_user_id, runtime_mcp_overlay, runtime_connected_apps,
     originator_source, trigger_evidence_kind, trigger_evidence_ref_id
 )
 VALUES (
-    $1, $2, NULL, 'queued', $3, $4,
+    $1, $2, NULL, (SELECT workspace_id FROM agent WHERE id = $1), 'queued', $3, $4,
     sqlc.narg(originator_user_id),
     sqlc.narg(accountable_user_id),
     sqlc.narg(runtime_mcp_overlay),
@@ -413,13 +413,13 @@ RETURNING *;
 -- carries a non-NULL source and evidence rather than bypassing attribution
 -- (MUL-4302 §2).
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, trigger_comment_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, trigger_comment_id,
     trigger_summary, is_leader_task, squad_id, escalation_for_task_id, fire_at,
     originator_user_id, accountable_user_id, originator_source,
     delegated_from_task_id, trigger_evidence_kind, trigger_evidence_ref_id
 )
 VALUES (
-    @agent_id, @runtime_id, @issue_id, 'deferred', @priority,
+    @agent_id, @runtime_id, @issue_id, (SELECT workspace_id FROM agent WHERE id = @agent_id), 'deferred', @priority,
     sqlc.narg(trigger_comment_id),
     sqlc.narg(trigger_summary),
     COALESCE(sqlc.narg('is_leader_task')::boolean, FALSE),
@@ -442,8 +442,11 @@ RETURNING *;
 -- quick-create tasks land here unset). Fixes the activity row staying on
 -- "Creating issue" forever after completion.
 UPDATE agent_task_queue
-SET issue_id = $2
-WHERE id = $1 AND issue_id IS NULL;
+SET issue_id = $2,
+    workspace_id = (SELECT workspace_id FROM issue WHERE id = $2)
+WHERE agent_task_queue.id = $1 AND agent_task_queue.issue_id IS NULL
+  AND EXISTS (SELECT 1 FROM issue i JOIN agent a ON a.id = agent_task_queue.agent_id
+              WHERE i.id = $2 AND i.workspace_id = a.workspace_id);
 
 -- name: CreateRetryTask :one
 -- Clones a parent task into a fresh queued attempt. Carries forward the
@@ -499,7 +502,7 @@ WHERE id = $1 AND issue_id IS NULL;
 -- task API (MUL-4910). The Go retryAttemptCeiling already refuses to raise a
 -- disabled (max_attempts<=1) task, so this only ever widens, never revives.
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, chat_session_id, autopilot_run_id,
+    agent_id, runtime_id, issue_id, workspace_id, chat_session_id, autopilot_run_id,
     status, priority, trigger_comment_id, coalesced_comment_ids, trigger_summary, context,
     session_id, work_dir,
     attempt, max_attempts, parent_task_id, force_fresh_session, is_leader_task,
@@ -509,7 +512,7 @@ INSERT INTO agent_task_queue (
     chat_input_task_id, fire_at
 )
 SELECT
-    p.agent_id, p.runtime_id, p.issue_id, p.chat_session_id, p.autopilot_run_id,
+    p.agent_id, p.runtime_id, p.issue_id, p.workspace_id, p.chat_session_id, p.autopilot_run_id,
     CASE WHEN sqlc.narg(fire_at)::timestamptz IS NOT NULL THEN 'deferred' ELSE 'queued' END,
     CASE WHEN p.chat_session_id IS NOT NULL THEN GREATEST(p.priority, 3) ELSE p.priority END,
     p.trigger_comment_id, p.coalesced_comment_ids, p.trigger_summary, p.context,
@@ -1135,11 +1138,12 @@ RETURNING *;
 -- Ordered oldest activity first, then task id, so an operator sweep reads a
 -- stable, deterministic window. Values are bound parameters, never
 -- interpolated into the SQL text.
-SELECT id, agent_id, issue_id, status, priority, dispatched_at, started_at,
+SELECT id, agent_id, issue_id, workspace_id, status, priority, dispatched_at, started_at,
        completed_at, error, created_at, runtime_id, attempt, max_attempts,
        failure_reason, daemon_id
 FROM agent_task_queue
-WHERE (sqlc.narg('status')::text IS NULL OR status = sqlc.narg('status')::text)
+WHERE (sqlc.narg('workspace_id')::uuid IS NULL OR workspace_id = sqlc.narg('workspace_id')::uuid)
+  AND (sqlc.narg('status')::text IS NULL OR status = sqlc.narg('status')::text)
   AND (sqlc.narg('daemon_id')::text IS NULL OR daemon_id = sqlc.narg('daemon_id')::text)
   AND (sqlc.narg('older_than')::timestamptz IS NULL
        OR COALESCE(started_at, dispatched_at, created_at) <= sqlc.narg('older_than')::timestamptz)
@@ -1157,7 +1161,7 @@ LIMIT sqlc.arg('max_rows')::integer;
 -- or retryable reason. The active lease is cleared; runtime provenance is
 -- kept for audit.
 WITH prev AS (
-    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id')
+    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id') AND (sqlc.narg('workspace_id')::uuid IS NULL OR aq.workspace_id = sqlc.narg('workspace_id')::uuid)
 ),
 updated AS (
     UPDATE agent_task_queue
@@ -1169,6 +1173,7 @@ updated AS (
         wait_reason = NULL
     WHERE id = sqlc.arg('task_id')
       AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+      AND (sqlc.narg('workspace_id')::uuid IS NULL OR workspace_id = sqlc.narg('workspace_id')::uuid)
     RETURNING *
 )
 SELECT u.*, p.status AS previous_status
@@ -1187,7 +1192,7 @@ FROM updated u, prev p;
 -- intentionally preserved: agent_task_queue_active_requires_runtime requires
 -- an active row to carry one.
 WITH prev AS (
-    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id')
+    SELECT status FROM agent_task_queue aq WHERE aq.id = sqlc.arg('task_id') AND (sqlc.narg('workspace_id')::uuid IS NULL OR aq.workspace_id = sqlc.narg('workspace_id')::uuid)
 ),
 updated AS (
     UPDATE agent_task_queue
@@ -1199,6 +1204,7 @@ updated AS (
         delivered_comment_ids = '{}'
     WHERE id = sqlc.arg('task_id')
       AND status IN ('dispatched', 'running', 'waiting_local_directory')
+      AND (sqlc.narg('workspace_id')::uuid IS NULL OR workspace_id = sqlc.narg('workspace_id')::uuid)
     RETURNING *
 )
 SELECT u.*, p.status AS previous_status
