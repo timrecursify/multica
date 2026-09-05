@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+readonly BELT_CANONICAL_WORKSPACES_ROOT="/home/newadmin/multica-workspaces-gsp"
+readonly BELT_WORKSPACE_UUIDS=("da3c5c5c-a123-4567-b999-c3ed1820da00" "f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f")
+workspace_root_resolve() {
+  local configured="${MULTICA_DAEMON_WORKSPACES_ROOT-${MULTICA_WORKSPACES_ROOT-$BELT_CANONICAL_WORKSPACES_ROOT}}"
+  if [[ -n "${MULTICA_DAEMON_WORKSPACES_ROOT-}" && -n "${MULTICA_WORKSPACES_ROOT-}" &&
+        "$MULTICA_DAEMON_WORKSPACES_ROOT" != "$MULTICA_WORKSPACES_ROOT" ]]; then
+    echo "daemon and belt workspace roots disagree" >&2; return 64
+  fi
+  if [[ ! -v MULTICA_DAEMON_WORKSPACES_ROOT && ! -v MULTICA_WORKSPACES_ROOT && -n "${BELT_WORKSPACES_ROOT_OVERRIDE-}" ]]; then
+    [[ "${BELT_TEST_MODE-0}" == 1 ]] || { echo "workspace root override is restricted to BELT_TEST_MODE=1" >&2; return 64; }
+    configured="$BELT_WORKSPACES_ROOT_OVERRIDE"
+  fi
+  if [[ "${BELT_TEST_MODE-0}" != 1 && "$configured" != "$BELT_CANONICAL_WORKSPACES_ROOT" ]]; then
+    echo "workspace root is not canonical: $configured" >&2; return 64
+  fi
+  [[ -n "$configured" && "$configured" == /* ]] || { echo "workspace root must be an absolute path" >&2; return 64; }
+  [[ -d "$configured" && ! -L "$configured" ]] || { echo "workspace root must be an existing non-symlink directory: $configured" >&2; return 64; }
+  [[ "$(realpath -e -- "$configured")" == "$configured" ]] || { echo "workspace root must be canonical: $configured" >&2; return 64; }
+  printf '%s\n' "$configured"
+}
+workspace_root_validate_children() {
+  local root="$1" child name allowed bad=0
+  while IFS= read -r -d '' child; do
+    name="${child##*/}"; allowed=0
+    for uuid in "${BELT_WORKSPACE_UUIDS[@]}"; do [[ "$name" == "$uuid" ]] && allowed=1; done
+    if (( ! allowed )) || [[ ! -d "$child" || -L "$child" ]]; then
+      echo "workspace drift: malformed or unknown workspace directory: $name" >&2; bad=1
+    fi
+  done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
+  return "$bad"
+}
+workspace_root_validate() { local root; root="$(workspace_root_resolve)" || return; workspace_root_validate_children "$root" || return 64; printf '%s\n' "$root"; }

@@ -23,10 +23,11 @@ export CODEX_BIN="$requested_codex_bin"
 # system Go toolchain ahead of inherited user paths for every task.
 export PATH="/usr/local/go/bin:${PATH}"
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"
 
 cpu_count="$(belt_cpu_count)" || exit 64
 cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}"
-root="${MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp}"
+root="${MULTICA_DAEMON_WORKSPACES_ROOT-$BELT_CANONICAL_WORKSPACES_ROOT}"
 help_timeout="${MULTICA_DAEMON_HELP_TIMEOUT_SECONDS:-5}"
 if [[ -n "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS+x}" && ! "$cap_raw" =~ ^[0-9]+$ ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a non-negative integer" >&2
@@ -37,8 +38,8 @@ if (( cap_raw > cpu_count )); then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must not exceed CPU count ($cpu_count)" >&2
   exit 64
 fi
-if [[ -z "$root" || "$root" != /* ]]; then
-  echo "multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path" >&2
+if ! root="$(workspace_root_validate 2>&1)"; then
+  echo "multica-daemon-wrapper: ${root##*$'\n'}" >&2
   exit 64
 fi
 if [[ ! "$help_timeout" =~ ^[1-9][0-9]*$ ]]; then

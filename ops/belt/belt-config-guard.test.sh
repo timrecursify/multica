@@ -26,16 +26,21 @@ assert_valid() {
 export BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 12'
 unset MULTICA_DAEMON_MAX_CONCURRENT_TASKS MULTICA_DAEMON_WORKSPACES_ROOT
 source "$root_dir/belt-config-guard.sh"
+test_workspace_root="$(mktemp -d)"
+mkdir -p "$test_workspace_root/da3c5c5c-a123-4567-b999-c3ed1820da00" "$test_workspace_root/f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f"
+export BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$test_workspace_root"
 IFS='|' read -r expected_cap expected_root < <(daemon_launch_config)
 assert_eq '2|/tmp/gsp-workspaces' "$(MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces daemon_launch_config)" 'configured daemon launch config'
-MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces assert_valid
+MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT="$test_workspace_root" assert_valid
 assert_eq '10|/home/newadmin/multica-workspaces-gsp' "$(BELT_CPU_COUNT_CMD='printf 12' BELT_RUNNER_COUNT_CMD='printf 2' env -u BELT_IDLE_RUNNER_COUNT_CMD -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT bash -c 'source "$1"; daemon_launch_config' _ "$root_dir/belt-config-guard.sh")" 'undeclared daemon launch config'
 export MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2
 expected_cap=2
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=bad MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces assert_invalid
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS='' MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces assert_invalid
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT=relative assert_invalid
-MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT='' assert_invalid
+if (unset MULTICA_DAEMON_WORKSPACES_ROOT; MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT='' bash -c 'source "$1"; validate_daemon_launch_config' _ "$root_dir/belt-config-guard.sh"); then
+  echo 'empty workspace root unexpectedly accepted' >&2; exit 1
+fi
 assert_eq missing "$(tower_concurrency_state 'multica-daemon/server daemon start')" 'missing Tower concurrency flag'
 assert_eq correct "$(tower_concurrency_state "multica-daemon/server daemon start --max-concurrent-tasks=${expected_cap}")" 'configured Tower concurrency flag'
 assert_eq mismatched "$(tower_concurrency_state "multica-daemon/server daemon start --max-concurrent-tasks=$((expected_cap + 1))")" 'mismatched Tower concurrency flag'
