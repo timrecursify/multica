@@ -188,7 +188,7 @@ validated_release_pair() {
 # before either destination is touched; installation is protected by a lock
 # and rolls back if the second rename fails.
 repair_source_runtime_parity() {
-  local guard_sha wrapper_sha release candidate_guard candidate_wrapper lock staging old_guard old_wrapper metadata source_sha manifest_sha256 wrapper_source guard_source
+  local guard_sha wrapper_sha release candidate_guard candidate_wrapper lock staging old_guard old_wrapper metadata source_sha manifest_sha256 wrapper_source guard_source guard_mode wrapper_mode final_guard_sha final_wrapper_sha
   local guard_present=0 wrapper_present=0 needs_repair=0
   guard_source="$GUARD_SOURCE"
   guard_sha=$(sha256sum -- "$guard_source" 2>/dev/null | awk '{print $1}')
@@ -268,6 +268,16 @@ repair_source_runtime_parity() {
     repair_failure 'phase=repair class=permission staging-copy-failed'
     return 0
   fi
+  # Keep the source executable modes.  The runtime copies are installed as a
+  # pair, so a mode change must be prepared before either rename occurs.
+  guard_mode=$(stat -c '%a' -- "$release/ops/belt/belt-config-guard.sh" 2>/dev/null) || guard_mode=''
+  wrapper_mode=$(stat -c '%a' -- "$release/ops/belt/multica-daemon-wrapper.sh" 2>/dev/null) || wrapper_mode=''
+  if [[ ! "$guard_mode" =~ ^[0-7]{3,4}$ || ! "$wrapper_mode" =~ ^[0-7]{3,4}$ ]] ||
+     ! chmod -- "$guard_mode" "$staging/guard" || ! chmod -- "$wrapper_mode" "$staging/wrapper"; then
+    rm -rf -- "$staging"
+    repair_failure 'phase=repair class=permission staging-mode-failed'
+    return 0
+  fi
   [[ "$guard_present" == 1 ]] && cp -- "$RUNTIME_GUARD" "$old_guard"
   [[ "$wrapper_present" == 1 ]] && cp -- "$RUNTIME_WRAPPER" "$old_wrapper"
   if ! mv -f -- "$staging/guard" "$RUNTIME_GUARD" || ! mv -f -- "$staging/wrapper" "$RUNTIME_WRAPPER"; then
@@ -278,7 +288,14 @@ repair_source_runtime_parity() {
     return 0
   fi
   rm -rf -- "$staging"
-  chmod 0755 -- "$RUNTIME_GUARD" "$RUNTIME_WRAPPER" 2>/dev/null || true
+  final_guard_sha=$(sha256sum -- "$RUNTIME_GUARD" 2>/dev/null | awk '{print $1}')
+  final_wrapper_sha=$(sha256sum -- "$RUNTIME_WRAPPER" 2>/dev/null | awk '{print $1}')
+  if [[ "$final_guard_sha" != "$guard_sha" || "$final_wrapper_sha" != "$wrapper_sha" ]]; then
+    if [[ "$guard_present" == 1 ]]; then cp -- "$old_guard" "$RUNTIME_GUARD"; else rm -f -- "$RUNTIME_GUARD"; fi
+    if [[ "$wrapper_present" == 1 ]]; then cp -- "$old_wrapper" "$RUNTIME_WRAPPER"; else rm -f -- "$RUNTIME_WRAPPER"; fi
+    repair_failure 'phase=repair class=post-write-digest-mismatch'
+    return 0
+  fi
   fixed+=("belt runtime/source parity repaired from release")
 }
 
