@@ -72,6 +72,18 @@ test("stageEligibility re-opens a stage when inputs change after evidence_missin
   assert.equal(result.reason, "input_changed");
 });
 
+test("stageEligibility retries FAILED after TTL but not before or at the attempt cap", async () => {
+  const now = Date.parse("2026-09-05T20:00:00Z");
+  const prior = { outcome: "FAILED", blocked_on: null, input_hash: "h1", outcome_at: "2026-09-05T19:45:00Z" };
+  let c = fakeClient([[prior], [{ input_hash: "h1" }]]);
+  assert.equal((await so.stageEligibility(c, "i3", "In Progress", { failedTtlMinutes: 30, now })).reason, "outcome_unchanged:FAILED");
+  c = fakeClient([[prior], [{ input_hash: "h1" }]]);
+  assert.equal((await so.stageEligibility(c, "i3", "In Progress", { failedTtlMinutes: 15, now })).reason, "failed_ttl_expired");
+  c = fakeClient([[prior], [{ input_hash: "h1" }]]);
+  const capped = await so.stageEligibility(c, "i3", "In Progress", { failedTtlMinutes: 15, now, attempt: 2, maxAttempts: 2 });
+  assert.deepEqual({ eligible: capped.eligible, reason: capped.reason }, { eligible: false, reason: "attempt_budget_exhausted" });
+});
+
 test("input hash ignores belt output and keys operator comments by content", () => {
   const sql = so.stageInputHashSql();
   // A builder's own comment must never re-open the stage it just reported on.
