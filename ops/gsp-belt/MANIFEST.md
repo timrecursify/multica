@@ -38,7 +38,7 @@ current running baseline, not the spec's stale citation.
 | --- | --- |
 | `ops/gsp-belt/bridge/multica-bridge.cjs` | `640fca26677251ecf1168dad16188747e3d56640f93fb5262eb0b636aef2da75` |
 | `ops/belt/parity/multica-relay-advance-daemon.cjs` | Verified by `ops/belt/verify.sh` against `/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs` |
-| `ops/gsp-belt/worker/multica-cicd-worker.cjs` | `a1dd05b157d8afe4a654696344a5f7f7ed8ab537ea5477f211671dd3650fefe6` |
+| `ops/gsp-belt/worker/multica-cicd-worker.cjs` | `3320c3c61fb45ac54a95a63d53a78e9d95065c108d79c7f95926376f472c8f62` |
 | `ops/gsp-belt/worker/multica-archiver.cjs` | `f06d02552741fb25e53bd695566f2600861f344b5fc9a962167738562eb03480` |
 
 Run `bash ops/gsp-belt/scripts/belt-fingerprint.sh` (or `belt-guard-check.sh`) on a
