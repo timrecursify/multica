@@ -20,13 +20,13 @@ EOF
 chmod +x "$tmp/bin/go"
 cat >"$tmp/bin/pm2" <<'EOF'
 #!/usr/bin/env bash
-case "$1" in jlist) printf '[{"name":"gsp-multica-bridge","pm2_env":{"status":"online","pm_cwd":"%s"}},{"name":"multica-relay-advance","pm2_env":{"status":"online","pm_cwd":"%s"}},{"name":"gsp-multica-worker","pm2_env":{"status":"online","pm_cwd":"%s"}},{"name":"multica-cicd-worker","pm2_env":{"status":"online","pm_cwd":"%s"}},{"name":"multica-archiver","pm2_env":{"status":"online","pm_cwd":"%s"}}]' "$EXPECT_RELEASE" "$EXPECT_RELEASE" "$EXPECT_RELEASE" "$EXPECT_RELEASE" "$EXPECT_RELEASE";; startOrReload) printf '%s %s\n' "${MULTICA_INCLUDE_WORKER:-0}" "${MULTICA_SKIP_CICD_WORKER:-0}" >> "$PM2_LOG";; *) exit 0;; esac
+case "$1" in jlist) printf '[{"name":"gsp-multica-bridge","pm2_env":{"status":"online","pm_cwd":"%s"}},{"name":"multica-relay-advance","pm2_env":{"status":"online","pm_cwd":"%s","pm_exec_path":"%s/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh"}},{"name":"gsp-multica-worker","pm2_env":{"status":"online","pm_cwd":"%s"}},{"name":"multica-cicd-worker","pm2_env":{"status":"online","pm_cwd":"%s"}},{"name":"multica-archiver","pm2_env":{"status":"online","pm_cwd":"%s"}}]' "$EXPECT_RELEASE" "$EXPECT_RELEASE" "$EXPECT_RELEASE" "$EXPECT_RELEASE" "$EXPECT_RELEASE" "$EXPECT_RELEASE";; startOrReload) printf '%s %s\n' "${MULTICA_INCLUDE_WORKER:-0}" "${MULTICA_SKIP_CICD_WORKER:-0}" >> "$PM2_LOG";; *) exit 0;; esac
 EOF
 chmod +x "$tmp/bin/pm2"; export EXPECT_RELEASE="$tmp/releases/$sha" PM2_LOG="$tmp/pm2.log"
 env PM2_BIN="$tmp/bin/pm2" MULTICA_RELEASE_ROOT="$tmp/releases" MULTICA_RECEIPT_ROOT="$tmp/receipts" "$root/ops/belt/deploy-release.sh" --preflight "$sha" >/dev/null
 [[ ! -e "$tmp/releases/$sha" ]]
 env PATH="$tmp/bin:$PATH" GIT_FAKE_SHA="$sha" PM2_BIN="$tmp/bin/pm2" MULTICA_RELEASE_ROOT="$tmp/releases" MULTICA_RECEIPT_ROOT="$tmp/receipts" "$root/ops/belt/deploy-release.sh" --apply "$sha"
-[[ -f "$tmp/receipts/belt-$sha.json" ]] && node -e 'const fs=require("fs");process.exit((fs.readFileSync(process.argv[1],"utf8").match(/script:/g)||[]).length===5?0:1)' "$tmp/releases/$sha/ops/belt/ecosystem.gsp-belt.config.js"
+[[ -f "$tmp/receipts/belt-$sha.json" ]] && node -e 'const fs=require("fs");const s=fs.readFileSync(process.argv[1],"utf8");process.exit((s.match(/script:/g)||[]).length===6 && s.includes("multica-relay-advance-wrapper.sh") ? 0 : 1)' "$tmp/releases/$sha/ops/belt/ecosystem.gsp-belt.config.js"
 [[ "$(tail -n 1 "$tmp/pm2.log")" == '0 0' ]]
 env PATH="$tmp/bin:$PATH" GIT_FAKE_SHA="$sha" PM2_BIN="$tmp/bin/pm2" MULTICA_RELEASE_ROOT="$tmp/releases" MULTICA_RECEIPT_ROOT="$tmp/receipts" "$root/ops/belt/deploy-release.sh" --rollback "$sha" --include-worker --skip-cicd-worker
 [[ "$(tail -n 1 "$tmp/pm2.log")" == '1 1' ]]
