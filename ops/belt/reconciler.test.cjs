@@ -133,6 +133,26 @@ test("per-stage attempt ceiling grows to admit a new task", async () => {
   assert.equal(insert.values[8], 3);
 });
 
+test("typed outcome eligibility runs before creating a retry task", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [{ ...issue, status: "In Progress" }] };
+    if (sql.includes("FROM issue_stage_outcome")) {
+      return { rows: [{ outcome: "FAILED", blocked_on: null, input_hash: "h1", outcome_at: "2026-09-05T19:00:00Z" }] };
+    }
+    if (sql.includes("SELECT md5(concat_ws")) return { rows: [{ input_hash: "h1" }] };
+    if (sql.includes("max(attempt)")) return { rows: [{ attempt: 0, max_attempts: 2 }] };
+    return original(sql, values);
+  };
+  const result = await reconcileIssue(db, issue.id, {
+    evaluate: ok,
+    typedOutcomes: true,
+    failedTtlMinutes: 15
+  });
+  assert.deepEqual(result, { action: "created", taskId: "task-1" });
+});
+
 test("two reconciler sessions converge on one task", async () => {
   const shared = { live: [], lock: Promise.resolve(), sequence: 0 };
   const session = () => {

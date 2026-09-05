@@ -314,6 +314,9 @@ async function reconcileIssue(client, issueId, options = {}) {
       const reason = recent.status === "completed" ? "completed_stage_cooldown" : "issue_cooldown";
       return { action: "skipped", reason, taskId: recent.id };
     }
+    const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
+    const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
+    const maxAttempts = Math.max(Number(stageAttempts.rows[0]?.max_attempts || 0), options.defaultMaxAttempts, attempt + 1);
     if (options.typedOutcomes) {
       // GSP-1826: a recorded outcome for this stage with unchanged inputs is final until the inputs change.
       const eligibility = await stageEligibility(client, issue.id, issue.status, {
@@ -347,9 +350,6 @@ async function reconcileIssue(client, issueId, options = {}) {
       await client.query("COMMIT");
       return { action: "skipped", reason: "lifetime_task_limit", count: lifetimeCount };
     }
-    const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
-    const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
-    const maxAttempts = Math.max(Number(stageAttempts.rows[0]?.max_attempts || 0), options.defaultMaxAttempts, attempt + 1);
     if (issue.status === "CI/CD & Deploy") {
       // The CI/CD worker owns this stage's exit; a desk task here buys nothing.
       await client.query("COMMIT");
