@@ -17,7 +17,7 @@ test("legacy heuristics map known outputs; unknown is FAILED", () => {
   assert.equal(so.parseOutcome("release blocked by queued CI").blockedOn, "ci");
   assert.equal(so.parseOutcome("validated the already-merged implementation").outcome, "NO_OP");
   assert.equal(so.parseOutcome("relay transition Queue -> In Progress denied (409 transition_denied)").outcome, "ADVANCED");
-  assert.equal(so.parseOutcome("relay rejected In Progress -> In Review evidence_missing").outcome, "ADVANCED");
+  assert.equal(so.parseOutcome("relay rejected In Progress -> In Review evidence_missing").outcome, "FAILED");
   assert.equal(so.parseOutcome("BUILD-READY posted").outcome, "ADVANCED");
   assert.equal(so.parseOutcome("specification posted; now in Queue").outcome, "ADVANCED");
   assert.deepEqual(so.parseOutcome(""), { outcome: "FAILED", blockedOn: null, typed: false });
@@ -52,6 +52,21 @@ test("recordStageOutcomes upserts one row per unrecorded completion", async () =
   assert.deepEqual(r, { scanned: 1, recorded: 1 });
   assert.match(c.calls[2].sql, /INSERT INTO issue_stage_outcome/);
   assert.deepEqual(c.calls[2].params, ["i1", "In Review", "ADVANCED", null, "t1", "h"]);
+});
+
+test("recordStageOutcomes persists relay evidence_missing as a non-ADVANCED outcome", async () => {
+  const c = fakeClient([[{ id: "t2", issue_id: "i2", stage: "Queue", output: "relay rejected Queue -> In Progress evidence_missing" }], [{ input_hash: "h1" }], []]);
+  const r = await so.recordStageOutcomes(c, { logger: { log() {} } });
+  assert.deepEqual(r, { scanned: 1, recorded: 1 });
+  assert.equal(c.calls[2].params[2], "FAILED");
+  assert.notEqual(c.calls[2].params[2], "ADVANCED");
+});
+
+test("stageEligibility re-opens a stage when inputs change after evidence_missing", async () => {
+  const c = fakeClient([[{ outcome: "FAILED", blocked_on: null, input_hash: "h1" }], [{ input_hash: "h2" }]]);
+  const result = await so.stageEligibility(c, "i2", "Queue");
+  assert.equal(result.eligible, true);
+  assert.equal(result.reason, "input_changed");
 });
 
 test("input hash ignores belt output and keys operator comments by content", () => {
