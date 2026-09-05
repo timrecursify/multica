@@ -7,10 +7,9 @@ cat >"$fake/daemon" <<'EOF'
 if [ "$*" = 'daemon start --help' ]; then
   if [ "${HANG_HELP:-0}" = 1 ]; then sleep 3; fi
   if [ "${FAIL_HELP:-0}" = 1 ]; then exit 17; fi
+  printf '%s\n' '      --foreground' '      --daemon-id string' '      --heartbeat-interval duration' '      --poll-interval duration' '      --max-concurrent-tasks int Max tasks running in parallel'
   if [ "${DAEMON_SUPPORTS_WORKSPACES_FLAG:-1}" = 1 ]; then
     printf '%s\n' '      --workspaces-root string Base directory for task workspaces'
-  else
-    printf '%s\n' '      --max-concurrent-tasks int Max tasks running in parallel'
   fi
   exit 0
 fi
@@ -26,33 +25,34 @@ EOF
 chmod +x "$fake/daemon"
 daemon_cwd="$fake/daemon-root"
 mkdir -p -- "$daemon_cwd"
+mkdir -p -- "$fake/ws" "$fake/new-workspaces"
 capture="$fake/capture"
 launch_marker="$fake/daemon-launch"
-DAEMON_LAUNCH_MARKER="$launch_marker" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/ws" "$root_dir/multica-daemon-wrapper.sh"
+DAEMON_LAUNCH_MARKER="$launch_marker" BELT_TEST_MODE=1 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/ws" "$root_dir/multica-daemon-wrapper.sh"
 [[ -e "$launch_marker" ]]
 grep -q -- "--workspaces-root=$fake/ws" "$capture"
 grep -q -- "--max-concurrent-tasks=2" "$capture"
 grep -q 'cap=2 root=.* daemon_root=.* workspaces=2' "$capture"
 grep -qx 'go_path=/usr/local/go/bin' "$capture"
 grep -q "cwd=$daemon_cwd" "$capture"
-env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/empty.lock" "$root_dir/multica-daemon-wrapper.sh"
+env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/empty.lock" "$root_dir/multica-daemon-wrapper.sh"
 grep -q -- '--max-concurrent-tasks=2' "$capture"
-DAEMON_SUPPORTS_WORKSPACES_FLAG=0 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 12' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/new.lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=12 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/new-workspaces" "$root_dir/multica-daemon-wrapper.sh"
+DAEMON_SUPPORTS_WORKSPACES_FLAG=0 BELT_TEST_MODE=1 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 12' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/new.lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=12 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/new-workspaces" "$root_dir/multica-daemon-wrapper.sh"
 grep -q '^daemon start --foreground --daemon-id=gsp-multica-worker --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks=12$' "$capture"
 grep -q "cap=12 root=$fake/new-workspaces daemon_root=$fake/new-workspaces workspaces=2" "$capture"
 if grep -q -- '--workspaces-root' "$capture"; then
   echo 'flagless daemon unexpectedly received --workspaces-root' >&2
   exit 1
 fi
-HOLD_DAEMON=1 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh" &
+HOLD_DAEMON=1 BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh" &
 pid=$!; sleep 0.1
-if BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh"; then exit 1; fi
+if BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh"; then exit 1; fi
 wait "$pid"
 assert_wrapper_rejects() {
   local label="$1" expected="$2" stderr="$fake/$1.stderr" status
   shift 2
   rm -f -- "$capture"
-  if env BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 "$@" DAEMON_LAUNCH_MARKER="$launch_marker" MULTICA_DAEMON_LOCK_FILE="$fake/$label.lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$stderr"; then
+  if env BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 "$@" DAEMON_LAUNCH_MARKER="$launch_marker" MULTICA_DAEMON_LOCK_FILE="$fake/$label.lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$stderr"; then
     echo "$label unexpectedly succeeded" >&2
     return 1
   else
@@ -74,10 +74,10 @@ assert_wrapper_rejects cap-empty \
   'multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a non-negative integer' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=
 assert_wrapper_rejects root-relative \
-  'multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path' \
+  'multica-daemon-wrapper: workspace root must be an absolute path' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_WORKSPACES_ROOT=relative
 assert_wrapper_rejects root-empty \
-  'multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path' \
+  'multica-daemon-wrapper: workspace root must be an absolute path' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_WORKSPACES_ROOT=
 assert_wrapper_rejects cwd-relative \
   'multica-daemon-wrapper: MULTICA_DAEMON_CWD must be an existing absolute directory' \
