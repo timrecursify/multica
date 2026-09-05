@@ -68,6 +68,19 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
     const parsed = qcTaskEvidenceResult(task);
     if (!parsed.evidence) {
       logger.log(`${logPrefix} [qc-evidence-skipped] task=${task.id} reason=${parsed.reason}`);
+      // Make rejected evidence visible on the ticket so a discarded verdict
+      // is actionable instead of silently triggering another QC run.
+      try {
+        const content = `<!-- multica-qc-evidence-rejected -->\nQC evidence rejected: ${parsed.reason}\nsource_task_id: ${task.id}`;
+        await client.query(
+          `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+           SELECT $1::uuid, i.workspace_id, 'system', '00000000-0000-0000-0000-000000000000'::uuid, $2::text, 'system'
+             FROM issue i WHERE i.id = $1::uuid
+               AND NOT EXISTS (SELECT 1 FROM comment WHERE issue_id = $1::uuid AND content = $2::text)`,
+          [task.issue_id, content]);
+      } catch (error) {
+        logger.log(`${logPrefix} [qc-evidence-rejection-comment-failed] task=${task.id} error=${error.message}`);
+      }
       continue;
     }
     const { evidence } = parsed;

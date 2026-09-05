@@ -7,7 +7,8 @@ Emit the model and effort your agent actually runs (see your task context); the 
 
 1. Read every acceptance criterion and the builder work-product comment.
 2. The task prompt supplies `NUMBER`, the pull-request HTTPS URL (`REPO`), and
-   full bound SHA (`BOUND_SHA`). Run `sk multica qc-checkout "$REPO" --ref
+   full bound SHA (`BOUND_SHA`). `BOUND_SHA` is authoritative task context; do
+   not transcribe it from a comment or checkout output. Run `sk multica qc-checkout "$REPO" --ref
    "$BOUND_SHA"`. Its JSON `.path` is `CHECKOUT` and `.sha` must equal
    `BOUND_SHA`; otherwise use the BLOCKED procedure.
 3. Run the smallest check that can prove or disprove each criterion.
@@ -39,7 +40,9 @@ Minimum sk-cli requirement: `sk multica verdict` must accept `--board gsp`; if i
 CHECKOUT_RESULT="$(sk multica qc-checkout "$REPO" --ref "$BOUND_SHA")"
 CHECKOUT="$(jq -r '.path' <<<"$CHECKOUT_RESULT")"
 OBSERVED_SHA="$(jq -r '.sha' <<<"$CHECKOUT_RESULT")"
+[[ "$BOUND_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo 'BLOCKED: task BOUND_SHA is not a full 40-character SHA' >&2; exit 1; }
 test "$OBSERVED_SHA" = "$BOUND_SHA"
+[[ "$OBSERVED_SHA" =~ ^[0-9a-fA-F]{40}$ ]] || { echo 'BLOCKED: checkout returned an invalid SHA' >&2; exit 1; }
 WORK_PRODUCT_MD5="$(git -C "$CHECKOUT" ls-tree -r --full-tree "$BOUND_SHA" | LC_ALL=C sort | md5sum | cut -d' ' -f1)"
 FAILURE_CLASS=none; QUALIFYING=true
 # For a defect: FAILURE_CLASS=implementation; QUALIFYING=false.
@@ -58,6 +61,13 @@ QC_EVIDENCE_JSON="$(jq -cn --arg verdict "$VERDICT" --arg work_product_md5 "$WOR
   --arg failure_class "$FAILURE_CLASS" --arg model "$QC_MODEL" --arg effort "$QC_EFFORT" \
   --argjson qualifying "$QUALIFYING" \
   '{verdict:$verdict,work_product_md5:$work_product_md5,bound_sha:$bound_sha,observed_sha:$observed_sha,failure_class:$failure_class,qualifying:$qualifying,model:$model,effort:$effort}')"
+# Fail closed before submission if shell quoting or model edits changed the
+# marker contract. `qualifying` must remain a native JSON boolean.
+jq -e --arg sha "$BOUND_SHA" \
+  '(.bound_sha|type)=="string" and (.observed_sha|type)=="string" and
+   (.bound_sha|test("^[0-9a-f]{40}$";"i")) and .bound_sha == $sha and
+   .observed_sha == $sha and (.qualifying|type)=="boolean"' \
+  <<<"$QC_EVIDENCE_JSON" >/dev/null || { echo 'BLOCKED: QC evidence self-check failed' >&2; exit 1; }
 printf 'QC_EVIDENCE_JSON=%s\n' "$QC_EVIDENCE_JSON"
 test -z "${BLOCKED_REASON:-}" || printf 'BLOCKED: %s\n' "$BLOCKED_REASON"
 sk multica verdict "$NUMBER" --board "$BOARD" --verdict "$VERDICT" \
