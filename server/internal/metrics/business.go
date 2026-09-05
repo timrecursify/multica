@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"sync"
+	"time"
 
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 	"github.com/prometheus/client_golang/prometheus"
@@ -15,16 +16,17 @@ type activeTaskLabels struct {
 }
 
 type BusinessMetrics struct {
-	taskEnqueued     *prometheus.CounterVec
-	taskDispatched   *prometheus.CounterVec
-	taskStarted      *prometheus.CounterVec
-	taskTerminal     *prometheus.CounterVec
-	taskFailed       *prometheus.CounterVec
-	taskQueueWait    *prometheus.HistogramVec
-	taskRunSeconds   *prometheus.HistogramVec
-	taskTotalSeconds *prometheus.HistogramVec
-	taskInProgress   *prometheus.GaugeVec
-	taskIterations   *prometheus.HistogramVec
+	orchestratorHeartbeat prometheus.Gauge
+	taskEnqueued          *prometheus.CounterVec
+	taskDispatched        *prometheus.CounterVec
+	taskStarted           *prometheus.CounterVec
+	taskTerminal          *prometheus.CounterVec
+	taskFailed            *prometheus.CounterVec
+	taskQueueWait         *prometheus.HistogramVec
+	taskRunSeconds        *prometheus.HistogramVec
+	taskTotalSeconds      *prometheus.HistogramVec
+	taskInProgress        *prometheus.GaugeVec
+	taskIterations        *prometheus.HistogramVec
 
 	llmTokens         *prometheus.CounterVec
 	llmCostUSD        *prometheus.CounterVec
@@ -50,6 +52,10 @@ type BusinessMetrics struct {
 func NewBusinessMetrics() *BusinessMetrics {
 	validateBusinessMetricLabels()
 	m := &BusinessMetrics{
+		orchestratorHeartbeat: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "multica_orchestrator_heartbeat_timestamp_seconds",
+			Help: "Unix timestamp of the most recent successfully processed daemon heartbeat.",
+		}),
 		taskEnqueued: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica",
 			Subsystem: "agent_task",
@@ -183,6 +189,7 @@ func NewBusinessMetrics() *BusinessMetrics {
 
 func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 	return append([]prometheus.Collector{
+		m.orchestratorHeartbeat,
 		m.taskEnqueued,
 		m.taskDispatched,
 		m.taskStarted,
@@ -204,6 +211,16 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.admissionRejected,
 		m.admissionNearLimit,
 	}, m.events.collectors()...)
+}
+
+// RecordOrchestratorHeartbeat advances the liveness timestamp after a
+// heartbeat has been processed successfully. It is intentionally unlabeled:
+// the alert is about this orchestrator process, not an individual runtime.
+func (m *BusinessMetrics) RecordOrchestratorHeartbeat() {
+	if m == nil {
+		return
+	}
+	m.orchestratorHeartbeat.Set(float64(time.Now().UnixNano()) / 1e9)
 }
 
 func (m *BusinessMetrics) RecordTaskEnqueued(source, runtimeMode string) {
