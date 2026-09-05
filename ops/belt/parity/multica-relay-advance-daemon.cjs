@@ -1,6 +1,7 @@
 const http = require('http');
 const { Pool } = require('pg');
 const { execFileSync } = require('child_process');
+const { createGithubApi } = require('../github-api-adapter.cjs');
 const { classifyStageRoute } = require('../stage-routing.cjs');
 const {
   instructionCompatibility,
@@ -138,9 +139,10 @@ async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } 
 // are routed through REST here, the same way multica-cicd-worker.cjs does.
 const PR_URL_RE = /github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i;
 
-function ghExec(args) {
-  return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
-}
+const beltGithub = createGithubApi({
+  alert: ({ remaining, reset }) => console.error(`${LOG_PREFIX} [github-quota] sentinel remaining=${remaining} reset=${reset}`)
+});
+function ghExec(args) { return beltGithub.command(args); }
 
 // gh returns statusCheckRollup as one flat list of check contexts. REST splits
 // the same facts across check-runs and the combined commit status, so both are

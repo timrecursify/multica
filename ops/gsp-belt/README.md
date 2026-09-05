@@ -57,6 +57,11 @@ migration-provenance table lets you verify the import is the running bridge.
 | `GSP_BELT_PG_MODULE` | `/home/newadmin/node_modules/pg` | cicd worker `pg` module path |
 | `CICD_RATE_LIMIT_BASE_MS` | `30000` | cicd worker initial rate-limit backoff |
 | `CICD_RATE_LIMIT_MAX_MS` | `900000` | cicd worker maximum rate-limit cooldown |
+| `GITHUB_APP_ID` | (required unless token is supplied) | GitHub App id used to mint the belt installation token |
+| `GITHUB_APP_INSTALLATION_ID` | (required unless token is supplied) | GitHub App installation id |
+| `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_FILE` | (secret) | App signing key, supplied only by the runtime secret manager |
+| `GITHUB_APP_INSTALLATION_TOKEN` | (optional) | Pre-minted installation token for runtimes that mint outside the worker |
+| `GITHUB_RATE_LIMIT_STATE_FILE` | `/tmp/multica-github-rate-limit.json` | Shared cross-process cooldown state |
 | `CICD_ATTEMPT_TIMEOUT_MS` | `2700000` | watchdog threshold for stale CI/CD attempts (45 minutes) |
 | `GSP_BELT_CODEX_BIN` | `/home/newadmin/tools/codex-native` | daemon wrapper codex binary |
 | `MULTICA_DAEMON_DIR` | `/home/newadmin/multica-daemon` | daemon/fleet server binary + workdir |
