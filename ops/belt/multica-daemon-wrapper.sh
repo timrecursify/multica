@@ -88,4 +88,16 @@ daemon_args=(daemon start --foreground --daemon-id=gsp-multica-worker
 if grep -Fq -- '--workspaces-root' <<<"$daemon_help"; then
   daemon_args+=(--workspaces-root="$root")
 fi
+# Validate the complete argument vector against the installed binary.  This
+# turns a binary/wrapper drift into an actionable startup failure instead of
+# an opaque PM2 crash loop.  Help output is intentionally the source of truth
+# so rollback binaries with a different option set remain supported.
+for arg in "${daemon_args[@]:2}"; do
+  [[ "$arg" == --* ]] || continue
+  flag="${arg%%=*}"
+  if ! grep -Eq -- "(^|[[:space:]])${flag}([=[:space:]]|$)" <<<"$daemon_help"; then
+    echo "unknown daemon start flag: $flag" >&2
+    exit 64
+  fi
+done
 exec "$daemon_bin" "${daemon_args[@]}"
