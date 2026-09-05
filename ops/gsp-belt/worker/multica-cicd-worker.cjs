@@ -3,6 +3,10 @@
 const fs=require('fs'),http=require('http'),{execFileSync}=require('child_process');
 const {admit}=require('./merge-admission.cjs');
 const {createGithubApi}=require('../../belt/github-api-adapter.cjs');
+const {resolvePaths}=require('../lib/runtime-paths.cjs');
+const runtimePaths=resolvePaths();
+process.env.GSP_BELT_SECRETS_ENV_FILE ||= runtimePaths.secretsEnvFile;
+process.env.GSP_BELT_PG_MODULE ||= runtimePaths.pgModule;
 function findAllPRs(work){const out=[],seen=new Set(),re=/github[.]com\/([^/]+)\/([^/]+)\/pull\/([0-9]+)/gi;let m;while((m=re.exec(work||''))){const p={repo:`${m[1]}/${m[2]}`,num:m[3]},k=`${p.repo}#${p.num}`;if(!seen.has(k)){seen.add(k);out.push(p)}}return out}
 function withTimeout(p,ms,label){let t;return Promise.race([Promise.resolve(p),new Promise((_,rej)=>{t=setTimeout(()=>rej(new Error(`${label||'operation'} timeout`)),ms)})]).finally(()=>clearTimeout(t))}
 function createWorker({pool,gh,relay=async()=>({ok:true,status:200}),log=console.log,mergeEnabled=true,timeoutMs=30000,leaseMs=120000,enforceLease=false,now=()=>Date.now(),random=Math.random,rateLimitBaseMs=30000,rateLimitMaxMs=900000,attemptTimeoutMs=2700000}={}){

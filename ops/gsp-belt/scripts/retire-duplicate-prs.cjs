@@ -2,6 +2,10 @@
 'use strict';
 // Owner-operated only. This module intentionally never merges PRs.
 const fs=require('fs'),{execFileSync}=require('child_process');
+const {resolvePaths}=require('../lib/runtime-paths.cjs');
+const runtimePaths=resolvePaths();
+process.env.GSP_BELT_SECRETS_ENV_FILE ||= runtimePaths.secretsEnvFile;
+process.env.GSP_BELT_PG_MODULE ||= runtimePaths.pgModule;
 const CLUSTERS=[[44,63,179,196,215],[66,157,231],[145,185],[69,77],[43,51],[67,153]];
 function ciStatus(r){return Array.isArray(r)&&r.length&&r.every(x=>x.status==='COMPLETED'&&x.conclusion==='SUCCESS')?'green':'not-green'}
 function admitted(r){return !!(r&&!r.error&&r.state==='OPEN'&&r.mergeable==='MERGEABLE'&&r.ci==='green'&&r.qc&&r.qc.verdict==='PASS'&&r.qc.qualifying===true&&r.qc.model==='gpt-5.6-sol'&&r.qc.effort==='low'&&r.qc.bound_sha===r.headRefOid)}

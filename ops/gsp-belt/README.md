@@ -55,6 +55,7 @@ migration-provenance table lets you verify the import is the running bridge.
 | `GSP_BELT_SECRETS_DIR` | `/home/newadmin/.secrets` | daemon/fleet wrappers source `deepseek.env`, `openrouter.env` |
 | `GSP_BELT_SECRETS_ENV_FILE` | `/home/newadmin/.secrets/multica-remote/remote-bridge.env` | cicd worker |
 | `GSP_BELT_PG_MODULE` | `/home/newadmin/node_modules/pg` | cicd worker `pg` module path |
+| `GSP_BELT_CODEX_BIN` | `/home/newadmin/tools/codex-openrouter` | fleet daemon codex executable |
 | `CICD_RATE_LIMIT_BASE_MS` | `30000` | cicd worker initial rate-limit backoff |
 | `CICD_RATE_LIMIT_MAX_MS` | `900000` | cicd worker maximum rate-limit cooldown |
 | `GITHUB_APP_ID` | (required unless token is supplied) | GitHub App id used to mint the belt installation token |
@@ -66,6 +67,15 @@ migration-provenance table lets you verify the import is the running bridge.
 | `GSP_BELT_CODEX_BIN` | `/home/newadmin/tools/codex-native` | daemon wrapper codex binary |
 | `MULTICA_DAEMON_DIR` | `/home/newadmin/multica-daemon` | daemon/fleet server binary + workdir |
 | `GSP_WORKSPACES_ROOT` | `/home/newadmin/multica-workspaces-gsp` | daemon `--workspaces-root` |
+
+For the service-user install, set these variables from the systemd
+`EnvironmentFile` (for example `/etc/gsp/multica/workers.env`) to values such as
+`GSP_BELT_SECRETS_DIR=/etc/gsp/multica`,
+`GSP_BELT_SECRETS_ENV_FILE=/etc/gsp/multica/remote-bridge.env`,
+`GSP_BELT_PG_MODULE=/opt/gsp/multica-workers/node_modules/pg`,
+`MULTICA_DAEMON_DIR=/opt/gsp/multica-workers`, and
+`GSP_WORKSPACES_ROOT=/opt/gsp/multica-workspaces`. Leaving them unset retains
+the noc2 defaults above.
 
 ## Review
 
