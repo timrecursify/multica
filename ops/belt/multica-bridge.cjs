@@ -388,6 +388,25 @@ async function latestQcVerdict(client, issueId) {
   return result.rows[0] || null;
 }
 
+// A deploy may only be admitted after the Sol-low QC lane has recorded a
+// qualifying PASS bound to the exact reviewed tree.  Keep this check at the
+// relay boundary as well as in the policy table: a stale database alt edge or
+// a hand-written request must not create a deploy task.
+async function directDeployQcAdmission(client, issueId) {
+  const result = await client.query(
+    `SELECT verdict, qualifying, model, effort, bound_sha, observed_head
+       FROM qc_attempt
+      WHERE issue_id = $1
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`, [issueId]
+  );
+  const row = result.rows[0];
+  return Boolean(row && row.verdict === 'PASS' && row.qualifying === true &&
+    row.model === 'gpt-5.6-sol' && row.effort === 'low' &&
+    SHA_RE.test(String(row.bound_sha || '')) &&
+    String(row.bound_sha).toLowerCase() === String(row.observed_head || '').toLowerCase());
+}
+
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explicitTaskId = null) {
   const result = await client.query(
       `SELECT t.id, t.agent_id, t.status, t.context, t.result, t.completed_at,
@@ -821,6 +840,33 @@ function admitConfiguredTransition({ fromStage, toStage, expectedStage, altStage
     toStage,
     ok: exceptional || allowed.includes(toStage)
   };
+}
+
+// Every committed relay transition gets one compact, secret-free audit event.
+// The JSON shape is intentionally stable so operators can query actor, route,
+// reason, and outcome without reverse-engineering empty activity rows.
+async function recordTransitionAudit(client, issue, {
+  fromStage, toStage, actorType = 'system', actorId = null, reason = null,
+  evidence = {}, result = 'committed', error = null
+} = {}) {
+  const details = {
+    issue_id: issue.id,
+    from_stage: fromStage,
+    to_stage: toStage,
+    actor_type: actorType,
+    actor_id: actorId,
+    reason: typeof reason === 'string' && reason.trim() ? reason.trim().slice(0, 500) : null,
+    evidence: evidence && typeof evidence === 'object' ? evidence : {},
+    result,
+    error: error ? String(error).slice(0, 500) : null,
+    timestamp: new Date().toISOString()
+  };
+  await client.query(
+    `INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+     VALUES ($1::uuid, $2::uuid, $3::text, 'relay_transition', $4::jsonb)`,
+    [issue.workspace_id, issue.id, actorType, JSON.stringify(details)]
+  );
+  return details;
 }
 
 function isCicdReturn(fromStage, toStage, reason) {
@@ -1392,6 +1438,15 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    if (issue.status === 'In Progress' && to_stage === 'CI/CD & Deploy' && !body.merged_pr_evidence) {
+      const allowed = await directDeployQcAdmission(client, issue.id);
+      if (!allowed) {
+        await client.query('ROLLBACK');
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'qualifying_qc_pass_required' }));
+        return;
+      }
+    }
     const evidenceRequested = body.merged_pr_evidence === true ||
       (body.merged_pr_evidence && typeof body.merged_pr_evidence === 'object');
     const evidenceOperator = evidenceRequested && !OPERATOR_SECRET_DISABLED &&
@@ -2169,6 +2224,10 @@ async function relayAdvance(req, res, body) {
       relayLogId = await ensureCompletedRelayLog(client, issue_id, issue.status, to_stage);
       await client.query(`UPDATE relay_run_log SET parked_audit=$2::jsonb WHERE id=$1`,
         [relayLogId, JSON.stringify(evidenceAudit)]);
+      await recordTransitionAudit(client, issue, {
+        fromStage: issue.status, toStage: to_stage, reason, evidence: evidenceAudit,
+        actorType: 'operator', result: 'committed'
+      });
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ success: true, issue: result.rows[0], task_id: null, relay_log_id: relayLogId }));
@@ -2181,6 +2240,11 @@ async function relayAdvance(req, res, body) {
       relayLogId = relayLogId || await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
+      await recordTransitionAudit(client, issue, {
+        fromStage: issue.status, toStage: to_stage, reason, evidence: parkedAudit || {},
+        actorType: explicitTerminalExit || explicitHumanReviewRelease ? 'operator' : 'system',
+        result: 'committed'
+      });
       // Terminal, human-gate, and parked-disposition arrivals have no stage owner, task, or
       // successor relay. Keep this return before every dispatch path.
       await client.query("COMMIT");
@@ -2276,6 +2340,17 @@ async function relayAdvance(req, res, body) {
       relayLogId = successor.relayLogId;
     }
 
+    await recordTransitionAudit(client, issue, {
+      fromStage: issue.status, toStage: to_stage, reason,
+      evidence: {
+        ...(retryEscalation ? { retry_escalation: retryEscalation.reason } : {}),
+        ...(cicdReturn ? { cicd_return: true } : {}),
+        ...(noArtifactRescope ? { no_artifact_rescope: true } : {})
+      },
+      actorType: explicitTerminalExit || explicitHumanReviewRelease ? 'operator' : 'system',
+      actorId: stage?.agent_id || null,
+      result: 'committed'
+    });
     await client.query("COMMIT");
 
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -2462,6 +2537,8 @@ module.exports = {
   recordBookkeepingHandoff,
   validateRelayVerdict,
   qcBounceDecision,
+  directDeployQcAdmission,
+  recordTransitionAudit,
   latestCompletedSolLowQcTask,
   latestRunningSolLowQcTask,
   qcTaskEvidence,

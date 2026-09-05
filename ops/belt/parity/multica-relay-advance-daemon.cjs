@@ -210,10 +210,6 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
     return { reviewRequiredRoute: route?.kind || 'review', pr: route?.pr_url || pointer,
       boundSha: route?.boundSha || pointer };
   }
-  if (row.to_stage === 'In Progress' && targetStage === 'CI/CD & Deploy') {
-    return { noReviewRoute: route?.kind || 'deploy', pr: route?.pr_url || pointer,
-      boundSha: route?.boundSha || pointer };
-  }
   if (row.to_stage === 'In Progress' && targetStage === 'Done') {
     return { noDeployRoute: route?.kind || 'no_pr', workProductEvidence: pointer };
   }
