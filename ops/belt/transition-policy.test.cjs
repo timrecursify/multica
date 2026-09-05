@@ -34,6 +34,13 @@ test('requires evidence and never accepts request booleans as authority', () => 
     evidence: { recordedDecision: true, isOperator: true } }).code, 'request_boolean_authority_denied');
 });
 
+test('never admits a direct In Progress deploy, even with deploy-shaped evidence', () => {
+  assert.equal(evaluate({ from: 'In Progress', to: 'CI/CD & Deploy', actor: 'system', evidence: {
+    noReviewRoute: true, pr: true, boundSha: true, qualifyingPass: true,
+    observedShaMatchesBound: true, completedSolLowTask: true
+  }).code, 'transition_denied');
+});
+
 test('allows only system retry escalation from Queue back to Spec', () => {
   assert.equal(evaluate({ from: 'Queue', to: 'Spec', actor: 'system',
     evidence: { retry_escalation: true } }).ok, true);
