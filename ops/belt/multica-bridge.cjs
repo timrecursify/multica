@@ -1608,6 +1608,32 @@ async function relayAdvance(req, res, body) {
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
     const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease;
+
+    // Check the durable gate before the same-stage/idempotency fast path. A
+    // replay of a Done request must not turn a newly recorded QC FAIL into a
+    // successful 200 noop; every route that asks to reach Done is subject to
+    // the same fail-closed admission decision.
+    const doneGate = to_stage === "Done" ? await latestQcGateComment(client, issue.id) : null;
+    if (to_stage === "Done" && doneGate?.verdict === "FAIL") {
+      await client.query("ROLLBACK");
+      console.warn(JSON.stringify({
+        event: "relay_advance_rejected",
+        reason: "qc_gate_failed",
+        issue_id: issue.id,
+        gate_comment_id: doneGate.id,
+        from_stage: issue.status,
+        to_stage
+      }));
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "qc_gate_failed",
+        message: "Done is refused while the newest QC gate verdict is FAIL",
+        gate_comment_id: doneGate.id,
+        from_stage: issue.status,
+        to_stage
+      }));
+      return;
+    }
     if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
         OPERATOR_SECRET_DISABLED) {
       await client.query("ROLLBACK");
@@ -1876,27 +1902,6 @@ async function relayAdvance(req, res, body) {
     }
 
     if (to_stage === "Done") {
-      const gate = await latestQcGateComment(client, issue.id);
-      if (gate?.verdict === "FAIL") {
-        await client.query("ROLLBACK");
-        console.warn(JSON.stringify({
-          event: "relay_advance_rejected",
-          reason: "qc_gate_failed",
-          issue_id: issue.id,
-          gate_comment_id: gate.id,
-          from_stage: issue.status,
-          to_stage
-        }));
-        res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({
-          error: "qc_gate_failed",
-          message: "Done is refused while the newest QC gate verdict is FAIL",
-          gate_comment_id: gate.id,
-          from_stage: issue.status,
-          to_stage
-        }));
-        return;
-      }
       const verdict = await client.query(
         `SELECT verdict, work_product_md5 FROM qc_verdict
           WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]
