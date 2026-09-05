@@ -54,9 +54,9 @@ if grep -q -- '--workspaces-root' "$capture"; then
   echo 'flagless daemon unexpectedly received --workspaces-root' >&2
   exit 1
 fi
-HOLD_DAEMON=1 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh" &
+HOLD_DAEMON=1 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" MULTICA_DAEMON_WORKSPACES_ROOT="$fake/ws" MULTICA_WORKSPACES_ROOT="$fake/ws" "$root_dir/multica-daemon-wrapper.sh" &
 pid=$!; sleep 0.1
-if BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" "$root_dir/multica-daemon-wrapper.sh"; then exit 1; fi
+if BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" MULTICA_DAEMON_WORKSPACES_ROOT="$fake/ws" MULTICA_WORKSPACES_ROOT="$fake/ws" "$root_dir/multica-daemon-wrapper.sh"; then exit 1; fi
 wait "$pid"
 assert_wrapper_rejects() {
   local label="$1" expected="$2" stderr="$fake/$1.stderr" status
