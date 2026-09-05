@@ -30,7 +30,11 @@ function parseOutcome(output) {
 
 function legacyOutcome(text) {
   if (/"qualifying"\s*:\s*true/.test(text) || /"verdict"\s*:\s*"(PASS|FAIL)"/.test(text)) return { outcome: "ADVANCED", blockedOn: null };
-  if (/relay transition .* denied \(409 transition_denied\)|relay rejected .* evidence_missing|BUILD-READY posted|specification posted.*now in Queue/i.test(text)) return { outcome: "ADVANCED", blockedOn: null };
+  // A transition_denied response is idempotent (the issue may already be in
+  // the requested stage), but evidence_missing is a hard relay rejection:
+  // required evidence was not supplied and the stage did not move.
+  if (/relay transition .* denied \(409 transition_denied\)|BUILD-READY posted|specification posted.*now in Queue/i.test(text)) return { outcome: "ADVANCED", blockedOn: null };
+  if (/relay rejected .* evidence_missing/i.test(text)) return { outcome: "FAILED", blockedOn: null };
   if (/QC-BLOCKED NO-SHA|no implementation (pull request|commit)/i.test(text)) return { outcome: "BLOCKED", blockedOn: "sha" };
   if (/blocked by (queued|pending|running) CI|waiting (on|for) CI/i.test(text)) return { outcome: "BLOCKED", blockedOn: "ci" };
   if (/usage limit|provider_quota_limit/i.test(text)) return { outcome: "BLOCKED", blockedOn: "quota" };
