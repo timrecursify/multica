@@ -865,7 +865,7 @@ func (h *Handler) SearchProjects(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("search projects timed out",
 				"workspace_id", workspaceID,
 				"query", q,
-				"timeout", searchStatementTimeout)
+				"timeout", effectiveSearchStatementTimeout())
 			writeError(w, http.StatusServiceUnavailable, "search timed out; please refine your query or try again")
 			return
 		}
