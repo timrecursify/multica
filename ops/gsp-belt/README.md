@@ -165,6 +165,13 @@ when a selected predicate fails and verifies recovery. Exit 0 is healthy, exit 1
 identifies unavailable/stale/wedged conditions, and exit 2 means invalid arguments.
 Missing or malformed telemetry is unhealthy.
 
+The daemon and watchdog share the effective port through `MULTICA_DAEMON_PORT`
+and `MULTICA_HEALTH_PORT`; when neither is set the GSP fleet default is `20464`.
+Setting both is supported only when they agree, so a stale `20463` probe fails
+with an actionable mismatch before any restart is attempted. Verify a live
+deployment with `bash <release-dir>/ops/gsp-belt/scripts/fleet-health.sh`; use
+`--repair` only after correcting configuration, then rerun the probe.
+
 ## Tests
 
 ```bash

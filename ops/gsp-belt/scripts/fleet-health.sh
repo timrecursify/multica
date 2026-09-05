@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 usage() { echo "usage: $0 [--port N] [--max-age SEC] [--tick-max-age SEC] [--repair]" >&2; exit 2; }
-port="${MULTICA_HEALTH_PORT:-20463}"; max_age="${MULTICA_HEARTBEAT_MAX_AGE_SECONDS:-90}"; tick_max_age="${MULTICA_TICK_MAX_AGE_SECONDS:-120}"; repair=0
+requested_daemon_port="${MULTICA_DAEMON_PORT-}"
+requested_health_port="${MULTICA_HEALTH_PORT-}"
+if [[ -n "$requested_daemon_port" && -n "$requested_health_port" && "$requested_daemon_port" != "$requested_health_port" ]]; then
+  echo "fleet-health: MULTICA_DAEMON_PORT ($requested_daemon_port) disagrees with MULTICA_HEALTH_PORT ($requested_health_port)" >&2
+  exit 2
+fi
+port="${requested_daemon_port:-${requested_health_port:-20464}}"; max_age="${MULTICA_HEARTBEAT_MAX_AGE_SECONDS:-90}"; tick_max_age="${MULTICA_TICK_MAX_AGE_SECONDS:-120}"; repair=0
 while (($#)); do case "$1" in --port) port="${2:-}"; shift 2;; --max-age) max_age="${2:-}"; shift 2;; --tick-max-age) tick_max_age="${2:-}"; shift 2;; --repair) repair=1; shift;; -h|--help) usage;; *) usage;; esac; done
 [[ "$port" =~ ^[0-9]+$ && "$max_age" =~ ^[0-9]+$ && "$tick_max_age" =~ ^[0-9]+$ ]] || usage
 probe() { python3 - "$port" "$max_age" "$tick_max_age" <<'PY'
@@ -17,7 +23,10 @@ def parse_stamp(name):
  try: return (datetime.now(timezone.utc)-datetime.fromisoformat(stamp.replace('Z','+00:00'))).total_seconds()
  except (TypeError,ValueError): return None
 age=parse_stamp('last_heartbeat_at')
-print(f"fleet status={h.get('status','unknown')} pid={h.get('pid','unknown')} heartbeat_age={age if age is not None else 'unknown'}s")
+reported_port=h.get('health_port')
+if reported_port is not None and reported_port != p:
+ print(f"fleet-health: endpoint reports health_port={reported_port}, expected {p}",file=sys.stderr); raise SystemExit(1)
+print(f"fleet status={h.get('status','unknown')} pid={h.get('pid','unknown')} health_port={reported_port if reported_port is not None else p} heartbeat_age={age if age is not None else 'unknown'}s")
 tick_age=parse_stamp('last_tick_completed_at')
 print(f"fleet tick_count={h.get('tick_count','unknown')} tick_outcome={h.get('last_tick_outcome','unknown')} tick_age={tick_age if tick_age is not None else 'unknown'}s")
 if h.get('status')!='running': print('fleet-health: daemon is not running',file=sys.stderr); raise SystemExit(1)
