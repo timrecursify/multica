@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -324,7 +325,9 @@ type Daemon struct {
 	// command resolves; read by runTask to launch the custom command for a
 	// claimed task. Guarded by mu.
 	profileLaunchSpecs map[string]profileLaunchSpec
-	reloading          sync.Mutex         // prevents concurrent workspace syncs
+	reloading          sync.Mutex // prevents concurrent workspace syncs
+	authIncidentMu     sync.Mutex
+	authIncidentActive bool               // one durable authentication incident per outage
 	runtimeSet         *runtimeSetWatcher // multi-subscriber pub/sub for runtime-set changes
 
 	versionsMu    sync.RWMutex      // guards agentVersions
@@ -3325,8 +3328,21 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 
 	workspaces, err := d.client.ListWorkspaces(apiCtx)
 	if err != nil {
+		if isUnauthorizedError(err) {
+			d.authIncidentMu.Lock()
+			if !d.authIncidentActive {
+				// This structured log line is consumed by the belt sentinel and
+				// deliberately excludes the bearer token and response body.
+				d.logger.Error("AUTHENTICATION_INCIDENT: daemon workspace registration rejected; run multica login", "sentinel", "daemon_auth", "status", http.StatusUnauthorized)
+				d.authIncidentActive = true
+			}
+			d.authIncidentMu.Unlock()
+		}
 		return fmt.Errorf("list workspaces: %w", err)
 	}
+	d.authIncidentMu.Lock()
+	d.authIncidentActive = false
+	d.authIncidentMu.Unlock()
 	d.logger.Debug("workspace sync: fetched workspaces", "count", len(workspaces))
 
 	apiIDs := make(map[string]string, len(workspaces)) // id -> name

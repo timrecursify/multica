@@ -33,5 +33,6 @@ module.exports = {
     { name: 'gsp-multica-worker',    script: '__GSP_BELT_RELEASE__/fleet/multica-daemon-wrapper.sh',                       ...guardrails,
       kill_timeout: 30000 },         // Tower may hold long-running flights
     { name: 'multica-relay-advance', script: '__GSP_BELT_RELEASE__/relay/multica-relay-advance-wrapper.sh',                ...guardrails },
+    { name: 'multica-daemon-health-sentinel', script: '__GSP_BELT_RELEASE__/daemon-health-sentinel.sh',                    ...guardrails },
   ],
 };
