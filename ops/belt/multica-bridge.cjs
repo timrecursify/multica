@@ -1642,6 +1642,13 @@ async function relayAdvance(req, res, body) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
       const relayLogId = isTerminalStage(to_stage)
         ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
+      await client.query(
+        `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
+         SELECT $1, $2, $2, 'noop', jsonb_build_object('reason', 'same_stage')
+          WHERE NOT EXISTS (SELECT 1 FROM relay_run_log
+            WHERE issue_id = $1 AND from_stage = $2 AND to_stage = $2
+              AND status = 'noop' AND created_at > NOW() - interval '1 minute')`,
+        [issue.id, issue.status]);
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
