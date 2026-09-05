@@ -1773,6 +1773,13 @@ test('lifetime ceiling applies an auditable terminal rejection instead of a re-s
   assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
 });
 
+test('operator Human Review releases record actor, target, and reason in the audit payload', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /operator_release:\s*\{[\s\S]*?actor:\s*"operator"/);
+  assert.match(source, /operator_release:\s*\{[\s\S]*?target_stage:\s*to_stage/);
+  assert.match(source, /operator_release:\s*\{[\s\S]*?reason:\s*reason\.trim\(\)/);
+});
+
 test('operator cap release requires the current PASS work-product hash', async () => {
   const client = { query: async () => ({ rows: [{ verdict: 'PASS',
     work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e' }] }) };

@@ -112,7 +112,8 @@ async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } 
   // GSP-1826 item 5: one provider quota failure holds all dispatch for the breaker window.
   if (QUOTA_BREAKER_MINUTES > 0) {
     const probe = await dbPool.query(
-      `SELECT completed_at FROM agent_task_queue WHERE failure_reason = 'agent_error.provider_quota_limit'
+      `SELECT completed_at FROM agent_task_queue
+        WHERE failure_reason ~* '(402|provider_quota_limit|payment[ _-]?required)'
          AND completed_at > NOW() - ($1::int * interval '1 minute') ORDER BY completed_at DESC LIMIT 1`, [QUOTA_BREAKER_MINUTES]);
     if (probe.rows[0]) {
       logger.log(`Reconcile cycle: held (provider quota failure at ${new Date(probe.rows[0].completed_at).toISOString()}, breaker ${QUOTA_BREAKER_MINUTES}m)`);
@@ -1194,8 +1195,14 @@ const INFRA_FAILURE_REASONS = [
   'agent_error.provider_quota_limit'
 ];
 
+const QUOTA_FAILURE_RE = /\b402\b|provider_quota_limit|payment[ _-]?required/i;
+
+function isQuotaFailure(reason) {
+  return QUOTA_FAILURE_RE.test(String(reason || ''));
+}
+
 function isInfrastructureFailure(reason) {
-  return INFRA_FAILURE_REASONS.includes(reason || 'cancelled');
+  return INFRA_FAILURE_REASONS.includes(reason || 'cancelled') || isQuotaFailure(reason);
 }
 
 function selectReplayAttempt(row) {
@@ -1559,6 +1566,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           const recentFailures = await client.query(
             `SELECT failure_reason, updated_at FROM agent_task_queue
               WHERE agent_id = $1::uuid AND status = 'failed'
+                AND failure_reason ~* '(402|provider_quota_limit|payment[ _-]?required)'
                 AND updated_at > NOW() - ($3::bigint * INTERVAL '1 millisecond')
               ORDER BY created_at DESC LIMIT $2::integer`,
             [row.agent_id, QUOTA_FAILURE_LIMIT, QUOTA_PAUSE_MAX_AGE_MS]
@@ -1569,14 +1577,16 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           const quotaPause = circuit.pause
             ? await pauseQuotaLane(client, row, circuit.consecutive)
             : null;
+          // Quota exhaustion is a retryable provider condition, not a human
+          // decision. Keep the issue in its executable stage and let the
+          // breaker/pause window clear; the next recovery pass can enqueue it
+          // again without creating a Human Review transition or audit.
           await client.query('COMMIT');
-          const moved = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
-            agent_token: RELAY_AGENT_SECRET, reason: 'payment_required_402' });
           if (quotaPause) {
             logQuotaPauseFlip({ agent_name: quotaPause.agent_name,
               timestamp: quotaPause.paused_at, paused: true });
           }
-          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; relay=${moved.status}; lane_paused=${Boolean(quotaPause)}`);
+          console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: provider quota breaker; lane_paused=${Boolean(quotaPause)}`);
           continue;
         }
         const releaseAt = row.metadata?.parked_release_at ||
@@ -2064,6 +2074,6 @@ if (require.main === module) startDaemon();
 
 module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestRetryEscalation,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
-  INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
+  INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
   github, restPrView, restStatusCheckRollup };
