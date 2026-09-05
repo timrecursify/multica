@@ -137,6 +137,12 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
   if (!prior) return { eligible: true, reason: "no_outcome" };
   const currentRow = (await client.query(stageInputHashSql(), [issueId])).rows[0] || {};
   const current = currentRow.input_hash || null;
+  // A recorded outcome belongs only to the stage that recorded it. Once the
+  // issue has moved on, never re-open that historical stage—even if another
+  // input changed later.
+  if (currentRow.issue_status && currentRow.issue_status !== stage) {
+    return { eligible: false, reason: `stage_moved_on:${currentRow.issue_status}`, prior };
+  }
   if (current && prior.input_hash && current !== prior.input_hash) return { eligible: true, reason: "input_changed", prior };
   if (Number.isInteger(attempt) && Number.isInteger(maxAttempts) && attempt >= maxAttempts) {
     return { eligible: false, reason: "attempt_budget_exhausted", prior };
