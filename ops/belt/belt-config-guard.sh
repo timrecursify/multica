@@ -40,14 +40,16 @@ readonly RELEASE_MANIFEST=(
   ops/belt/stage-routing.cjs ops/belt/qc-strict-evidence.cjs
   ops/belt/qc-verdict-policy.cjs ops/belt/belt-config-guard.sh
   ops/belt/multica-daemon-wrapper.sh ops/belt/ecosystem.gsp-belt.config.js
+  ops/belt/workspace-root.sh
   ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md
   ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md
   ops/belt/WORKER_COMMON.md ops/belt/relay-completion-admission.cjs
 )
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"
 WANT_CONCURRENCY="$(belt_resolve_concurrency)"
 readonly WANT_CONCURRENCY
-readonly WANT_WORKSPACES_ROOT=/home/newadmin/multica-workspaces-gsp
+readonly WANT_WORKSPACES_ROOT="$BELT_CANONICAL_WORKSPACES_ROOT"
 readonly BUILD_AGENT=gsp-build-deepseek-flash-1
 # 2026-08-31 14:20 UTC: global 12 -> 20, build capacity 3 -> 15, QC 4 each.
 # Tim's directive: 12-15 build employees, 3-4 QC.
@@ -464,7 +466,8 @@ daemon_launch_config() {
 validate_daemon_launch_config() {
   local cap root
   IFS='|' read -r cap root < <(daemon_launch_config)
-  [[ "$cap" =~ ^[1-9][0-9]*$ ]] && (( cap <= $(belt_cpu_count) )) && [[ -n "$root" && "$root" == /* ]]
+  [[ "$cap" =~ ^[1-9][0-9]*$ ]] && (( cap <= $(belt_cpu_count) )) || return 1
+  workspace_root_validate >/dev/null
 }
 
 wrapper_has_explicit_concurrency_flag() {
@@ -477,10 +480,10 @@ wrapper_has_explicit_concurrency_flag() {
 
 guard_wrapper() {
   if ! validate_daemon_launch_config; then
-    unfixable+=("invalid PM2 daemon launch config: cap must be a positive integer and workspaces root an absolute path")
+    unfixable+=("invalid PM2 daemon launch config: cap must be a positive integer and workspace root must be canonical with valid children")
   elif [[ ! -x "$WRAPPER" ]] ||
        ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS-' "$WRAPPER" ||
-       ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp' "$WRAPPER" ||
+       ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT-' "$WRAPPER" ||
        ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS' "$ECOSYSTEM" ||
        ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT' "$ECOSYSTEM" ||
        ! wrapper_has_explicit_concurrency_flag "$WRAPPER"; then
