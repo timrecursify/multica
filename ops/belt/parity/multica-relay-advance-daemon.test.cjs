@@ -5,7 +5,7 @@ const { randomUUID } = require('node:crypto');
 const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
-  isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
+  isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
@@ -41,6 +41,21 @@ test('guarded runner contains startup rejection and allows the next pass', async
   await runner();
   assert.equal(calls, 2);
   assert.match(errors[0], /startup-test.*injected startup rejection/);
+});
+
+test('provider quota aliases remain retryable infrastructure failures', () => {
+  for (const reason of [
+    'agent_error.provider_quota_limit',
+    'payment_required_402',
+    'upstream returned HTTP 402 payment required'
+  ]) {
+    assert.equal(isQuotaFailure(reason), true, reason);
+    assert.equal(isInfrastructureFailure(reason), true, reason);
+    assert.equal(selectReplayAttempt({
+      dead_task_id: 'task-1', dead_task_status: 'failed', attempt: 2,
+      failure_reason: reason
+    }), 2, reason);
+  }
 });
 
 test('guarded runner suppresses overlapping ticks', async () => {

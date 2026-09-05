@@ -2255,6 +2255,13 @@ async function relayAdvance(req, res, body) {
         runtimeId: stage.selected_runtime_id,
         context,
         relayAudit: operatorCapBypass ? JSON.stringify({
+          ...(explicitHumanReviewRelease ? {
+            operator_release: {
+              actor: "operator",
+              target_stage: to_stage,
+              reason: reason.trim()
+            }
+          } : {}),
           ...(explicitTerminalExit ? {
             terminal_exit: { operator_marker: true, reason: reason.trim() }
           } : {}),
