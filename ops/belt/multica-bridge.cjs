@@ -388,6 +388,27 @@ async function latestQcVerdict(client, issueId) {
   return result.rows[0] || null;
 }
 
+// QC workers leave a durable, human-readable gate comment in addition to the
+// normalized qc_verdict row.  Keep the comment as an independent admission
+// signal: a stale PASS/hash must never make a ticket Done after a newer gate
+// explicitly failed.  The id is returned so callers can audit the exact gate
+// that caused the refusal.
+async function latestQcGateComment(client, issueId) {
+  const result = await client.query(
+    `SELECT id, content, created_at
+       FROM comment
+      WHERE issue_id = $1
+        AND content LIKE '%<!-- multica-qc-gate -->%'
+      ORDER BY created_at DESC, id DESC
+      LIMIT 1`, [issueId]
+  );
+  const row = result.rows[0];
+  if (!row) return null;
+  const match = String(row.content || '').match(/QC[- ]GATE\s*:\s*(PASS|FAIL)\b/i) ||
+    String(row.content || '').match(/QC[- ]GATE\s+(PASS|FAIL)\b/i);
+  return { id: row.id, created_at: row.created_at, verdict: match?.[1]?.toUpperCase() || null };
+}
+
 // A deploy may only be admitted after the Sol-low QC lane has recorded a
 // qualifying PASS bound to the exact reviewed tree.  Keep this check at the
 // relay boundary as well as in the policy table: a stale database alt edge or
@@ -1587,6 +1608,32 @@ async function relayAdvance(req, res, body) {
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
     const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease;
+
+    // Check the durable gate before the same-stage/idempotency fast path. A
+    // replay of a Done request must not turn a newly recorded QC FAIL into a
+    // successful 200 noop; every route that asks to reach Done is subject to
+    // the same fail-closed admission decision.
+    const doneGate = to_stage === "Done" ? await latestQcGateComment(client, issue.id) : null;
+    if (to_stage === "Done" && doneGate?.verdict === "FAIL") {
+      await client.query("ROLLBACK");
+      console.warn(JSON.stringify({
+        event: "relay_advance_rejected",
+        reason: "qc_gate_failed",
+        issue_id: issue.id,
+        gate_comment_id: doneGate.id,
+        from_stage: issue.status,
+        to_stage
+      }));
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        error: "qc_gate_failed",
+        message: "Done is refused while the newest QC gate verdict is FAIL",
+        gate_comment_id: doneGate.id,
+        from_stage: issue.status,
+        to_stage
+      }));
+      return;
+    }
     if (isTerminalStage(issue.status) && explicitTerminalExitRequested &&
         OPERATOR_SECRET_DISABLED) {
       await client.query("ROLLBACK");
@@ -2570,6 +2617,7 @@ module.exports = {
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
+  latestQcGateComment,
   isTerminalStage,
   isNoDispatchArrivalStage,
   retryEscalationReason,
