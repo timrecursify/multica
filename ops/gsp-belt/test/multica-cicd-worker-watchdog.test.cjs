@@ -42,3 +42,26 @@ test('active lease prevents a duplicate merge', async () => {
   await h.worker.sweep();
   assert.ok(!h.sqls.some(s => s.includes("UPDATE agent_task_queue SET status='completed'")));
 });
+
+test('completed attempt makes a repeated watchdog tick idempotent', async () => {
+  let relayCalls = 0;
+  let advanced = false;
+  const worker = createWorker({
+    pool: { query: async (sql, params) => {
+      if (sql.includes('SELECT status FROM cicd_deploy_attempt')) return { rows: advanced ? [{ status: 'advanced' }] : [] };
+      return (await (async () => {
+        if (sql.includes('FROM issue WHERE')) return { rows: [issue] };
+        if (sql.includes('FROM comment')) return { rows: [{ content: pr }] };
+        if (sql.includes('FROM qc_attempt')) return { rows: [{ verdict: 'PASS', qualifying: true, model: 'gpt-5.6-sol', effort: 'low', bound_sha: sha }] };
+        if (sql.includes('INSERT INTO cicd_deploy_attempt')) { if (!sql.includes('RETURNING')) advanced = true; return { rows: [{ issue_id: 'i' }] }; }
+        return { rows: [] };
+      })());
+    } },
+    gh: args => args[0] === 'pr' && args[1] === 'merge' ? '' : args[0] === 'pr' ? JSON.stringify({ state: 'CLOSED', mergeable: 'MERGEABLE', headRefOid: sha }) : '',
+    relay: async () => { relayCalls++; return { ok: true, status: 200 }; },
+    enforceLease: true
+  });
+  await worker.sweep();
+  await worker.sweep();
+  assert.equal(relayCalls, 1);
+});
