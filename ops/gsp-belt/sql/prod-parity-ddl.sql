@@ -85,7 +85,8 @@ CREATE TABLE public.qc_verdict (
     work_product_md5 text NOT NULL,
     notes text,
     created_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT qc_verdict_verdict_check CHECK ((verdict = ANY (ARRAY['PASS'::text, 'FAIL'::text, 'NEEDS_WORK'::text])))
+    CONSTRAINT qc_verdict_verdict_check CHECK ((verdict = ANY (ARRAY['PASS'::text, 'FAIL'::text, 'NEEDS_WORK'::text]))),
+    CONSTRAINT qc_verdict_work_product_md5_check CHECK (work_product_md5 ~* '^[0-9a-f]{32}$')
 );
 
 
