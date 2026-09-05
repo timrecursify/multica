@@ -99,7 +99,12 @@ query_restic() {
       export AWS_SECRET_ACCESS_KEY="${B2_ACCOUNT_KEY:-${AWS_SECRET_ACCESS_KEY:-}}"
     fi
     export RESTIC_CACHE_DIR="$STATE_DIR/restic-cache"
-    [[ -n "${RESTIC_PASSWORD:-}" ]] || { echo "NOPASSWORD" >&2; exit 92; }
+    # Restic accepts a password directly, from a file, or from a command.
+    # Reject the query only when none of those supported sources is configured.
+    if [[ -z "${RESTIC_PASSWORD:-}" && -z "${RESTIC_PASSWORD_FILE:-}" && -z "${RESTIC_PASSWORD_COMMAND:-}" ]]; then
+      echo "NOPASSWORD" >&2
+      exit 92
+    fi
     local args=(-r "$repo" snapshots --latest 1 --json)
     [[ -n "$tag" ]] && args+=(--tag "$tag")
     # An rclone: repo makes restic spawn rclone, and rclone REWRITES ITS OWN
