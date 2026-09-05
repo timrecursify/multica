@@ -56,7 +56,7 @@ type IssueStatusContract struct {
 func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, error) {
 	canonical := []string{
 		"Registered", "Spec", "Queue", "In Progress", "In Review",
-		"Human Review", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
+		"Human Review", "Blocked (human)", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
 	}
 	aliases := map[string]string{
 		"todo":        "Spec",
@@ -67,17 +67,18 @@ func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, e
 		"QC":          "In Review",
 		"blocked":     "Human Review",
 		"Blocked":     "Human Review",
+		"blocked_human": "Blocked (human)",
 		"done":        "Done",
 		"cancelled":   "Cancelled",
 		"dead_letter": "Cancelled",
 	}
-	terminal := []string{"Done", "Cancelled", "Archived"}
+	terminal := []string{"Done", "Cancelled", "Archived", "Blocked (human)"}
 	display := map[string]string{}
 	switch profile {
 	case IssueStatusProfileLinear:
 		display = map[string]string{
 			"Spec": "todo", "Queue": "backlog", "In Progress": "in_progress", "In Review": "in_review",
-			"Human Review": "blocked", "Done": "done", "Cancelled": "cancelled", "Archived": "cancelled",
+			"Human Review": "blocked", "Blocked (human)": "blocked", "Done": "done", "Cancelled": "cancelled", "Archived": "cancelled",
 		}
 	case IssueStatusProfilePPP:
 		for _, status := range canonical {
@@ -220,7 +221,7 @@ func (c *IssueStatusContract) orderCASE(statusExpr string) string {
 // float to the top of a search. It maps every canonical status to a rank so a
 // canonical spelling never collapses into the fallback.
 func (c *IssueStatusContract) activityRankCASE(statusExpr string) string {
-	rank := []string{"In Progress", "In Review", "Registered", "Spec", "Queue", "Human Review", "CI/CD & Deploy", "Done", "Cancelled", "Archived"}
+	rank := []string{"In Progress", "In Review", "Registered", "Spec", "Queue", "Human Review", "CI/CD & Deploy", "Done", "Blocked (human)", "Cancelled", "Archived"}
 	var b strings.Builder
 	b.WriteString("CASE ")
 	b.WriteString(statusExpr)

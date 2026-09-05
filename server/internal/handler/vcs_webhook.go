@@ -260,7 +260,7 @@ func (h *Handler) mirrorVCSPullRequest(ctx context.Context, conn db.VcsConnectio
 
 	if ev.State == "merged" || ev.State == "closed" {
 		for _, issue := range reevalIssues {
-			if issue.Status == "Done" || issue.Status == "Cancelled" || issue.Status == "Archived" {
+			if issue.Status == "Done" || issue.Status == "Cancelled" || issue.Status == "Archived" || issue.Status == "Blocked (human)" {
 				continue
 			}
 			counts, err := h.Queries.GetIssueCombinedPullRequestCloseAggregate(ctx, issue.ID)

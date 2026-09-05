@@ -90,7 +90,7 @@ var validIssuePriorities = []string{"urgent", "high", "medium", "low", "none"}
 var validIssueStatuses = []string{
 	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
 	"Registered", "Spec", "Queue", "Building", "In Progress", "QC", "In Review", "Human Review",
-	"CI/CD & Deploy", "Done", "Blocked", "Cancelled", "Archived", "dead_letter",
+	"CI/CD & Deploy", "Done", "Blocked", "Blocked (human)", "Cancelled", "Archived", "dead_letter",
 }
 
 func validateIssueEnum(w http.ResponseWriter, field, value string, allowed []string) bool {
@@ -526,7 +526,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	whereClause := "(" + strings.Join(whereParts, " OR ") + ")"
 
 	if !includeClosed {
-		whereClause += " AND i.status NOT IN ('Done', 'Cancelled', 'Archived')"
+		whereClause += " AND i.status NOT IN ('Done', 'Cancelled', 'Archived', 'Blocked (human)')"
 	}
 
 	// --- ORDER BY clause ---
