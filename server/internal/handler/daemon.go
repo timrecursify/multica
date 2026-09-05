@@ -1300,6 +1300,9 @@ func (h *Handler) processHeartbeat(ctx context.Context, rt db.AgentRuntime, supp
 		}
 	}
 
+	// Advance the process-level liveness gauge only after the heartbeat has
+	// completed successfully and an acknowledgement can be returned.
+	h.Metrics.RecordOrchestratorHeartbeat()
 	return ack, m, nil
 }
 
