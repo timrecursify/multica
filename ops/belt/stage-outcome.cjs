@@ -71,7 +71,8 @@ function stageInputHashSql() {
          FROM comment c WHERE c.issue_id = i.id AND c.source_task_id IS NULL),
       (SELECT string_agg(d.depends_on_issue_id::text || ':' || di.status, ',' ORDER BY d.depends_on_issue_id)
          FROM issue_dependency d JOIN issue di ON di.id = d.depends_on_issue_id WHERE d.issue_id = i.id),
-      md5(coalesce(i.description, '')))) AS input_hash
+      md5(coalesce(i.description, '')))) AS input_hash,
+    i.status AS issue_status
     FROM issue i WHERE i.id = $1::uuid`;
 }
 
@@ -104,6 +105,22 @@ async function recordStageOutcomes(client, { windowMinutes = 180, logger = conso
   let recorded = 0;
   for (const row of rows) {
     const parsed = parseOutcome(row.output);
+    // An In Progress completion is the implementation handoff. It cannot be
+    // advanced without a linked PR and bound head SHA, so do not persist a
+    // misleading terminal ADVANCED outcome when that evidence is absent.
+    if (parsed.outcome === "ADVANCED" && row.stage === "In Progress") {
+      const evidence = (await client.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM issue_pull_request ipr
+           JOIN github_pull_request p ON p.id = ipr.pull_request_id
+           WHERE ipr.issue_id = $1::uuid AND NULLIF(p.head_sha, '') IS NOT NULL
+         ) AS has_review_evidence`, [row.issue_id])).rows[0];
+      if (!evidence?.has_review_evidence) {
+        parsed.outcome = "FAILED";
+        parsed.blockedOn = null;
+        logger.log(`[stage-outcome] rejected unsupported ADVANCED task=${row.id} stage=${row.stage}: missing review evidence`);
+      }
+    }
     const hash = (await client.query(stageInputHashSql(), [row.issue_id])).rows[0]?.input_hash || null;
     await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, parsed.blockedOn, row.id, hash]);
     recorded += 1;
@@ -118,7 +135,14 @@ async function recordStageOutcomes(client, { windowMinutes = 180, logger = conso
 async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Number.parseInt(process.env.MULTICA_FAILED_TTL_MINUTES || "15", 10), now = Date.now(), attempt, maxAttempts } = {}) {
   const prior = (await client.query(outcomeForStageSql(), [issueId, stage])).rows[0];
   if (!prior) return { eligible: true, reason: "no_outcome" };
-  const current = (await client.query(stageInputHashSql(), [issueId])).rows[0]?.input_hash || null;
+  const currentRow = (await client.query(stageInputHashSql(), [issueId])).rows[0] || {};
+  const current = currentRow.input_hash || null;
+  // A recorded outcome belongs only to the stage that recorded it. Once the
+  // issue has moved on, never re-open that historical stage—even if another
+  // input changed later.
+  if (currentRow.issue_status && currentRow.issue_status !== stage) {
+    return { eligible: false, reason: `stage_moved_on:${currentRow.issue_status}`, prior };
+  }
   if (current && prior.input_hash && current !== prior.input_hash) return { eligible: true, reason: "input_changed", prior };
   if (Number.isInteger(attempt) && Number.isInteger(maxAttempts) && attempt >= maxAttempts) {
     return { eligible: false, reason: "attempt_budget_exhausted", prior };
@@ -128,6 +152,15 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
   if (prior.outcome === "FAILED" && Number.isFinite(ttl) && ttl > 0 && Number.isFinite(outcomeAt) &&
       Number(now) - outcomeAt >= ttl * 60 * 1000) {
     return { eligible: true, reason: "failed_ttl_expired", prior };
+  }
+  if (prior.outcome === "ADVANCED") {
+    const configured = Number(process.env.MULTICA_ADVANCED_STALL_TTL_MINUTES);
+    const ttlMinutes = Number.isFinite(configured) && configured > 0 ? configured : 15;
+    const outcomeAt = Date.parse(prior.outcome_at);
+    if (currentRow.issue_status === stage && Number.isFinite(outcomeAt) &&
+        Number(now) - outcomeAt >= ttlMinutes * 60 * 1000) {
+      return { eligible: true, reason: "advanced_stall", prior };
+    }
   }
   return { eligible: false, reason: `outcome_unchanged:${prior.outcome}${prior.blocked_on ? "/" + prior.blocked_on : ""}`, prior };
 }

@@ -38,7 +38,7 @@ test('never admits a direct In Progress deploy, even with deploy-shaped evidence
   assert.equal(evaluate({ from: 'In Progress', to: 'CI/CD & Deploy', actor: 'system', evidence: {
     noReviewRoute: true, pr: true, boundSha: true, qualifyingPass: true,
     observedShaMatchesBound: true, completedSolLowTask: true
-  }).code, 'transition_denied');
+  }}).code, 'transition_denied');
 });
 
 test('allows only system retry escalation from Queue back to Spec', () => {
