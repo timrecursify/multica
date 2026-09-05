@@ -2,13 +2,26 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
 const {
-  isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
+  isBundledChild, instructionCompatibility, agentRegistryDefects, hasActiveTaskForIssueStage,
   crossStageExecutionAdmission,
   retryAdmission, spendPreflight, beltRoutingAdmission, budgetCountPredicate, stageCycleAdmission, lifetimeTaskAdmission,
   isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
   quotaCircuitAdmission, QUOTA_PAUSE_MAX_AGE_MS, quotaPauseClearance, quotaPauseFlipLogLine
   , resolveBuilderRoute
 } = require('./guardrails.cjs');
+
+test('agent registry rejects duplicates, blanks, and pooled zero-stage members', () => {
+  const bad = [{ id: 'a', name: 'dup', instructions: 'RUNBOOK_SPEC_WORKER.md' },
+    { id: 'b', name: 'dup', instructions: 'RUNBOOK_SPEC_WORKER.md' },
+    { id: 'c', name: 'blank', instructions: '' }];
+  assert.deepEqual(agentRegistryDefects(bad, [{ agent_id: 'c', stage_name: 'Spec', enabled: true }]), [
+    'c:blank:Spec:zero_permitted_stages',
+    'c:blank:blank_instructions',
+    'dup:duplicate_name:a,b'
+  ]);
+  assert.deepEqual(agentRegistryDefects([{ id: 'ok', name: 'spec', instructions: 'RUNBOOK_SPEC_WORKER.md' }],
+    [{ agent_id: 'ok', stage_name: 'Spec', enabled: true }]), []);
+});
 
 test('builder route resolver rejects contradictory configuration and admits immutable route', () => {
   const agent = { name: 'gsp-build-deepseek-low', model: 'deepseek/deepseek-v4-flash-0731',
