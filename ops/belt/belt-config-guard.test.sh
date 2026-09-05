@@ -231,6 +231,13 @@ printf '{"source_sha":"%s","manifest_sha256":"%s"}\n' "$(basename -- "$release_r
 rm -f "$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
 repair_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_SOURCE_WRAPPER="$repair_root/missing-source-wrapper.sh" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; guard_source_runtime_parity; printf "%s|%s|%s" "$PARITY_OK" "${#fixed[@]}" "-f $RUNTIME_WRAPPER"' _ "$root_dir/belt-config-guard.sh")
 assert_eq '1|1|-f '"$repair_root"'/gsp-multica/fleet/multica-daemon-wrapper.sh' "$repair_result" 'missing wrapper repaired from complete release'
+# If the deployed/source guard itself is missing, the same validated release
+# pair is the authority; a second repair is idempotent.
+rm -f "$repair_root/tools/belt-config-guard.sh"
+missing_guard_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_SOURCE_GUARD="$repair_root/missing-source-guard.sh" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; printf "%s|%s|%s" "$PARITY_OK" "${#fixed[@]}" "$(sha256sum "$RUNTIME_GUARD" | cut -d" " -f1)"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '1|1|'"$(sha256sum "$release_root/ops/belt/belt-config-guard.sh" | awk '{print $1}')" "$missing_guard_result" 'missing source guard repaired from complete release'
+idempotent_result=$(BELT_SOURCE_ROOT="$root_dir" BELT_SOURCE_GUARD="$repair_root/missing-source-guard.sh" BELT_RUNTIME_ROOT="$repair_root" BELT_RELEASE_ROOT="$repair_root/releases" bash -c 'source "$1"; fixed=(); unfixable=(); repair_source_runtime_parity; printf "%s|%s" "$PARITY_OK" "${#fixed[@]}"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '1|0' "$idempotent_result" 'release parity repair is idempotent'
 printf '%s\n' original-guard >"$repair_root/tools/belt-config-guard.sh"
 printf '%s\n' original-wrapper >"$repair_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
 printf '{"source_sha":"cccccccccccccccccccccccccccccccccccccccc","manifest_sha256":"%s"}\n' "$release_manifest_digest" >"$release_root/.gsp-belt-release.json"

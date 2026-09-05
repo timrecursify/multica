@@ -152,26 +152,57 @@ validated_release_wrapper() {
   return 1
 }
 
+# Resolve an authenticated release containing the complete parity pair.  The
+# caller may provide either expected digest (or an empty value when that
+# source member is absent); metadata and the complete manifest remain
+# mandatory, so a lone copied blob can never become an authority.
+validated_release_pair() {
+  local expected_guard_sha="${1:-}" expected_wrapper_sha="${2:-}"
+  local candidate_guard release candidate_wrapper metadata source_sha manifest_sha256
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || return 1
+  while IFS= read -r candidate_guard; do
+    release="${candidate_guard%/ops/belt/belt-config-guard.sh}"
+    candidate_wrapper="$release/ops/belt/multica-daemon-wrapper.sh"
+    [[ -d "$release" && ! -L "$release" && -r "$candidate_guard" && -r "$candidate_wrapper" ]] || continue
+    [[ "$(basename -- "$release")" =~ ^[0-9a-f]{40}$ ]] || continue
+    [[ -x "$candidate_guard" && -x "$candidate_wrapper" ]] || continue
+    [[ -z "$expected_guard_sha" || "$(sha256sum -- "$candidate_guard" | awk '{print $1}')" == "$expected_guard_sha" ]] || continue
+    [[ -z "$expected_wrapper_sha" || "$(sha256sum -- "$candidate_wrapper" | awk '{print $1}')" == "$expected_wrapper_sha" ]] || continue
+    metadata="$release/.gsp-belt-release.json"
+    [[ -r "$metadata" ]] || continue
+    source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
+    manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
+    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ &&
+       "${source_sha,,}" == "$(basename -- "$release")" &&
+       "$manifest_sha256" == "$(release_manifest_checksum "$release")" ]] || continue
+    printf '%s\n' "$release"
+    return 0
+  done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
+  return 1
+}
+
 # Recover a missing member of the guard/wrapper pair only from a complete,
 # immutable release that contains the exact source blobs.  Validation happens
 # before either destination is touched; installation is protected by a lock
 # and rolls back if the second rename fails.
 repair_source_runtime_parity() {
-  local guard_sha wrapper_sha release candidate_guard candidate_wrapper lock staging old_guard old_wrapper metadata source_sha manifest_sha256 wrapper_source
+  local guard_sha wrapper_sha release candidate_guard candidate_wrapper lock staging old_guard old_wrapper metadata source_sha manifest_sha256 wrapper_source guard_source
   local guard_present=0 wrapper_present=0 needs_repair=0
-  guard_sha=$(sha256sum -- "$GUARD_SOURCE" 2>/dev/null | awk '{print $1}')
+  guard_source="$GUARD_SOURCE"
+  guard_sha=$(sha256sum -- "$guard_source" 2>/dev/null | awk '{print $1}')
   wrapper_source="$WRAPPER_SOURCE"
   wrapper_sha=$(sha256sum -- "$wrapper_source" 2>/dev/null | awk '{print $1}')
-  if [[ ! "$guard_sha" =~ ^[0-9a-f]{64}$ ]]; then
-    repair_failure 'phase=repair missing=source-guard'
-    return 0
+  if [[ ! "$guard_sha" =~ ^[0-9a-f]{64}$ || ! "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    release=$(validated_release_pair "$guard_sha" "$wrapper_sha" 2>/dev/null || true)
+    if [[ -n "$release" ]]; then
+      guard_source="$release/ops/belt/belt-config-guard.sh"
+      wrapper_source="$release/ops/belt/multica-daemon-wrapper.sh"
+      guard_sha=$(sha256sum -- "$guard_source" | awk '{print $1}')
+      wrapper_sha=$(sha256sum -- "$wrapper_source" | awk '{print $1}')
+    fi
   fi
-  if [[ ! "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]]; then
-    wrapper_source=$(validated_release_wrapper "$guard_sha" 2>/dev/null || true)
-    wrapper_sha=$(sha256sum -- "$wrapper_source" 2>/dev/null | awk '{print $1}')
-  fi
-  if [[ ! "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]]; then
-    repair_failure 'phase=repair missing=source-wrapper'
+  if [[ ! "$guard_sha" =~ ^[0-9a-f]{64}$ || ! "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    repair_failure 'phase=repair missing=source-pair'
     return 0
   fi
   if [[ -r "$RUNTIME_GUARD" ]]; then
@@ -255,12 +286,20 @@ repair_source_runtime_parity() {
 # the source tree and the two expected runtime locations; no broad filesystem
 # search is performed.
 guard_source_runtime_parity() {
-  local source_file runtime_file source_sha runtime_sha label runtime_dir staging fallback
+  local source_file runtime_file source_sha runtime_sha label runtime_dir staging fallback guard_source wrapper_source release
+  guard_source="$GUARD_SOURCE"; wrapper_source="$WRAPPER_SOURCE"
+  if [[ ! -r "$guard_source" || ! -r "$wrapper_source" ]]; then
+    release=$(validated_release_pair "$(sha256sum -- "$guard_source" 2>/dev/null | awk '{print $1}')" "$(sha256sum -- "$wrapper_source" 2>/dev/null | awk '{print $1}')" 2>/dev/null || true)
+    if [[ -n "$release" ]]; then
+      guard_source="$release/ops/belt/belt-config-guard.sh"
+      wrapper_source="$release/ops/belt/multica-daemon-wrapper.sh"
+    fi
+  fi
   for label in guard wrapper; do
     if [[ "$label" == guard ]]; then
-      source_file="$GUARD_SOURCE"; runtime_file="$RUNTIME_GUARD"
+      source_file="$guard_source"; runtime_file="$RUNTIME_GUARD"
     else
-      source_file="$WRAPPER_SOURCE"; runtime_file="$RUNTIME_WRAPPER"
+      source_file="$wrapper_source"; runtime_file="$RUNTIME_WRAPPER"
     fi
     if [[ ! -r "$source_file" && "$label" == wrapper ]]; then
       fallback=$(validated_release_wrapper "$(sha256sum -- "$GUARD_SOURCE" 2>/dev/null | awk '{print $1}')" 2>/dev/null || true)
