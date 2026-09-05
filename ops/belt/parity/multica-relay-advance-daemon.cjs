@@ -1972,12 +1972,26 @@ async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
   const client = await dbPool.connect();
   try {
     const result = await client.query(
-      `SELECT o.issue_id, o.task_id, v.work_product_md5, v.created_at AS verdict_at
+      `SELECT o.issue_id, o.task_id, v.work_product_md5, v.created_at AS verdict_at,
+              (v.verdict IS NULL AND EXISTS (
+                SELECT 1 FROM agent_task_queue ng
+                 WHERE ng.issue_id = o.issue_id AND ng.status = 'completed'
+                   AND ng.result::text ILIKE '%QC-BLOCKED NO-GATE%'
+                   AND ng.completed_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
+                     WHERE l.issue_id = o.issue_id AND l.to_stage = 'In Review'), '-infinity')
+              )) AS no_gate
          FROM issue_stage_outcome o
          JOIN issue i ON i.id = o.issue_id AND i.status = 'In Review'
-         JOIN LATERAL (SELECT verdict, work_product_md5, created_at FROM qc_verdict
+         LEFT JOIN LATERAL (SELECT verdict, work_product_md5, created_at FROM qc_verdict
                         WHERE issue_id = o.issue_id ORDER BY created_at DESC LIMIT 1) v ON TRUE
-        WHERE o.stage = 'In Review' AND o.outcome IN ('ADVANCED', 'FAILED') AND v.verdict = 'FAIL'
+        WHERE o.stage = 'In Review' AND o.outcome IN ('ADVANCED', 'FAILED')
+          AND (v.verdict = 'FAIL' OR (v.verdict IS NULL AND EXISTS (
+            SELECT 1 FROM agent_task_queue ng
+             WHERE ng.issue_id = o.issue_id AND ng.status = 'completed'
+               AND ng.result::text ILIKE '%QC-BLOCKED NO-GATE%'
+               AND ng.completed_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
+                 WHERE l.issue_id = o.issue_id AND l.to_stage = 'In Review'), '-infinity')
+          )))
           AND v.created_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
                                         WHERE l.issue_id = o.issue_id AND l.to_stage = 'In Review'), '-infinity')
           AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
@@ -1985,7 +1999,9 @@ async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
         ORDER BY o.outcome_at ASC LIMIT 40`);
     const returned = [];
     for (const row of result.rows) {
-      const cause = `QC FAIL ${row.work_product_md5 || 'no-md5'} at ${new Date(row.verdict_at).toISOString()}; rework required`;
+      const cause = row.no_gate
+        ? 'QC-BLOCKED NO-GATE; rework required'
+        : `QC FAIL ${row.work_product_md5 || 'no-md5'} at ${new Date(row.verdict_at).toISOString()}; rework required`;
       // Count durable relay bounces before each return.  The bridge applies the
       // same limit, but enforcing it here prevents this daemon from repeatedly
       // enqueueing a fresh builder task when a relay request is rejected.

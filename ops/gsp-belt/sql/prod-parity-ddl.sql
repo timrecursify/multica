@@ -123,7 +123,7 @@ CREATE TABLE public.relay_run_log (
     task_id uuid,
     status text DEFAULT 'pending'::text,
     created_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT relay_run_log_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'completed'::text, 'failed'::text])))
+    CONSTRAINT relay_run_log_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'completed'::text, 'failed'::text, 'noop'::text])))
 );
 
 

@@ -195,6 +195,25 @@ async function linkObservedPullRequest(client, issue, options = {}) {
   return true;
 }
 
+async function mergedPullRequestNoop(client, issue, options = {}) {
+  const pointer = await commentPullRequestUrl(client, issue);
+  if (!pointer) return null;
+  try {
+    const view = JSON.parse((options.githubCommand || ghExec)(["pr", "view", pointer.url,
+      "--json", "state,mergedAt,headRefOid,url"]));
+    if (String(view.state).toUpperCase() !== "MERGED" && !view.mergedAt) return null;
+    const verdict = policyFor(options)({ from: issue.status, to: "Done", actor: "operator",
+      evidence: { reason: "merged_pull_request", url: view.url || pointer.url, merged_at: view.mergedAt } });
+    if (!verdict?.ok) return null;
+    await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
+    await client.query("UPDATE issue SET status = 'Done', updated_at = NOW() WHERE id = $1::uuid", [issue.id]);
+    await client.query(`INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
+      VALUES ($1::uuid, $2, 'Done', 'completed', jsonb_build_object('reason','merged_pull_request','url',$3::text))`,
+      [issue.id, issue.status, view.url || pointer.url]);
+    return { action: "no_op", reason: "merged_pull_request", status: "Done" };
+  } catch (_) { return null; }
+}
+
 async function terminalBlocker(client, issue, prior, options = {}) {
   if (!prior || prior.outcome !== "BLOCKED") return null;
   const why = prior.blocked_on;
@@ -254,6 +273,8 @@ async function reconcileIssue(client, issueId, options = {}) {
       await client.query("COMMIT");
       return { action: "skipped", reason: "stage_disabled" };
     }
+    const mergedNoop = await mergedPullRequestNoop(client, issue, options);
+    if (mergedNoop) { await client.query("COMMIT"); return mergedNoop; }
     const live = (await client.query(liveTasksSql(), [issue.id, LIVE])).rows;
     const stale = live.filter((task) => UNSTARTED.includes(task.status) && task.context?.to_stage !== issue.status);
     if (stale.length) await client.query(
@@ -302,6 +323,24 @@ async function reconcileIssue(client, issueId, options = {}) {
         await client.query("COMMIT");
         return routed || { action: "skipped", reason: eligibility.reason };
       }
+    }
+    // Lifetime cap is per issue and includes every reconciler-created task,
+    // regardless of terminal status.  Stop the paid loop before selecting an
+    // owner or inserting another task; route the durable blocker to a human.
+    const lifetime = await client.query(lifetimeTasksSql(), [issue.id]);
+    const lifetimeCount = Number(lifetime.rows[0]?.count || 0);
+    if (lifetimeCount >= options.lifetimeTaskLimit) {
+      const capReason = `lifetime_task_limit:${lifetimeCount}/${options.lifetimeTaskLimit}`;
+      const routed = options.humanReviewRouting && HUMAN_REVIEW_FROM.has(issue.status) &&
+        options.budget.humanReview < options.maxHumanReviewPerCycle
+        ? await moveToHumanReview(client, issue, capReason, options) : null;
+      if (routed) {
+        options.budget.humanReview += 1;
+        await client.query("COMMIT");
+        return routed;
+      }
+      await client.query("COMMIT");
+      return { action: "skipped", reason: "lifetime_task_limit", count: lifetimeCount };
     }
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
     const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
@@ -421,4 +460,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, reconcileIssue, reconcileCycle };
