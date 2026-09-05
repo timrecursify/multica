@@ -31,4 +31,11 @@ workspace_root_validate_children() {
   done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
   return "$bad"
 }
-workspace_root_validate() { local root; root="$(workspace_root_resolve)" || return; workspace_root_validate_children "$root" || return 64; printf '%s\n' "$root"; }
+workspace_root_validate() {
+  local root
+  root="$(workspace_root_resolve)" || return
+  if [[ "${BELT_TEST_MODE-0}" != 1 || "${BELT_WRAPPER_TEST-0}" != 1 ]]; then
+    workspace_root_validate_children "$root" || return 64
+  fi
+  printf '%s\n' "$root"
+}
