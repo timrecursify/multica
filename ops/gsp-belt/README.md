@@ -127,6 +127,15 @@ bash <release-dir>/ops/gsp-belt/scripts/belt-status.sh --release <release-dir> \
 If the relay counter increases, inspect the emitted PM2 error-log path and exit
 code/signal, correct the operator environment or deployment, then rerun status.
 
+The worker restart-burst finding tracks the PM2 `unstable_restarts` counter
+between status runs. By default it reports unhealthy when more than 3 restarts
+are observed within 300 seconds. Configure with
+`--worker-restart-burst-threshold`, `--worker-restart-burst-window-seconds`,
+and `--worker-restart-burst-state` (or the corresponding
+`GSP_WORKER_RESTART_BURST_*` environment variables). A missing or malformed
+worker counter is a diagnostic failure; inspect the emitted `pm2_error_log`
+path and remediate the worker before rerunning the check.
+
 ## Dispatch controls
 
 `RECONCILE_MAX_CREATE_PER_CYCLE` limits tasks created per cycle; set it to `0` to halt task creation. `RECONCILE_DISPATCH_HOLD=1` is the supported way to stop dispatch, holding the reconcile cycle before any database access.
