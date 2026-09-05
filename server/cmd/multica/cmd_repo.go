@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -55,6 +57,39 @@ var repoCheckoutCmd = &cobra.Command{
 }
 
 var repoCheckoutRef string
+
+const repoCheckoutTimeoutFloor = 5 * time.Minute
+
+func repoCheckoutTimeout() time.Duration { return repoCheckoutTimeoutFloor }
+
+func repoCheckoutTimedOut(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+// repoCheckoutWithRetry owns the checkout wait budget. A timeout is transient
+// infrastructure failure: give the identical request one more full attempt,
+// while preserving a distinct exhausted-timeout error for the worker receipt.
+func repoCheckoutWithRetry(client *http.Client, endpoint string, data []byte) (*http.Response, error) {
+	var lastErr error
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, err := client.Post(endpoint, "application/json", bytes.NewReader(data))
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if !repoCheckoutTimedOut(err) || attempt == 2 {
+			break
+		}
+	}
+	if repoCheckoutTimedOut(lastErr) {
+		return nil, fmt.Errorf("checkout request timed out after one retry: %w", lastErr)
+	}
+	return nil, lastErr
+}
 
 func init() {
 	repoListCmd.Flags().String("output", "table", "Output format: table or json")
@@ -364,12 +399,8 @@ func runRepoCheckout(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("encode request: %w", err)
 	}
 
-	client := &http.Client{Timeout: 5 * time.Minute}
-	resp, err := client.Post(
-		fmt.Sprintf("http://127.0.0.1:%s/repo/checkout", daemonPort),
-		"application/json",
-		bytes.NewReader(data),
-	)
+	client := &http.Client{Timeout: repoCheckoutTimeout()}
+	resp, err := repoCheckoutWithRetry(client, fmt.Sprintf("http://127.0.0.1:%s/repo/checkout", daemonPort), data)
 	if err != nil {
 		return fmt.Errorf("connect to daemon: %w", err)
 	}
