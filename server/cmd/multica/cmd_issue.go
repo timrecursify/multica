@@ -381,6 +381,7 @@ var validIssueStatuses = []string{
 	"backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled",
 	"Registered", "Spec", "Queue", "Building", "In Progress", "QC", "In Review", "Human Review",
 	"CI/CD & Deploy", "Done", "Blocked", "Cancelled", "Archived", "dead_letter",
+	"Blocked (human)",
 }
 
 var validIssuePriorities = []string{
@@ -417,7 +418,7 @@ func validateIssueStatus(status string) error {
 // and transition in relay_run_log. The generic CLI must not bypass that path.
 func isTerminalIssueStatus(status string) bool {
 	switch status {
-	case "done", "cancelled", "Done", "Cancelled", "Archived":
+	case "done", "cancelled", "Done", "Cancelled", "Archived", "Blocked (human)":
 		return true
 	default:
 		return false

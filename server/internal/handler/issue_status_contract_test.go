@@ -40,7 +40,7 @@ func TestIssueStatusContractProfilesShareCanonicalStorage(t *testing.T) {
 		{"todo", "Spec"}, {"backlog", "Spec"}, {"Registered", "Registered"}, {"Spec", "Spec"},
 		{"Queue", "Queue"}, {"In Progress", "In Progress"}, {"in_progress", "In Progress"}, {"Building", "In Progress"},
 		{"In Review", "In Review"}, {"in_review", "In Review"}, {"QC", "In Review"}, {"Human Review", "Human Review"},
-		{"CI/CD & Deploy", "CI/CD & Deploy"},
+		{"CI/CD & Deploy", "CI/CD & Deploy"}, {"Blocked (human)", "Blocked (human)"},
 		{"blocked", "Human Review"}, {"Done", "Done"}, {"done", "Done"},
 		{"Cancelled", "Cancelled"}, {"cancelled", "Cancelled"}, {"Archived", "Archived"},
 	} {
@@ -62,7 +62,7 @@ func TestIssueStatusContractProfilesShareCanonicalStorage(t *testing.T) {
 func TestIssueStatusContractCanonicalStatusesMatchRelayVocabulary(t *testing.T) {
 	want := []string{
 		"Registered", "Spec", "Queue", "In Progress", "In Review",
-		"Human Review", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
+		"Human Review", "Blocked (human)", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
 	}
 	for _, profile := range []IssueStatusProfile{IssueStatusProfileLinear, IssueStatusProfilePPP} {
 		if got := mustTestStatusContract(profile).CanonicalStatuses(); !reflect.DeepEqual(got, want) {
@@ -106,7 +106,7 @@ func TestIssueStatusContractDefaultAndTerminal(t *testing.T) {
 		t.Errorf("ppp default = %q, want Spec", ppp.DefaultStatus())
 	}
 	for _, contract := range []*IssueStatusContract{linear, ppp} {
-		if !contract.IsTerminal("Done") || !contract.IsTerminal("Cancelled") || !contract.IsTerminal("Archived") {
+		if !contract.IsTerminal("Done") || !contract.IsTerminal("Cancelled") || !contract.IsTerminal("Archived") || !contract.IsTerminal("Blocked (human)") {
 			t.Errorf("%s terminals not recognized", contract.Profile())
 		}
 		if contract.IsTerminal("Spec") || contract.IsTerminal("In Progress") {
@@ -122,7 +122,7 @@ func TestIssueStatusContractOrderCASE(t *testing.T) {
 		if !strings.Contains(expr, "WHEN 'Registered' THEN 0") {
 			t.Errorf("%s orderCASE missing canonical first status: %s", profile, expr)
 		}
-		if !strings.Contains(expr, "WHEN 'Cancelled' THEN 9") {
+		if !strings.Contains(expr, "WHEN 'Cancelled' THEN 10") {
 			t.Errorf("%s orderCASE missing canonical last status: %s", profile, expr)
 		}
 	}
