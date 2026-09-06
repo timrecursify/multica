@@ -21,7 +21,7 @@ workspace_root_resolve() {
   printf '%s\n' "$configured"
 }
 workspace_root_validate_children() {
-  local root="$1" child name allowed bad=0
+  local root="$1" child name allowed bad=0 quarantine target suffix
   while IFS= read -r -d '' child; do
     name="${child##*/}"
     # The canonical root also holds belt infrastructure beside the workspace
@@ -31,6 +31,22 @@ workspace_root_validate_children() {
     [[ "$name" == .* ]] && continue
     allowed=0
     for uuid in "${BELT_WORKSPACE_UUIDS[@]}"; do [[ "$name" == "$uuid" ]] && allowed=1; done
+    if (( ! allowed )) && [[ -d "$child" && ! -L "$child" ]]; then
+      # Empty unknown directories are harmless stale artifacts: move them
+      # atomically beneath a dot-prefixed quarantine so startup can proceed.
+      if [[ -z "$(find "$child" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+        quarantine="$root/.quarantine"
+        mkdir -p -- "$quarantine" || { echo "workspace drift: quarantine unavailable: $child" >&2; bad=1; continue; }
+        target="$quarantine/$name"
+        suffix=0
+        while ! mv -T -- "$child" "$target" 2>/dev/null; do
+          suffix=$((suffix + 1)); target="$quarantine/${name}.$suffix"
+          (( suffix > 1000 )) && { echo "workspace drift: quarantine failed: $child" >&2; bad=1; break; }
+        done
+        (( suffix <= 1000 )) && echo "warning: quarantined unknown workspace directory: $child -> $target" >&2
+        continue
+      fi
+    fi
     if (( ! allowed )) || [[ ! -d "$child" || -L "$child" ]]; then
       echo "workspace drift: malformed or unknown workspace directory: $name" >&2; bad=1
     fi
