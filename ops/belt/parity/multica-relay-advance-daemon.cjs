@@ -129,7 +129,8 @@ async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } 
   }
   const client = await dbPool.connect();
   try {
-    const results = await reconcileCycle(client, { maxCreatePerCycle: reconcileCreateLimit(maxCreate) });
+    const results = await reconcileCycle(client,
+      { maxCreatePerCycle: reconcileCreateLimit(maxCreate), githubCommand: reconcileGithubCommand });
     logger.log(`${LOG_PREFIX} reconciled ${results.length} ticket(s)`);
     return results;
   } finally {
@@ -207,16 +208,63 @@ function restStatusCheckRollup(repo, sha, run = ghExec) {
 // files(first: 100); per_page=100 is the same window. REST reports a merged PR
 // as state=closed plus merged=true, so MERGED is restored here.
 function restPrView(repo, num, run = ghExec) {
+  return restPrViewFields(repo, num, GATE_PR_FIELDS, run);
+}
+
+// The gate's fixed selection. reconciler.cjs asks for a wider one, so the field
+// list is honoured per call and both callers share one REST rebuild.
+const GATE_PR_FIELDS = ['state', 'files', 'headRefOid', 'mergeStateStatus', 'statusCheckRollup'];
+
+// REST answers a merged PR as state=closed plus merged=true, and answers
+// mergeable as a boolean where GraphQL answers MERGEABLE/CONFLICTING/UNKNOWN.
+// Both are restored to the GraphQL spelling the callers already consume.
+// files(first: 100) in GraphQL is per_page=100 here.
+function restPrViewFields(repo, num, fields, run = ghExec) {
+  const want = new Set(fields);
   const pr = JSON.parse(run(['api', `repos/${repo}/pulls/${num}`]));
-  const files = JSON.parse(run(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]));
   const sha = pr.head && pr.head.sha;
-  return JSON.stringify({
-    state: pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase(),
-    files: files.map((f) => ({ path: f.filename })),
-    headRefOid: sha,
-    mergeStateStatus: String(pr.mergeable_state || 'unknown').toUpperCase(),
-    statusCheckRollup: restStatusCheckRollup(repo, sha, run)
-  });
+  const out = {};
+  if (want.has('number')) out.number = pr.number;
+  if (want.has('title')) out.title = pr.title;
+  if (want.has('state')) out.state = pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase();
+  if (want.has('url')) out.url = pr.html_url;
+  if (want.has('headRefOid')) out.headRefOid = sha;
+  if (want.has('headRefName')) out.headRefName = pr.head && pr.head.ref;
+  if (want.has('author')) out.author = pr.user ? { login: pr.user.login } : null;
+  if (want.has('createdAt')) out.createdAt = pr.created_at;
+  if (want.has('updatedAt')) out.updatedAt = pr.updated_at;
+  if (want.has('mergedAt')) out.mergedAt = pr.merged_at;
+  if (want.has('closedAt')) out.closedAt = pr.closed_at;
+  if (want.has('additions')) out.additions = pr.additions;
+  if (want.has('deletions')) out.deletions = pr.deletions;
+  if (want.has('changedFiles')) out.changedFiles = pr.changed_files;
+  if (want.has('mergeable')) {
+    out.mergeable = pr.mergeable === true ? 'MERGEABLE' : pr.mergeable === false ? 'CONFLICTING' : 'UNKNOWN';
+  }
+  if (want.has('mergeStateStatus')) out.mergeStateStatus = String(pr.mergeable_state || 'unknown').toUpperCase();
+  if (want.has('files')) {
+    out.files = JSON.parse(run(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]))
+      .map((f) => ({ path: f.filename }));
+  }
+  if (want.has('statusCheckRollup')) out.statusCheckRollup = restStatusCheckRollup(repo, sha, run);
+  return JSON.stringify(out);
+}
+
+// reconciler.cjs shells `gh pr view <url> --json <fields>` directly. That call
+// carried no token, so every reconcile cycle failed it: linkObservedPullRequest
+// logged and left pr_url empty, and mergedPullRequestNoop swallowed the error
+// whole, which is why a merged PR never completed its ticket. Hand the
+// reconciler this authenticated REST reader instead.
+function reconcileGithubCommand(args, run = ghExec) {
+  if (args[0] !== 'pr' || args[1] !== 'view') {
+    throw new Error(`unsupported GitHub command: ${args.join(' ')}`);
+  }
+  const match = PR_URL_RE.exec(String(args[2] || ''));
+  if (!match) throw new Error(`unsupported pull request reference: ${args[2]}`);
+  const index = args.indexOf('--json');
+  const fields = index === -1 ? []
+    : String(args[index + 1] || '').split(',').map((f) => f.trim()).filter(Boolean);
+  return restPrViewFields(`${match[1]}/${match[2]}`, Number(match[3]), fields, run);
 }
 
 function github(args, run = ghExec) {
@@ -2268,4 +2316,4 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
-  github, restPrView, restStatusCheckRollup };
+  github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup };
