@@ -111,7 +111,14 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
     if (!parsed.evidence) {
       logger.log(`${logPrefix} [qc-evidence-skipped] task=${task.id} reason=${parsed.reason}` +
         (parsed.detail ? ` ${parsed.detail}` : ''));
-      await commentQcEvidenceRejection(client, task, parsed);
+      // Bookkeeping for one rejected task must not abandon the rest of the
+      // batch. Without this an unwritable claim or comment threw out of the
+      // loop and no later candidate in the cycle was converted at all.
+      try {
+        await commentQcEvidenceRejection(client, task, parsed);
+      } catch (error) {
+        logger.log(`${logPrefix} [qc-evidence-rejection-comment-failed] task=${task.id} error=${error.message}`);
+      }
       continue;
     }
     const { evidence } = parsed;
