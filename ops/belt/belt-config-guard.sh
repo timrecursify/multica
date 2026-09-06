@@ -20,6 +20,7 @@ readonly RELAY_ENV_FILE="${BELT_RELAY_ENV_FILE:-$RUNTIME_ROOT/gsp-multica/.env}"
 readonly RELAY_HEALTH_URL="${BELT_RELAY_HEALTH_URL:-}"
 readonly WRAPPER="$RUNTIME_ROOT/gsp-multica/fleet/multica-daemon-wrapper.sh"
 readonly SOURCE_ROOT="${BELT_SOURCE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+source "$SOURCE_ROOT/release-manifest.sh"
 readonly GUARD_SOURCE="${BELT_SOURCE_GUARD:-${SOURCE_ROOT}/belt-config-guard.sh}"
 readonly WRAPPER_SOURCE="${BELT_SOURCE_WRAPPER:-${SOURCE_ROOT}/multica-daemon-wrapper.sh}"
 readonly RUNTIME_GUARD="${RUNTIME_ROOT}/tools/belt-config-guard.sh"
@@ -29,22 +30,7 @@ readonly ECOSYSTEM="$RUNTIME_ROOT/gsp-multica/fleet/ecosystem.gsp-belt.config.js
 # Keep release identity validation aligned with deploy-release.sh.  The
 # metadata digest is meaningful only when it covers the complete runtime
 # manifest, including both members of the parity pair.
-readonly RELEASE_MANIFEST=(
-  ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs
-  ops/belt/parked-diagnosis.cjs ops/belt/parked-entry-audit.cjs
-  ops/belt/parity/multica-relay-advance-daemon.cjs
-  ops/belt/parity/relay-dead-rows.cjs ops/belt/multica-cicd-worker.cjs
-  ops/belt/cicd-watchdog.cjs ops/belt/cicd-deploy-evidence.cjs
-  ops/belt/multica-archiver.cjs ops/belt/reconciler.cjs
-  ops/belt/stage-outcome.cjs ops/belt/transition-policy.cjs
-  ops/belt/stage-routing.cjs ops/belt/qc-strict-evidence.cjs
-  ops/belt/qc-verdict-policy.cjs ops/belt/belt-config-guard.sh
-  ops/belt/multica-daemon-wrapper.sh ops/belt/ecosystem.gsp-belt.config.js
-  ops/belt/workspace-root.sh
-  ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md
-  ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md
-  ops/belt/WORKER_COMMON.md ops/belt/relay-completion-admission.cjs
-)
+readonly RELEASE_MANIFEST=("${BELT_RELEASE_MANIFEST[@]}")
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"
 # workspace-root.sh sets -e for its own direct use.  Sourcing it turns errexit

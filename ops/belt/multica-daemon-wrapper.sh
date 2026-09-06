@@ -22,8 +22,11 @@ export CODEX_BIN="$requested_codex_bin"
 # The belt executes repository build commands through this process. Keep the
 # system Go toolchain ahead of inherited user paths for every task.
 export PATH="/usr/local/go/bin:${PATH}"
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
-source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"
+wrapper_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+tools_dir="${BELT_TOOLS_ROOT:-$wrapper_dir}"
+[[ -r "$tools_dir/belt-concurrency.sh" ]] || tools_dir="$(cd -- "$wrapper_dir/../../tools" 2>/dev/null && pwd)"
+source "$tools_dir/belt-concurrency.sh"
+source "$tools_dir/workspace-root.sh"
 
 cpu_count="$(belt_cpu_count)" || exit 64
 cap_raw="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}"

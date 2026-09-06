@@ -21,6 +21,7 @@ while (( $# )); do
 done
 
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "$root_dir/release-manifest.sh"
 
 if [[ -n "$source_commit" && ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'Invalid source commit: %s\n' "$source_commit" >&2
@@ -39,75 +40,11 @@ fi
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/var/lib/gsp}"
 
-declare -a sources=(
-  "$root_dir/multica-bridge.cjs"
-  "$root_dir/guardrails.cjs"
-  "$root_dir/parked-diagnosis.cjs"
-  "$root_dir/parked-entry-audit.cjs"
-  "$root_dir/github-api-adapter.cjs"
-  "$root_dir/parity/multica-relay-advance-daemon.cjs"
-  "$root_dir/parity/relay-dead-rows.cjs"
-  "$root_dir/multica-cicd-worker.cjs"
-  "$root_dir/cicd-deploy-evidence.cjs"
-  "$root_dir/cicd-watchdog.cjs"
-  "$root_dir/multica-archiver.cjs"
-  "$root_dir/merged-pr-recovery-sweep.cjs"
-  "$root_dir/belt-config-guard.sh"
-  "$root_dir/belt-concurrency.sh"
-  "$root_dir/multica-daemon-wrapper.sh"
-  "$root_dir/daemon-health-sentinel.sh"
-  "$root_dir/daemon-health-sentinel.cjs"
-  "$root_dir/ecosystem.gsp-belt.config.js"
-  "$root_dir/multica-bundle.py"
-  "$root_dir/RUNBOOK_SPEC_WORKER.md"
-  "$root_dir/RUNBOOK_BUILD_WORKER.md"
-  "$root_dir/RUNBOOK_QC_WORKER.md"
-  "$root_dir/WORKER_COMMON.md"
-  "$root_dir/relay-completion-admission.cjs"
-  "$root_dir/qc-lane.cjs"
-  "$root_dir/reconciler.cjs"
-  "$root_dir/stage-outcome.cjs"
-  "$root_dir/transition-policy.cjs"
-  "$root_dir/stage-routing.cjs"
-  "$root_dir/qc-strict-evidence.cjs"
-  "$root_dir/stage-routing.json"
-  "$root_dir/qc-verdict-policy.cjs"
-)
-
-declare -a targets=(
-  "$runtime_root/gsp-multica/multica-bridge.cjs"
-  "$runtime_root/gsp-multica/guardrails.cjs"
-  "$runtime_root/gsp-multica/parked-diagnosis.cjs"
-  "$runtime_root/gsp-multica/parked-entry-audit.cjs"
-  "$runtime_root/gsp-multica/github-api-adapter.cjs"
-  "$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
-  "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs"
-  "$runtime_root/multica-cicd-worker.cjs"
-  "$runtime_root/cicd-deploy-evidence.cjs"
-  "$runtime_root/cicd-watchdog.cjs"
-  "$runtime_root/multica-archiver.cjs"
-  "$runtime_root/merged-pr-recovery-sweep.cjs"
-  "$runtime_root/tools/belt-config-guard.sh"
-  "$runtime_root/tools/belt-concurrency.sh"
-  "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
-  "$runtime_root/gsp-multica/daemon-health-sentinel.sh"
-  "$runtime_root/gsp-multica/daemon-health-sentinel.cjs"
-  "$runtime_root/gsp-multica/fleet/ecosystem.gsp-belt.config.js"
-  "$runtime_root/tools/multica-bundle.py"
-  "$runtime_root/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
-  "$runtime_root/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
-  "$runtime_root/multica-doctrine/RUNBOOK_QC_WORKER.md"
-  "$runtime_root/multica-doctrine/WORKER_COMMON.md"
-  "$runtime_root/gsp-multica/relay-completion-admission.cjs"
-  "$runtime_root/gsp-multica/qc-lane.cjs"
-  "$runtime_root/gsp-multica/reconciler.cjs"
-  "$runtime_root/gsp-multica/stage-outcome.cjs"
-  "$runtime_root/gsp-multica/transition-policy.cjs"
-  "$runtime_root/gsp-multica/stage-routing.cjs"
-  "$runtime_root/gsp-multica/qc-strict-evidence.cjs"
-  "$runtime_root/gsp-multica/stage-routing.json"
-  "$runtime_root/gsp-multica/qc-verdict-policy.cjs"
-)
+declare -a sources=() targets=()
+for i in "${!BELT_MANIFEST_SOURCE_REL[@]}"; do
+  sources+=("$root_dir/${BELT_MANIFEST_SOURCE_REL[$i]}")
+  targets+=("$runtime_root/${BELT_MANIFEST_TARGET_REL[$i]}")
+done
 
 selected() {
   local name="${sources[$1]##*/}"
@@ -203,6 +140,7 @@ for index in "${!sources[@]}"; do
   # the release before the parity repair can run.
   [[ "${targets[$index]}" == "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh" ]] && new_targets[$index]=1
   [[ "${targets[$index]}" == "$runtime_root/tools/belt-concurrency.sh" ]] && new_targets[$index]=1
+  [[ "${targets[$index]}" == "$runtime_root/tools/workspace-root.sh" ]] && new_targets[$index]=1
   # Added after the last rollout (#547 sentinel, #559 API adapter), so no
   # runtime copy exists yet.  Same reasoning as the wrapper above: let this
   # deployment create them rather than refuse the release.
@@ -278,6 +216,7 @@ for index in "${!targets[@]}"; do
   if [[ "$mode" == dry-run ]]; then
     printf 'Would back up %s to %s\n' "$target_file" "$backup_file"
   else
+    mkdir -p -- "$(dirname -- "$target_file")"
     if [[ -f "$target_file" ]]; then
       cp --preserve=mode -- "$target_file" "$backup_file"
       printf 'Backed up %s to %s\n' "$target_file" "$backup_file"
@@ -297,6 +236,7 @@ for index in "${!sources[@]}"; do
     continue
   fi
   touched+=("$index")
+  mkdir -p -- "$(dirname -- "$target_file")"
   if [[ "${BELT_DEPLOY_FAIL_INDEX:-}" == "$index" ]]; then
     printf 'Injected deployment failure at index %s\n' "$index" >&2
     false
