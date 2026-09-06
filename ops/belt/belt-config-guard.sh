@@ -47,6 +47,12 @@ readonly RELEASE_MANIFEST=(
 )
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"
+# workspace-root.sh sets -e for its own direct use.  Sourcing it turns errexit
+# on here too, which contradicts the -uo pipefail chosen above: the repair
+# path assigns from probes that are expected to fail (a missing source
+# wrapper, an absent runtime file) and must continue to the release
+# fallback rather than abort the guard.
+set +e
 WANT_CONCURRENCY="$(belt_resolve_concurrency)"
 readonly WANT_CONCURRENCY
 readonly WANT_WORKSPACES_ROOT="$BELT_CANONICAL_WORKSPACES_ROOT"
