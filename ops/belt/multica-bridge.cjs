@@ -1158,6 +1158,26 @@ async function ensureCompletedRelayLog(client, issueId, fromStage, toStage) {
   return existing.rows[0]?.id || null;
 }
 
+// A withheld dispatch still moves the issue, and the arrival must still be
+// recorded: the reconciler's per-stage-entry task budget opens its window on
+// the newest relay_run_log row with from_stage <> to_stage for the stage
+// (ops/belt/reconciler.cjs lifetimeTasksSql). With no row for this arrival the
+// window resolves to a previous pass through the same stage and the budget
+// counts that entire history -- on 2026-09-06 gsp-multica#2220 re-parked at
+// lifetime_task_limit:13/6 minutes after an operator released it.
+// ensureCompletedRelayLog cannot serve here: it de-duplicates on
+// (issue, from_stage, to_stage) for all time, so a second traversal of the same
+// edge writes nothing and returns the first traversal's row.
+async function recordWithheldArrival(client, issueId, fromStage, toStage) {
+  const inserted = await client.query(
+    `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status)
+     VALUES ($1, $2, $3, 'completed')
+     RETURNING id`,
+    [issueId, fromStage, toStage]
+  );
+  return inserted.rows[0]?.id || null;
+}
+
 async function completedTerminalRelayLog(client, issueId, toStage) {
   const existing = await client.query(
     `SELECT id FROM relay_run_log
@@ -2450,6 +2470,8 @@ async function relayAdvance(req, res, body) {
 
     if (bookkeepingTransition) {
       relayLogId = bookkeepingHandoff.relayLogId;
+    } else if (bundledChild && result.rowCount > 0) {
+      relayLogId = await recordWithheldArrival(client, issue_id, issue.status, to_stage);
     } else if (stage.agent_id && !bundledChild && isExecutionStage(to_stage)) {
       // Preserve the board's issue priority on the queue row. The daemon
       // orders claims by this integer (urgent=4 .. none=0); omitting it
@@ -2723,6 +2745,7 @@ module.exports = {
   replaceStageTask,
   ownerStageForTransition,
   ensureCompletedRelayLog,
+  recordWithheldArrival,
   completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff,
