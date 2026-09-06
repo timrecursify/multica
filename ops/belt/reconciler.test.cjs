@@ -389,8 +389,14 @@ test("the task budget counts only tasks since the issue entered its stage", asyn
   const sql = lifetimeTasksSql();
   assert.match(sql, /relay_run_log/);
   assert.match(sql, /to_stage = \$2/);
-  assert.match(sql, /created_at >= COALESCE/);
+  assert.match(sql, /created_at >= GREATEST/);
   // A dispatch writes from_stage = to_stage. Without this the window restarts
   // on every dispatch and the budget can never be reached.
   assert.match(sql, /from_stage IS DISTINCT FROM to_stage/);
+  // A Parked or Human Review release opens the window too, matching the
+  // bridge's humanReleaseAt: a release followed by a direct Queue -> In
+  // Progress hand-off writes no arrival row, so GSP-2351 was counted at 9/6
+  // against an arrival that predated the release.
+  assert.match(sql, /parked_release_at/);
+  assert.match(sql, /human_review_release_at/);
 });

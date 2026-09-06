@@ -1962,6 +1962,17 @@ function diagnosisText(result) {
     .filter(Boolean).join('\n');
 }
 
+async function diagnosisTextWithComment(client, task) {
+  const text = diagnosisText(task.result);
+  if (parseDiagnosisOutcome(text) || !task.agent_id) return text;
+  const comment = await client.query(
+    `SELECT content FROM comment
+      WHERE issue_id = $1::uuid AND author_id = $2::uuid AND created_at >= $3::timestamptz
+        AND content ~* '(outcome|diagnosis)\\s*[:=]\\s*(fixable|already_fixed|duplicate|genuinely_blocked)'
+      ORDER BY created_at DESC LIMIT 1`, [task.issue_id, task.agent_id, task.created_at]);
+  return comment.rows[0] ? comment.rows[0].content : text;
+}
+
 async function recordDiagnosisReleaseFailure(client, taskId, context, failure) {
   const attempts = Number.parseInt(context?.diagnosis_release_attempts || '0', 10) || 0;
   const nextAttempts = attempts + 1;
@@ -2014,7 +2025,7 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
       // may tick together; SKIP LOCKED prevents duplicate outcomes/comments.
       await client.query('BEGIN');
       const locked = await client.query(
-        `SELECT t.id, t.issue_id, t.result, t.context,
+        `SELECT t.id, t.issue_id, t.result, t.context, t.agent_id, t.created_at,
                 i.workspace_id, i.status, i.number
            FROM agent_task_queue t
            JOIN issue i ON i.id = t.issue_id
@@ -2041,7 +2052,10 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
         continue;
       }
       const task = locked.rows[0];
-      const text = diagnosisText(task.result);
+      // The diagnosis seat posts its verdict as an issue comment and then
+      // returns an empty final message, so the task result is bare. Read the
+      // newest outcome comment it wrote for this task in that case.
+      const text = await diagnosisTextWithComment(client, task);
       const parsedOutcome = parseDiagnosisOutcome(text);
       const evidence = diagnosisEvidence(text);
       const blocker = namedBlocker(text);

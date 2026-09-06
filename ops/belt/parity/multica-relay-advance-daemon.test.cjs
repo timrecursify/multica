@@ -1171,6 +1171,43 @@ test('Parked diagnosis releases clear retry escalation regardless of reason, whi
   assert.ok(!held.queries.some(({ sql }) => sql.includes("- 'retry_escalation'")));
 });
 
+test('a diagnosis that answered in a comment and returned nothing is still read', async () => {
+  // Every rerun diagnosis today posted its verdict as an issue comment and
+  // returned an empty final message (codex rollout: agent_message "" then
+  // turn_aborted), so the bare task result held no outcome.
+  const run = async (result) => {
+    const task = { id: randomUUID(), issue_id: randomUUID(), workspace_id: randomUUID(), number: 2351,
+      status: 'Parked', context: {}, result, agent_id: randomUUID(), created_at: '2026-09-06T19:40:00Z' };
+    const queries = [];
+    const relayPosts = [];
+    const client = { query: async (sql, values = []) => {
+      queries.push({ sql, values });
+      if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+      if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+      if (sql.includes('SELECT content FROM comment')) return { rows: [{ content: 'outcome: fixable' }] };
+      if (sql.includes("content LIKE '%## Spec%'")) return { rows: [{}], rowCount: 1 };
+      return { rows: [] };
+    }, release() {} };
+    await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+      relayPost: async (body) => { relayPosts.push(body); return { ok: true, status: 200 }; } });
+    return { task, queries, relayPosts };
+  };
+
+  const bare = await run('');
+  const lookup = bare.queries.find(({ sql }) => sql.includes('SELECT content FROM comment'));
+  assert.ok(lookup, 'a bare task result must fall back to the seat\'s own comment');
+  assert.match(lookup.sql, /author_id = \$2::uuid AND created_at >= \$3::timestamptz/);
+  assert.deepEqual(lookup.values, [bare.task.issue_id, bare.task.agent_id, bare.task.created_at]);
+  const outcomeComment = bare.queries.find(({ sql }) => sql.includes('INSERT INTO comment'));
+  assert.match(outcomeComment.values[3], /outcome: fixable\./);
+  assert.deepEqual(bare.relayPosts.map((body) => body.to_stage), ['Queue']);
+
+  // A result that carries its own outcome is never overridden by a comment.
+  const spoken = await run('outcome: genuinely_blocked\nblocker: awaiting operator input');
+  assert.equal(spoken.queries.some(({ sql }) => sql.includes('SELECT content FROM comment')), false);
+  assert.deepEqual(spoken.relayPosts, []);
+});
+
 test('diagnosis release retries every non-2xx response and records the attempt', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /if \(!response\.ok\)/);

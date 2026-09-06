@@ -66,15 +66,25 @@ function ownerSql() {
 // with from_stage = to_stage, so a window keyed on to_stage alone would restart
 // on each dispatch and the count would never exceed one, which is the guard
 // switched off.
+//
+// A Parked or Human Review release also opens a window. The bridge already
+// counts from parked_release_at / human_review_release_at (humanReleaseAt);
+// a release that is followed by a direct Queue -> In Progress hand-off writes
+// no arrival row, and without this the old In Progress arrival still counts.
 function lifetimeTasksSql() {
   return `SELECT count(*)::int AS count
             FROM agent_task_queue
            WHERE issue_id = $1::uuid AND trigger_comment_id IS NULL
-             AND created_at >= COALESCE(
-                   (SELECT max(created_at) FROM relay_run_log
-                     WHERE issue_id = $1::uuid AND to_stage = $2
-                       AND from_stage IS DISTINCT FROM to_stage),
-                   '-infinity'::timestamptz)`;
+             AND created_at >= GREATEST(
+                   COALESCE(
+                     (SELECT max(created_at) FROM relay_run_log
+                       WHERE issue_id = $1::uuid AND to_stage = $2
+                         AND from_stage IS DISTINCT FROM to_stage),
+                     '-infinity'::timestamptz),
+                   COALESCE((SELECT GREATEST(
+                       NULLIF(metadata->>'parked_release_at', '')::timestamptz,
+                       NULLIF(metadata->>'human_review_release_at', '')::timestamptz)
+                     FROM issue WHERE id = $1::uuid), '-infinity'::timestamptz))`;
 }
 
 function stageAttemptsSql() {
