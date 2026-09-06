@@ -106,11 +106,32 @@ test("recordStageOutcomes rejects an In Progress ADVANCED result without PR evid
   const c = fakeClient([
     [{ id: "t3", issue_id: "i3", stage: "In Progress", output: "OUTCOME: ADVANCED" }],
     [{ has_review_evidence: false }],
+    [],
+    [{ has_review_evidence: false }],
     [{ input_hash: "h1" }], []
   ]);
   await so.recordStageOutcomes(c, { logger: { log: (line) => logs.push(line) } });
-  assert.equal(c.calls[3].params[2], "FAILED");
+  assert.equal(c.calls[5].params[2], "FAILED");
   assert.match(logs[0], /missing review evidence/);
+});
+
+test("recordStageOutcomes reconciles a PR URL before accepting In Progress ADVANCED", async () => {
+  const reconciler = require("./reconciler.cjs");
+  const original = reconciler.linkObservedPullRequest;
+  let linked = false;
+  reconciler.linkObservedPullRequest = async () => { linked = true; return true; };
+  try {
+    const c = fakeClient([
+      [{ id: "t4", issue_id: "i4", stage: "In Progress", output: "OUTCOME: ADVANCED" }],
+      [{ has_review_evidence: false }],
+      [{ id: "i4", workspace_id: "w1", status: "In Progress" }],
+      [{ has_review_evidence: true }],
+      [{ input_hash: "h4" }], []
+    ]);
+    await so.recordStageOutcomes(c, { githubCommand: () => "{}", logger: { log() {} } });
+    assert.equal(linked, true);
+    assert.equal(c.calls[5].params[2], "ADVANCED");
+  } finally { reconciler.linkObservedPullRequest = original; }
 });
 
 test("input hash ignores belt output and keys operator comments by content", () => {
