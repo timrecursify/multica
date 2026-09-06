@@ -37,6 +37,9 @@ done < <(grep -o '/[a-z-]*\.sh"$' "$root_dir/multica-daemon-wrapper.sh" | tr -d 
 # Resolve each one against the deployed layout instead of trusting the path.
 for parity_file in "$root_dir"/parity/*.cjs; do
   [[ -e "$parity_file" ]] || continue
+  # Test files stay in the repository, so their requires say nothing about the
+  # deployed layout.
+  case "$parity_file" in *.test.cjs) continue ;; esac
   while read -r required; do
     [[ -n "$required" ]] || continue
     printf '%s\n' "${targets[@]}" | grep -q "/app/$required\$" || {
