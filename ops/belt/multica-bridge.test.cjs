@@ -1872,14 +1872,24 @@ test('QC bounce ceiling changes hands to an exact Sol-low Spec task, never Parke
 test('retry escalation requires an explicit Sol-low owner and never stores null lineage', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /!isQcLane\(owner\.model, owner\.thinking_level\)/);
-  assert.doesNotMatch(source, /source_task_id: null/);
+  // Read the escalation records, not the whole file. The qc_bounce_ceiling path
+  // logs source_task_id: null to state honestly that no source task survived,
+  // and a file-wide regex counted that log line as stored lineage.
+  const records = source.match(/retryEscalation = \{[\s\S]*?\};/g) || [];
+  assert.ok(records.length > 0, 'no retryEscalation record found to check');
+  for (const record of records) assert.doesNotMatch(record, /source_task_id: null/);
 });
 
 test('relay request maps snake-case stage into successor task input', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /replaceStageTask\(client, \{[\s\S]*toStage: to_stage,/);
-  assert.doesNotMatch(source, /\n\s*toStage,\n/);
+  // Only the relay's own replaceStageTask call is in scope. Forbidding the
+  // shorthand file-wide also caught an unrelated function that legitimately
+  // holds a variable of that name.
+  const call = source.match(/replaceStageTask\(client, \{[\s\S]*?\}\)/);
+  assert.ok(call, 'replaceStageTask call not found');
+  assert.match(call[0], /toStage: to_stage,/);
+  assert.doesNotMatch(call[0], /\n\s*toStage,\n/);
 });
 
 test('relay stage lookups bind configuration and owners to the issue workspace', () => {
