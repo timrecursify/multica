@@ -80,15 +80,15 @@ function reset(status) {
   };
 }
 
-function request(to_stage) {
+function request(to_stage, { actor, headers = {}, agent_token = "test-relay-secret" } = {}) {
   return new Promise((resolve) => {
     const req = new EventEmitter();
     req.method = "POST";
     req.url = "/relay/advance";
-    req.headers = {};
+    req.headers = headers;
     const res = { status: 0, body: "", writeHead(status) { this.status = status; }, end(body = "") { this.body = body; resolve(this); } };
     handler(req, res);
-    req.emit("data", JSON.stringify({ issue_id: issueId, to_stage, agent_token: "test-relay-secret" }));
+    req.emit("data", JSON.stringify({ issue_id: issueId, to_stage, agent_token, ...(actor ? { actor } : {}) }));
     req.emit("end");
   });
 }
@@ -141,6 +141,14 @@ function request(to_stage) {
   assert.equal(state.status, illegalBefore.status);
   assert.equal(state.updatedAt, illegalBefore.updatedAt);
   assert.equal(state.updates, illegalBefore.updates);
+
+  // A caller cannot smuggle the archiver identity through the general relay
+  // secret to gain authority over a non-archive edge.
+  reset("Queue");
+  const spoofedArchiver = await request("In Progress", { actor: "archiver" });
+  assert.equal(spoofedArchiver.status, 401);
+  assert.equal(state.status, "Queue");
+  assert.equal(state.updates, 0);
 
   reset("Queue");
   const repeated = await request("Queue");

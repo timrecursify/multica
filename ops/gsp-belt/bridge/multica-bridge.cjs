@@ -267,7 +267,10 @@ async function relayAdvance(req, res, body) {
     // Validate agent token
     const archiverRequest = body.actor === 'archiver' && to_stage === 'Archived' &&
       req.headers['x-relay-archiver-secret'] === ARCHIVER_AGENT_SECRET;
-    if (agent_token !== RELAY_AGENT_SECRET && !archiverRequest) {
+    // The archiver's identity must never inherit the general relay authority.
+    // Its dedicated header and receipt are valid only for Done -> Archived.
+    const relayRequest = agent_token === RELAY_AGENT_SECRET && body.actor !== 'archiver';
+    if (!relayRequest && !archiverRequest) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
