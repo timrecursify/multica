@@ -13,7 +13,8 @@ const NON_EXECUTION_STAGES = new Set([
 ]);
 const EXTERNAL_TRANSITION_STAGES = new Set(['Done']);
 const QUOTA_PAUSE_MAX_AGE_MS = 15 * 60 * 1000;
-const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('./qc-lane.cjs');
+const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray,
+  isSpecLane, specLaneModelsSqlArray } = require('./qc-lane.cjs');
 
 // The route admitted for a builder is immutable task input.  Keep this pure so
 // relay admission, daemon claim and tests all use the same contract.
@@ -173,7 +174,13 @@ function beltRoutingAdmission(agent, selectedRuntime = {}) {
   if (!build && !qcOrSpec) return { ok: true };
   if (effort !== QC_LANE_EFFORT) return { ok: false, reason: 'belt_low_reasoning_effort_required', ...details };
   if (build && !(/^deepseek[/:]/.test(model) || model === 'gpt-5.6-terra')) return { ok: false, reason: 'builder_requires_deepseek_or_terra', ...details, expected_model: 'deepseek/*|gpt-5.6-terra' };
-  if (qcOrSpec && !isQcLane(model, effort)) return { ok: false, reason: 'qc_spec_requires_qc_lane', ...details, expected_model: qcLaneModelsSqlArray().join('|') };
+  // A *spec* agent scopes tickets and may run the opus spec lane; a *qc* agent
+  // may not. Both still require the low-effort belt setting checked above.
+  const spec = name.includes('spec') && !name.includes('qc');
+  if (qcOrSpec && !isQcLane(model, effort) && !(spec && isSpecLane(model, effort))) {
+    return { ok: false, reason: 'qc_spec_requires_qc_lane', ...details,
+      expected_model: [...qcLaneModelsSqlArray(), ...(spec ? specLaneModelsSqlArray() : [])].join('|') };
+  }
   return { ok: true };
 }
 

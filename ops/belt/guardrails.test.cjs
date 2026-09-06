@@ -44,6 +44,10 @@ test('belt routing allows DeepSeek/Terra builders and QC-lane QC/spec only', () 
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-luna', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
   assert.equal(beltRoutingAdmission({ name: 'ppp-spec', model: 'gpt-5.6-terra', thinking_level: 'low' }).reason, 'qc_spec_requires_qc_lane');
+  // Scoping runs on opus by doctrine; QC must not.
+  assert.equal(beltRoutingAdmission({ name: 'gsp-spec-sol-low-public', model: 'claude-opus-4-6', thinking_level: 'low' }).ok, true);
+  assert.equal(beltRoutingAdmission({ name: 'gsp-qc-sol-low-1', model: 'claude-opus-4-6', thinking_level: 'low' }).reason, 'qc_spec_requires_qc_lane');
+  assert.equal(beltRoutingAdmission({ name: 'gsp-spec-opus', model: 'claude-opus-4-6', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
   const configOnly = beltRoutingAdmission({ id: 'agent-1', name: 'gsp-build', model: 'gpt-5.6-luna', thinking_level: '', runtime_config: { model: 'gpt-5.6-terra', reasoning_effort: 'low' } });
   assert.equal(configOnly.reason, 'belt_low_reasoning_effort_required');
   assert.deepEqual({ agent_name: configOnly.agent_name, agent_id: configOnly.agent_id, model: configOnly.model, effort: configOnly.effort }, { agent_name: 'gsp-build', agent_id: 'agent-1', model: 'gpt-5.6-luna', effort: '' });
