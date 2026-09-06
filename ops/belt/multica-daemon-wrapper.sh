@@ -2,6 +2,22 @@
 # shellcheck disable=SC1091
 set -euo pipefail
 
+# Keep the runtime lane and operator-owned identity explicit.  The deployed
+# wrapper historically supplied these values from daemon.env; retaining the
+# defaults here makes a source checkout safe to deploy while still allowing
+# the host environment to override non-sensitive settings deliberately.
+if [[ -r /etc/gsp/multica/daemon.env && "${BELT_TEST_MODE:-0}" != 1 ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source /etc/gsp/multica/daemon.env
+  set +a
+fi
+export HOME="${HOME:-/var/lib/gsp-multica}"
+export CODEX_HOME="${CODEX_HOME:-/var/lib/gsp-multica/.codex}"
+export CODEX_BIN="${CODEX_BIN:-/usr/local/bin/codex}"
+export MULTICA_MODEL="${MULTICA_MODEL:-gpt-5.6-luna}"
+export MULTICA_PROVIDER="${MULTICA_PROVIDER:-openai}"
+
 # A belt task that restarts this worker leaks its own task context into pm2's
 # saved process definition. The daemon then refuses every start with
 # "daemon start is not available inside a daemon-managed task", and pm2
@@ -92,7 +108,7 @@ if [[ $help_status -ne 0 ]]; then
   echo "multica-daemon-wrapper: daemon start capability probe failed (exit $help_status)" >&2
   exit 64
 fi
-daemon_args=(daemon start --foreground --daemon-id=gsp-multica-worker
+daemon_args=(daemon start --foreground --profile=gsp-codex --daemon-id=gsp-codex
   --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks="$cap_raw")
 # `--workspaces-root` was removed from a short-lived daemon release. The
 # environment setting is its documented replacement; old rollback artifacts
@@ -113,4 +129,17 @@ for arg in "${daemon_args[@]:2}"; do
     exit 64
   fi
 done
-exec "$daemon_bin" "${daemon_args[@]}"
+"$daemon_bin" "${daemon_args[@]}" &
+server_pid=$!
+
+# The scoping leg is part of the worker's runtime contract.  Start it only
+# when the deployed artifact is present so unit fixtures and rollback images
+# can still exercise the daemon wrapper in isolation.
+scoping_driver="${MULTICA_SCOPING_DRIVER:-$(dirname -- "${BASH_SOURCE[0]}")/scoping-claude-driver.sh}"
+if [[ -x "$scoping_driver" ]]; then
+  scoping_log="${MULTICA_SCOPING_DRIVER_LOG:-/var/lib/gsp-multica/scoping-claude-driver.log}"
+  mkdir -p -- "$(dirname -- "$scoping_log")"
+  "$scoping_driver" >>"$scoping_log" 2>&1 &
+fi
+
+wait "$server_pid"
