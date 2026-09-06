@@ -879,10 +879,17 @@ function admitConfiguredTransition({ fromStage, toStage, expectedStage, altStage
 // Every committed relay transition gets one compact, secret-free audit event.
 // The JSON shape is intentionally stable so operators can query actor, route,
 // reason, and outcome without reverse-engineering empty activity rows.
+// activity_log.actor_type is constrained to the member/agent/system enum
+// (001_init.up.sql:160). Relay roles such as 'archiver' and 'operator' are
+// finer-grained than that column admits, so the column carries the enum value
+// and details.actor_type keeps the exact role for querying.
+const ACTIVITY_LOG_ACTOR_TYPES = new Set(['member', 'agent', 'system']);
+
 async function recordTransitionAudit(client, issue, {
   fromStage, toStage, actorType = 'system', actorId = null, reason = null,
   evidence = {}, result = 'committed', error = null
 } = {}) {
+  const columnActorType = ACTIVITY_LOG_ACTOR_TYPES.has(actorType) ? actorType : 'system';
   const details = {
     issue_id: issue.id,
     from_stage: fromStage,
@@ -898,7 +905,7 @@ async function recordTransitionAudit(client, issue, {
   await client.query(
     `INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
      VALUES ($1::uuid, $2::uuid, $3::text, 'relay_transition', $4::jsonb)`,
-    [issue.workspace_id, issue.id, actorType, JSON.stringify(details)]
+    [issue.workspace_id, issue.id, columnActorType, JSON.stringify(details)]
   );
   return details;
 }
