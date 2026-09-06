@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
-  moveToHumanReview, terminalBlocker, isLeafSql } = require("./reconciler.cjs");
+  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
 const ok = () => ({ ok: true });
@@ -383,4 +383,11 @@ test("terminalBlocker never invents evidence it cannot observe", async () => {
     { githubCommand: () => { throw new Error("gh: not found"); } }),
     "blocked_sha_unobservable");
   assert.deepEqual(broken.writes, []);
+});
+
+test("the task budget counts only tasks since the issue entered its stage", async () => {
+  const sql = lifetimeTasksSql();
+  assert.match(sql, /relay_run_log/);
+  assert.match(sql, /to_stage = \$2/);
+  assert.match(sql, /created_at >= COALESCE/);
 });
