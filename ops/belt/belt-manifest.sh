@@ -17,6 +17,11 @@
 # The wrapper sources belt-concurrency.sh and workspace-root.sh by absolute
 # path, so a runtime missing either cannot start at all. They belong here for
 # the same reason the wrapper does.
+#
+# Files under parity/ require their siblings one directory up, so
+# github-api-adapter.cjs ships to app/, not app/parity/. deploy.test.sh resolves
+# every such require against this list; a target in the wrong directory is a
+# MODULE_NOT_FOUND at daemon start, not a deploy error.
 
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
@@ -85,7 +90,7 @@ declare -a targets=(
   "$runtime_root/multica-relay-advance/app/stage-outcome.cjs"
   "$runtime_root/multica-relay-advance/app/stage-routing.cjs"
   "$runtime_root/multica-relay-advance/app/parity/multica-relay-advance-daemon.cjs"
-  "$runtime_root/multica-relay-advance/app/parity/github-api-adapter.cjs"
+  "$runtime_root/multica-relay-advance/app/github-api-adapter.cjs"
   "$runtime_root/multica-relay-advance/app/parity/relay-dead-rows.cjs"
   "$runtime_root/multica-cicd-worker/cicd-watchdog.cjs"
   "$runtime_root/multica-cicd-worker/multica-cicd-worker.cjs"
