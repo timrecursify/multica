@@ -69,7 +69,13 @@ function createGithubApi({ env = process.env, run = (args, options) => execFileS
       const response = parseResponse(`${error.stdout || ''}\n${error.stderr || ''}`);
       const remaining = Number(response.headers['x-ratelimit-remaining']);
       const reset = Number(response.headers['x-ratelimit-reset']) * 1000;
-      if (remaining === 0 || /rate limit|\b403\b/i.test(response.body)) {
+      // Only an actual rate-limit signal may open the circuit. Matching a bare
+      // "403" anywhere in the body held every belt process for a full hour on
+      // an unrelated error: a hold was written with 7389 requests remaining on
+      // 2026-09-06 and blocked every merged-PR check until the quota reset.
+      const rateLimited = remaining === 0
+        || /\brate limit\b|\bsecondary rate\b|\babuse detection\b/i.test(response.body);
+      if (rateLimited) {
         shared.hold(reset || now() + 3600000, Number.isFinite(remaining) ? remaining : 0, reset);
         error.rateLimited = true;
       }

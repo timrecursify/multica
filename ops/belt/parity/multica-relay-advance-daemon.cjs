@@ -153,6 +153,7 @@ const PR_URL_RE = /github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i;
 // refreshed with five minutes to spare), so nothing here holds a token that
 // could outlive its hour on a daemon that runs for days.
 const GIT_CREDENTIAL_HELPER = process.env.GSP_BELT_GIT_CREDENTIAL || '/usr/local/bin/gsp-belt-git-credential';
+const DEFAULT_GH_REPO = 'multica';
 let credentialHelperFailureLogged = false;
 function scrubToken(text) { return String(text).replace(/password=\S+/g, 'password=[redacted]'); }
 function logCredentialHelperFailure(detail) {
@@ -163,29 +164,41 @@ function logCredentialHelperFailure(detail) {
 
 // Returns '' when the helper is absent or fails. That degrades exactly the way
 // a missing token already degraded, and never throws out of ghExec.
-function mintGithubToken() {
+function mintGithubToken(repo) {
   try {
-    const output = execFileSync(GIT_CREDENTIAL_HELPER, ['get'], { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
-    const line = String(output).split(/\r?\n/).find(value => value.startsWith('password='));
-    const token = line ? line.slice('password='.length).trim() : '';
+    const output = execFileSync(GIT_CREDENTIAL_HELPER, ['token', repo], { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
+    const token = String(output).trim().split(/\r?\n/)[0] || '';
     if (token) { credentialHelperFailureLogged = false; return token; }
-    logCredentialHelperFailure('returned no password line');
+    logCredentialHelperFailure(`returned no token for ${repo}`);
   } catch (error) {
-    logCredentialHelperFailure(`mint failed: ${error && error.message ? error.message : error}`);
+    logCredentialHelperFailure(`mint failed for ${repo}: ${error && error.message ? error.message : error}`);
   }
   return '';
 }
 
+// The helper scopes a token to one repository, so the repository has to come
+// from the call itself. Every gh call this daemon makes names it in a REST
+// path; a call that names none falls back to the helper's own default, which
+// is what the single-repository token used to be.
+const GH_REPO_RE = /(?:^|\/)repos\/[\w.-]+\/([\w.-]+)(?:\/|$)/;
+function repoFromGhArgs(args) {
+  for (const arg of args || []) {
+    const match = GH_REPO_RE.exec(String(arg));
+    if (match) return match[1];
+  }
+  return DEFAULT_GH_REPO;
+}
+
 // Built per call, never cached in module scope: a captured installation token
 // dies after an hour and the daemon outlives that many times over.
-function beltGithub() {
-  const token = mintGithubToken();
+function beltGithub(repo = DEFAULT_GH_REPO) {
+  const token = mintGithubToken(repo);
   return createGithubApi({
     env: token ? { ...process.env, GITHUB_APP_INSTALLATION_TOKEN: token } : process.env,
     alert: ({ remaining, reset }) => console.error(`${LOG_PREFIX} [github-quota] sentinel remaining=${remaining} reset=${reset}`)
   });
 }
-function ghExec(args) { return beltGithub().command(args); }
+function ghExec(args) { return beltGithub(repoFromGhArgs(args)).command(args); }
 
 // gh returns statusCheckRollup as one flat list of check contexts. REST splits
 // the same facts across check-runs and the combined commit status, so both are
