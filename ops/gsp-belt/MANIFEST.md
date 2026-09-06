@@ -36,10 +36,10 @@ current running baseline, not the spec's stale citation.
 
 | File | SHA-256 (current running baseline, 2026-08-31 ~14:57Z) |
 | --- | --- |
-| `ops/gsp-belt/bridge/multica-bridge.cjs` | `640fca26677251ecf1168dad16188747e3d56640f93fb5262eb0b636aef2da75` |
+| `ops/gsp-belt/bridge/multica-bridge.cjs` | `fbb697b8e6e7bbc03fbd5a0080dc7d0fc3b1abadec39040ea784d7225c26d5c0` |
 | `ops/belt/parity/multica-relay-advance-daemon.cjs` | Verified by `ops/belt/verify.sh` against `/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs` |
-| `ops/gsp-belt/worker/multica-cicd-worker.cjs` | `3320c3c61fb45ac54a95a63d53a78e9d95065c108d79c7f95926376f472c8f62` |
-| `ops/gsp-belt/worker/multica-archiver.cjs` | `f06d02552741fb25e53bd695566f2600861f344b5fc9a962167738562eb03480` |
+| `ops/gsp-belt/worker/multica-cicd-worker.cjs` | `77ffb9b79fb7fc3637207cef99bd5aa72994b23d74c97ca1534e84d6fe6d24db` |
+| `ops/gsp-belt/worker/multica-archiver.cjs` | `f5b44f992f24e8ae8c269a9ef3b373db913734cc1bdbc14278320ade0e7be94f` |
 
 Run `bash ops/gsp-belt/scripts/belt-fingerprint.sh` (or `belt-guard-check.sh`) on a
 deployed release to reconfirm the checksums of every manifest file against the
