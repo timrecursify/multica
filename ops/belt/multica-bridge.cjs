@@ -301,7 +301,8 @@ const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "
 const RETRY_ESCALATION_REASONS = new Set([
   "completion_blocked", "completion_qc_blocked", "completion_spec_blocked",
   "completion_build_blocked", "completion_failed", "completion_no_work_product",
-  "missing_result", "qc_bounce_ceiling", "stage_cycle_limit", "lifetime_task_limit"
+  "missing_result", "qc_bounce_ceiling", "stage_cycle_limit", "lifetime_task_limit",
+  "attempt_budget_exhausted"
 ]);
 const RETRY_ESCALATION_DEADLINE_MINUTES = Number.parseInt(
   process.env.RELAY_RETRY_ESCALATION_DEADLINE_MINUTES || "20", 10

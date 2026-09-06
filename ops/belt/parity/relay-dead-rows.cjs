@@ -55,6 +55,7 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
         AND t.result->>'output' LIKE '%QC_EVIDENCE_JSON=%'
         AND COALESCE(a.model, a.runtime_config->>'model') = ANY($1::text[])
         AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $2::text
+        AND COALESCE(t.context->>'qc_evidence_rejected', 'false') <> 'true'
         AND NOT EXISTS (
           SELECT 1 FROM qc_verdict verdict WHERE verdict.issue_id = t.issue_id
             AND verdict.created_at >= t.created_at)
@@ -68,6 +69,17 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
     const parsed = qcTaskEvidenceResult(task);
     if (!parsed.evidence) {
       logger.log(`${logPrefix} [qc-evidence-skipped] task=${task.id} reason=${parsed.reason}`);
+      // Invalid evidence is terminal for this QC attempt. Persist the
+      // rejection on the task so the next sweep cannot select it again.
+      await client.query(
+        `UPDATE agent_task_queue
+            SET context = COALESCE(context, '{}'::jsonb) ||
+              jsonb_build_object('qc_evidence_rejected', true,
+                'qc_evidence_rejection_reason', $2::text)
+          WHERE id = $1::uuid
+            AND status = 'completed'
+            AND COALESCE(context->>'qc_evidence_rejected', 'false') <> 'true'`,
+        [task.id, parsed.reason]);
       // Make rejected evidence visible on the ticket so a discarded verdict
       // is actionable instead of silently triggering another QC run.
       try {

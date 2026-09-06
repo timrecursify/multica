@@ -1502,7 +1502,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
         continue;
       }
       const infra = isInfrastructureFailure(row.failure_reason);
-      if (infra && !coldStart) {
+      if (!coldStart) {
         const headroom = await client.query(
           `SELECT COALESCE(max(EXTRACT(epoch FROM (now() - created_at)) / 60), 0) AS age
              FROM agent_task_queue WHERE status = 'queued'`
@@ -1516,7 +1516,11 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           infraReasons: INFRA_FAILURE_REASONS
         });
         if (!admission.ok) {
-          console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: ${admission.reason}`);
+          // A consumed retry budget is terminal for this task. Escalate once
+          // through the relay so the ticket is handed to Sol-low re-spec and
+          // the retry_escalation marker retires it from future sweeps.
+          const escalation = await requestRetryEscalation(row, admission.reason, postRelay);
+          console.log(`${LOG_PREFIX} [requeue] ESCALATED #${row.number}: ${admission.reason}; relay=${escalation.status}`);
           continue;
         }
       }
