@@ -1780,9 +1780,15 @@ async function relayAdvance(req, res, body) {
         human_review_release_at: new Date().toISOString(),
         human_review_release_reason: reason.trim() };
     }
-    const releaseAt = issue.metadata?.human_review_release_at ||
-      issue.metadata?.parked_release_at ||
-      issue.metadata?.retry_escalation_at || null;
+    // A person releasing a ticket is a decision to spend more on it, so it
+    // resets both budgets. The belt escalating to itself is not: it writes
+    // retry_escalation_at on every lap, and honouring that as a lifetime floor
+    // handed the ticket a fresh six paid runs each time. The stage-cycle budget
+    // still honours it, because handing the flight to a bounded re-spec is
+    // exactly what that escalation is for.
+    const humanReleaseAt = issue.metadata?.human_review_release_at ||
+      issue.metadata?.parked_release_at || null;
+    const releaseAt = humanReleaseAt || issue.metadata?.retry_escalation_at || null;
     if (issue.status === to_stage && !retryEscalation) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
       const relayLogId = isTerminalStage(to_stage)
@@ -2238,7 +2244,7 @@ async function relayAdvance(req, res, body) {
             AND trigger_comment_id IS NULL
             ${budgetCountPredicate()}
             AND ($2::timestamptz IS NULL OR created_at >= $2)`,
-        [issue.id, releaseAt]
+        [issue.id, humanReleaseAt]
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
