@@ -53,8 +53,22 @@ function ownerSql() {
            ORDER BY pool.last_selected_at NULLS FIRST, pool.agent_id LIMIT 1`;
 }
 
+// The budget is per stage entry, not per lifetime. Counting every task an issue
+// ever had retired tickets permanently for outages that were never theirs: on
+// 2026-09-06 a revoked provider credential and an unreachable board burned six
+// attempts on 59 tickets in a single morning, and no later fix could return
+// them to the belt. Counting from the issue's most recent arrival in its
+// current stage keeps the guard that matters — a stage cannot spin on paid
+// tasks forever — and lets a stage change, including an operator returning the
+// issue, grant a fresh budget.
 function lifetimeTasksSql() {
-  return "SELECT count(*)::int AS count FROM agent_task_queue WHERE issue_id = $1::uuid AND trigger_comment_id IS NULL";
+  return `SELECT count(*)::int AS count
+            FROM agent_task_queue
+           WHERE issue_id = $1::uuid AND trigger_comment_id IS NULL
+             AND created_at >= COALESCE(
+                   (SELECT max(created_at) FROM relay_run_log
+                     WHERE issue_id = $1::uuid AND to_stage = $2),
+                   '-infinity'::timestamptz)`;
 }
 
 function stageAttemptsSql() {
@@ -365,7 +379,7 @@ async function reconcileIssue(client, issueId, options = {}) {
     // Lifetime cap is per issue and includes every reconciler-created task,
     // regardless of terminal status.  Stop the paid loop before selecting an
     // owner or inserting another task; route the durable blocker to a human.
-    const lifetime = await client.query(lifetimeTasksSql(), [issue.id]);
+    const lifetime = await client.query(lifetimeTasksSql(), [issue.id, issue.status]);
     const lifetimeCount = Number(lifetime.rows[0]?.count || 0);
     if (lifetimeCount >= options.lifetimeTaskLimit) {
       const capReason = `lifetime_task_limit:${lifetimeCount}/${options.lifetimeTaskLimit}`;
