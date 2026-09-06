@@ -23,6 +23,7 @@ const { deploymentCompletionAdmission } = require('../relay-completion-admission
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
+const { runQcGate, getHardChecks } = require('../qc-gate.cjs');
 const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
 const { reconcileCycle } = require('../reconciler.cjs');
 const { recordStageOutcomes } = require('../stage-outcome.cjs');
@@ -35,6 +36,11 @@ const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
 const RECONCILE_INTERVAL_MS = 30000;
+const QC_GATE_PENDING_RECHECK_MS = Number.parseInt(process.env.QC_GATE_PENDING_RECHECK_MS || '300000', 10);
+const QC_GATE_GH_COOLDOWN_MS = Number.parseInt(process.env.QC_GATE_GH_COOLDOWN_MS || '600000', 10);
+const qcGatePending = new Map();
+let qcGateGhCooldownUntil = 0;
+let lastCooldownLog = 0;
 function scheduleEvery(fn, ms, label) {
   return setInterval(
     () => Promise.resolve().then(fn)
@@ -139,10 +145,46 @@ async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } 
 // are routed through REST here, the same way multica-cicd-worker.cjs does.
 const PR_URL_RE = /github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i;
 
-const beltGithub = createGithubApi({
-  alert: ({ remaining, reset }) => console.error(`${LOG_PREFIX} [github-quota] sentinel remaining=${remaining} reset=${reset}`)
-});
-function ghExec(args) { return beltGithub.command(args); }
+// The relay unit carries no GH_TOKEN, so every `gh` call answered "To get
+// started with GitHub CLI, please run: gh auth login" and the QC gate took its
+// tool_error path. Mint a scoped GitHub App installation token through the
+// canonical credential helper instead. The helper owns the cache (file-backed,
+// refreshed with five minutes to spare), so nothing here holds a token that
+// could outlive its hour on a daemon that runs for days.
+const GIT_CREDENTIAL_HELPER = process.env.GSP_BELT_GIT_CREDENTIAL || '/usr/local/bin/gsp-belt-git-credential';
+let credentialHelperFailureLogged = false;
+function scrubToken(text) { return String(text).replace(/password=\S+/g, 'password=[redacted]'); }
+function logCredentialHelperFailure(detail) {
+  if (credentialHelperFailureLogged) return;
+  credentialHelperFailureLogged = true;
+  console.error(`${LOG_PREFIX} [github-token] ${GIT_CREDENTIAL_HELPER} ${scrubToken(detail).slice(0, 200)}`);
+}
+
+// Returns '' when the helper is absent or fails. That degrades exactly the way
+// a missing token already degraded, and never throws out of ghExec.
+function mintGithubToken() {
+  try {
+    const output = execFileSync(GIT_CREDENTIAL_HELPER, ['get'], { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
+    const line = String(output).split(/\r?\n/).find(value => value.startsWith('password='));
+    const token = line ? line.slice('password='.length).trim() : '';
+    if (token) { credentialHelperFailureLogged = false; return token; }
+    logCredentialHelperFailure('returned no password line');
+  } catch (error) {
+    logCredentialHelperFailure(`mint failed: ${error && error.message ? error.message : error}`);
+  }
+  return '';
+}
+
+// Built per call, never cached in module scope: a captured installation token
+// dies after an hour and the daemon outlives that many times over.
+function beltGithub() {
+  const token = mintGithubToken();
+  return createGithubApi({
+    env: token ? { ...process.env, GITHUB_APP_INSTALLATION_TOKEN: token } : process.env,
+    alert: ({ remaining, reset }) => console.error(`${LOG_PREFIX} [github-quota] sentinel remaining=${remaining} reset=${reset}`)
+  });
+}
+function ghExec(args) { return beltGithub().command(args); }
 
 // gh returns statusCheckRollup as one flat list of check contexts. REST splits
 // the same facts across check-runs and the combined commit status, so both are
@@ -221,6 +263,16 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
     return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };
   }
   return {};
+}
+
+// Gate by ticket transition and PR evidence, never by the stage row that
+// happened to record the worker completion. Queue-produced PRs can skip the
+// In Progress outcome entirely.
+function qcGateRequired(row, targetStage, route) {
+  if (targetStage === 'In Review') return true;
+  if (targetStage !== 'Done') return false;
+  const prUrl = route?.pr_url || resultPointer(row);
+  return PR_URL_RE.test(String(prUrl || ''));
 }
 
 function greenChecks(checks) {
@@ -803,6 +855,117 @@ async function advanceTick() {
   }
 }
 
+async function enqueueQcGateRework(client, row, failed, postRelay) {
+  let source = row;
+  if (source.attempt == null || source.max_attempts == null) {
+    const sourceResult = await client.query(
+      'SELECT attempt, max_attempts FROM agent_task_queue WHERE id = $1::uuid', [row.task_id]);
+    source = { ...row, ...(sourceResult.rows[0] || {}) };
+  }
+  const config = await client.query(`SELECT rsc.agent_id,
+      COALESCE((SELECT ar.id FROM agent_runtime ar WHERE ar.id = a.runtime_id
+        AND ar.workspace_id = rsc.workspace_id AND ar.status = 'online'),
+        (SELECT ar.id FROM agent_runtime ar WHERE ar.workspace_id = rsc.workspace_id
+          AND ar.status = 'online' AND ar.provider = CASE WHEN a.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END
+          ORDER BY ar.updated_at DESC LIMIT 1)) AS runtime_id
+    FROM relay_stage_config rsc JOIN agent a ON a.id = rsc.agent_id
+      AND a.workspace_id = rsc.workspace_id AND a.archived_at IS NULL
+    WHERE rsc.workspace_id = $1 AND rsc.next_stage = $2
+      AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true' LIMIT 1`,
+    [row.workspace_id, 'In Progress']);
+  const selected = config.rows[0];
+  const attempt = Number(source.attempt || 0) + 1;
+  const maxAttempts = Number(source.max_attempts || 3);
+  if (attempt > maxAttempts || !selected?.agent_id) {
+    await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review', agent_token: RELAY_AGENT_SECRET,
+      relay_source_task_id: row.task_id, reason: attempt > maxAttempts ? 'QC-GATE FAIL attempts exhausted' : 'QC-GATE FAIL no In Progress stage owner' });
+    return null;
+  }
+  const checks = failed.map(c => ({ name: c.name, detail: c.detail }));
+  const context = JSON.stringify({ source: 'qc-gate-fail', from_stage: 'In Progress', to_stage: 'In Progress',
+    requeue_of_task: row.task_id, gate_checks: checks });
+  const summary = `QC-GATE FAIL: ${checks.map(c => `${c.name}: ${c.detail}`).join('; ')}`.slice(0, 500);
+  const task = await client.query(`INSERT INTO agent_task_queue (
+      agent_id, issue_id, status, runtime_id, context, trigger_summary,
+      force_fresh_session, originator_source, trigger_evidence_kind, attempt, max_attempts, retry_of_task_id)
+    VALUES ($1, $2, 'queued', $3, $4::jsonb, $5, TRUE, 'unattributed', 'relay_stage_transition', $6, $7, $8)
+    RETURNING id`, [selected.agent_id, row.issue_id, selected.runtime_id, context, summary, attempt, maxAttempts, row.task_id]);
+  return task.rows[0]?.id || null;
+}
+async function applyQcGate(client, row, postRelay, logger, gateRunner = runQcGate, now = Date.now) {
+  const issueResult = await client.query('SELECT id, number, workspace_id, metadata FROM issue WHERE id = $1::uuid', [row.issue_id]);
+  const issue = issueResult.rows[0] || { id: row.issue_id, workspace_id: row.workspace_id, metadata: {} };
+  const hintedSha = row.qc_attempt_bound_sha || row.qc_attempt_observed_sha || '';
+  const hintedKey = `${row.issue_id}:${hintedSha}`;
+  const cached = qcGatePending.get(hintedKey) || [...qcGatePending].find(([key]) => key.startsWith(`${row.issue_id}:`))?.[1];
+  const current = now();
+  if (current < qcGateGhCooldownUntil) {
+    if (current - lastCooldownLog >= 60000) {
+      logger.log(`${LOG_PREFIX} [qc-gate] COOLDOWN until=${new Date(qcGateGhCooldownUntil).toISOString()}`);
+      lastCooldownLog = current;
+    }
+    return 'pending';
+  }
+  if (cached && current - cached.at < QC_GATE_PENDING_RECHECK_MS) return 'pending';
+  let gate;
+  try {
+    gate = await gateRunner({ issue, workspace: { id: issue.workspace_id || row.workspace_id }, evidence: issue.metadata || {}, gh: ghExec, db: client });
+  } catch (err) {
+    const message = String(err?.message || err);
+    const transient = /rate limit|secondary rate|abuse|timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|502|503|504/i.test(message);
+    const cls = transient ? 'transient' : 'tool_error';
+    logger.log(`${LOG_PREFIX} [qc-gate] ERROR issue=${row.issue_id} class=${cls} ${message.slice(0, 160)}`);
+    if (transient) qcGateGhCooldownUntil = current + QC_GATE_GH_COOLDOWN_MS;
+    const key = `${row.issue_id}:${hintedSha}`;
+    const prior = qcGatePending.get(key);
+    qcGatePending.set(key, prior || { at: current, firstAt: current });
+    while (qcGatePending.size > 500) qcGatePending.delete(qcGatePending.keys().next().value);
+    if (process.env.QC_GATE_FAIL_OPEN === '1' && !transient) {
+      const content = `<!-- multica-qc-gate -->\nQC-GATE SKIPPED (tool_error): ${message.slice(0, 500)}`;
+      await client.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type) VALUES ($1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system')`, [issue.id, issue.workspace_id || row.workspace_id, '00000000-0000-0000-0000-000000000000', content]);
+      return 'pass';
+    }
+    return 'pending';
+  }
+  const sha = gate.bound_sha || 'none';
+  if (gate.verdict === 'PASS') {
+    for (const key of qcGatePending.keys()) if (key.startsWith(`${row.issue_id}:`)) qcGatePending.delete(key);
+    const soft = gate.checks.filter(c => !getHardChecks().includes(c.name) && !c.ok)
+      .map(c => `soft: ${c.name}: ${c.detail}`).join('; ');
+    const content = `<!-- multica-qc-gate -->\nQC-GATE PASS (${gate.checks.length} checks)${soft ? ` ${soft}` : ''} sha=${gate.bound_sha} pr=#${gate.pr_number}`;
+    await client.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+      SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
+      WHERE NOT EXISTS (SELECT 1 FROM comment WHERE issue_id=$1::uuid AND content LIKE '<!-- multica-qc-gate -->%' AND content LIKE $5::text)`,
+      [issue.id, issue.workspace_id || row.workspace_id, '00000000-0000-0000-0000-000000000000', content, `%sha=${sha}%`]);
+    return 'pass';
+  }
+  const pending = gate.verdict === 'FAIL' && process.env.QC_GATE_CI_ADVISORY === '0' && gate.checks.some(c => c.name === 'ci_complete' && !c.ok && c.detail === 'ci_pending');
+  if (pending) {
+    const key = `${row.issue_id}:${gate.bound_sha || hintedSha}`;
+    const prior = qcGatePending.get(key);
+    const entry = prior && current - prior.at >= QC_GATE_PENDING_RECHECK_MS
+      ? { at: current, firstAt: prior.firstAt } : prior || { at: current, firstAt: current };
+    qcGatePending.set(key, entry);
+    while (qcGatePending.size > 500) qcGatePending.delete(qcGatePending.keys().next().value);
+    logger.log(`${LOG_PREFIX} [qc-gate] PENDING issue=${row.issue_id} ci_pending since=${new Date(entry.firstAt).toISOString()}`);
+    return 'pending';
+  }
+  for (const key of qcGatePending.keys()) if (key.startsWith(`${row.issue_id}:`)) qcGatePending.delete(key);
+  const hardChecks = getHardChecks();
+  const failed = gate.checks.filter(c => hardChecks.includes(c.name) && !c.ok);
+  const soft = gate.checks.filter(c => !hardChecks.includes(c.name) && !c.ok);
+  const detail = failed.map(c => `${c.name}: ${c.detail}`).concat(soft.map(c => `soft: ${c.name}: ${c.detail}`)).join('; ');
+  const content = `<!-- multica-qc-gate -->\nQC-GATE FAIL: ${detail}`;
+  await client.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+    SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
+    WHERE NOT EXISTS (SELECT 1 FROM comment WHERE issue_id=$1::uuid AND content LIKE '<!-- multica-qc-gate -->%' AND content LIKE $5::text)`,
+    [issue.id, issue.workspace_id || row.workspace_id, '00000000-0000-0000-0000-000000000000', content, `%sha=${sha}%`]);
+  if (row.log_id) await markRelayLogCompletedById(client, row.log_id);
+  const taskId = await enqueueQcGateRework(client, row, failed, postRelay);
+  if (taskId) logger.log(`${LOG_PREFIX} [qc-gate] FAIL issue=${row.issue_id} checks=${failed.map(c => c.name).join(',')} -> requeued task ${taskId}`);
+  return 'returned';
+}
+
 async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   logger = console } = {}) {
   const client = await dbPool.connect();
@@ -930,6 +1093,10 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
           evidence: completionEvidence(row, targetStage, route, qcAdvance),
           ...(route ? { routing_classification: route } : {}),
           ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
+        if (process.env.QC_GATE_ENABLED === '1' && qcGateRequired(row, targetStage, route)) {
+          const gate = await applyQcGate(client, row, postRelay, logger);
+          if (gate === 'pending' || gate === 'returned') continue;
+        }
         const response = await postRelay(payload);
 
         if (response.ok) {
@@ -1937,6 +2104,15 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         logger.log(`${LOG_PREFIX} [typed-readvance] skipped issue=${row.issue_id} reason=${qcAdvance.reason}`);
         continue;
       }
+      if (process.env.QC_GATE_ENABLED === '1' && qcGateRequired(row, targetStage, route)) {
+        const gate = await applyQcGate(client, row, postRelay, logger);
+        if (gate === 'pending') continue;
+        if (gate === 'returned') {
+          await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = NULL
+            WHERE issue_id = $1::uuid AND stage = 'In Progress'`, [row.issue_id]);
+          continue;
+        }
+      }
       const response = await postRelay({ issue_id: row.issue_id, to_stage: targetStage,
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
         evidence: completionEvidence(row, targetStage, route, qcAdvance),
@@ -2088,7 +2264,7 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestRetryEscalation,
+module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestRetryEscalation,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
