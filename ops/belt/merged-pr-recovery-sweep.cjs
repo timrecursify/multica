@@ -7,7 +7,7 @@ const http = require('http');
 const LIMIT = Number(process.env.MERGED_PR_RECOVERY_LIMIT || 50);
 const INTERVAL_MS = Number(process.env.MERGED_PR_RECOVERY_INTERVAL_MS || 300000);
 const WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f';
-const envPath = process.env.MULTICA_REMOTE_BRIDGE_ENV || '/home/newadmin/.secrets/multica-remote/remote-bridge.env';
+const envPath = process.env.MULTICA_REMOTE_BRIDGE_ENV || '/var/lib/gsp/.secrets/multica-remote/remote-bridge.env';
 const env = fs.readFileSync(envPath, 'utf8');
 const value = key => env.split('\n').find(line => line.startsWith(`${key}=`))?.slice(key.length + 1).trim();
 const token = value('RELAY_AGENT_SECRET');

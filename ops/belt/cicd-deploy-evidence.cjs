@@ -1,10 +1,10 @@
 const fs = require('fs');
 const { execFileSync } = require('child_process');
 
-const beltReceiptDir = '/home/newadmin/gsp-multica/deploy-receipts';
+const beltReceiptDir = process.env.CICD_BELT_RECEIPT_DIR || '/var/lib/gsp/gsp-multica/deploy-receipts';
 const backendContainer = 'gsp-multica-v2-backend-1';
 // This is an owned, fetched sk-cli clone, deliberately not the Multica worktree.
-const skCheckout = process.env.CICD_SK_CHECKOUT || '/home/newadmin/worktrees/sk-cli-cicd';
+const skCheckout = process.env.CICD_SK_CHECKOUT || '/var/lib/gsp/worktrees/sk-cli-cicd';
 const multicaCheckout = process.env.CICD_MULTICA_CHECKOUT || __dirname + '/../..';
 
 function command(file, args) {

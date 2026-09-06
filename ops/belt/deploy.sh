@@ -37,13 +37,14 @@ if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]];
 fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/home/newadmin}"
+runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/var/lib/gsp}"
 
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
   "$root_dir/guardrails.cjs"
   "$root_dir/parked-diagnosis.cjs"
   "$root_dir/parked-entry-audit.cjs"
+  "$root_dir/github-api-adapter.cjs"
   "$root_dir/parity/multica-relay-advance-daemon.cjs"
   "$root_dir/parity/relay-dead-rows.cjs"
   "$root_dir/multica-cicd-worker.cjs"
@@ -78,6 +79,7 @@ declare -a targets=(
   "$runtime_root/gsp-multica/guardrails.cjs"
   "$runtime_root/gsp-multica/parked-diagnosis.cjs"
   "$runtime_root/gsp-multica/parked-entry-audit.cjs"
+  "$runtime_root/gsp-multica/github-api-adapter.cjs"
   "$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
   "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs"
   "$runtime_root/multica-cicd-worker.cjs"
@@ -201,6 +203,12 @@ for index in "${!sources[@]}"; do
   # the release before the parity repair can run.
   [[ "${targets[$index]}" == "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh" ]] && new_targets[$index]=1
   [[ "${targets[$index]}" == "$runtime_root/tools/belt-concurrency.sh" ]] && new_targets[$index]=1
+  # Added after the last rollout (#547 sentinel, #559 API adapter), so no
+  # runtime copy exists yet.  Same reasoning as the wrapper above: let this
+  # deployment create them rather than refuse the release.
+  [[ "${targets[$index]}" == "$runtime_root/gsp-multica/daemon-health-sentinel.sh" ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/daemon-health-sentinel.cjs" ||
+      "${targets[$index]}" == "$runtime_root/gsp-multica/github-api-adapter.cjs" ]] && new_targets[$index]=1
   [[ "${targets[$index]}" =~ /(qc-lane|reconciler|stage-outcome|transition-policy|stage-routing|qc-strict-evidence|qc-verdict-policy)\.cjs$ ||
       "${targets[$index]}" == "$runtime_root/gsp-multica/stage-routing.json" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then

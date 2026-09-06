@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 requested_commit="${1:-}"; [[ "$requested_commit" =~ ^[0-9a-f]{40}$ ]] || { echo "Usage: $0 <40-character source commit>" >&2; exit 2; }
-root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"; repo_root="$(cd -- "$root_dir/../.." && pwd)"; runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/home/newadmin}"
+root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"; repo_root="$(cd -- "$root_dir/../.." && pwd)"; runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/var/lib/gsp}"
 resolved_commit="$(git -C "$repo_root" rev-parse --verify --quiet "${requested_commit}^{commit}")" || { echo "Unresolvable source commit: $requested_commit" >&2; exit 1; }; [[ "$resolved_commit" == "$requested_commit" ]] || { echo "Source commit did not resolve exactly" >&2; exit 1; }
 source_tree="$(mktemp -d "${TMPDIR:-/tmp}/belt-verify.XXXXXX")"; trap 'rm -rf -- "$source_tree"' EXIT; git -C "$repo_root" archive --format=tar "$resolved_commit" | tar -x -C "$source_tree" || { echo "Could not materialize source commit" >&2; exit 1; }
 declare -a rels=(ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs ops/belt/parked-entry-audit.cjs ops/belt/parity/multica-relay-advance-daemon.cjs ops/belt/parity/relay-dead-rows.cjs ops/belt/multica-cicd-worker.cjs ops/belt/cicd-watchdog.cjs ops/belt/cicd-deploy-evidence.cjs ops/belt/belt-config-guard.sh ops/belt/multica-daemon-wrapper.sh ops/belt/ecosystem.gsp-belt.config.js ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md ops/belt/WORKER_COMMON.md)

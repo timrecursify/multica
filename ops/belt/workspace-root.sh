@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-readonly BELT_CANONICAL_WORKSPACES_ROOT="/home/newadmin/multica-workspaces-gsp"
+readonly BELT_CANONICAL_WORKSPACES_ROOT="/var/lib/gsp/multica/workspaces"
 readonly BELT_WORKSPACE_UUIDS=("da3c5c5c-a123-4567-b999-c3ed1820da00" "f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f")
 workspace_root_resolve() {
   local configured="${MULTICA_DAEMON_WORKSPACES_ROOT-${MULTICA_WORKSPACES_ROOT-$BELT_CANONICAL_WORKSPACES_ROOT}}"

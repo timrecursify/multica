@@ -32,7 +32,7 @@ export BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$test_workspace_root"
 IFS='|' read -r expected_cap expected_root < <(daemon_launch_config)
 assert_eq '2|/tmp/gsp-workspaces' "$(MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces daemon_launch_config)" 'configured daemon launch config'
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT="$test_workspace_root" assert_valid
-assert_eq '10|/home/newadmin/multica-workspaces-gsp' "$(BELT_CPU_COUNT_CMD='printf 12' BELT_RUNNER_COUNT_CMD='printf 2' env -u BELT_IDLE_RUNNER_COUNT_CMD -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT bash -c 'source "$1"; daemon_launch_config' _ "$root_dir/belt-config-guard.sh")" 'undeclared daemon launch config'
+assert_eq '10|/var/lib/gsp/multica/workspaces' "$(BELT_CPU_COUNT_CMD='printf 12' BELT_RUNNER_COUNT_CMD='printf 2' env -u BELT_IDLE_RUNNER_COUNT_CMD -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT bash -c 'source "$1"; daemon_launch_config' _ "$root_dir/belt-config-guard.sh")" 'undeclared daemon launch config'
 export MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2
 expected_cap=2
 MULTICA_DAEMON_MAX_CONCURRENT_TASKS=bad MULTICA_DAEMON_WORKSPACES_ROOT=/tmp/gsp-workspaces assert_invalid

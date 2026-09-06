@@ -8,6 +8,14 @@ export BELT_WRAPPER_TEST=1
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 fake="$(mktemp -d)"; trap 'rm -rf "$fake"' EXIT
 mkdir -p -- "$fake/ws" "$fake/new-workspaces"
+# Cases that assert an unrelated rejection (bad cap, bad cwd, probe failure)
+# pass neither MULTICA_DAEMON_WORKSPACES_ROOT nor MULTICA_WORKSPACES_ROOT, so
+# without this the root resolves to the canonical fleet path, which exists only
+# on the belt host.  The wrapper then rejects on the root before reaching the
+# behaviour under test.  This is the override the header comment refers to; it
+# applies only when both variables are unset, so the explicit-root cases below
+# still exercise the real validation.
+export BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws"
 cat >"$fake/daemon" <<'EOF'
 #!/bin/sh
 if [ "$*" = 'daemon start --help' ]; then
@@ -84,10 +92,10 @@ assert_wrapper_rejects cap-empty \
   'multica-daemon-wrapper: MULTICA_DAEMON_MAX_CONCURRENT_TASKS must be a non-negative integer' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=
 assert_wrapper_rejects root-relative \
-  'multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path' \
+  'multica-daemon-wrapper: workspace root must be an absolute path' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_WORKSPACES_ROOT=relative
 assert_wrapper_rejects root-empty \
-  'multica-daemon-wrapper: MULTICA_DAEMON_WORKSPACES_ROOT must be an absolute path' \
+  'multica-daemon-wrapper: workspace root must be an absolute path' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_WORKSPACES_ROOT=
 assert_wrapper_rejects cwd-relative \
   'multica-daemon-wrapper: MULTICA_DAEMON_CWD must be an existing absolute directory' \

@@ -12,8 +12,8 @@ unset MULTICA_TASK_ID MULTICA_TASK_SLOT MULTICA_TASK_CONFIG_ROOT \
 
 # Paid lane remains explicitly opt-in.
 export MULTICA_ALLOW_PAID_LANE="${MULTICA_ALLOW_PAID_LANE:-0}"
-requested_codex_bin="${CODEX_BIN:-/home/newadmin/tools/codex-native}"
-if [[ "$requested_codex_bin" == "/home/newadmin/tools/codex-openrouter" && "$MULTICA_ALLOW_PAID_LANE" != 1 ]]; then
+requested_codex_bin="${CODEX_BIN:-/var/lib/gsp/tools/codex-native}"
+if [[ "$requested_codex_bin" == "/var/lib/gsp/tools/codex-openrouter" && "$MULTICA_ALLOW_PAID_LANE" != 1 ]]; then
   echo "multica-daemon-wrapper: refusing paid OpenRouter lane; set MULTICA_ALLOW_PAID_LANE=1 explicitly" >&2
   exit 64
 fi
@@ -52,7 +52,7 @@ export MULTICA_DAEMON_WORKSPACES_ROOT="$root"
 # wrapper variable above for the belt guard and rollback scripts.
 export MULTICA_WORKSPACES_ROOT="$root"
 
-lock_file="${MULTICA_DAEMON_LOCK_FILE:-/home/newadmin/.local/state/gsp-multica-worker.lock}"
+lock_file="${MULTICA_DAEMON_LOCK_FILE:-/var/lib/gsp/.local/state/gsp-multica-worker.lock}"
 mkdir -p -- "$(dirname -- "$lock_file")"
 exec 9>"$lock_file"
 if ! flock -n 9; then
@@ -60,8 +60,8 @@ if ! flock -n 9; then
   exit 75
 fi
 
-daemon_bin="${MULTICA_DAEMON_BIN:-/home/newadmin/multica-daemon/server}"
-daemon_cwd="${MULTICA_DAEMON_CWD:-/home/newadmin/multica-daemon}"
+daemon_bin="${MULTICA_DAEMON_BIN:-/var/lib/gsp/multica-daemon/server}"
+daemon_cwd="${MULTICA_DAEMON_CWD:-/var/lib/gsp/multica-daemon}"
 if [[ -z "$daemon_cwd" || "$daemon_cwd" != /* || ! -d "$daemon_cwd" ]]; then
   echo "multica-daemon-wrapper: MULTICA_DAEMON_CWD must be an existing absolute directory" >&2
   exit 64

@@ -8,12 +8,34 @@ on:
 jobs:
   audit:
     runs-on: ubuntu-latest
+    # `secrets` is not available in a step-level `if`, so the presence of the
+    # deployed-database secret is resolved once here into a plain env flag.
+    env:
+      LOCAL_DB_URL: postgres://gsp_multica:gsp_multica@localhost:5432/gsp_multica?sslmode=disable
+      USE_LOCAL_DB: ${{ secrets.GSP_DATABASE_URL == '' }}
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: gsp_multica
+          POSTGRES_USER: gsp_multica
+          POSTGRES_PASSWORD: gsp_multica
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gsp_multica -d gsp_multica"
+          --health-interval 5s --health-timeout 5s --health-retries 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: server/go.mod
+      - name: Bootstrap local audit database
+        if: env.USE_LOCAL_DB == 'true'
+        env:
+          DATABASE_URL: ${{ env.LOCAL_DB_URL }}
+        run: cd server && go run ./cmd/migrate up
       - name: Audit deployed database
         env:
-          DATABASE_URL: ${{ secrets.GSP_DATABASE_URL }}
+          DATABASE_URL: ${{ secrets.GSP_DATABASE_URL || env.LOCAL_DB_URL }}
         run: ./scripts/check-migration-drift.sh
