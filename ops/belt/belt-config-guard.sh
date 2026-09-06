@@ -12,20 +12,20 @@
 # setting below is re-asserted on a schedule rather than trusted once.
 set -uo pipefail
 
-readonly PM2=/home/newadmin/.npm-global/bin/pm2
-readonly SK=/home/newadmin/bin/sk
+readonly RUNTIME_ROOT="${BELT_RUNTIME_ROOT:-/var/lib/gsp}"
+readonly PM2="${BELT_PM2:-$RUNTIME_ROOT/.npm-global/bin/pm2}"
+readonly SK="${BELT_SK:-$RUNTIME_ROOT/bin/sk}"
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
-readonly RELAY_ENV_FILE="${BELT_RELAY_ENV_FILE:-/home/newadmin/gsp-multica/.env}"
+readonly RELAY_ENV_FILE="${BELT_RELAY_ENV_FILE:-$RUNTIME_ROOT/gsp-multica/.env}"
 readonly RELAY_HEALTH_URL="${BELT_RELAY_HEALTH_URL:-}"
-readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
+readonly WRAPPER="$RUNTIME_ROOT/gsp-multica/fleet/multica-daemon-wrapper.sh"
 readonly SOURCE_ROOT="${BELT_SOURCE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
 readonly GUARD_SOURCE="${BELT_SOURCE_GUARD:-${SOURCE_ROOT}/belt-config-guard.sh}"
 readonly WRAPPER_SOURCE="${BELT_SOURCE_WRAPPER:-${SOURCE_ROOT}/multica-daemon-wrapper.sh}"
-readonly RUNTIME_ROOT="${BELT_RUNTIME_ROOT:-/home/newadmin}"
 readonly RUNTIME_GUARD="${RUNTIME_ROOT}/tools/belt-config-guard.sh"
 readonly RUNTIME_WRAPPER="${RUNTIME_ROOT}/gsp-multica/fleet/multica-daemon-wrapper.sh"
-readonly RELEASE_ROOT="${BELT_RELEASE_ROOT:-/home/newadmin/gsp-multica-runtime/releases}"
-readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
+readonly RELEASE_ROOT="${BELT_RELEASE_ROOT:-$RUNTIME_ROOT/gsp-multica-runtime/releases}"
+readonly ECOSYSTEM="$RUNTIME_ROOT/gsp-multica/fleet/ecosystem.gsp-belt.config.js"
 # Keep release identity validation aligned with deploy-release.sh.  The
 # metadata digest is meaningful only when it covers the complete runtime
 # manifest, including both members of the parity pair.
@@ -103,7 +103,7 @@ readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver 
 # Operators may intentionally hold the AI worker while investigating spend or
 # deploying guardrails.  This marker suppresses only worker self-healing; all
 # pipeline services remain under the normal liveness guard.
-readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-/home/newadmin/.local/state/multica-ai-hold}"
+readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-$RUNTIME_ROOT/.local/state/multica-ai-hold}"
 readonly PSQL=(docker exec -i gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At)
 
 fixed=(); unfixable=()

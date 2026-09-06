@@ -37,7 +37,7 @@ if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]];
 fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/home/newadmin}"
+runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/var/lib/gsp}"
 
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"

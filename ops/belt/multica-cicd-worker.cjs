@@ -11,14 +11,14 @@ const http = require('http');
 const { execFileSync } = require('child_process');
 const { evaluate } = require('./transition-policy.cjs');
 const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
-const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/home/newadmin/gsp-multica-runtime/receipts';
+const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multica-runtime/receipts';
 let pool;
 let relayToken;
 let readReceipt = (sha) => JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/belt-${sha}.json`, 'utf8'));
 
 function initializeRuntime() {
   const { Pool } = require('pg');
-  const envPath = process.env.MULTICA_REMOTE_BRIDGE_ENV || '/home/newadmin/.secrets/multica-remote/remote-bridge.env';
+  const envPath = process.env.MULTICA_REMOTE_BRIDGE_ENV || '/var/lib/gsp/.secrets/multica-remote/remote-bridge.env';
   const env = fs.readFileSync(envPath, 'utf8');
   relayToken = env.split('\n').find(l => l.startsWith('RELAY_AGENT_SECRET=')).split('=')[1];
   pool = new Pool({ connectionString: env.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });

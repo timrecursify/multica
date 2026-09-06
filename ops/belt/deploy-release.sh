@@ -14,8 +14,8 @@ while [[ $# -gt 0 ]]; do case "$1" in
   *) usage ;;
 esac; shift; done
 checkout="${MULTICA_CHECKOUT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
-release_root="${MULTICA_RELEASE_ROOT:-/home/newadmin/gsp-multica-runtime/releases}"
-receipt_root="${MULTICA_RECEIPT_ROOT:-/home/newadmin/gsp-multica-runtime/receipts}"
+release_root="${MULTICA_RELEASE_ROOT:-/var/lib/gsp/gsp-multica-runtime/releases}"
+receipt_root="${MULTICA_RECEIPT_ROOT:-/var/lib/gsp/gsp-multica-runtime/receipts}"
 pm2_bin="${PM2_BIN:-pm2}"
 actual_sha="$(git -C "$checkout" rev-parse HEAD)"
 [[ "$actual_sha" == "$requested_sha" ]] || { echo "checkout SHA is $actual_sha, expected $requested_sha" >&2; exit 65; }
