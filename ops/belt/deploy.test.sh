@@ -31,6 +31,21 @@ while read -r sourced; do
   }
 done < <(grep -o '/[a-z-]*\.sh"$' "$root_dir/multica-daemon-wrapper.sh" | tr -d '/"')
 
+# Same failure, one directory over: a file under parity/ reaches its siblings
+# with require('../name.cjs'), which resolves outside parity/. Shipping such a
+# file into parity/ leaves the require unresolved and the daemon dies at start.
+# Resolve each one against the deployed layout instead of trusting the path.
+for parity_file in "$root_dir"/parity/*.cjs; do
+  [[ -e "$parity_file" ]] || continue
+  while read -r required; do
+    [[ -n "$required" ]] || continue
+    printf '%s\n' "${targets[@]}" | grep -q "/app/$required\$" || {
+      echo "parity/$(basename "$parity_file") requires ../$required, which the manifest does not deploy to app/" >&2
+      exit 1
+    }
+  done < <(grep -o "require('\.\./[a-z-]*\.cjs')" "$parity_file" | sed "s|require('\.\./||; s|')||")
+done
+
 # These targets are absent beforehand, so a rollback must delete them outright
 # rather than restore a backup.
 is_new_target() {
