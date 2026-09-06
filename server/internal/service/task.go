@@ -2348,6 +2348,11 @@ type CancelTaskOptions struct {
 	QueuedOnly          bool
 	ExpectedChatSession pgtype.UUID
 	QueueAction         string
+	// FailureReason stamps agent_task_queue.failure_reason on the cancelled
+	// row. Set it on every server-initiated cancel so the terminal row names
+	// its own cause; leave it empty for a user-initiated cancel, where a NULL
+	// failure_reason is the signal that a human pressed Cancel.
+	FailureReason string
 }
 
 // CancelTask cancels a single task by ID. It broadcasts a task:cancelled event
@@ -2360,6 +2365,23 @@ func (s *TaskService) CancelTask(ctx context.Context, taskID pgtype.UUID) (*db.A
 	// synchronous restore anyway, and the durable path is the only one that can
 	// hand the prompt back at all.
 	result, err := s.CancelTaskWithResult(ctx, taskID, CancelTaskOptions{ClientSupportsDraftRestore: true})
+	if err != nil {
+		return nil, err
+	}
+	return &result.Task, nil
+}
+
+// CancelTaskWithReason is CancelTask for a cancel the server decided on its
+// own — a claim-path refusal, a guard tripping, a reconciler giving up. reason
+// is a short stable token (not a sentence) written to
+// agent_task_queue.failure_reason, so an operator reading the queue can tell a
+// refused task from a user-cancelled one without correlating server logs.
+func (s *TaskService) CancelTaskWithReason(ctx context.Context, taskID pgtype.UUID, reason string) (*db.AgentTaskQueue, error) {
+	result, err := s.CancelTaskWithResult(ctx, taskID, CancelTaskOptions{
+		ClientSupportsDraftRestore: true,
+		Cause:                      reason,
+		FailureReason:              reason,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -2404,9 +2426,20 @@ func (s *TaskService) CancelTaskWithResult(ctx context.Context, taskID pgtype.UU
 			if err := lockChatSessionForTaskWrite(ctx, qtx, taskID); err != nil {
 				return err
 			}
-			cancelled, err := qtx.CancelAgentTask(ctx, taskID)
-			if err != nil {
-				return err
+			var (
+				cancelled db.AgentTaskQueue
+				cancelErr error
+			)
+			if opts.FailureReason != "" {
+				cancelled, cancelErr = qtx.CancelAgentTaskWithReason(ctx, db.CancelAgentTaskWithReasonParams{
+					ID:            taskID,
+					FailureReason: pgtype.Text{String: opts.FailureReason, Valid: true},
+				})
+			} else {
+				cancelled, cancelErr = qtx.CancelAgentTask(ctx, taskID)
+			}
+			if cancelErr != nil {
+				return cancelErr
 			}
 			task = cancelled
 			if !cancelled.ChatSessionID.Valid {

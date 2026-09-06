@@ -1413,13 +1413,13 @@ func (h *Handler) repairStaleCommentPlanIfNeeded(ctx context.Context, task *db.A
 		return true, &claimBuildFailure{outcome: "error_stale_comment_plan", status: http.StatusInternalServerError, message: "failed to repair stale comment task"}
 	}
 	if uuidToString(issue.WorkspaceID) != runtimeWorkspaceID {
-		if _, cancelErr := h.TaskService.CancelTask(ctx, task.ID); cancelErr != nil {
+		if _, cancelErr := h.TaskService.CancelTaskWithReason(ctx, task.ID, "claim_cross_workspace_comment_task"); cancelErr != nil {
 			slog.Error("task claim: cancel stale cross-workspace task failed",
 				"task_id", uuidToString(task.ID), "error", cancelErr)
 		}
 		return true, &claimBuildFailure{outcome: "error_workspace", status: http.StatusInternalServerError, message: "task workspace isolation check failed"}
 	}
-	cancelled, cancelErr := h.TaskService.CancelTask(ctx, task.ID)
+	cancelled, cancelErr := h.TaskService.CancelTaskWithReason(ctx, task.ID, "claim_stale_comment_plan_repair")
 	if cancelErr != nil {
 		return true, &claimBuildFailure{outcome: "error_stale_comment_plan", status: http.StatusInternalServerError, message: "failed to repair stale comment task"}
 	}
@@ -1580,7 +1580,7 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		if !rt.OwnerID.Valid {
 			slog.Error("batch claim: runtime owner missing; cancelling task to avoid unscoped agent credentials",
 				"task_id", uuidToString(task.ID), "runtime_id", uuidToString(task.RuntimeID))
-			if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+			if _, cerr := h.TaskService.CancelTaskWithReason(r.Context(), task.ID, "claim_runtime_owner_missing"); cerr != nil {
 				slog.Error("batch claim: cancel after missing runtime owner failed",
 					"task_id", uuidToString(task.ID), "error", cerr)
 			}
@@ -2366,7 +2366,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 					"chat_session_id", uuidToString(cs.ID),
 					"chat_input_task_id", uuidToString(task.ChatInputTaskID),
 				)
-				if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+				if _, cerr := h.TaskService.CancelTaskWithReason(r.Context(), task.ID, "claim_empty_chat_input"); cerr != nil {
 					slog.Error("chat claim: cancel after empty input failed",
 						"task_id", uuidToString(task.ID), "error", cerr)
 				}
@@ -2573,7 +2573,7 @@ func (h *Handler) buildClaimedTaskResponse(r *http.Request, task *db.AgentTaskQu
 			"has_autopilot_run", task.AutopilotRunID.Valid,
 			"has_quick_create", hasQuickCreate,
 		)
-		if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+		if _, cerr := h.TaskService.CancelTaskWithReason(r.Context(), task.ID, "claim_workspace_isolation"); cerr != nil {
 			slog.Error("task claim: cancel after workspace check failed",
 				"task_id", uuidToString(task.ID), "error", cerr)
 		}
@@ -2708,7 +2708,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 			"runtime_id", runtimeID,
 			"workspace_id", runtimeWorkspaceID,
 		)
-		if _, cerr := h.TaskService.CancelTask(r.Context(), task.ID); cerr != nil {
+		if _, cerr := h.TaskService.CancelTaskWithReason(r.Context(), task.ID, "claim_runtime_owner_missing"); cerr != nil {
 			slog.Error("task claim: cancel after missing runtime owner failed",
 				"task_id", uuidToString(task.ID), "error", cerr)
 		}

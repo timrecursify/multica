@@ -1253,6 +1253,22 @@ SET status = 'cancelled', completed_at = now(), prepare_lease_expires_at = NULL
 WHERE id = $1 AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
 RETURNING *;
 
+-- name: CancelAgentTaskWithReason :one
+-- Same cancellation as CancelAgentTask, but stamps a machine-readable cause.
+-- Server-initiated cancels (claim-path refusals in particular) otherwise land
+-- as a terminal row with status='cancelled' and every diagnostic column NULL,
+-- which makes a fleet-wide refusal indistinguishable from a user pressing
+-- Cancel. A user cancel keeps using CancelAgentTask and stays NULL, so a
+-- non-NULL failure_reason on a cancelled row always means the server refused.
+UPDATE agent_task_queue
+SET status = 'cancelled',
+    completed_at = now(),
+    failure_reason = sqlc.arg('failure_reason'),
+    prepare_lease_expires_at = NULL
+WHERE id = sqlc.arg('id')
+  AND status IN ('queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred')
+RETURNING *;
+
 -- name: CancelQueuedAgentTask :one
 -- Queue editing is a compare-and-set: never cancel a task that the daemon
 -- promoted between the user's click and this statement.
