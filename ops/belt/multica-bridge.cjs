@@ -16,6 +16,7 @@ const {
   crossStageExecutionAdmission,
   resolveBuilderRoute
 } = require("./guardrails.cjs");
+const { isQcLane, isSpecLane } = require("./qc-lane.cjs");
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvidenceReference } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
@@ -731,8 +732,12 @@ async function selectRetryEscalationOwner(client, issue) {
   if (!owner?.agent_id || !owner.owner_id || owner.archived_at || !owner.selected_runtime_id) {
     throw new Error(`No active Sol-low re-spec owner for workspace ${issue.workspace_id}`);
   }
-  if (owner.model !== "gpt-5.6-sol" || owner.thinking_level !== "low") {
-    throw new Error(`Sol-low re-spec owner has invalid lane: ${owner.agent_name}`);
+  // A re-spec is a scoping run, so the spec lane is admissible here alongside
+  // QC's. Hard-coding gpt-5.6-sol rejected the workspace's actual Spec owner --
+  // an opus scoper, which guardrails.cjs already admits through isSpecLane --
+  // and every retry escalation threw before it could hand the ticket back.
+  if (!isQcLane(owner.model, owner.thinking_level) && !isSpecLane(owner.model, owner.thinking_level)) {
+    throw new Error(`re-spec owner has invalid lane: ${owner.agent_name}`);
   }
   const compatibility = instructionCompatibility(owner.instructions, "Spec");
   const preflight = spendPreflight(owner, { provider: owner.selected_runtime_provider });
@@ -2652,6 +2657,7 @@ if (require.main === module) {
 
 module.exports = {
   assertRequiredEnvironment,
+  selectRetryEscalationOwner,
   existingStageTask,
   replaceStageTask,
   ownerStageForTransition,
