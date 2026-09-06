@@ -311,6 +311,18 @@ async function reconcileIssue(client, issueId, options = {}) {
       [issue.id, issue.status, options.issueCooldownMinutes, options.completedStageCooldownMinutes]
     )).rows[0];
     if (recent) {
+      // Do not let the broad completed-task cooldown mask an aged typed
+      // outcome. Once its TTL expires, admission must re-arm the stage.
+      let ttlExpired = false;
+      if (options.typedOutcomes && recent.status === "completed") {
+        const eligibility = await stageEligibility(client, issue.id, issue.status, {
+          failedTtlMinutes: options.failedTtlMinutes
+        });
+        ttlExpired = eligibility.eligible && ["unchanged_ttl_expired", "advanced_stall", "failed_ttl_expired"].includes(eligibility.reason);
+        if (ttlExpired && eligibility.reason === "unchanged_ttl_expired") {
+          console.log(`[reconcile] SENTINEL unchanged_outcome_over_1h: issue=${issue.id} stage=${issue.status}`);
+        }
+      }
       // Older daemons could report a failed/no-work-product run through the
       // success callback.  Do not let that poisoned terminal row arm the
       // completed-stage burn guard: make the failure durable and let the
@@ -329,9 +341,11 @@ async function reconcileIssue(client, issueId, options = {}) {
           return { action: "skipped", reason: admission.reason, taskId: recent.id };
         }
       }
-      await client.query("COMMIT");
-      const reason = recent.status === "completed" ? "completed_stage_cooldown" : "issue_cooldown";
-      return { action: "skipped", reason, taskId: recent.id };
+      if (!ttlExpired) {
+        await client.query("COMMIT");
+        const reason = recent.status === "completed" ? "completed_stage_cooldown" : "issue_cooldown";
+        return { action: "skipped", reason, taskId: recent.id };
+      }
     }
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
     const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
