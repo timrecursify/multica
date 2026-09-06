@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+const http = require('http');
 const crypto = require('crypto');
 const { Pool } = require('pg');
 
@@ -30,7 +31,8 @@ function advanceToArchived(issueID) {
     const body = JSON.stringify({ issue_id: issueID, to_stage: 'Archived', actor: 'archiver',
       evidence: { signedArchivePlanReceipt: archiveReceipt(issueID) }, agent_token: ARCHIVER_AGENT_SECRET });
     const request = http.request({ hostname: '127.0.0.1', port: 5005, path: '/relay/advance', method: 'POST', timeout: 5000,
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) } }, (response) => {
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body),
+        'x-relay-archiver-secret': ARCHIVER_AGENT_SECRET } }, (response) => {
       response.resume(); response.on('end', () => resolve(response.statusCode >= 200 && response.statusCode < 300));
     });
     request.on('error', reject);
