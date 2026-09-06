@@ -15,6 +15,34 @@ spec:
   groups:
     - name: multica-business-sampler
       rules:
+        - alert: OrchestratorHeartbeatMissing
+          expr: absent(multica_orchestrator_heartbeat_timestamp_seconds)
+          for: 5m
+          labels:
+            severity: critical
+            service: multica-orchestrator
+            expected_instance: {{ .Values.monitoring.prometheusRule.heartbeatExpectedInstance | quote }}
+          annotations:
+            summary: "Multica orchestrator heartbeat is missing"
+            description: "The orchestrator metrics target is not exporting its heartbeat gauge."
+        - alert: OrchestratorHeartbeatStale
+          expr: time() - multica_orchestrator_heartbeat_timestamp_seconds > {{ .Values.monitoring.prometheusRule.heartbeatStaleSeconds }}
+          for: 1m
+          labels:
+            severity: critical
+            service: multica-orchestrator
+          annotations:
+            summary: "Multica orchestrator heartbeat is stale"
+            description: "The orchestrator heartbeat has not advanced within the expected interval."
+        - alert: OrchestratorHeartbeatWriteFailing
+          expr: increase(multica_orchestrator_heartbeat_write_failures_total[5m]) > 0
+          for: 2m
+          labels:
+            severity: critical
+            service: multica-orchestrator
+          annotations:
+            summary: "Multica orchestrator heartbeat writes are failing"
+            description: "The orchestrator is reporting failures while exporting heartbeat telemetry."
         - alert: MulticaBusinessSamplerQueryErrors
           expr: |
             sum by (name) (
