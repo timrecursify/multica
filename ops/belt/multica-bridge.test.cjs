@@ -31,6 +31,7 @@ const {
   replaceStageTask,
   ownerStageForTransition,
   ensureCompletedRelayLog,
+  recordWithheldArrival,
   completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff,
@@ -1340,6 +1341,36 @@ test('bookkeeping handoff refuses a Queue shortcut without a builder predecessor
   assert.equal(await recordBookkeepingHandoff(client, 'issue-without-build'), null);
   assert.equal(calls.length, 1);
   assert.doesNotMatch(calls[0].sql, /INSERT INTO relay_run_log/);
+});
+
+test('a withheld bundled-child dispatch still records the stage arrival', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ id: 'arrival-log' }] };
+  } };
+
+  const first = await recordWithheldArrival(client, 'issue-1', 'Spec', 'Queue');
+  const second = await recordWithheldArrival(client, 'issue-1', 'Spec', 'Queue');
+
+  assert.equal(first, 'arrival-log');
+  assert.equal(second, 'arrival-log');
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.match(call.sql, /INSERT INTO relay_run_log/);
+    assert.deepEqual(call.values, ['issue-1', 'Spec', 'Queue']);
+    // from_stage <> to_stage is what makes the row an arrival for the
+    // reconciler's per-stage-entry budget window.
+    assert.notEqual(call.values[1], call.values[2]);
+    // A repeat traversal of the same edge must open a NEW window, so this
+    // insert must not carry ensureCompletedRelayLog's all-time de-duplication.
+    assert.doesNotMatch(call.sql, /NOT EXISTS/);
+  }
+});
+
+test('the bundled-child branch records an arrival before withholding the task', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /\} else if \(bundledChild && result\.rowCount > 0\) \{\s*\n\s*relayLogId = await recordWithheldArrival\(client, issue_id, issue\.status, to_stage\);/);
 });
 
 test('relay dispatch gates bypass paid admission only for the bookkeeping hop', () => {
