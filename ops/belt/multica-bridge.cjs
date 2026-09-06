@@ -17,7 +17,7 @@ const {
   crossStageExecutionAdmission,
   resolveBuilderRoute
 } = require("./guardrails.cjs");
-const { isQcLane, isSpecLane, qcEscalationModels, QC_ESCALATION_BOUNCES } = require("./qc-lane.cjs");
+const { isQcLane, isSpecLane, qcEscalationModels, QC_ESCALATION_BOUNCES, qcLaneModelsSqlArray, QC_LANE_EFFORT } = require("./qc-lane.cjs");
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvidenceReference } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
@@ -384,7 +384,9 @@ function validateRelayVerdict(payload) {
   if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
   if (!FAILURE_CLASSES.has(payload.failure_class)) return "invalid_failure_class";
   if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
-  if (payload.model !== "gpt-5.6-sol" || payload.effort !== "low") return "invalid_qc_lane";
+  // QC lane is Sol or Luna at low effort (qc-lane.cjs); Sol alone rejected every
+  // Luna verdict as invalid_qc_lane after the 2026-09-02 order moved QC to Luna.
+  if (!isQcLane(payload.model, payload.effort)) return "invalid_qc_lane";
   if (typeof payload.idem_key !== "string" || !IDEM_KEY_RE.test(payload.idem_key)) return "invalid_idem_key";
   return null;
 }
@@ -430,7 +432,7 @@ async function latestQcGateComment(client, issueId) {
   return { id: row.id, created_at: row.created_at, verdict: match?.[1]?.toUpperCase() || null };
 }
 
-// A deploy may only be admitted after the Sol-low QC lane has recorded a
+// A deploy may only be admitted after the configured QC lane has recorded a
 // qualifying PASS bound to the exact reviewed tree.  Keep this check at the
 // relay boundary as well as in the policy table: a stale database alt edge or
 // a hand-written request must not create a deploy task.
@@ -444,7 +446,7 @@ async function directDeployQcAdmission(client, issueId) {
   );
   const row = result.rows[0];
   return Boolean(row && row.verdict === 'PASS' && row.qualifying === true &&
-    row.model === 'gpt-5.6-sol' && row.effort === 'low' &&
+    isQcLane(row.model, row.effort) &&
     SHA_RE.test(String(row.bound_sha || '')) &&
     String(row.bound_sha).toLowerCase() === String(row.observed_head || '').toLowerCase());
 }
@@ -458,12 +460,12 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explici
        JOIN agent a ON a.id = t.agent_id AND a.workspace_id = i.workspace_id
       WHERE t.issue_id = $1 AND i.workspace_id = $2 AND t.status = 'completed'
         AND t.context->>'to_stage' = 'In Review'
-        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($4::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $5::text
         AND ($3::uuid IS NULL OR t.id = $3::uuid)
       ORDER BY t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
       LIMIT 1 FOR UPDATE`,
-    [issueId, workspaceId, explicitTaskId]
+    [issueId, workspaceId, explicitTaskId, qcLaneModelsSqlArray(), QC_LANE_EFFORT]
   );
   return result.rows[0] || null;
 }
@@ -578,9 +580,9 @@ async function latestQcNoArtifactSignal(client, issue) {
       WHERE t.issue_id = $1 AND t.workspace_id = $2
         AND t.context->>'to_stage' = 'In Review'
         AND t.status IN ('queued','dispatched','running','waiting_local_directory','deferred','completed')
-        AND COALESCE(a.model, a.runtime_config->>'model') = 'gpt-5.6-sol'
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = 'low'
-      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id]);
+        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($3::text[])
+        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $4::text
+      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id, qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
   const row = latest.rows[0];
   return Boolean(row && (isNoArtifactQcBlock(taskResultText(row.result)) ||
     isNoArtifactQcBlock(row.content)));
@@ -600,7 +602,7 @@ function qcTaskEvidence(task) {
       !SHA_RE.test(String(evidence.observed_sha || "")) ||
       String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase() ||
       !FAILURE_CLASSES.has(evidence.failure_class) || typeof evidence.qualifying !== "boolean" ||
-      evidence.model !== "gpt-5.6-sol" || evidence.effort !== "low") return null;
+      !isQcLane(evidence.model, evidence.effort)) return null;
   return evidence;
 }
 

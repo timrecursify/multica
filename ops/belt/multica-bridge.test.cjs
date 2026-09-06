@@ -60,6 +60,7 @@ const {
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
+  directDeployQcAdmission,
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
@@ -616,6 +617,21 @@ test('verdict validation accepts the sanctioned CLI checker field and rejects fo
   assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
+});
+
+test('the QC lane admits every configured reviewer model, not Sol alone', async () => {
+  // qc-lane.cjs configures the lane as gpt-5.6-sol or gpt-5.6-luna at low
+  // effort. The bridge hardcoded gpt-5.6-sol, so every Luna verdict was
+  // refused invalid_qc_lane once the standing order moved QC to Luna.
+  assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-luna' }), null);
+  assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
+  assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-luna', effort: 'high' }), 'invalid_qc_lane');
+
+  const qcRow = (model) => ({ query: async () => ({ rows: [{ verdict: 'PASS', qualifying: true,
+    model, effort: 'low', bound_sha: validVerdict.bound_sha, observed_head: validVerdict.bound_sha }] }) });
+  assert.equal(await directDeployQcAdmission(qcRow('gpt-5.6-luna'), validVerdict.issue_id), true);
+  assert.equal(await directDeployQcAdmission(qcRow('gpt-5.6-sol'), validVerdict.issue_id), true);
+  assert.equal(await directDeployQcAdmission(qcRow('gpt-5.6-terra'), validVerdict.issue_id), false);
 });
 
 test('routing rejections expose only bounded agent routing fields', () => {
