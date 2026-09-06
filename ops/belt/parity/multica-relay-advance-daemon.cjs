@@ -105,7 +105,7 @@ async function recordOutcomesPass({ dbPool = pool, logger = console } = {}) {
   if (!TYPED_OUTCOMES) return null;
   const client = await dbPool.connect();
   try {
-    const result = await recordStageOutcomes(client, { logger });
+    const result = await recordStageOutcomes(client, { logger, githubCommand: reconcileGithubCommand });
     if (result.recorded) logger.log(`${LOG_PREFIX} [stage-outcome] recorded=${result.recorded}`);
     return result;
   } finally { client.release(); }

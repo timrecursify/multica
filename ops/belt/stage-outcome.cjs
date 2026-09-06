@@ -124,13 +124,13 @@ function unrecordedCompletionsSql() {
 // as long as it stayed in the window. Each row is therefore isolated, and a write
 // the database refuses is retried once without blocked_on so the outcome kind
 // still lands.
-async function recordStageOutcomes(client, { windowMinutes = 180, logger = console } = {}) {
+async function recordStageOutcomes(client, { windowMinutes = 180, logger = console, githubCommand } = {}) {
   const rows = (await client.query(unrecordedCompletionsSql(), [windowMinutes])).rows;
   let recorded = 0;
   let failed = 0;
   for (const row of rows) {
     try {
-      recorded += await recordOneOutcome(client, row, logger);
+      recorded += await recordOneOutcome(client, row, logger, { githubCommand });
     } catch (error) {
       failed += 1;
       logger.log(`[stage-outcome] record failed task=${row.id} stage=${row.stage}: ${error?.message || error}`);
@@ -139,7 +139,7 @@ async function recordStageOutcomes(client, { windowMinutes = 180, logger = conso
   return { scanned: rows.length, recorded, failed };
 }
 
-async function recordOneOutcome(client, row, logger) {
+async function recordOneOutcome(client, row, logger, { githubCommand } = {}) {
   const parsed = parseOutcome(row.output);
   // An In Progress completion is the implementation handoff. It cannot be
   // advanced without a linked PR and bound head SHA, so do not persist a
@@ -151,12 +151,31 @@ async function recordOneOutcome(client, row, logger) {
          JOIN github_pull_request p ON p.id = ipr.pull_request_id
          WHERE ipr.issue_id = $1::uuid AND NULLIF(p.head_sha, '') IS NOT NULL
        ) AS has_review_evidence`, [row.issue_id])).rows[0];
+    if (!evidence?.has_review_evidence && githubCommand) {
+      const issue = (await client.query(
+        `SELECT id, workspace_id, status FROM issues WHERE id = $1::uuid`, [row.issue_id])).rows[0];
+      if (issue) {
+        const { linkObservedPullRequest } = require('./reconciler.cjs');
+        await linkObservedPullRequest(client, issue, { githubCommand });
+      }
+      const retriedEvidence = (await client.query(
+        `SELECT EXISTS (
+           SELECT 1 FROM issue_pull_request ipr
+           JOIN github_pull_request p ON p.id = ipr.pull_request_id
+           WHERE ipr.issue_id = $1::uuid AND NULLIF(p.head_sha, '') IS NOT NULL
+         ) AS has_review_evidence`, [row.issue_id])).rows[0];
+      if (retriedEvidence?.has_review_evidence) return persistOutcome(client, row, parsed, logger);
+    }
     if (!evidence?.has_review_evidence) {
       parsed.outcome = "FAILED";
       parsed.blockedOn = null;
       logger.log(`[stage-outcome] rejected unsupported ADVANCED task=${row.id} stage=${row.stage}: missing review evidence`);
     }
   }
+  return persistOutcome(client, row, parsed, logger);
+}
+
+async function persistOutcome(client, row, parsed, logger) {
   const hash = (await client.query(stageInputHashSql(), [row.issue_id])).rows[0]?.input_hash || null;
   try {
     await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, parsed.blockedOn, row.id, hash]);
