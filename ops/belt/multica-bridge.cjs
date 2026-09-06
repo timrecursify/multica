@@ -1795,11 +1795,18 @@ async function relayAdvance(req, res, body) {
       const relayLogId = isTerminalStage(to_stage)
         ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
       await client.query(
+        // relay_run_log.status admits only pending/completed/failed/rejected, so
+        // a same-stage replay records 'completed' like every other audit-only
+        // row (parked-entry-audit.cjs, reconciler merged-PR no-op, operator
+        // respec, ensureCompletedRelayLog). parked_audit->>'reason' carries the
+        // 'same_stage' discriminator and is what dedupes the replay, which is
+        // stricter than the old status match and needs no new index.
         `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
-         SELECT $1, $2, $2, 'noop', jsonb_build_object('reason', 'same_stage')
+         SELECT $1, $2, $2, 'completed', jsonb_build_object('reason', 'same_stage')
           WHERE NOT EXISTS (SELECT 1 FROM relay_run_log
             WHERE issue_id = $1 AND from_stage = $2 AND to_stage = $2
-              AND status = 'noop' AND created_at > NOW() - interval '1 minute')`,
+              AND parked_audit->>'reason' = 'same_stage'
+              AND created_at > NOW() - interval '1 minute')`,
         [issue.id, issue.status]);
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
