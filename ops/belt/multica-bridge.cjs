@@ -24,6 +24,7 @@ const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const JWT_SECRET = process.env.JWT_SECRET;
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
+const ARCHIVER_AGENT_SECRET = process.env.ARCHIVER_AGENT_SECRET;
 // Optional at process start, but mandatory for an explicit operator terminal
 // exit. Leaving it unset therefore fails that exceptional path closed.
 const RELAY_OPERATOR_SECRET = process.env.RELAY_OPERATOR_SECRET;
@@ -52,6 +53,7 @@ for (const [name, value] of Object.entries({
   JWT_SECRET,
   DATABASE_URL: MULTICA_DB,
   RELAY_AGENT_SECRET,
+  ARCHIVER_AGENT_SECRET,
   MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID
 })) {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -89,6 +91,17 @@ function isTerminalStage(stage) {
 
 function isNoDispatchArrivalStage(stage) {
   return isTerminalStage(stage) || NO_DISPATCH_ARRIVAL_STAGES.has(stage);
+}
+
+function validArchiveReceipt(issueId, receipt) {
+  if (typeof receipt !== "string" || !ARCHIVER_AGENT_SECRET) return false;
+  const payload = `archiver:${issueId}:Done->Archived`;
+  const prefix = `${payload}:`;
+  if (!receipt.startsWith(prefix)) return false;
+  const supplied = receipt.slice(prefix.length);
+  if (!/^[a-f0-9]{64}$/i.test(supplied)) return false;
+  const expected = crypto.createHmac("sha256", ARCHIVER_AGENT_SECRET).update(payload).digest("hex");
+  return crypto.timingSafeEqual(Buffer.from(supplied, "hex"), Buffer.from(expected, "hex"));
 }
 
 async function verifiedParkedEvidenceRelease(client, issue, toStage, reason) {
@@ -1415,8 +1428,14 @@ async function relayAdvance(req, res, body) {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
       operator_rescope_issue_id, operator_terminal_exit, operator_release } = body;
     
-    // Validate agent token
-    if (agent_token !== RELAY_AGENT_SECRET) {
+    // The archiver is a narrowly-scoped service authority. It authenticates
+    // with its dedicated header and a signed receipt; it must not inherit the
+    // general relay or operator authority.
+    const archiveEvidence = body.evidence?.signedArchivePlanReceipt;
+    const archiverRequest = body.actor === "archiver" && to_stage === "Archived" &&
+      req.headers["x-relay-archiver-secret"] === ARCHIVER_AGENT_SECRET;
+    const relayRequest = agent_token === RELAY_AGENT_SECRET && body.actor !== "archiver";
+    if (!relayRequest && !archiverRequest) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
@@ -1459,6 +1478,12 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    if (archiverRequest && (issue.status !== "Done" || !validArchiveReceipt(issue.id, archiveEvidence))) {
+      await client.query("ROLLBACK");
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_archiver_evidence" }));
+      return;
+    }
     // In Progress -> Done is the genuine no-code terminal path.  The build
     // worker cannot self-assert it: only the relay/system may submit a
     // machine-readable NO-SHA work product, and any code-bearing route must
@@ -2320,8 +2345,12 @@ async function relayAdvance(req, res, body) {
         client, issue_id, issue.status, to_stage
       );
       await recordTransitionAudit(client, issue, {
-        fromStage: issue.status, toStage: to_stage, reason, evidence: parkedAudit || {},
-        actorType: explicitTerminalExit || explicitHumanReviewRelease ? 'operator' : 'system',
+        fromStage: issue.status, toStage: to_stage, reason,
+        evidence: {
+          ...(parkedAudit || {}),
+          ...(archiverRequest ? { signedArchivePlanReceipt: archiveEvidence } : {})
+        },
+        actorType: archiverRequest ? 'archiver' : (explicitTerminalExit || explicitHumanReviewRelease ? 'operator' : 'system'),
         result: 'committed'
       });
       // Terminal, human-gate, and parked-disposition arrivals have no stage owner, task, or
@@ -2426,7 +2455,8 @@ async function relayAdvance(req, res, body) {
         ...(cicdReturn ? { cicd_return: true } : {}),
         ...(noArtifactRescope ? { no_artifact_rescope: true } : {})
       },
-      actorType: explicitTerminalExit || explicitHumanReviewRelease ? 'operator' : 'system',
+      actorType: archiverRequest ? 'archiver' : (explicitTerminalExit || explicitHumanReviewRelease ? 'operator' : 'system'),
+      evidence: archiverRequest ? { signedArchivePlanReceipt: archiveEvidence } : {},
       actorId: stage?.agent_id || null,
       result: 'committed'
     });

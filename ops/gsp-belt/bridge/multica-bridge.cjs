@@ -28,6 +28,17 @@ function resolveSite(req) {
   return { host, ...site };
 }
 
+function validArchiveReceipt(issueId, receipt) {
+  if (typeof receipt !== 'string' || !ARCHIVER_AGENT_SECRET) return false;
+  const payload = `archiver:${issueId}:Done->Archived`;
+  const prefix = `${payload}:`;
+  if (!receipt.startsWith(prefix)) return false;
+  const supplied = receipt.slice(prefix.length);
+  if (!/^[a-f0-9]{64}$/i.test(supplied)) return false;
+  const expected = crypto.createHmac('sha256', ARCHIVER_AGENT_SECRET).update(payload).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(supplied, 'hex'), Buffer.from(expected, 'hex'));
+}
+
 for (const [name, value] of Object.entries({
   JWT_SECRET,
   DATABASE_URL: MULTICA_DB,
@@ -254,7 +265,8 @@ async function relayAdvance(req, res, body) {
     let { issue_id, to_stage, agent_token, relay_source_task_id } = body;
 
     // Validate agent token
-    const archiverRequest = body.actor === 'archiver' && agent_token === ARCHIVER_AGENT_SECRET;
+    const archiverRequest = body.actor === 'archiver' && to_stage === 'Archived' &&
+      req.headers['x-relay-archiver-secret'] === ARCHIVER_AGENT_SECRET;
     if (agent_token !== RELAY_AGENT_SECRET && !archiverRequest) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
@@ -299,6 +311,13 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    if (archiverRequest && (issue.status !== 'Done' ||
+        !validArchiveReceipt(issue.id, body.evidence?.signedArchivePlanReceipt))) {
+      await client.query('ROLLBACK');
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_archiver_evidence' }));
+      return;
+    }
     if (issue.status === to_stage) {
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
