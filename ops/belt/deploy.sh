@@ -5,6 +5,7 @@ mode="dry-run"
 rollback_timestamp=""
 only_target=""
 source_commit=""
+allow_full=0
 
 while (( $# )); do
   case "$1" in
@@ -12,9 +13,10 @@ while (( $# )); do
     --apply) mode="apply"; shift ;;
     --rollback) mode="rollback"; rollback_timestamp="${2:-}"; shift 2 ;;
     --only) only_target="${2:-}"; shift 2 ;;
+    --all) allow_full=1; shift ;;
     --source-commit) source_commit="${2:-}"; shift 2 ;;
     *)
-      printf 'Usage: %s [--dry-run|--apply] [--source-commit SHA] [--only TARGET] | %s --rollback YYYYMMDDTHHMMSSZ [--only TARGET]\n' "$0" "$0" >&2
+      printf 'Usage: %s [--dry-run|--apply] [--all] [--source-commit SHA] [--only TARGET] | %s --rollback YYYYMMDDTHHMMSSZ [--only TARGET]\n' "$0" "$0" >&2
       exit 2
       ;;
   esac
@@ -36,78 +38,18 @@ if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]];
   exit 2
 fi
 
+# A bare --apply would rewrite every managed target at once. Runtime and tracked
+# tree have drifted independently, so an unscoped apply must be asked for by name.
+if [[ "$mode" == apply && -z "$only_target" && $allow_full -eq 0 ]]; then
+  printf 'Refusing an unscoped --apply: pass --only TARGET, or --all to deploy every managed file.\n' >&2
+  exit 2
+fi
+
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/var/lib/gsp}"
+runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/opt/gsp/multica-workers}"
 
-declare -a sources=(
-  "$root_dir/multica-bridge.cjs"
-  "$root_dir/guardrails.cjs"
-  "$root_dir/parked-diagnosis.cjs"
-  "$root_dir/parked-entry-audit.cjs"
-  "$root_dir/github-api-adapter.cjs"
-  "$root_dir/parity/multica-relay-advance-daemon.cjs"
-  "$root_dir/parity/relay-dead-rows.cjs"
-  "$root_dir/multica-cicd-worker.cjs"
-  "$root_dir/cicd-deploy-evidence.cjs"
-  "$root_dir/cicd-watchdog.cjs"
-  "$root_dir/multica-archiver.cjs"
-  "$root_dir/merged-pr-recovery-sweep.cjs"
-  "$root_dir/belt-config-guard.sh"
-  "$root_dir/belt-concurrency.sh"
-  "$root_dir/multica-daemon-wrapper.sh"
-  "$root_dir/daemon-health-sentinel.sh"
-  "$root_dir/daemon-health-sentinel.cjs"
-  "$root_dir/ecosystem.gsp-belt.config.js"
-  "$root_dir/multica-bundle.py"
-  "$root_dir/RUNBOOK_SPEC_WORKER.md"
-  "$root_dir/RUNBOOK_BUILD_WORKER.md"
-  "$root_dir/RUNBOOK_QC_WORKER.md"
-  "$root_dir/WORKER_COMMON.md"
-  "$root_dir/relay-completion-admission.cjs"
-  "$root_dir/qc-lane.cjs"
-  "$root_dir/reconciler.cjs"
-  "$root_dir/stage-outcome.cjs"
-  "$root_dir/transition-policy.cjs"
-  "$root_dir/stage-routing.cjs"
-  "$root_dir/qc-strict-evidence.cjs"
-  "$root_dir/stage-routing.json"
-  "$root_dir/qc-verdict-policy.cjs"
-)
-
-declare -a targets=(
-  "$runtime_root/gsp-multica/multica-bridge.cjs"
-  "$runtime_root/gsp-multica/guardrails.cjs"
-  "$runtime_root/gsp-multica/parked-diagnosis.cjs"
-  "$runtime_root/gsp-multica/parked-entry-audit.cjs"
-  "$runtime_root/gsp-multica/github-api-adapter.cjs"
-  "$runtime_root/gsp-multica/parity/multica-relay-advance-daemon.cjs"
-  "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs"
-  "$runtime_root/multica-cicd-worker.cjs"
-  "$runtime_root/cicd-deploy-evidence.cjs"
-  "$runtime_root/cicd-watchdog.cjs"
-  "$runtime_root/multica-archiver.cjs"
-  "$runtime_root/merged-pr-recovery-sweep.cjs"
-  "$runtime_root/tools/belt-config-guard.sh"
-  "$runtime_root/tools/belt-concurrency.sh"
-  "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh"
-  "$runtime_root/gsp-multica/daemon-health-sentinel.sh"
-  "$runtime_root/gsp-multica/daemon-health-sentinel.cjs"
-  "$runtime_root/gsp-multica/fleet/ecosystem.gsp-belt.config.js"
-  "$runtime_root/tools/multica-bundle.py"
-  "$runtime_root/multica-doctrine/RUNBOOK_SPEC_WORKER.md"
-  "$runtime_root/multica-doctrine/RUNBOOK_BUILD_WORKER.md"
-  "$runtime_root/multica-doctrine/RUNBOOK_QC_WORKER.md"
-  "$runtime_root/multica-doctrine/WORKER_COMMON.md"
-  "$runtime_root/gsp-multica/relay-completion-admission.cjs"
-  "$runtime_root/gsp-multica/qc-lane.cjs"
-  "$runtime_root/gsp-multica/reconciler.cjs"
-  "$runtime_root/gsp-multica/stage-outcome.cjs"
-  "$runtime_root/gsp-multica/transition-policy.cjs"
-  "$runtime_root/gsp-multica/stage-routing.cjs"
-  "$runtime_root/gsp-multica/qc-strict-evidence.cjs"
-  "$runtime_root/gsp-multica/stage-routing.json"
-  "$runtime_root/gsp-multica/qc-verdict-policy.cjs"
-)
+# Manifest lives in one place; see belt-manifest.sh.
+. "$root_dir/belt-manifest.sh"
 
 selected() {
   local name="${sources[$1]##*/}"
