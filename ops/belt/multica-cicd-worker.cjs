@@ -11,6 +11,7 @@ const http = require('http');
 const { execFileSync } = require('child_process');
 const { evaluate } = require('./transition-policy.cjs');
 const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
+const { mintGithubToken, repoFromGhArgs } = require('./github-token.cjs');
 const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multica-runtime/receipts';
 let pool;
 let relayToken;
@@ -56,8 +57,7 @@ let gh = function github(args) {
   // GraphQL (gh pr view/merge) shares one per-user quota with every operator
   // session and was exhausted at 02:19Z on 2026-09-03; route both through REST.
   if (args[0] === 'pr' && args[1] === 'view' && args[3] === '-R') {
-    const raw = execFileSync('gh', ['api', '-i', `repos/${args[4]}/pulls/${args[2]}`],
-      { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 });
+    const raw = execFileSync('gh', ['api', '-i', `repos/${args[4]}/pulls/${args[2]}`], ghOptions(args));
     const pr = JSON.parse(rateLimitBody(raw));
     return JSON.stringify({
       state: pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase(),
@@ -68,8 +68,7 @@ let gh = function github(args) {
   }
   if (args[0] === 'pr' && args[1] === 'merge' && args[3] === '-R') {
     try {
-      const raw = execFileSync('gh', ['api', '-i', '-X', 'PUT', `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'],
-        { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 });
+      const raw = execFileSync('gh', ['api', '-i', '-X', 'PUT', `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'], ghOptions(args));
       return rateLimitBody(raw).trim();
     } catch (e) {
       const text = `${e.stdout || ''}\n${e.stderr || ''}`;
@@ -79,7 +78,7 @@ let gh = function github(args) {
   }
   try {
     const command = args[0] === 'api' && !args.includes('-i') ? ['api', '-i', ...args.slice(1)] : args;
-    const raw = execFileSync('gh', command, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 });
+    const raw = execFileSync('gh', command, ghOptions(args));
     return args[0] === 'api' ? rateLimitBody(raw).trim() : raw.trim();
   } catch (e) {
     const text = `${e.stdout || ''}\n${e.stderr || ''}`;
@@ -89,6 +88,7 @@ let gh = function github(args) {
     throw e;
   }
 };
+function ghOptions(args) { const token = mintGithubToken(repoFromGhArgs(args)); return { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6, ...(token ? { env: { ...process.env, GH_TOKEN: token } } : {}) }; }
 let ghBackoffUntil = 0;
 function rateLimitReset(raw) {
   const m = raw.match(/x-ratelimit-reset:\s*(\d+)/i); return m ? Number(m[1]) * 1000 : Date.now() + 3600000;
@@ -120,7 +120,6 @@ let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reaso
     req.write(body); req.end();
   });
 };
-
 function parseRelayResponse(raw, toStage) {
   let body;
   try { body = JSON.parse(raw); } catch (_) {
