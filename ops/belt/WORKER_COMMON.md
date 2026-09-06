@@ -95,6 +95,8 @@ Delete a test you wrote that turned out to prove nothing.
   checkout.
 - Use a branch and pull request. Never push to `main` or force-push.
 - Push first, then run `gh pr create` as its own separate command (never chained with `&&` or in a script). The daemon reads the pull request URL from that command's output alone; any other text in the same output marks the task failed even though the PR exists.
+- `gh` has no ambient credential on the belt. Mint one for the repository you are in, on the same command line, so the output stays the pull request URL and nothing else:
+  `GH_TOKEN=$(gsp-belt-git-credential token <repo>) gh pr create --title '...' --body '...'`, where `<repo>` is `multica`, `sk-cli`, or `ppp`. Every other `gh` call needs the same prefix.
 - Never print secrets. Money, auth, migrations, secrets, and production flags
   require Sol-low QC before merge or deployment.
 
