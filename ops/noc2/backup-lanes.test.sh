@@ -29,13 +29,15 @@ tag=''
 while (($#)); do
   if [[ "$1" == --tag ]]; then tag="$2"; shift 2; else shift; fi
 done
-if [[ "$tag" == broken ]]; then
-  exit 17
-fi
+case "$tag" in
+  missing) echo 'repository does not exist' >&2; exit 10 ;;
+  auth) echo 'wrong password' >&2; exit 12 ;;
+  transport) echo 'connection timed out' >&2; exit 17 ;;
+esac
 printf '[{"time":"2026-09-05T05:31:49Z"}]\n'
 EOF
 chmod 0755 "$fixture/bin/restic"
-printf 'healthy|restic|fixture:healthy|%s|tag=healthy\nunreadable|restic|fixture:broken|%s|tag=broken\n' "$fixture/env" "$fixture/env" >"$fixture/lanes.conf"
+printf 'healthy|restic|fixture:healthy|%s|tag=healthy\nmissing|restic|fixture:missing|%s|tag=missing\nauth|restic|fixture:auth|%s|tag=auth\ntransport|restic|fixture:transport|%s|tag=transport\n' "$fixture/env" "$fixture/env" "$fixture/env" "$fixture/env" >"$fixture/lanes.conf"
 if PATH="$fixture/bin:$PATH" \
   BACKUP_BOX=fixture BACKUP_LANES_CONF="$fixture/lanes.conf" \
   OUT_DIR="$fixture/out" STATE_DIR="$fixture/state" \
@@ -45,5 +47,7 @@ if PATH="$fixture/bin:$PATH" \
 fi
 grep -q 'backup_last_success_timestamp_seconds{box="fixture",lane="healthy"' "$fixture/out/gsp_backup_age.prom"
 grep -q 'backup_lane_query_ok{box="fixture",lane="healthy"} 1' "$fixture/out/gsp_backup_age.prom"
-grep -q 'backup_lane_query_ok{box="fixture",lane="unreadable"} 0' "$fixture/out/gsp_backup_age.prom"
+grep -q 'backup_lane_query_failure{box="fixture",lane="missing",reason="missing_repo"} 1' "$fixture/out/gsp_backup_age.prom"
+grep -q 'backup_lane_query_failure{box="fixture",lane="auth",reason="authentication"} 1' "$fixture/out/gsp_backup_age.prom"
+grep -q 'backup_lane_query_failure{box="fixture",lane="transport",reason="transport"} 1' "$fixture/out/gsp_backup_age.prom"
 echo PASS

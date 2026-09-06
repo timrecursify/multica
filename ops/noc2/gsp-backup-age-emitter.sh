@@ -13,6 +13,7 @@
 # Metrics:
 #   backup_last_success_timestamp_seconds{box,lane,repo}
 #   backup_lane_query_ok{box,lane}
+#   backup_lane_query_failure{box,lane,reason}
 #   backup_emitter_last_run_timestamp_seconds{box}
 #   backup_emitter_errors_total{box}
 #   backup_emitter_duration_seconds{box}
@@ -36,6 +37,8 @@ START_TS="$(date +%s.%N)"
 TMP_FILE="$(mktemp -p "$OUT_DIR" gsp_backup_age.prom.XXXXXX 2>/dev/null || mktemp)"
 BODY="$(mktemp)"
 trap 'rm -f "$TMP_FILE" "$BODY" 2>/dev/null || true' EXIT
+FAILURE_BODY="$(mktemp)"
+trap 'rm -f "$TMP_FILE" "$BODY" "$FAILURE_BODY" 2>/dev/null || true' EXIT
 
 RUN_ERRORS=0
 
@@ -169,6 +172,20 @@ opt_of() { # opt_of "<opts>" "<key>"
   printf '%s' "$1" | tr ',' '\n' | sed -n "s/^$2=//p" | head -1
 }
 
+classify_failure() {
+  local rc="$1" err="$2"
+  # Emit only fixed reasons; provider stderr may contain sensitive values.
+  if [[ "$rc" -eq 10 ]] || grep -Eiq 'repository.*(does not exist|not found)|no such repository|NotFound' "$err"; then
+    printf 'missing_repo'
+  elif [[ "$rc" -eq 12 ]] || grep -Eiq 'wrong password|incorrect password|authentication|unauthorized|access denied|permission denied' "$err"; then
+    printf 'authentication'
+  elif [[ "$rc" -eq 91 || "$rc" -eq 92 || "$rc" -eq 93 || "$rc" -eq 94 ]]; then
+    printf 'configuration'
+  else
+    printf 'transport'
+  fi
+}
+
 if [[ ! -r "$CONF" ]]; then
   log "lane table unreadable: $CONF"
   RUN_ERRORS=$((RUN_ERRORS + 1))
@@ -180,14 +197,14 @@ while IFS='|' read -r lane type repo envs opts; do
   lane="${lane// }"; type="${type// }"
   opts="${opts:-}"
 
-  json=""; rc=0
+  json=""; rc=0; err_file="$(mktemp)"
   case "$type" in
     restic)
-      json="$(query_restic "$repo" "$envs" "$(opt_of "$opts" tag)" "$(opt_of "$opts" b2alias)" 2>/dev/null)" || rc=$?
+      json="$(query_restic "$repo" "$envs" "$(opt_of "$opts" tag)" "$(opt_of "$opts" b2alias)" 2>"$err_file")" || rc=$?
       epoch="$(printf '%s' "$json" | max_snapshot_epoch 2>/dev/null)"
       ;;
     pgbackrest)
-      json="$(query_pgbackrest "$(opt_of "$opts" stanza)" "$(opt_of "$opts" conf)" "$envs" 2>/dev/null)" || rc=$?
+      json="$(query_pgbackrest "$(opt_of "$opts" stanza)" "$(opt_of "$opts" conf)" "$envs" 2>"$err_file")" || rc=$?
       epoch="$(printf '%s' "$json" | pgbackrest_stop_epoch 2>/dev/null)"
       ;;
     *)
@@ -203,10 +220,13 @@ while IFS='|' read -r lane type repo envs opts; do
       "$BOX" "$lane" "$repo" "$epoch" >>"$BODY"
     printf 'backup_lane_query_ok{box="%s",lane="%s"} 1\n' "$BOX" "$lane" >>"$BODY"
   else
-    log "lane $lane: query failed (rc=$rc epoch=$epoch)"
+    reason="$(classify_failure "$rc" "$err_file")"
+    log "lane $lane: query failed (reason=$reason)"
     RUN_ERRORS=$((RUN_ERRORS + 1))
     printf 'backup_lane_query_ok{box="%s",lane="%s"} 0\n' "$BOX" "$lane" >>"$BODY"
+    printf 'backup_lane_query_failure{box="%s",lane="%s",reason="%s"} 1\n' "$BOX" "$lane" "$reason" >>"$FAILURE_BODY"
   fi
+  rm -f "$err_file"
 done < <(cat "$CONF" 2>/dev/null)
 
 TOTAL="$(cat "$ERR_FILE" 2>/dev/null)"
@@ -223,6 +243,9 @@ DURATION="$(awk -v s="$START_TS" -v e="$(date +%s.%N)" 'BEGIN{printf "%.3f", e-s
   echo '# HELP backup_lane_query_ok Whether the emitter could read this lane repository (1=yes, 0=no).'
   echo '# TYPE backup_lane_query_ok gauge'
   grep '^backup_lane_query_ok' "$BODY" 2>/dev/null
+  echo '# HELP backup_lane_query_failure Classified reason the emitter could not read a lane repository.'
+  echo '# TYPE backup_lane_query_failure gauge'
+  cat "$FAILURE_BODY"
   echo '# HELP backup_emitter_last_run_timestamp_seconds Unix epoch the emitter last completed.'
   echo '# TYPE backup_emitter_last_run_timestamp_seconds gauge'
   printf 'backup_emitter_last_run_timestamp_seconds{box="%s"} %s\n' "$BOX" "$(date +%s)"
