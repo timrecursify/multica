@@ -130,29 +130,14 @@ done
 
 for index in "${!sources[@]}"; do
   selected "$index" || continue
+  # A missing target is allowed only when its service directory already
+  # exists. That is the real guard: it catches a wrong runtime root -- the
+  # failure that shipped a manifest pointing at /var/lib/gsp/gsp-multica, a
+  # tree absent on gsp -- while letting a genuinely new file be created. The
+  # per-file allowlist this replaces had to be edited for every added file and
+  # silently encoded the old layout.
   new_targets[$index]=0
-  [[ "${targets[$index]}" == "$runtime_root/gsp-multica/guardrails.cjs" ||
-      "${targets[$index]}" == "$runtime_root/gsp-multica/parked-diagnosis.cjs" ||
-      "${targets[$index]}" == "$runtime_root/gsp-multica/parked-entry-audit.cjs" ||
-      "${targets[$index]}" == "$runtime_root/gsp-multica/parity/relay-dead-rows.cjs" ||
-      "${targets[$index]}" == "$runtime_root/cicd-deploy-evidence.cjs" ||
-      "${targets[$index]}" == "$runtime_root/cicd-watchdog.cjs" ||
-      "${targets[$index]}" == "$runtime_root/merged-pr-recovery-sweep.cjs" ||
-      "${targets[$index]}" == "$runtime_root/gsp-multica/relay-completion-admission.cjs" ]] && new_targets[$index]=1
-  # The wrapper is part of the runtime/source parity contract.  A previous
-  # deployment may have left it absent (for example after a partial rollout),
-  # so allow this deployment to create the named target instead of rejecting
-  # the release before the parity repair can run.
-  [[ "${targets[$index]}" == "$runtime_root/gsp-multica/fleet/multica-daemon-wrapper.sh" ]] && new_targets[$index]=1
-  [[ "${targets[$index]}" == "$runtime_root/tools/belt-concurrency.sh" ]] && new_targets[$index]=1
-  # Added after the last rollout (#547 sentinel, #559 API adapter), so no
-  # runtime copy exists yet.  Same reasoning as the wrapper above: let this
-  # deployment create them rather than refuse the release.
-  [[ "${targets[$index]}" == "$runtime_root/gsp-multica/daemon-health-sentinel.sh" ||
-      "${targets[$index]}" == "$runtime_root/gsp-multica/daemon-health-sentinel.cjs" ||
-      "${targets[$index]}" == "$runtime_root/gsp-multica/github-api-adapter.cjs" ]] && new_targets[$index]=1
-  [[ "${targets[$index]}" =~ /(qc-lane|reconciler|stage-outcome|transition-policy|stage-routing|qc-strict-evidence|qc-verdict-policy)\.cjs$ ||
-      "${targets[$index]}" == "$runtime_root/gsp-multica/stage-routing.json" ]] && new_targets[$index]=1
+  [[ -d "$(dirname -- "${targets[$index]}")" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
     invalid=1
