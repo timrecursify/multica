@@ -143,9 +143,9 @@ async function commentPullRequestUrl(client, issue) {
 
 // Persist the observed PR so the stage input hash (stage-outcome.cjs:51-55) can
 // see a head sha and a checks rollup from here on. Every column is copied from
-// the GitHub API response; nothing is synthesised. installation_id carries the
-// belt's existing 0 sentinel because the relay reads GitHub through `gh`, not
-// through a GitHub App installation.
+// the GitHub API response; nothing is synthesised. installation_id keeps the
+// belt's existing 0 sentinel: the daemon supplies githubCommand, so this row
+// is not keyed to whichever installation minted the token that read it.
 async function linkObservedPullRequest(client, issue, options = {}) {
   const githubCommand = options.githubCommand || ghExec;
   const pointer = await commentPullRequestUrl(client, issue);
@@ -213,7 +213,13 @@ async function mergedPullRequestNoop(client, issue, options = {}) {
       VALUES ($1::uuid, $2, 'Done', 'completed', jsonb_build_object('reason','merged_pull_request','url',$3::text))`,
       [issue.id, issue.status, view.url || pointer.url]);
     return { action: "no_op", reason: "merged_pull_request", status: "Done" };
-  } catch (_) { return null; }
+  } catch (error) {
+    // This used to swallow everything. An unauthenticated `gh` failed here on
+    // every cycle and said nothing, so a merged PR never completed its ticket
+    // and the cause was invisible in the log.
+    console.error(`[reconcile] merged PR check failed issue=${issue.id} pr=${pointer.url} ${error.message}`);
+    return null;
+  }
 }
 
 async function terminalBlocker(client, issue, prior, options = {}) {

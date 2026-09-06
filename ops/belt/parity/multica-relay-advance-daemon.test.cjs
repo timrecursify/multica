@@ -1274,7 +1274,7 @@ test('retry escalation handles Spec in place without posting a self-transition',
 
 // --- GitHub reads run on REST, not GraphQL (relay rate-limit migration) -----
 
-const { github: githubRest, restPrView } = require('./multica-relay-advance-daemon.cjs');
+const { github: githubRest, restPrView , reconcileGithubCommand } = require('./multica-relay-advance-daemon.cjs');
 
 function stubGh(responses) {
   const calls = [];
@@ -1320,6 +1320,57 @@ test('a merged PR reads as MERGED and an unchecked commit rolls up to null', () 
   assert.equal(pr.state, 'MERGED');
   assert.equal(pr.mergeStateStatus, 'UNKNOWN');
   assert.equal(pr.statusCheckRollup, null);
+});
+
+// reconciler.cjs reads these exact names off the parsed result and writes them
+// straight into github_pull_request. A REST name reaching that insert is a
+// silently empty column, so the translation is asserted field by field.
+test('the reconciler PR read translates every REST name it consumes', () => {
+  const { run, calls } = stubGh({ 'pulls/42': JSON.stringify({
+    number: 42, title: 'Fix the belt', state: 'open', merged: false, html_url: 'https://github.com/acme/widget/pull/42',
+    head: { sha: 'c'.repeat(40), ref: 'fix/belt' }, user: { login: 'gsp-multica-belt' },
+    created_at: '2026-09-01T00:00:00Z', updated_at: '2026-09-02T00:00:00Z',
+    merged_at: null, closed_at: null, additions: 3, deletions: 1, changed_files: 2,
+    mergeable: true, mergeable_state: 'clean' }) });
+  const pr = JSON.parse(reconcileGithubCommand(['pr', 'view', 'https://github.com/acme/widget/pull/42',
+    '--json', 'number,title,state,url,headRefOid,createdAt,updatedAt,mergedAt,closedAt,author,headRefName,' +
+    'additions,deletions,changedFiles,mergeable,mergeStateStatus'], run));
+  assert.equal(pr.number, 42);
+  assert.equal(pr.title, 'Fix the belt');
+  assert.equal(pr.state, 'OPEN');
+  assert.equal(pr.url, 'https://github.com/acme/widget/pull/42');
+  assert.equal(pr.headRefOid, 'c'.repeat(40));
+  assert.equal(pr.headRefName, 'fix/belt');
+  assert.deepEqual(pr.author, { login: 'gsp-multica-belt' });
+  assert.equal(pr.createdAt, '2026-09-01T00:00:00Z');
+  assert.equal(pr.updatedAt, '2026-09-02T00:00:00Z');
+  assert.equal(pr.mergedAt, null);
+  assert.equal(pr.closedAt, null);
+  assert.equal(pr.additions, 3);
+  assert.equal(pr.deletions, 1);
+  assert.equal(pr.changedFiles, 2);
+  assert.equal(pr.mergeable, 'MERGEABLE');
+  assert.equal(pr.mergeStateStatus, 'CLEAN');
+  // An unrequested field costs no call: files and checks were never asked for.
+  assert.equal(calls.length, 1);
+});
+
+test('the reconciler merged-PR check sees MERGED through the same reader', () => {
+  const { run } = stubGh({ 'pulls/7': JSON.stringify({ state: 'closed', merged: true,
+    merged_at: '2026-09-03T00:00:00Z', html_url: 'https://github.com/acme/widget/pull/7',
+    head: { sha: 'd'.repeat(40) }, mergeable_state: 'unknown' }) });
+  const pr = JSON.parse(reconcileGithubCommand(['pr', 'view', 'https://github.com/acme/widget/pull/7',
+    '--json', 'state,mergedAt,headRefOid,url'], run));
+  assert.equal(pr.state, 'MERGED');
+  assert.equal(pr.mergedAt, '2026-09-03T00:00:00Z');
+  assert.equal(pr.url, 'https://github.com/acme/widget/pull/7');
+});
+
+test('the reconciler reader refuses a command it cannot serve', () => {
+  assert.throws(() => reconcileGithubCommand(['pr', 'merge', 'https://github.com/acme/widget/pull/7']),
+    /unsupported GitHub command/);
+  assert.throws(() => reconcileGithubCommand(['pr', 'view', 'not-a-pr-url', '--json', 'state']),
+    /unsupported pull request reference/);
 });
 
 test('pr merge becomes a REST squash merge and other gh verbs pass through', () => {
