@@ -21,7 +21,8 @@ workspace_root_resolve() {
   printf '%s\n' "$configured"
 }
 workspace_root_validate_children() {
-  local root="$1" child name allowed bad=0
+  local root="$1" child name allowed bad=0 quarantine candidate
+  quarantine="$root/.quarantine"
   while IFS= read -r -d '' child; do
     name="${child##*/}"
     # The canonical root also holds belt infrastructure beside the workspace
@@ -31,11 +32,43 @@ workspace_root_validate_children() {
     [[ "$name" == .* ]] && continue
     allowed=0
     for uuid in "${BELT_WORKSPACE_UUIDS[@]}"; do [[ "$name" == "$uuid" ]] && allowed=1; done
+    if (( ! allowed )) && [[ -d "$child" && ! -L "$child" ]]; then
+      # Empty unknown directories are safe to quarantine atomically.
+      if [[ -z "$(find "$child" -mindepth 1 -print -quit)" ]]; then
+        mkdir -p -- "$quarantine" || { echo "workspace drift: quarantine unavailable: $child" >&2; bad=1; continue; }
+        candidate="$quarantine/$name"
+        local suffix=0
+        while ! mkdir -- "$candidate" 2>/dev/null; do
+          suffix=$((suffix + 1)); candidate="$quarantine/${name}.$suffix"
+        done
+        rmdir -- "$candidate"
+        if ! mv -- "$child" "$candidate"; then
+          echo "workspace drift: quarantine failed: $name" >&2; bad=1
+        else
+          echo "warning: quarantined unknown empty workspace directory: $child -> $candidate" >&2
+        fi
+        continue
+      fi
+    fi
     if (( ! allowed )) || [[ ! -d "$child" || -L "$child" ]]; then
       echo "workspace drift: malformed or unknown workspace directory: $name" >&2; bad=1
     fi
   done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
   return "$bad"
+}
+workspace_root_workspace_path() {
+  local root="$1" uuid="$2"
+  for allowed in "${BELT_WORKSPACE_UUIDS[@]}"; do
+    [[ "$uuid" == "$allowed" ]] && { printf '%s/%s\n' "$root" "$uuid"; return 0; }
+  done
+  echo "invalid workspace UUID for directory creation: $uuid" >&2
+  return 64
+}
+workspace_root_create_workspace_dir() {
+  local root="$1" uuid="$2" path
+  path="$(workspace_root_workspace_path "$root" "$uuid")" || return
+  mkdir -p -- "$path"
+  printf '%s\n' "$path"
 }
 workspace_root_validate() {
   local root
