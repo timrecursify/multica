@@ -2130,8 +2130,21 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
   }
 }
 
+// The bridge puts the discriminating half of a refusal in `reason` or
+// `message`, not in `error`: `retry_escalation_source_task_required` alone does
+// not say which of the two task budgets tripped, and reading the bridge source
+// was the only way to find out. Carry every field the body offers into the log.
+function relayDenialDetail(response) {
+  let parsed = {};
+  try { parsed = JSON.parse(response.body || '{}') || {}; } catch (_) { parsed = {}; }
+  const parts = [response.error || parsed.error, parsed.reason, parsed.message]
+    .filter((part) => typeof part === 'string' && part.trim());
+  return [...new Set(parts)].join('; ') || String(response.body || '').trim() || 'unknown';
+}
+
 // Retry recorded successful work without creating another agent task.  A relay
-// denial is retried at most three times, then the durable outcome becomes human-owned.
+// refusal (4xx) parks the outcome for a human at once; a denial that can clear
+// by itself is retried at most three times, then the outcome becomes human-owned.
 async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRelay,
   logger = console, typedOutcomes = TYPED_OUTCOMES } = {}) {
   if (!typedOutcomes) return [];
@@ -2183,7 +2196,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         logger.log(`${LOG_PREFIX} [typed-readvance] advanced issue=${row.issue_id} ${row.to_stage}->${targetStage}`);
         continue;
       }
-      const error = `status=${response.status}; error=${response.error || response.body || 'unknown'}`;
+      const error = `status=${response.status}; error=${relayDenialDetail(response)}`;
       const denied = await client.query(
         `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
              jsonb_build_object('typed_readvance_denials',
@@ -2191,7 +2204,19 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
                'typed_readvance_error', $2::text)
           WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)
         RETURNING COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) AS denials`, [row.task_id, error]);
-      if (Number(denied.rows[0]?.denials || 0) >= 3) {
+      // A 4xx is the relay refusing on policy, not failing: the identical POST
+      // earns the identical refusal until something outside this loop changes
+      // the ticket, so retrying it is pure waste. The three-strike allowance is
+      // for a denial that can clear by itself (202 deferred, 5xx no-owner).
+      //
+      // The counter alone did not bound the 4xx case: it lives on the task's
+      // newest relay_run_log row, and a completed task that never produced one
+      // makes the UPDATE match nothing, so `denials` reads 0 forever. Issue
+      // cae70ef9 (task ce297efa, zero relay_run_log rows) was refused
+      // `parked_release_required` on every cycle for hours on 2026-09-06 while
+      // issues whose task did have a run log stopped at exactly three.
+      const refused = response.status >= 400 && response.status < 500;
+      if (refused || Number(denied.rows[0]?.denials || 0) >= 3) {
         await client.query(`UPDATE issue_stage_outcome SET blocked_on = 'human'
           WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
       }

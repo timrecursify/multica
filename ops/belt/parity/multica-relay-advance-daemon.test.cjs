@@ -1380,3 +1380,44 @@ test('pr merge becomes a REST squash merge and other gh verbs pass through', () 
   githubRest(['repo', 'view'], run);
   assert.equal(calls[1], 'repo view');
 });
+
+test('a 409 relay refusal parks the outcome instead of re-posting it every cycle', async () => {
+  const calls = [];
+  const logs = [];
+  const client = { release() {}, query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1',
+      to_stage: 'Parked', outcome: 'ADVANCED', task_id: 'task-1', task_status: 'completed',
+      task_result: { output: 'done' }, issue_title: 'work', next_stage: 'Queue' }] };
+    // The completed task has no relay_run_log row, so the denial counter has
+    // nowhere to live and the UPDATE matches nothing.
+    return { rows: [] };
+  }};
+  let posts = 0;
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => { posts += 1; return { ok: false, status: 409,
+      error: 'parked_release_required',
+      body: '{"error":"parked_release_required","message":"a completed Sol-low diagnosis must authorize one deliberate release"}' }; },
+    logger: { log: (line) => logs.push(line) }, typedOutcomes: true });
+  assert.equal(posts, 1);
+  const parked = calls.find(({ sql }) => sql.includes("SET blocked_on = 'human'"));
+  assert.ok(parked, 'a 409 refusal must park the outcome, or the daemon re-posts it every cycle');
+  assert.deepEqual(parked.values, ['issue-1', 'Parked']);
+  assert.match(logs.join('\n'), /a completed Sol-low diagnosis must authorize one deliberate release/);
+});
+
+test('a transient relay denial keeps its three-strike allowance', async () => {
+  const calls = [];
+  const client = { release() {}, query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1',
+      to_stage: 'Queue', outcome: 'ADVANCED', task_id: 'task-1', task_status: 'completed',
+      task_result: { output: 'done' }, issue_title: 'work', next_stage: 'In Progress' }] };
+    if (sql.includes('typed_readvance_denials')) return { rows: [{ denials: 1 }] };
+    return { rows: [] };
+  }};
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => ({ ok: false, status: 500, error: 'No eligible stage owner in pool' }),
+    logger: { log() {} }, typedOutcomes: true });
+  assert.equal(calls.some(({ sql }) => sql.includes("SET blocked_on = 'human'")), false);
+});
