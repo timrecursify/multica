@@ -49,6 +49,23 @@ test("zero-task issue creates exactly one reconcile task and pending log", async
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO relay_run_log")));
 });
 
+test("completed task with failed outcome is repaired instead of cooling down the stage", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.includes("SELECT id, status, result, error FROM agent_task_queue")) {
+      return { rows: [{ id: "task-poisoned", status: "completed", result: JSON.stringify({ output: "OUTCOME: FAILED\nmultica: command not found" }), error: null }] };
+    }
+    return original(sql, values);
+  };
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "skipped", reason: "completion_failed", taskId: "task-poisoned"
+  });
+  const repair = db.calls.find((call) => call.sql.includes("SET status = 'failed'"));
+  assert.ok(repair, "poisoned completion should be persisted as failed");
+  assert.equal(repair.values[1], "completion_failed");
+});
+
 test("restart is idempotent when the current-stage task is live", async () => {
   const db = harness({ live: [{ id: "task-live", status: "queued", context: taskContext("Queue") }] });
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), { action: "already_live", taskId: "task-live" });

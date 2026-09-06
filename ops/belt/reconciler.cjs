@@ -2,6 +2,7 @@
 const { stageEligibility } = require("./stage-outcome.cjs");
 const { execFileSync } = require("child_process");
 const { resolveBuilderRoute } = require("./guardrails.cjs");
+const { completionAdmission } = require("./relay-completion-admission.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
@@ -303,13 +304,31 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     // Burn guard: never re-dispatch the same stage of one issue inside the cooldown window (GSP-1826).
     const recent = (await client.query(
-      `SELECT id, status FROM agent_task_queue WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
+      `SELECT id, status, result, error FROM agent_task_queue WHERE issue_id = $1::uuid AND context->>'to_stage' = $2::text
          AND (created_at > NOW() - ($3::int * interval '1 minute')
            OR (status = 'completed' AND completed_at > NOW() - ($4::int * interval '1 minute')))
        ORDER BY created_at DESC LIMIT 1`,
       [issue.id, issue.status, options.issueCooldownMinutes, options.completedStageCooldownMinutes]
     )).rows[0];
     if (recent) {
+      // Older daemons could report a failed/no-work-product run through the
+      // success callback.  Do not let that poisoned terminal row arm the
+      // completed-stage burn guard: make the failure durable and let the
+      // normal retry/admission path observe it on the next cycle.
+      if (recent.status === "completed") {
+        const admission = completionAdmission(recent.result ?? (recent.error ? { error: recent.error } : null));
+        if (!admission.ok) {
+          await client.query(
+            `UPDATE agent_task_queue
+                SET status = 'failed', completed_at = COALESCE(completed_at, NOW()),
+                    failure_reason = $2, error = COALESCE(error, $3), updated_at = NOW()
+              WHERE id = $1::uuid AND status = 'completed'`,
+            [recent.id, admission.reason, typeof recent.result === "string" ? recent.result : JSON.stringify(recent.result ?? {})]
+          );
+          await client.query("COMMIT");
+          return { action: "skipped", reason: admission.reason, taskId: recent.id };
+        }
+      }
       await client.query("COMMIT");
       const reason = recent.status === "completed" ? "completed_stage_cooldown" : "issue_cooldown";
       return { action: "skipped", reason, taskId: recent.id };
