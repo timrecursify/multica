@@ -17,22 +17,56 @@ function qcTaskEvidenceResult(task) {
   if (matches.length !== 1) return { reason: 'duplicate-marker' };
   try {
     const evidence = JSON.parse(matches[0][1] ?? matches[0][2]);
-    if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence) ||
-      !['PASS', 'FAIL'].includes(evidence.verdict) ||
-      !/^[0-9a-f]{32}$/i.test(String(evidence.work_product_md5 || '')) ||
-      !/^[0-9a-f]{40}$/i.test(String(evidence.bound_sha || '')) ||
-      !/^[0-9a-f]{40}$/i.test(String(evidence.observed_sha || '')) ||
-      String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase() ||
-      !['none', 'implementation', 'evidence', 'tool', 'access'].includes(evidence.failure_class) ||
-      typeof evidence.qualifying !== 'boolean' || !isQcLane(evidence.model, evidence.effort)) {
-      return { reason: 'invalid-evidence' };
-    }
+    if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return { reason: 'invalid-verdict' };
+    if (evidence.verdict === 'ESCALATE') return { reason: 'escalate-verdict' };
+    if (!['PASS', 'FAIL'].includes(evidence.verdict)) return { reason: 'invalid-verdict' };
+    if (!/^[0-9a-f]{32}$/i.test(String(evidence.work_product_md5 || '')))
+      return { reason: 'invalid-work-product-md5', detail: `len=${String(evidence.work_product_md5 || '').length}` };
+    if (!/^[0-9a-f]{40}$/i.test(String(evidence.bound_sha || '')))
+      return { reason: 'invalid-bound-sha', detail: `len=${String(evidence.bound_sha || '').length}` };
+    if (!/^[0-9a-f]{40}$/i.test(String(evidence.observed_sha || '')))
+      return { reason: 'invalid-observed-sha', detail: `len=${String(evidence.observed_sha || '').length}` };
+    if (String(evidence.bound_sha).toLowerCase() !== String(evidence.observed_sha).toLowerCase()) return { reason: 'sha-binding-mismatch' };
+    if (!['none', 'implementation', 'evidence', 'tool', 'access'].includes(evidence.failure_class)) return { reason: 'invalid-failure-class' };
+    if (typeof evidence.qualifying !== 'boolean') return { reason: 'invalid-qualifying' };
+    if (!isQcLane(evidence.model, evidence.effort)) return { reason: 'non-qc-lane' };
     return { evidence };
   } catch { return { reason: 'invalid-json' }; }
 }
 
 function qcTaskEvidence(task) {
   return qcTaskEvidenceResult(task).evidence || null;
+}
+
+// The claim is what keeps the candidate query from selecting this task again,
+// so every rejected verdict records one -- ESCALATE included. It used to return
+// before claiming, and because a rejected verdict never produces a qc_verdict
+// row, the NOT EXISTS in the candidate query stayed true and the same ten tasks
+// came back every cycle, roughly every 15 seconds, indefinitely (GSP-2329).
+// The key is the task id alone: a re-QC is a new task, so a corrected verdict
+// is never suppressed by an earlier task's claim.
+async function claimQcEvidenceRejection(client, task) {
+  const claimed = await client.query(
+    `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+      'qc_evidence_skipped', COALESCE(metadata->'qc_evidence_skipped', '{}'::jsonb) || jsonb_build_object($2::text, true))
+      WHERE id = $1::uuid AND NOT (COALESCE(metadata->'qc_evidence_skipped', '{}'::jsonb) ? $2::text) RETURNING id`,
+    [task.issue_id, String(task.id)]);
+  return claimed.rowCount > 0;
+}
+
+async function commentQcEvidenceRejection(client, task, parsed) {
+  if (!await claimQcEvidenceRejection(client, task)) return;
+  // An ESCALATE verdict is claimed like any other, but carries no remediation
+  // instruction, so it gets no ticket comment.
+  if (parsed.reason === 'escalate-verdict') return;
+  const detail = parsed.detail ? ` (${parsed.detail})` : '';
+  let instruction = 'the marker failed validation.';
+  if (parsed.reason === 'invalid-bound-sha' || parsed.reason === 'invalid-observed-sha') instruction = 'bound_sha and observed_sha must each be the full 40-character SHA from the QC-GATE PASS comment. Do not copy a SHA out of a QC-ESCALATE comment. Re-derive it.';
+  else if (parsed.reason === 'invalid-qualifying') instruction = 'qualifying must be an unquoted JSON boolean (true or false), not a string.';
+  const content = `[qc-evidence-discarded] Verdict was discarded: reason=${parsed.reason}${detail}. ${instruction}`;
+  await client.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+    VALUES ($1::uuid, $2::uuid, 'system', '00000000-0000-0000-0000-000000000000'::uuid, $3::text, 'system')`,
+  [task.issue_id, task.workspace_id, content]);
 }
 
 function noArtifactRescopeBatch(env = process.env) {
@@ -45,7 +79,7 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
   logPrefix = '[relay-advance-daemon]', env = process.env } = {}) {
   if (!conversionEnabled(env)) return new Set();
   const candidates = await client.query(
-    `SELECT t.id, t.issue_id, t.created_at, t.result, a.name AS agent_name, i.number,
+    `SELECT t.id, t.issue_id, t.workspace_id, t.created_at, t.result, a.name AS agent_name, i.number,
             COALESCE(a.model, a.runtime_config->>'model') AS agent_model,
             COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') AS agent_effort
        FROM agent_task_queue t
@@ -58,6 +92,14 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
         AND NOT EXISTS (
           SELECT 1 FROM qc_verdict verdict WHERE verdict.issue_id = t.issue_id
             AND verdict.created_at >= t.created_at)
+        -- Drop tasks whose evidence was already rejected. Without this the row
+        -- is re-read forever: a rejected verdict writes no qc_verdict, so the
+        -- clause above never stops matching. The LIKE also covers the earlier
+        -- "<task>:<reason>" key so an already-marked task is not re-commented.
+        AND NOT EXISTS (
+          SELECT 1 FROM jsonb_object_keys(
+            COALESCE(i.metadata->'qc_evidence_skipped', '{}'::jsonb)) k
+           WHERE k = t.id::text OR k LIKE t.id::text || ':%')
       ORDER BY t.issue_id, t.completed_at DESC NULLS LAST, t.created_at DESC, t.id DESC
       LIMIT 100`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]
   );
@@ -67,20 +109,9 @@ async function convertCompletedQcEvidence(client, { postRelay, logger = console,
     if (seenIssues.has(task.issue_id)) continue;
     const parsed = qcTaskEvidenceResult(task);
     if (!parsed.evidence) {
-      logger.log(`${logPrefix} [qc-evidence-skipped] task=${task.id} reason=${parsed.reason}`);
-      // Make rejected evidence visible on the ticket so a discarded verdict
-      // is actionable instead of silently triggering another QC run.
-      try {
-        const content = `<!-- multica-qc-evidence-rejected -->\nQC evidence rejected: ${parsed.reason}\nsource_task_id: ${task.id}`;
-        await client.query(
-          `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
-           SELECT $1::uuid, i.workspace_id, 'system', '00000000-0000-0000-0000-000000000000'::uuid, $2::text, 'system'
-             FROM issue i WHERE i.id = $1::uuid
-               AND NOT EXISTS (SELECT 1 FROM comment WHERE issue_id = $1::uuid AND content = $2::text)`,
-          [task.issue_id, content]);
-      } catch (error) {
-        logger.log(`${logPrefix} [qc-evidence-rejection-comment-failed] task=${task.id} error=${error.message}`);
-      }
+      logger.log(`${logPrefix} [qc-evidence-skipped] task=${task.id} reason=${parsed.reason}` +
+        (parsed.detail ? ` ${parsed.detail}` : ''));
+      await commentQcEvidenceRejection(client, task, parsed);
       continue;
     }
     const { evidence } = parsed;
@@ -128,6 +159,14 @@ async function rescopeCompletedNoArtifactQc(client, { postRelay, logger = consol
         AND NOT EXISTS (
           SELECT 1 FROM qc_verdict verdict WHERE verdict.issue_id = t.issue_id
             AND verdict.created_at >= t.created_at)
+        -- Drop tasks whose evidence was already rejected. Without this the row
+        -- is re-read forever: a rejected verdict writes no qc_verdict, so the
+        -- clause above never stops matching. The LIKE also covers the earlier
+        -- "<task>:<reason>" key so an already-marked task is not re-commented.
+        AND NOT EXISTS (
+          SELECT 1 FROM jsonb_object_keys(
+            COALESCE(i.metadata->'qc_evidence_skipped', '{}'::jsonb)) k
+           WHERE k = t.id::text OR k LIKE t.id::text || ':%')
         AND NOT EXISTS (
           SELECT 1 FROM agent_task_queue live WHERE live.issue_id = t.issue_id
             AND live.status IN ('queued', 'running'))
@@ -230,4 +269,5 @@ async function closeDeadRelayRows(client, { terminalStages, requestRetryEscalati
 }
 
 module.exports = { closeDeadRelayRows, convertCompletedQcEvidence, conversionEnabled,
+  qcTaskEvidenceResult, commentQcEvidenceRejection, claimQcEvidenceRejection,
   noArtifactRescopeBatch, rescopeCompletedNoArtifactQc };
