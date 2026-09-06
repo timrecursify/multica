@@ -44,6 +44,8 @@ EOF
 chmod +x "$fake/daemon"
 daemon_cwd="$fake/daemon-root"
 mkdir -p -- "$daemon_cwd"
+mkdir -p -- "$fake/ws" "$fake/new-workspaces"
+export BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws"
 capture="$fake/capture"
 launch_marker="$fake/daemon-launch"
 DAEMON_LAUNCH_MARKER="$launch_marker" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/ws" MULTICA_WORKSPACES_ROOT="$fake/ws" "$root_dir/multica-daemon-wrapper.sh"

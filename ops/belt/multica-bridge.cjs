@@ -7,6 +7,7 @@ const { execFileSync } = require("child_process");
 const {
   isBundledChild,
   instructionCompatibility,
+  agentRegistryDefects,
   spendPreflight,
   budgetCountPredicate,
   stageCycleAdmission,
@@ -2676,6 +2677,13 @@ async function assertRoutableStagesHaveOwners() {
         ORDER BY rsc.workspace_id, rsc.id`
     );
     assertRoutableStageOwners(result.rows);
+    const registry = await client.query(
+      `SELECT id, name, instructions, archived_at FROM agent
+       UNION ALL SELECT NULL::uuid, NULL::text, NULL::text, NULL::timestamptz WHERE false`
+    );
+    const pool = await client.query(`SELECT agent_id, stage_name, enabled FROM relay_stage_agent_pool`);
+    const defects = agentRegistryDefects(registry.rows, pool.rows);
+    if (defects.length) throw new Error(`Agent registry validation failed: ${defects.join('; ')}`);
   } finally {
     await client.end();
   }

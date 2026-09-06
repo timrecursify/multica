@@ -83,6 +83,28 @@ function instructionCompatibility(instructions, targetStage) {
   };
 }
 
+function agentRegistryDefects(agents = [], pool = []) {
+  const defects = [];
+  const names = new Map();
+  for (const agent of agents) {
+    const name = String(agent.name || '').trim();
+    if (!name) continue;
+    const list = names.get(name) || [];
+    list.push(agent); names.set(name, list);
+    if (!String(agent.instructions || '').trim()) defects.push(`${agent.id || '?'}:${name}:blank_instructions`);
+  }
+  for (const [name, list] of names) {
+    if (list.length > 1 && !list.every(a => a.archived_at != null)) defects.push(`${name}:duplicate_name:${list.map(a => a.id || '?').join(',')}`);
+  }
+  for (const member of pool) {
+    if (member.enabled === false) continue;
+    const agent = agents.find(a => String(a.id) === String(member.agent_id));
+    if (!agent) { defects.push(`${member.agent_id || '?'}:${member.stage_name}:missing_agent`); continue; }
+    if (instructionStages(agent.instructions).size === 0) defects.push(`${agent.id}:${agent.name}:${member.stage_name}:zero_permitted_stages`);
+  }
+  return defects.sort();
+}
+
 function hasActiveTaskForIssueStage(tasks, issueId, stage) {
   const wanted = canonicalStage(stage);
   return (tasks || []).some((task) => {
@@ -295,6 +317,7 @@ module.exports = {
   canonicalStage,
   isBundledChild,
   instructionStages,
+  agentRegistryDefects,
   instructionCompatibility,
   hasActiveTaskForIssueStage,
   isActiveExecutionTask,
