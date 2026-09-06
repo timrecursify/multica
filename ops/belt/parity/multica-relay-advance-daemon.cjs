@@ -326,6 +326,19 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
   return {};
 }
 
+// RUNBOOK_BUILD_WORKER.md tells a builder to record NO-SHA in its comment for
+// no-code work, while the bridge reads NO-SHA from the posted work product.
+// Carry the newest NO-SHA comment when the task result itself lacks the token.
+async function completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance) {
+  const evidence = completionEvidence(row, targetStage, route, qcAdvance);
+  if (route?.kind !== 'no_pr' || targetStage !== 'Done' ||
+      /\bNO-SHA\b/i.test(String(evidence.workProductEvidence || ''))) return evidence;
+  const comment = await client.query(
+    `SELECT content FROM comment WHERE issue_id = $1::uuid AND content ~* '\\mNO-SHA\\M'
+      ORDER BY created_at DESC LIMIT 1`, [row.issue_id]);
+  return comment.rows[0] ? { ...evidence, workProductEvidence: comment.rows[0].content } : evidence;
+}
+
 // Gate by ticket transition and PR evidence, never by the stage row that
 // happened to record the worker completion. Queue-produced PRs can skip the
 // In Progress outcome entirely.
@@ -362,6 +375,16 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   const pr = JSON.parse(githubCommand(['pr', 'view', prUrl, '--json',
     'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
   const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
+  // The bridge (#528) refuses In Progress -> CI/CD & Deploy unless a qualifying
+  // Sol-low QC pass exists, and only In Review produces one, so a runtime
+  // route posted straight from the build stage is refused every time and the
+  // ticket is rebuilt after cooldown. Send it through review; QC advances it
+  // to deploy (qcCompletionAdvance).
+  // The same applies to a merged non-runtime PR: In Progress -> Done is
+  // reserved for NO-SHA work products, so a code-bearing route reviews first.
+  if (row.to_stage === 'In Progress' && route.kind !== 'no_pr' && route.toStage && route.toStage !== 'In Review') {
+    return { ...route, toStage: 'In Review', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
+  }
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
       greenChecks(pr.statusCheckRollup)) {
     githubCommand(['pr', 'merge', prUrl, '--squash', '--admin']);
@@ -1151,7 +1174,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         const payload = { issue_id: row.issue_id, to_stage: targetStage,
           agent_token: RELAY_AGENT_SECRET,
           relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
-          evidence: completionEvidence(row, targetStage, route, qcAdvance),
+          evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
           ...(route ? { routing_classification: route } : {}),
           ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
         if (process.env.QC_GATE_ENABLED === '1' && qcGateRequired(row, targetStage, route)) {
@@ -2164,9 +2187,10 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         ORDER BY o.outcome_at ASC LIMIT 100`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
     const advanced = [];
     for (const row of result.rows) {
-      const route = row.outcome === 'NO_OP' && row.to_stage === 'In Progress'
-        ? { kind: 'no_pr', toStage: 'Done' }
-        : await buildCompletionRoute(client, row);
+      // A NO_OP build with a linked or commented PR still carries code: let
+      // buildCompletionRoute decide; it returns the no_pr -> Done route itself
+      // when no PR exists.
+      const route = await buildCompletionRoute(client, row);
       const targetStage = route?.toStage || row.next_stage;
       if (!targetStage) continue;
       const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
@@ -2189,7 +2213,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       }
       const response = await postRelay({ issue_id: row.issue_id, to_stage: targetStage,
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
-        evidence: completionEvidence(row, targetStage, route, qcAdvance),
+        evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
         ...(route ? { routing_classification: route } : {}) });
       if (response.ok) {
         advanced.push(row.issue_id);
