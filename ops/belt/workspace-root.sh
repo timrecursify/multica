@@ -23,7 +23,13 @@ workspace_root_resolve() {
 workspace_root_validate_children() {
   local root="$1" child name allowed bad=0
   while IFS= read -r -d '' child; do
-    name="${child##*/}"; allowed=0
+    name="${child##*/}"
+    # The canonical root also holds belt infrastructure beside the workspace
+    # directories -- .repos (the bare-clone cache QC reads), .multica and
+    # .skill-cache. They are not workspaces and never were drift, so treating
+    # them as such refuses to start the worker on a correctly provisioned host.
+    [[ "$name" == .* ]] && continue
+    allowed=0
     for uuid in "${BELT_WORKSPACE_UUIDS[@]}"; do [[ "$name" == "$uuid" ]] && allowed=1; done
     if (( ! allowed )) || [[ ! -d "$child" || -L "$child" ]]; then
       echo "workspace drift: malformed or unknown workspace directory: $name" >&2; bad=1
