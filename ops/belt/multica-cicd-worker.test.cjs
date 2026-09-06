@@ -197,6 +197,13 @@ test('closure stall returns to Spec with system retry-escalation evidence', asyn
   }), relay: async (...args) => calls.push(args) });
 });
 
+test('watchdog escalation carries the producing CI/CD task id', async () => {
+  const calls = [];
+  worker.setTestDependencies({ watchdog: { observe: () => ({ stage: 'CI/CD & Deploy', first_seen_at: new Date(0).toISOString(), last_error: 'x', correlation_key: 'c' }), stalled: () => true, markAlerted: r => r }, relay: async (...args) => calls.push(args) });
+  await worker.watchdogFailure({ ...issue, relay_source_task_id: '323e4567-e89b-42d3-a456-426614174000' }, 'x');
+  assert.equal(calls[0][6], '323e4567-e89b-42d3-a456-426614174000');
+});
+
 test('worker retains no self-deploy or direct database writes', () => {
   const source = require('fs').readFileSync(require.resolve('./multica-cicd-worker.cjs'), 'utf8');
   // Merge is belt-owned since 2026-09-03 (CI/CD & Deploy owned end to end);

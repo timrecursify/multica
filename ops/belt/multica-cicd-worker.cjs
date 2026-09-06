@@ -99,13 +99,14 @@ function rateLimitBody(raw) {
   return split[split.length - 1];
 }
 
-let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence) {
+let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence, sourceTaskId) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: relayToken,
       ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}),
       ...(reason ? { reason } : {}),
       ...(parkedAudit ? { parked_audit: parkedAudit } : {}),
-      ...(evidence ? { evidence } : {}) });
+      ...(evidence ? { evidence } : {}),
+      ...(sourceTaskId ? { relay_source_task_id: sourceTaskId } : {}) });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);
@@ -159,7 +160,7 @@ async function retryEscalation(issue, toStage, reason, evidence = {}) {
   const retryEvidence = { retry_escalation: true, blocker: reason, ...evidence };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: toStage, actor: 'system', evidence: retryEvidence });
   if (!verdict.ok) throw new Error(`transition policy rejected ${toStage}: ${verdict.code}`);
-  await relay(issue.id, toStage, null, reason, null, retryEvidence);
+  await relay(issue.id, toStage, null, reason, null, retryEvidence, issue.relay_source_task_id);
 }
 
 async function watchdogFailure(issue, error, sha = '') {
@@ -172,7 +173,7 @@ async function watchdogFailure(issue, error, sha = '') {
     const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
     const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
     if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
-    await relay(issue.id, 'Spec', null, detail, null, evidence);
+    await relay(issue.id, 'Spec', null, detail, null, evidence, issue.relay_source_task_id);
     log(`ESCALATE #${issue.number} — ${detail}`);
     return { stalled: true, audit: stalled };
   }
@@ -182,7 +183,7 @@ async function watchdogFailure(issue, error, sha = '') {
     const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
     const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
     if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
-    await relay(issue.id, 'Spec', null, detail, null, evidence);
+    await relay(issue.id, 'Spec', null, detail, null, evidence, issue.relay_source_task_id);
     log(`ESCALATE #${issue.number} — ${detail}`);
     return { stalled: true, audit: row };
   }
@@ -644,7 +645,10 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
 async function sweep() {
   const prCache = new Map();
   const { rows } = await pool.query(
-    `SELECT id, number, title, workspace_id, metadata FROM issue WHERE status='CI/CD & Deploy' ORDER BY number`);
+    `SELECT i.id, i.number, i.title, i.workspace_id, i.metadata,
+       (SELECT t.id FROM agent_task_queue t WHERE t.issue_id=i.id
+          AND t.context->>'to_stage'='CI/CD & Deploy' ORDER BY t.created_at DESC LIMIT 1) AS relay_source_task_id
+     FROM issue i WHERE i.status='CI/CD & Deploy' ORDER BY i.number`);
   if (!rows.length) { log('[poll] CI/CD & Deploy is empty'); return; }
   log(`[poll] ${rows.length} ticket(s) in CI/CD & Deploy`);
   for (let issueIndex = 0; issueIndex < rows.length; issueIndex++) {

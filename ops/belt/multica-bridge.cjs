@@ -637,7 +637,7 @@ async function retryEscalationSourceTask(client, issue, requestedTaskId = null) 
           OR (t.status IN ('completed','failed','cancelled') AND EXISTS (
             SELECT 1 FROM relay_run_log r
              WHERE r.task_id = t.id AND r.issue_id = t.issue_id
-               AND r.to_stage = $3::text AND r.status = 'pending'
+               AND r.to_stage = $3::text
           ))
         )
       ORDER BY t.created_at DESC, t.id DESC LIMIT 2 FOR UPDATE OF t`,

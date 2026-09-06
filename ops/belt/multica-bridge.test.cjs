@@ -86,6 +86,14 @@ test('relay transition admission is a single pre-mutation decision', () => {
     expectedStage: 'In Progress' }).ok, false);
 });
 
+test('terminal retry source accepts failed or completed provenance but requires one row', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: '223e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
+  const client = { query: async () => ({ rows: [{ id: '323e4567-e89b-42d3-a456-426614174000' }] }) };
+  assert.equal(await retryEscalationSourceTask(client, issue), '323e4567-e89b-42d3-a456-426614174000');
+  const empty = { query: async () => ({ rows: [] }) };
+  assert.equal(await retryEscalationSourceTask(empty, issue), null);
+});
+
 test('operator respec validates requests and replays the same receipt', async () => {
   const issueId = '123e4567-e89b-42d3-a456-426614174000';
   const payload = { issue_id: issueId, reason: 'lifetime cap exhausted', idempotency_key: 'respec-0001' };
