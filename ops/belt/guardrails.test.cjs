@@ -39,7 +39,10 @@ test('dispatch requires the target stage to be named by agent instructions', () 
 test('belt routing allows DeepSeek/Terra builders and QC-lane QC/spec only', () => {
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-deepseek', model: 'deepseek/v4', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-terra', model: 'gpt-5.6-terra', thinking_level: 'low' }).ok, true);
-  assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'low' }).reason, 'builder_requires_deepseek_or_terra');
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'low' }).ok, true);
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-terra', model: 'gpt-5.6-terra', thinking_level: 'low' }).ok, true);
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-opus', model: 'claude-opus-4-6', thinking_level: 'low' }).reason, 'builder_requires_build_lane');
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'medium' }).reason, 'belt_low_reasoning_effort_required');
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-luna', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
