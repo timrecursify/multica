@@ -1947,6 +1947,20 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         continue;
       }
       const error = `status=${response.status}; error=${response.error || response.body || 'unknown'}`;
+      // A duplicate means the destination already applied this transition.
+      // Record it as terminal for this outcome before generic denial retry
+      // accounting, otherwise every reconcile cycle submits the same request.
+      if (isDuplicateRelayResponse(response)) {
+        await client.query(`UPDATE issue_stage_outcome SET blocked_on = 'human'
+          WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
+        await client.query(
+          `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
+             jsonb_build_object('typed_readvance_duplicate', true, 'typed_readvance_error', $2::text)
+           WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)`,
+          [row.task_id, error]);
+        logger.log(`${LOG_PREFIX} [typed-readvance] duplicate treated as terminal issue=${row.issue_id} ${error}`);
+        continue;
+      }
       const denied = await client.query(
         `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
              jsonb_build_object('typed_readvance_denials',
@@ -1964,6 +1978,13 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
   } finally {
     client.release();
   }
+}
+
+function isDuplicateRelayResponse(response) {
+  if (!response || response.ok) return false;
+  const text = [response.error, response.body, response.message, response.code]
+    .filter(Boolean).join(' ');
+  return /\bduplicate\b|already\s+(?:advanced|in\s+the\s+requested\s+stage|exists)|transition[_ -]?already[_ -]?applied/i.test(text);
 }
 
 // A QC FAIL is a return to the builder, not a final stage outcome. The legacy
@@ -2092,4 +2113,5 @@ module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTas
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
+  isDuplicateRelayResponse,
   github, restPrView, restStatusCheckRollup };

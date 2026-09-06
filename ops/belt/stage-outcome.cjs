@@ -132,7 +132,7 @@ async function recordStageOutcomes(client, { windowMinutes = 180, logger = conso
 // Reconciler eligibility: dispatch only when nothing is recorded for this stage or
 // the inputs changed since. BLOCKED/human never re-opens without a hash change.
 // FAILED is retryable after a bounded TTL; callers may pass a clock/config for tests.
-async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Number.parseInt(process.env.MULTICA_FAILED_TTL_MINUTES || "15", 10), now = Date.now(), attempt, maxAttempts } = {}) {
+async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Number.parseInt(process.env.MULTICA_FAILED_TTL_MINUTES || "15", 10), unchangedTtlMinutes = Number.parseInt(process.env.MULTICA_UNCHANGED_TTL_MINUTES || "60", 10), now = Date.now(), attempt, maxAttempts } = {}) {
   const prior = (await client.query(outcomeForStageSql(), [issueId, stage])).rows[0];
   if (!prior) return { eligible: true, reason: "no_outcome" };
   const currentRow = (await client.query(stageInputHashSql(), [issueId])).rows[0] || {};
@@ -161,6 +161,15 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
         Number(now) - outcomeAt >= ttlMinutes * 60 * 1000) {
       return { eligible: true, reason: "advanced_stall", prior };
     }
+  }
+  // Unchanged outcomes are advisory, not terminal. Re-open the stage after a
+  // bounded wall-clock interval so a completed task cannot strand an issue
+  // indefinitely when no input hash changes. The reconciler's lifetime cap
+  // still bounds paid attempts and routes exhausted issues for review.
+  const unchangedTtl = Number(unchangedTtlMinutes);
+  if (Number.isFinite(unchangedTtl) && unchangedTtl > 0 && Number.isFinite(outcomeAt) &&
+      Number(now) - outcomeAt >= unchangedTtl * 60 * 1000) {
+    return { eligible: true, reason: "unchanged_ttl_expired", prior };
   }
   return { eligible: false, reason: `outcome_unchanged:${prior.outcome}${prior.blocked_on ? "/" + prior.blocked_on : ""}`, prior };
 }
