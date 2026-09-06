@@ -6,13 +6,19 @@ ALTER TABLE agent_task_queue
 -- task update timestamp, or may contain a stale value from a replay. Reconcile
 -- every row (not only NULLs) before enforcing the invariant so migration also
 -- succeeds on databases that already have this column populated.
+-- agent_task_queue_active_requires_runtime was added NOT VALID, so rows that
+-- predate it survive but cannot be updated at all: touching one raises a check
+-- violation and takes this whole migration down with it. Skip exactly those
+-- rows. On a database whose rows all satisfy that constraint this WHERE clause
+-- selects everything, so the backfill is unchanged.
 UPDATE agent_task_queue
 SET updated_at = GREATEST(
     COALESCE(updated_at, '-infinity'::timestamptz),
     created_at,
     COALESCE(started_at, '-infinity'::timestamptz),
     COALESCE(completed_at, '-infinity'::timestamptz)
-);
+)
+WHERE runtime_id IS NOT NULL OR completed_at IS NOT NULL;
 
 ALTER TABLE agent_task_queue
     ALTER COLUMN updated_at SET DEFAULT now(),
