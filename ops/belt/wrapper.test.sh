@@ -41,7 +41,7 @@ grep -q "cwd=$daemon_cwd" "$capture"
 env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/empty.lock" "$root_dir/multica-daemon-wrapper.sh"
 grep -q -- '--max-concurrent-tasks=2' "$capture"
 DAEMON_SUPPORTS_WORKSPACES_FLAG=0 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 12' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/new.lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=12 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/new-workspaces" "$root_dir/multica-daemon-wrapper.sh"
-grep -q '^daemon start --foreground --daemon-id=gsp-multica-worker --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks=12$' "$capture"
+grep -q '^daemon start --foreground --daemon-id=gsp-codex --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks=12 --profile=gsp-codex$' "$capture"
 grep -q "cap=12 root=$fake/new-workspaces daemon_root=$fake/new-workspaces workspaces=2" "$capture"
 if grep -q -- '--workspaces-root' "$capture"; then
   echo 'flagless daemon unexpectedly received --workspaces-root' >&2
