@@ -203,9 +203,13 @@ function stageCycleAdmission(taskCount, limit = 2) {
   const count = Number(taskCount);
   const ceiling = Number(limit);
   if (!Number.isInteger(ceiling) || ceiling < 1) return { ok: false, reason: 'invalid_stage_cycle_limit' };
+  // Reaching the ceiling stops another paid run at this stage; it does not end
+  // the ticket. Rejecting here killed work whose only fault was that the belt
+  // itself was broken while the cycles accrued. Hand the flight to the
+  // escalation lane instead, which is what qc_bounce_ceiling already does.
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Rejected' };
+    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Spec' };
 }
 
 function budgetCountPredicate(taskAlias = '') {

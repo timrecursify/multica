@@ -146,13 +146,26 @@ test('quota pauses self-clear after fifteen minutes without an exhausted workspa
     'quota_paused flip agent="DeepSeek Builder" timestamp=2026-09-01T12:00:00.000Z value=true');
 });
 
-test('stage cycle breaker rejects repeated task creation at its exact ceiling', () => {
+test('stage cycle breaker escalates rather than ending the ticket at its ceiling', () => {
   assert.deepEqual(stageCycleAdmission(0), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
+  // Spec, not Rejected: the ceiling stops another paid run at this stage, it
+  // does not terminate the work. A terminal disposition here killed 11 live
+  // tickets whose cycles accrued while the belt itself was broken.
   assert.deepEqual(stageCycleAdmission(2), {
     ok: false, reason: 'stage_cycle_limit', ceiling: 2,
-    disposition: 'Rejected'
+    disposition: 'Spec'
   });
+});
+
+test('the cycle ceiling never disposes a ticket to a terminal stage', () => {
+  const terminal = new Set(['Rejected', 'Cancelled']);
+  for (const count of [2, 3, 9]) {
+    const admission = stageCycleAdmission(count);
+    assert.equal(admission.ok, false);
+    assert.ok(!terminal.has(admission.disposition),
+      `cycle ceiling disposed to terminal stage ${admission.disposition}`);
+  }
 });
 
 test('budget predicate counts a completed In Review task with a post-completion verdict', () => {
