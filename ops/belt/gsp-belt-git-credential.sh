@@ -6,7 +6,15 @@
 # the narrowing is the whole point: an unscoped token would hand the belt write
 # access to every repository the app can see. Only the repositories the belt
 # actually works are allowed, and each token carries contents+pull_requests
-# write and metadata read, nothing else.
+# write, metadata read, and the two read-only commit-check permissions the QC
+# gate needs, nothing else.
+#
+# checks:read and statuses:read are here because the QC gate reads
+# `repos/<r>/commits/<sha>/check-runs` and `.../status` through this token.
+# Without them GitHub answers 403 "Resource not accessible by integration" and
+# names the missing scope in X-Accepted-Github-Permissions, the gate takes its
+# tool_error path, and the ticket's work is thrown away and re-attempted. Both
+# are read: the belt never creates or updates a check run or a commit status.
 #
 # Two modes:
 #   get                       git credential protocol; reads the repository
@@ -17,7 +25,7 @@
 #                             a shell that needs `gh` mints the token this way.
 set -euo pipefail
 
-ENV_FILE=/etc/gsp/gh-app/gsp.env
+ENV_FILE="${GSP_BELT_GH_ENV:-/etc/gsp/gh-app/gsp.env}"
 CACHE_DIR="${HOME:-/var/lib/gsp-multica}/.cache"
 ALLOWED_REPOS="multica sk-cli ppp"
 DEFAULT_REPO=multica
@@ -77,7 +85,7 @@ sig=$(printf "%s" "$header.$payload" | openssl dgst -sha256 -sign "$GH_APP_PEM" 
 token=$(curl -sS -X POST \
   -H "Authorization: Bearer $header.$payload.$sig" \
   -H "Accept: application/vnd.github+json" \
-  -d "{\"repositories\":[\"$repo\"],\"permissions\":{\"contents\":\"write\",\"pull_requests\":\"write\",\"metadata\":\"read\"}}" \
+  -d "{\"repositories\":[\"$repo\"],\"permissions\":{\"contents\":\"write\",\"pull_requests\":\"write\",\"metadata\":\"read\",\"checks\":\"read\",\"statuses\":\"read\"}}" \
   "https://api.github.com/app/installations/$GH_APP_INSTALLATION_ID/access_tokens" \
   | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"token\",\"\"))")
 

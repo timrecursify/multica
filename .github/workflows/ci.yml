@@ -272,6 +272,9 @@ jobs:
       - name: Test daemon deployment contract
         run: bash ops/belt/deploy.test.sh
 
+      - name: Test belt git token permission contract
+        run: bash ops/belt/gsp-belt-git-credential.test.sh
+
       - name: Test scoping driver satisfies the bridge spec gate
         run: bash ops/belt/scoping-driver-spec-contract.test.sh
 
