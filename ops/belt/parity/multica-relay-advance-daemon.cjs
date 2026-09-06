@@ -826,6 +826,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name AND rsc.workspace_id = i.workspace_id
       ${evidenceSql.joins}
       WHERE atq.status = 'completed'
+        AND (atq.relay_retired_at IS NULL OR atq.updated_at > atq.relay_retired_at)
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
       ORDER BY rrl.created_at ASC
@@ -860,6 +861,9 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         // trigger. This also neutralizes old rows created before the bridge
         // stopped terminal-stage dispatch.
         if (TERMINAL_STAGES.has(row.to_stage)) {
+          await client.query(`UPDATE agent_task_queue
+             SET relay_retired_at = NOW(), relay_retired_reason = 'terminal-stage'
+           WHERE id = $1 AND (relay_retired_at IS NULL OR updated_at > relay_retired_at)`, [row.task_id]);
           await markRelayLogCompletedById(client, row.log_id);
           logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
           continue;
