@@ -113,6 +113,31 @@ test("recordStageOutcomes rejects an In Progress ADVANCED result without PR evid
   assert.match(logs[0], /missing review evidence/);
 });
 
+test("recordStageOutcomes links observed PR before validating In Progress evidence", async () => {
+  const Module = require("node:module");
+  const originalLoad = Module._load;
+  let linked = false;
+  Module._load = function(request, parent, isMain) {
+    if (request === "./reconciler.cjs") return { linkObservedPullRequest: async () => { linked = true; } };
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    const c = fakeClient([
+      [{ id: "t4", issue_id: "i4", stage: "In Progress", output: "OUTCOME: ADVANCED" }],
+      [{ has_review_evidence: false }],
+      [{ id: "i4", workspace_id: "w1", status: "In Progress" }],
+      [{ has_review_evidence: true }],
+      [{ input_hash: "h4" }], []
+    ]);
+    const result = await so.recordStageOutcomes(c, { logger: { log() {} }, githubCommand: () => "{}" });
+    assert.deepEqual(result, { scanned: 1, recorded: 1, failed: 0 });
+    assert.equal(linked, true);
+    assert.equal(c.calls[5].params[2], "ADVANCED");
+  } finally {
+    Module._load = originalLoad;
+  }
+});
+
 test("input hash ignores belt output and keys operator comments by content", () => {
   const sql = so.stageInputHashSql();
   // A builder's own comment must never re-open the stage it just reported on.

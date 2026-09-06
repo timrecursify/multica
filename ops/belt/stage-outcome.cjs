@@ -153,7 +153,7 @@ async function recordOneOutcome(client, row, logger, { githubCommand } = {}) {
        ) AS has_review_evidence`, [row.issue_id])).rows[0];
     if (!evidence?.has_review_evidence && githubCommand) {
       const issue = (await client.query(
-        `SELECT id, workspace_id, status FROM issues WHERE id = $1::uuid`, [row.issue_id])).rows[0];
+        `SELECT id, workspace_id, status FROM issue WHERE id = $1::uuid`, [row.issue_id])).rows[0];
       if (issue) {
         const { linkObservedPullRequest } = require('./reconciler.cjs');
         await linkObservedPullRequest(client, issue, { githubCommand });
