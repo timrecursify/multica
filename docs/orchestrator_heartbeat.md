@@ -14,5 +14,10 @@ scrape_configs:
       - targets: ["multica:9090"] # match METRICS_ADDR
 ```
 
-The `OrchestratorHeartbeatMissing` alert should fire when the gauge is absent
-or older than the expected heartbeat interval (with a startup grace period).
+The rules distinguish three failure modes. `OrchestratorHeartbeatMissing` fires
+after five minutes when the gauge is absent and includes `service` and
+`expected_instance` identity labels. `OrchestratorHeartbeatStale` fires when
+the gauge value is older than the configured stale threshold (150 seconds by
+default). `OrchestratorHeartbeatWriteFailing` fires when the independent
+`multica_orchestrator_heartbeat_write_failures_total` counter increases; this
+identifies an exporter/write-path failure rather than a stopped process.
