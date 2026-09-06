@@ -227,15 +227,24 @@ async function closeDeadRelayRows(client, { terminalStages, requestRetryEscalati
                 t.relay_retired_reason AS reason`, []);
   for (const row of retired.rows || []) {
     let escalated = false;
+    let issueStageBefore = null;
+    let issueStageAfter = null;
     if (row.issue_id && Number(row.attempt || 0) >= Number(row.max_attempts || 0)) {
       const issue = await client.query(`SELECT id, status FROM issue WHERE id = $1 FOR UPDATE`, [row.issue_id]);
-      const stage = issue.rows[0]?.status;
-      if (stage && ![...(terminalStages || []), 'Human Review'].includes(stage)) {
+      issueStageBefore = issue.rows[0]?.status || null;
+      if (issueStageBefore && ![...(terminalStages || []), 'Human Review'].includes(issueStageBefore)) {
         await requestRetryEscalation?.(row, 'retry_exhausted', postRelay);
         escalated = true;
+        issueStageAfter = 'Human Review';
+      } else {
+        issueStageAfter = issueStageBefore;
       }
     }
-    logger.log(`${logPrefix} [relay-task-retired] task_id=${row.task_id} status=${row.status} attempt=${row.attempt} max_attempts=${row.max_attempts} reason=${row.reason} issue_id=${row.issue_id || 'null'} escalated=${escalated}`);
+    logger.log(JSON.stringify({ event: 'relay-task-retired', task_id: row.task_id,
+      status: row.status, attempt: row.attempt, max_attempts: row.max_attempts,
+      reason: row.reason, issue_id: row.issue_id || null,
+      issue_stage_before: issueStageBefore, escalated,
+      issue_stage_after: issueStageAfter }));
   }
 
   await convertCompletedQcEvidence(client, { postRelay: postVerdict, logger, logPrefix, env });

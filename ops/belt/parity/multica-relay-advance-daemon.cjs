@@ -1032,8 +1032,12 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   const client = await dbPool.connect();
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
+    const escalateExhaustedToHumanReview = (row, reason, relay = postRelay) => relay({
+      issue_id: row.issue_id, to_stage: 'Human Review', agent_token: RELAY_AGENT_SECRET,
+      reason: `retry_escalation:${reason}`, retry_escalation_task_id: row.task_id,
+      retry_escalation_stage: row.to_stage || row.stage });
     await closeDeadRelayRows(client, { terminalStages: [...TERMINAL_STAGES],
-      requestRetryEscalation, postRelay, postVerdict: postQcVerdict,
+      requestRetryEscalation: escalateExhaustedToHumanReview, postRelay, postVerdict: postQcVerdict,
       postNoArtifactRescope: (payload) => postRelay({ ...payload, agent_token: RELAY_AGENT_SECRET }),
       logger, logPrefix: LOG_PREFIX });
 
