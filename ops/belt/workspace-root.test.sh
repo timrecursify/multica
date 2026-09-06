@@ -7,11 +7,21 @@ mkdir -p "$fixture/da3c5c5c-a123-4567-b999-c3ed1820da00" \
 BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" \
   bash -c 'source "$1/workspace-root.sh"; [[ "$(workspace_root_validate)" == "$2" ]]' _ "$root_dir" "$fixture"
 mkdir "$fixture/ f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f"
+touch "$fixture/ f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f/state"
 if BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" \
   bash -c 'source "$1/workspace-root.sh"; workspace_root_validate' _ "$root_dir" 2>"$fixture/error"; then
   echo 'malformed child unexpectedly accepted' >&2; exit 1
 fi
 grep -q 'malformed or unknown workspace directory:  f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f' "$fixture/error"
+rm -rf -- "$fixture/ f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f"
+mkdir "$fixture/unknown-empty"
+BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" bash -c 'source "$1/workspace-root.sh"; workspace_root_validate_children "$2"' _ "$root_dir" "$fixture" 2>"$fixture/quarantine-log"
+[[ -d "$fixture/.quarantine/unknown-empty" && ! -e "$fixture/unknown-empty" ]]
+grep -q 'quarantined unknown empty workspace directory' "$fixture/quarantine-log"
+mkdir -p "$fixture/unknown-state"; touch "$fixture/unknown-state/state"
+if BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" bash -c 'source "$1/workspace-root.sh"; workspace_root_validate_children "$2"' _ "$root_dir" "$fixture" 2>"$fixture/state-error"; then exit 1; fi
+if BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" bash -c 'source "$1/workspace-root.sh"; workspace_root_create_workspace_dir "$2" bad-uuid' _ "$root_dir" "$fixture"; then exit 1; fi
+[[ ! -e "$fixture/bad-uuid" ]]
 if MULTICA_DAEMON_WORKSPACES_ROOT="$fixture" MULTICA_WORKSPACES_ROOT=/different \
   bash -c 'source "$1/workspace-root.sh"; workspace_root_validate' _ "$root_dir" 2>"$fixture/disagreement"; then
   echo 'root disagreement unexpectedly accepted' >&2; exit 1
