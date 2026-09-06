@@ -209,3 +209,5 @@ monitoring:
     samplerQueryErrorsFor: 5m
     samplerQueryLatencyFor: 10m
     severity: warning
+    heartbeatStaleSeconds: 150
+    heartbeatExpectedInstance: multica

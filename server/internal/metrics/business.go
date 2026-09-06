@@ -17,6 +17,7 @@ type activeTaskLabels struct {
 
 type BusinessMetrics struct {
 	orchestratorHeartbeat prometheus.Gauge
+	orchestratorHeartbeatWriteFailures prometheus.Counter
 	taskEnqueued          *prometheus.CounterVec
 	taskDispatched        *prometheus.CounterVec
 	taskStarted           *prometheus.CounterVec
@@ -55,6 +56,10 @@ func NewBusinessMetrics() *BusinessMetrics {
 		orchestratorHeartbeat: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "multica_orchestrator_heartbeat_timestamp_seconds",
 			Help: "Unix timestamp of the most recent successfully processed daemon heartbeat.",
+		}),
+		orchestratorHeartbeatWriteFailures: prometheus.NewCounter(prometheus.CounterOpts{
+			Name: "multica_orchestrator_heartbeat_write_failures_total",
+			Help: "Total failures while exporting orchestrator heartbeat telemetry.",
 		}),
 		taskEnqueued: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "multica",
@@ -190,6 +195,7 @@ func NewBusinessMetrics() *BusinessMetrics {
 func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 	return append([]prometheus.Collector{
 		m.orchestratorHeartbeat,
+		m.orchestratorHeartbeatWriteFailures,
 		m.taskEnqueued,
 		m.taskDispatched,
 		m.taskStarted,
@@ -211,6 +217,16 @@ func (m *BusinessMetrics) Collectors() []prometheus.Collector {
 		m.admissionRejected,
 		m.admissionNearLimit,
 	}, m.events.collectors()...)
+}
+
+// RecordOrchestratorHeartbeatWriteFailure records a failure exporting the
+// heartbeat. It is served by the process metrics endpoint, independently of
+// any external heartbeat transport.
+func (m *BusinessMetrics) RecordOrchestratorHeartbeatWriteFailure() {
+	if m == nil {
+		return
+	}
+	m.orchestratorHeartbeatWriteFailures.Inc()
 }
 
 // RecordOrchestratorHeartbeat advances the liveness timestamp after a
