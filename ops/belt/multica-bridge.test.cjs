@@ -1991,3 +1991,79 @@ test('identical relay and operator secrets disable explicit terminal exits', () 
   assert.match(source, /RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET/);
   assert.match(source, /terminal_stage_operator_secret_conflict/);
 });
+
+// relay_run_log.status is constrained to pending/completed/failed/rejected in
+// production. The same-stage fast path used to insert 'noop', so every
+// same-stage replay of /relay/advance died on the check constraint and the
+// caller saw a 500 instead of a clean no-op (9 ppp-production tickets in one
+// run: 24052, 24057, 24064, 24095, 24126, 24146, 24174, 24181, 24183).
+test('a same-stage replay records an allowed status and returns a clean no-op', async () => {
+  const RELAY_RUN_LOG_STATUSES = ['pending', 'completed', 'failed', 'rejected'];
+  const issueId = '00000000-0000-4000-8000-0000000024052';
+  const inserted = [];
+  const client = {
+    async connect() {},
+    async end() {},
+    async query(sql, values = []) {
+      if (/INSERT INTO relay_run_log/.test(sql)) {
+        // Stand in for relay_run_log_status_check: reject any status literal the
+        // production constraint would reject, exactly as Postgres does.
+        const status = (sql.match(/'(\w+)',\s*jsonb_build_object/) || [])[1];
+        if (status && !RELAY_RUN_LOG_STATUSES.includes(status)) {
+          const error = new Error('new row for relation "relay_run_log" ' +
+            'violates check constraint "relay_run_log_status_check"');
+          error.code = '23514';
+          error.constraint = 'relay_run_log_status_check';
+          throw error;
+        }
+        inserted.push({ sql, values, status });
+        return { rows: [], rowCount: 1 };
+      }
+      if (/FROM "issue"\s+WHERE id = \$1\s+FOR UPDATE/.test(sql)) {
+        return { rows: [{ id: issueId, status: 'Spec', workspace_id: 'test-workspace',
+          description: '', parent_issue_id: null, title: 'same-stage replay',
+          priority: 'none', metadata: {} }] };
+      }
+      if (/SELECT stage_name FROM relay_stage_config/.test(sql)) return { rows: [{ stage_name: values[1] }] };
+      if (/SELECT next_stage, alt_next_stages/.test(sql)) {
+        return { rows: [{ next_stage: 'Queue', alt_next_stages: [] }] };
+      }
+      return { rows: [] };
+    }
+  };
+  const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayAdvance({ headers: {} }, res,
+      { issue_id: issueId, to_stage: 'Spec', agent_token: 'test-relay-secret' });
+  } finally { setTestClientFactory(null); }
+
+  assert.equal(res.status, 200);
+  const json = JSON.parse(res.body);
+  assert.equal(json.success, true);
+  assert.equal(json.transition, 'already_applied');
+  assert.equal(json.issue.status, 'Spec');
+  assert.equal(inserted.length, 1);
+  assert.ok(RELAY_RUN_LOG_STATUSES.includes(inserted[0].status),
+    `same-stage no-op wrote an illegal status: ${inserted[0].status}`);
+  // The 'same_stage' reason, not the status, is what identifies and dedupes the
+  // no-op row now that its status is shared with real transitions.
+  assert.match(inserted[0].sql, /jsonb_build_object\('reason', 'same_stage'\)/);
+  assert.match(inserted[0].sql, /parked_audit->>'reason' = 'same_stage'/);
+});
+
+// Every status literal written into relay_run_log anywhere in the bridge must
+// be one the production check constraint admits.
+test('every relay_run_log status literal in the bridge is an allowed status', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const allowed = new Set(['pending', 'completed', 'failed', 'rejected']);
+  const illegal = [];
+  for (const match of source.matchAll(/INSERT INTO relay_run_log[\s\S]{0,600}?(?=`)/g)) {
+    for (const literal of match[0].matchAll(/'([a-z_]+)'(?=\s*,|\s*\))/g)) {
+      if (/^(pending|completed|failed|rejected)$/.test(literal[1]) || allowed.has(literal[1])) continue;
+      if (!/status/i.test(match[0])) continue;
+      illegal.push(literal[1]);
+    }
+  }
+  assert.deepEqual(illegal.filter((s) => s === 'noop'), []);
+});
