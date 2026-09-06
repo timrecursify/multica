@@ -34,3 +34,29 @@ test('a second adapter observes the shared cooldown without calling GitHub', () 
   assert.throws(() => api.api('repos/acme/repo'), /cooldown/);
   assert.equal(calls, 0);
 });
+
+// Every REST read the relay daemon makes arrives as command(['api', <path>]).
+// api() appends the path itself, so a path left in the extra args produced
+// `gh api -i <path> <path>`; gh rejected it and the daemon saw only a non-zero
+// exit. The path must appear exactly once.
+test('an api command sends its path exactly once', () => {
+  const calls = [];
+  const run = (args) => { calls.push(args); return 'HTTP/1.1 200 OK\n\n{"ok":true}'; };
+  const api = createGithubApi({ env: { GITHUB_APP_INSTALLATION_TOKEN: 't' }, run,
+    state: createRateLimitState({ file: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gh-adapter-')), 's.json') }) });
+  api.command(['api', 'repos/acme/repo/pulls/565']);
+  const sent = calls.at(-1);
+  assert.deepEqual(sent, ['api', '-i', 'repos/acme/repo/pulls/565']);
+  assert.equal(sent.filter(a => a === 'repos/acme/repo/pulls/565').length, 1);
+});
+
+test('an api command keeps its non-path arguments and still sends the path once', () => {
+  const calls = [];
+  const run = (args) => { calls.push(args); return 'HTTP/1.1 200 OK\n\n{"ok":true}'; };
+  const api = createGithubApi({ env: { GITHUB_APP_INSTALLATION_TOKEN: 't' }, run,
+    state: createRateLimitState({ file: path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gh-adapter-')), 's.json') }) });
+  api.command(['api', '-X', 'PUT', 'repos/acme/repo/pulls/1/merge', '-f', 'merge_method=squash']);
+  const sent = calls.at(-1);
+  assert.equal(sent.filter(a => a === 'repos/acme/repo/pulls/1/merge').length, 1);
+  assert.equal(sent.includes('-X') && sent.includes('PUT') && sent.includes('merge_method=squash'), true);
+});

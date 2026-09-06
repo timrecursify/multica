@@ -86,7 +86,11 @@ function createGithubApi({ env = process.env, run = (args, options) => execFileS
   function command(args) {
     if (args[0] === 'api') {
       const path = args.find(a => typeof a === 'string' && (a.startsWith('repos/') || a.startsWith('app/')));
-      return api(path, args.slice(1).filter(a => a !== '-i'));
+      // api() appends the path itself, so it must not also arrive in the extra
+      // args. Leaving it in sent `gh api -i <path> <path>`, which gh rejects, so
+      // every REST read the relay daemon made failed with an exit status and no
+      // useful message.
+      return api(path, args.slice(1).filter(a => a !== '-i' && a !== path));
     }
     if (args[0] === 'pr' && (args[1] === 'view' || args[1] === 'merge')) {
       const repo = args[args.indexOf('-R') + 1]; const num = args[2];
