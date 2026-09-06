@@ -213,7 +213,9 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
       boundSha: route?.boundSha || pointer };
   }
   if (row.to_stage === 'In Progress' && targetStage === 'Done') {
-    return { noDeployRoute: route?.kind || 'no_pr', workProductEvidence: pointer };
+    const resultText = typeof row.task_result === 'string' ? row.task_result : JSON.stringify(row.task_result || '');
+    return { noDeployRoute: route?.kind || 'no_pr',
+      workProductEvidence: /\bNO-SHA\b/i.test(resultText) ? resultText : pointer };
   }
   if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
     return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };

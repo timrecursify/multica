@@ -21,8 +21,10 @@ test('completion evidence satisfies every automatic transition policy row', () =
   ];
   for (const [from, to, actor] of cases) {
     const qc = from === 'In Review' ? { ok: true, evidenceTaskId: 'qc-task' } : { ok: false };
-    const route = { kind: to === 'In Review' ? 'risk' : 'runtime', pr_url: 'https://github.com/o/r/pull/1', boundSha: 'a'.repeat(40) };
-    assert.equal(evaluate({ from, to, actor, evidence: completionEvidence({ ...row, to_stage: from }, to, route, qc) }).ok, true,
+    const route = { kind: to === 'In Review' ? 'risk' : 'no_pr', pr_url: 'https://github.com/o/r/pull/1', boundSha: 'a'.repeat(40) };
+    const evidence = completionEvidence({ ...row, to_stage: from }, to, route, qc);
+    if (from === 'In Progress' && to === 'Done') evidence.workProductEvidence = 'NO-SHA: no deployable artifact';
+    assert.equal(evaluate({ from, to, actor, evidence }).ok, true,
       `${from} -> ${to}`);
   }
 });

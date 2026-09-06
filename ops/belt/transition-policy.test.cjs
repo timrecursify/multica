@@ -5,7 +5,8 @@ const test = require('node:test');
 const { TRANSITIONS, evaluate } = require('./transition-policy.cjs');
 
 function evidenceFor(fields) {
-  return Object.fromEntries(fields.map((field) => [field, field === 'reason' ? 'operator reason' : true]));
+  return Object.fromEntries(fields.map((field) => [field,
+    field === 'reason' ? 'operator reason' : field === 'workProductEvidence' ? 'NO-SHA: no deployable artifact' : true]));
 }
 
 test('accepts every DESIGN transition table row with its required evidence', () => {
@@ -17,6 +18,27 @@ test('accepts every DESIGN transition table row with its required evidence', () 
         `${row.from} -> ${row.to} by ${actor}`);
     }
   }
+});
+
+test('build workers cannot self-close In Progress work', () => {
+  const evidence = { noDeployRoute: true, workProductEvidence: 'NO-SHA: documentation only' };
+  assert.equal(evaluate({ from: 'In Progress', to: 'Done', actor: 'worker', evidence }).code, 'actor_denied');
+  assert.equal(evaluate({ from: 'In Progress', to: 'Done', actor: 'system', evidence }).ok, true);
+});
+
+test('a modified checkout cannot use the no-deploy route', () => {
+  const result = evaluate({ from: 'In Progress', to: 'Done', actor: 'system', evidence: {
+    noDeployRoute: true, workProductEvidence: 'NO-SHA: claimed',
+    checkout: { changedFiles: ['src/changed.js'] }
+  }});
+  assert.deepEqual(result, { ok: false, code: 'no_deploy_route_ineligible', files: ['src/changed.js'] });
+});
+
+test('code evidence must use the review route', () => {
+  assert.equal(evaluate({ from: 'In Progress', to: 'Done', actor: 'system', evidence: {
+    noDeployRoute: 'runtime', workProductEvidence: 'NO-SHA: claimed',
+    pr: 'https://github.com/o/r/pull/1', boundSha: 'a'.repeat(40)
+  }}).code, 'code_work_requires_review');
 });
 
 test('fails closed for unlisted, terminal, and actor-mismatched transitions', () => {

@@ -1459,6 +1459,31 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    // In Progress -> Done is the genuine no-code terminal path.  The build
+    // worker cannot self-assert it: only the relay/system may submit a
+    // machine-readable NO-SHA work product, and any code-bearing route must
+    // go through In Review (and then QC/deploy as configured).
+    if (issue.status === 'In Progress' && to_stage === 'Done') {
+      const completionEvidence = body.evidence && typeof body.evidence === 'object' ? body.evidence : {};
+      const changedFiles = Array.isArray(completionEvidence.changedFiles)
+        ? completionEvidence.changedFiles
+        : Array.isArray(completionEvidence.checkout?.changedFiles) ? completionEvidence.checkout.changedFiles : [];
+      const noSha = typeof completionEvidence.workProductEvidence === 'string' &&
+        /\bNO-SHA\b/i.test(completionEvidence.workProductEvidence);
+      if (completionEvidence.checkoutClean === false || changedFiles.length > 0) {
+        await client.query('ROLLBACK');
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'no_deploy_route_ineligible', files: changedFiles }));
+        return;
+      }
+      if (completionEvidence.noDeployRoute !== 'no_pr' || !noSha) {
+        await client.query('ROLLBACK');
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'no_deploy_route_evidence_required',
+          message: 'In Progress -> Done requires an independently checked NO-SHA work product' }));
+        return;
+      }
+    }
     if (issue.status === 'In Progress' && to_stage === 'CI/CD & Deploy' && !body.merged_pr_evidence) {
       const allowed = await directDeployQcAdmission(client, issue.id);
       if (!allowed) {
