@@ -390,4 +390,7 @@ test("the task budget counts only tasks since the issue entered its stage", asyn
   assert.match(sql, /relay_run_log/);
   assert.match(sql, /to_stage = \$2/);
   assert.match(sql, /created_at >= COALESCE/);
+  // A dispatch writes from_stage = to_stage. Without this the window restarts
+  // on every dispatch and the budget can never be reached.
+  assert.match(sql, /from_stage IS DISTINCT FROM to_stage/);
 });

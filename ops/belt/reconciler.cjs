@@ -61,13 +61,19 @@ function ownerSql() {
 // current stage keeps the guard that matters — a stage cannot spin on paid
 // tasks forever — and lets a stage change, including an operator returning the
 // issue, grant a fresh budget.
+//
+// Only an arrival opens a window. Every dispatch also writes a relay_run_log row
+// with from_stage = to_stage, so a window keyed on to_stage alone would restart
+// on each dispatch and the count would never exceed one, which is the guard
+// switched off.
 function lifetimeTasksSql() {
   return `SELECT count(*)::int AS count
             FROM agent_task_queue
            WHERE issue_id = $1::uuid AND trigger_comment_id IS NULL
              AND created_at >= COALESCE(
                    (SELECT max(created_at) FROM relay_run_log
-                     WHERE issue_id = $1::uuid AND to_stage = $2),
+                     WHERE issue_id = $1::uuid AND to_stage = $2
+                       AND from_stage IS DISTINCT FROM to_stage),
                    '-infinity'::timestamptz)`;
 }
 
