@@ -40,7 +40,9 @@ if PATH="$fixture/bin:$PATH" \
   BACKUP_BOX=fixture BACKUP_LANES_CONF="$fixture/lanes.conf" \
   OUT_DIR="$fixture/out" STATE_DIR="$fixture/state" \
   "$root/gsp-backup-age-emitter.sh"; then
-  echo 'expected an unreadable lane to fail the emitter' >&2
+  :
+else
+  echo 'expected a partial lane failure to keep the emitter healthy' >&2
   exit 1
 fi
 grep -q 'backup_last_success_timestamp_seconds{box="fixture",lane="healthy"' "$fixture/out/gsp_backup_age.prom"
