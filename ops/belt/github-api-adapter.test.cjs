@@ -60,3 +60,13 @@ test('an api command keeps its non-path arguments and still sends the path once'
   assert.equal(sent.filter(a => a === 'repos/acme/repo/pulls/1/merge').length, 1);
   assert.equal(sent.includes('-X') && sent.includes('PUT') && sent.includes('merge_method=squash'), true);
 });
+
+test('an error body that merely contains 403 does not open the circuit', () => {
+  const state = createRateLimitState({ file: `${require('os').tmpdir()}/rate-limit-${process.pid}.json` });
+  const run = () => { const e = new Error('gh failed');
+    e.stdout = 'x-ratelimit-remaining: 7389\nx-ratelimit-reset: 1788712824\n\n{"message":"Not Found","id":403}';
+    e.stderr = ''; throw e; };
+  const api = createGithubApi({ env: { GITHUB_APP_INSTALLATION_TOKEN: 't' }, run, state });
+  assert.throws(() => api.command(['api', 'repos/o/r/pulls/1']));
+  assert.equal(state.cooldown(), 0);
+});
