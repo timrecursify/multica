@@ -266,6 +266,30 @@ test("moveToHumanReview asks as the operator the belt acts for", async () => {
   assert.ok(seen.some((s) => /INSERT INTO relay_run_log/.test(s.sql || "")));
 });
 
+test("a capped Spec ticket can still exit to Human Review", async () => {
+  // Spec was excluded from HUMAN_REVIEW_FROM on the belief that RULES barred
+  // the transition. It does not: transition-policy lists Spec -> Human Review
+  // for the operator actor. With Spec excluded, a Spec ticket that had spent
+  // its lifetime task budget could neither be re-dispatched nor routed, so it
+  // was re-evaluated every cycle forever. Assert against the real policy.
+  const { evaluate } = require("./transition-policy.cjs");
+  const verdict = evaluate({
+    from: "Spec", to: "Human Review", actor: "operator",
+    evidence: { blocker: "lifetime_task_limit:33/6" }
+  });
+  assert.equal(verdict.ok, true);
+
+  const seen = [];
+  const db = { query: async (sql, values) => { seen.push({ sql, values }); return { rows: [] }; } };
+  const result = await moveToHumanReview(
+    db, { ...issue, status: "Spec" }, "lifetime_task_limit:33/6", { evaluate }
+  );
+  assert.deepEqual(result, { action: "human_review", reason: "lifetime_task_limit:33/6" });
+  assert.ok(seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
+  const logged = seen.find((s) => /INSERT INTO relay_run_log/.test(s.sql || ""));
+  assert.equal(logged.values[1], "Spec");
+});
+
 test("a policy rejection leaves the issue skipped rather than erroring the cycle", async () => {
   const db = harness();
   db.query = async (sql, values = []) => {

@@ -111,9 +111,11 @@ async function moveToHumanReview(client, issue, reason, options) {
   return { action: "human_review", reason };
 }
 
-// Spec is operator-owned here (RECONCILE_SKIP_STAGES) and RULES bars Spec -> Human
-// Review, so routing only ever fires from a belt execution stage.
-const HUMAN_REVIEW_FROM = new Set(["Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
+// RULES allows Spec -> Human Review for the operator actor, which is the actor
+// moveToHumanReview declares. Spec must stay routable: a Spec ticket that has
+// spent its lifetime task budget can no longer be re-dispatched, and without an
+// exit it is re-evaluated every cycle forever instead of reaching a human.
+const HUMAN_REVIEW_FROM = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LINK_TABLE = { ci: "issue_pull_request", sha: "issue_pull_request", dependency: "issue_dependency" };
 
 // A recorded BLOCKED outcome is terminal when no machine-observable input remains
