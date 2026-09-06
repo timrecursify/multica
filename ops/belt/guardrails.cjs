@@ -232,9 +232,13 @@ function lifetimeTaskAdmission(taskCount, limit = 6) {
   if (!Number.isInteger(ceiling) || ceiling < 1) {
     return { ok: false, reason: 'invalid_lifetime_task_limit' };
   }
+  // Reaching the ceiling stops another paid run on this ticket; it does not end
+  // the ticket. Rejecting here threw the work away, the same defect already
+  // fixed for stage_cycle_limit above. Hand the flight to the escalation lane
+  // instead, which is what qc_bounce_ceiling and the cycle ceiling both do.
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Rejected' };
+    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Spec' };
 }
 
 function isExecutionStage(stage) {

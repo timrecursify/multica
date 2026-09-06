@@ -190,10 +190,23 @@ test('bridge and daemon use the same budget predicate', () => {
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
   assert.deepEqual(lifetimeTaskAdmission(5), { ok: true, ceiling: 6 });
+  // Spec, not Rejected: the ceiling stops another paid run on this ticket, it
+  // does not terminate the work. Same defect class as the stage-cycle ceiling,
+  // which stopped disposing to a terminal stage in #580.
   assert.deepEqual(lifetimeTaskAdmission(6), {
     ok: false, reason: 'lifetime_task_limit', ceiling: 6,
-    disposition: 'Rejected'
+    disposition: 'Spec'
   });
+});
+
+test('the lifetime ceiling never disposes a ticket to a terminal stage', () => {
+  const terminal = new Set(['Rejected', 'Cancelled']);
+  for (const count of [6, 7, 20]) {
+    const admission = lifetimeTaskAdmission(count);
+    assert.equal(admission.ok, false);
+    assert.ok(!terminal.has(admission.disposition),
+      `lifetime ceiling disposed to terminal stage ${admission.disposition}`);
+  }
 });
 
 test('human and disposition stages never execute tasks', () => {
