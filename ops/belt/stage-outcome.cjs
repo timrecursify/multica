@@ -5,7 +5,10 @@
 
 const OUTCOMES = new Set(["ADVANCED", "BLOCKED", "NO_OP", "FAILED"]);
 const BLOCKED_ON = new Set(["ci", "human", "sha", "dependency", "quota", "checkout"]);
-const LINE = /^\s*OUTCOME:\s*(ADVANCED|BLOCKED|NO_OP|FAILED)(?:\s+blocked_on=([a-z]+))?\s*$/i;
+// `blocked_on=` is the documented form (WORKER_COMMON.md). Workers also emit the
+// reason as a bare token ("OUTCOME: BLOCKED sha"); accept both so a naming slip
+// does not drop the run onto the legacy heuristics.
+const LINE = /^\s*OUTCOME:\s*(ADVANCED|BLOCKED|NO_OP|FAILED)(?:\s+(?:blocked_on=)?([a-z_]+))?\s*$/i;
 
 // Contract: the last non-empty output line is `OUTCOME: <kind>[ blocked_on=<why>]`.
 // Legacy heuristics keep pre-contract output useful; anything else is FAILED.
@@ -88,45 +91,82 @@ function upsertOutcomeSql() {
 }
 
 // Completed stage tasks not yet recorded. Bounded window keeps the pass cheap.
+//
+// The table holds one row per (issue, stage), so only the newest completion of a
+// stage can survive. Selecting every unrecorded sibling made the pass rewrite the
+// same row on every cycle: recording an older run cleared the newer run's task_id,
+// which made the newer run "unrecorded" again, so two completions of one stage
+// ping-ponged the row for as long as they stayed in the window. DISTINCT ON keeps
+// the newest completion per (issue, stage), which is what the row is defined to
+// hold, so a recorded stage goes quiet instead of churning.
 function unrecordedCompletionsSql() {
-  return `SELECT t.id, t.issue_id, t.context->>'to_stage' AS stage, t.result->>'output' AS output
-    FROM agent_task_queue t
-    WHERE t.status = 'completed' AND t.completed_at > NOW() - ($1::int * interval '1 minute')
-      AND t.context->>'to_stage' IS NOT NULL AND t.issue_id IS NOT NULL
-      AND NOT EXISTS (SELECT 1 FROM issue_stage_outcome o WHERE o.task_id = t.id)
-      AND t.completed_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
-        WHERE l.issue_id = t.issue_id AND l.to_stage = t.context->>'to_stage'
-          AND l.from_stage <> l.to_stage), '-infinity')
-    ORDER BY t.completed_at ASC LIMIT 200`;
+  return `WITH latest AS (
+      SELECT DISTINCT ON (t.issue_id, t.context->>'to_stage')
+             t.id, t.issue_id, t.context->>'to_stage' AS stage,
+             t.result->>'output' AS output, t.completed_at
+      FROM agent_task_queue t
+      WHERE t.status = 'completed' AND t.completed_at > NOW() - ($1::int * interval '1 minute')
+        AND t.context->>'to_stage' IS NOT NULL AND t.issue_id IS NOT NULL
+        AND t.completed_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
+          WHERE l.issue_id = t.issue_id AND l.to_stage = t.context->>'to_stage'
+            AND l.from_stage <> l.to_stage), '-infinity')
+      ORDER BY t.issue_id, t.context->>'to_stage', t.completed_at DESC)
+    SELECT latest.id, latest.issue_id, latest.stage, latest.output
+    FROM latest
+    WHERE NOT EXISTS (SELECT 1 FROM issue_stage_outcome o WHERE o.task_id = latest.id)
+    ORDER BY latest.completed_at ASC LIMIT 200`;
 }
 
+// One rejected write must never cost the whole pass. The pass reads the oldest
+// unrecorded completions first, so a row the database refuses (a blocked_on value
+// this deployment's CHECK constraint does not carry, say) would abort the batch,
+// be re-read at the head of the next batch, and stall every later completion for
+// as long as it stayed in the window. Each row is therefore isolated, and a write
+// the database refuses is retried once without blocked_on so the outcome kind
+// still lands.
 async function recordStageOutcomes(client, { windowMinutes = 180, logger = console } = {}) {
   const rows = (await client.query(unrecordedCompletionsSql(), [windowMinutes])).rows;
   let recorded = 0;
+  let failed = 0;
   for (const row of rows) {
-    const parsed = parseOutcome(row.output);
-    // An In Progress completion is the implementation handoff. It cannot be
-    // advanced without a linked PR and bound head SHA, so do not persist a
-    // misleading terminal ADVANCED outcome when that evidence is absent.
-    if (parsed.outcome === "ADVANCED" && row.stage === "In Progress") {
-      const evidence = (await client.query(
-        `SELECT EXISTS (
-           SELECT 1 FROM issue_pull_request ipr
-           JOIN github_pull_request p ON p.id = ipr.pull_request_id
-           WHERE ipr.issue_id = $1::uuid AND NULLIF(p.head_sha, '') IS NOT NULL
-         ) AS has_review_evidence`, [row.issue_id])).rows[0];
-      if (!evidence?.has_review_evidence) {
-        parsed.outcome = "FAILED";
-        parsed.blockedOn = null;
-        logger.log(`[stage-outcome] rejected unsupported ADVANCED task=${row.id} stage=${row.stage}: missing review evidence`);
-      }
+    try {
+      recorded += await recordOneOutcome(client, row, logger);
+    } catch (error) {
+      failed += 1;
+      logger.log(`[stage-outcome] record failed task=${row.id} stage=${row.stage}: ${error?.message || error}`);
     }
-    const hash = (await client.query(stageInputHashSql(), [row.issue_id])).rows[0]?.input_hash || null;
-    await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, parsed.blockedOn, row.id, hash]);
-    recorded += 1;
-    if (!parsed.typed) logger.log(`[stage-outcome] legacy parse task=${row.id} stage=${row.stage} -> ${parsed.outcome}${parsed.blockedOn ? "/" + parsed.blockedOn : ""}`);
   }
-  return { scanned: rows.length, recorded };
+  return { scanned: rows.length, recorded, failed };
+}
+
+async function recordOneOutcome(client, row, logger) {
+  const parsed = parseOutcome(row.output);
+  // An In Progress completion is the implementation handoff. It cannot be
+  // advanced without a linked PR and bound head SHA, so do not persist a
+  // misleading terminal ADVANCED outcome when that evidence is absent.
+  if (parsed.outcome === "ADVANCED" && row.stage === "In Progress") {
+    const evidence = (await client.query(
+      `SELECT EXISTS (
+         SELECT 1 FROM issue_pull_request ipr
+         JOIN github_pull_request p ON p.id = ipr.pull_request_id
+         WHERE ipr.issue_id = $1::uuid AND NULLIF(p.head_sha, '') IS NOT NULL
+       ) AS has_review_evidence`, [row.issue_id])).rows[0];
+    if (!evidence?.has_review_evidence) {
+      parsed.outcome = "FAILED";
+      parsed.blockedOn = null;
+      logger.log(`[stage-outcome] rejected unsupported ADVANCED task=${row.id} stage=${row.stage}: missing review evidence`);
+    }
+  }
+  const hash = (await client.query(stageInputHashSql(), [row.issue_id])).rows[0]?.input_hash || null;
+  try {
+    await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, parsed.blockedOn, row.id, hash]);
+  } catch (error) {
+    if (!parsed.blockedOn) throw error;
+    logger.log(`[stage-outcome] blocked_on=${parsed.blockedOn} refused task=${row.id} stage=${row.stage}: ${error?.message || error}`);
+    await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, null, row.id, hash]);
+  }
+  if (!parsed.typed) logger.log(`[stage-outcome] legacy parse task=${row.id} stage=${row.stage} -> ${parsed.outcome}${parsed.blockedOn ? "/" + parsed.blockedOn : ""}`);
+  return 1;
 }
 
 // Reconciler eligibility: dispatch only when nothing is recorded for this stage or

@@ -117,4 +117,11 @@ OUTCOME: FAILED
 - `NO_OP`: the deliverable already exists (already merged, already deployed). Say where.
 - `FAILED`: you stopped for any other reason.
 
-The relay records this line against the issue and stage. A stage with a recorded outcome is not re-dispatched until its inputs change (PR head SHA, CI state, newest comment, dependency state, spec body). Missing or malformed line is recorded as `FAILED`.
+Write `blocked_on=` in full. `OUTCOME: BLOCKED sha` is read as `blocked_on=sha`, but
+the `blocked_on=` form is the one contract; anything else on the line is malformed.
+
+The relay records this line against the issue and stage, keeping one row per issue
+and stage: the newest completed run of a stage is the one recorded. A stage with a
+recorded outcome is not re-dispatched until its inputs change (PR head SHA, CI state,
+newest comment, dependency state, spec body). Missing or malformed line is recorded
+as `FAILED`.
