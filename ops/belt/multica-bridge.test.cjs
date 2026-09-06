@@ -1064,6 +1064,33 @@ test('empty stage pool preserves the canonical relay owner fallback', async () =
   assert.match(calls[2], /FROM relay_stage_config/);
 });
 
+// A Claude-modelled owner bound to a Claude runtime was dispatched onto the
+// newest online *codex* runtime, because both the own-runtime join and the
+// fallback lateral hard-coded provider = 'codex'. Codex on a ChatGPT account
+// rejects a Claude model with HTTP 400, so the task was billed and thrown away:
+// 16 tasks burned that way on gsp on 2026-09-06 against agent
+// gsp-spec-sol-low-public (model claude-opus-4-6, runtime "Claude (gsp-codex)").
+// The provider must be derived from the owner's model, as reconciler.cjs does.
+test('pool owner runtime resolution derives the provider from the agent model', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool p/.test(sql)) {
+      return { rows: [scoper({ agent_id: 'agent-claude', model: 'claude-opus-4-6',
+        instructions: 'Own Spec tickets only.' })] };
+    }
+    return { rows: [] };
+  } };
+  await selectPoolOwner(client, 'workspace-1', 'Spec', 'Spec');
+  const poolSql = calls.find((call) => /FROM relay_stage_agent_pool p/.test(call.sql)).sql;
+  const derived = /provider = CASE WHEN a\.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END/g;
+  // Both the agent's own bound runtime and the workspace fallback must be
+  // constrained to a runtime the model can actually run on.
+  assert.equal((poolSql.match(derived) || []).length, 2);
+  assert.equal(/provider = 'codex'/.test(poolSql), false);
+});
+
 test('pool selection applies to Queue and rotates equal-load agents', async () => {
   const calls = [];
   const builders = [

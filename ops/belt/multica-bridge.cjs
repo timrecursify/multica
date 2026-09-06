@@ -1292,7 +1292,8 @@ async function canonicalStageOwner(client, workspaceId, ownerStage) {
             (SELECT ar.provider FROM agent_runtime ar WHERE ar.id = a.runtime_id) AS selected_runtime_provider,
             COALESCE(a.runtime_id, (
               SELECT ar.id FROM agent_runtime ar
-               WHERE ar.workspace_id = $1 AND ar.provider = 'codex' AND ar.status = 'online'
+               WHERE ar.workspace_id = $1 AND ar.status = 'online'
+                 AND ar.provider = CASE WHEN a.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END
                ORDER BY ar.updated_at DESC LIMIT 1
             )) AS selected_runtime_id
        FROM relay_stage_config rsc
@@ -1317,10 +1318,12 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage, options
         AND policy.stage_name = p.stage_name AND policy.enabled = true
        LEFT JOIN agent a ON a.id = p.agent_id AND a.workspace_id = p.workspace_id
        LEFT JOIN agent_runtime own_runtime ON own_runtime.id = a.runtime_id
-        AND own_runtime.provider = 'codex' AND own_runtime.status = 'online'
+        AND own_runtime.status = 'online'
+        AND own_runtime.provider = CASE WHEN a.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END
        LEFT JOIN LATERAL (
          SELECT ar.id, ar.provider FROM agent_runtime ar
-          WHERE ar.workspace_id = p.workspace_id AND ar.provider = 'codex' AND ar.status = 'online'
+          WHERE ar.workspace_id = p.workspace_id AND ar.status = 'online'
+            AND ar.provider = CASE WHEN a.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END
           ORDER BY ar.updated_at DESC LIMIT 1
        ) online_runtime ON true
        LEFT JOIN LATERAL (
