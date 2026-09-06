@@ -99,13 +99,14 @@ function rateLimitBody(raw) {
   return split[split.length - 1];
 }
 
-let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence) {
+let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence, relaySourceTaskId) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: relayToken,
       ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}),
       ...(reason ? { reason } : {}),
       ...(parkedAudit ? { parked_audit: parkedAudit } : {}),
-      ...(evidence ? { evidence } : {}) });
+      ...(evidence ? { evidence } : {}),
+      ...(relaySourceTaskId ? { relay_source_task_id: relaySourceTaskId } : {}) });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);
@@ -159,7 +160,7 @@ async function retryEscalation(issue, toStage, reason, evidence = {}) {
   const retryEvidence = { retry_escalation: true, blocker: reason, ...evidence };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: toStage, actor: 'system', evidence: retryEvidence });
   if (!verdict.ok) throw new Error(`transition policy rejected ${toStage}: ${verdict.code}`);
-  await relay(issue.id, toStage, null, reason, null, retryEvidence);
+  await relay(issue.id, toStage, null, reason, null, retryEvidence, issue.cicd_task_id || issue.metadata?.cicd_task_id);
 }
 
 async function watchdogFailure(issue, error, sha = '') {
@@ -649,6 +650,8 @@ async function sweep() {
   log(`[poll] ${rows.length} ticket(s) in CI/CD & Deploy`);
   for (let issueIndex = 0; issueIndex < rows.length; issueIndex++) {
     const issue = rows[issueIndex];
+    const task = await pool.query(`SELECT id FROM agent_task_queue WHERE issue_id=$1::uuid AND context->>'to_stage'=$2::text ORDER BY created_at DESC LIMIT 1`, [issue.id, 'CI/CD & Deploy']);
+    issue.cicd_task_id = task.rows[0]?.id || null;
     try {
       watchdog.observe(issue.id);
       // Read the thread, not just its last line. The pull request is announced by

@@ -207,6 +207,16 @@ test('worker retains no self-deploy or direct database writes', () => {
   assert.match(source, /transition-policy\.cjs/);
 });
 
+test('watchdog escalation forwards producing CI/CD task id', async () => {
+  const calls = [];
+  worker.setTestDependencies({
+    watchdog: { observe: () => ({ stage: 'CI/CD & Deploy', first_seen_at: new Date(0).toISOString(), last_error: 'x', correlation_key: 'c' }), stalled: () => true, markAlerted: r => r },
+    relay: async (...args) => calls.push(args)
+  });
+  await worker.closureWatchdog({ id: 'i', number: 1, cicd_task_id: '223e4567-e89b-42d3-a456-426614174000' }, { status: 'pending' }, 'a'.repeat(40));
+  assert.equal(calls[0][6], '223e4567-e89b-42d3-a456-426614174000');
+});
+
 test('a merge that triggered no deploy workflow ships as merge_is_deploy', async () => {
   const noDeployRunGh = (args) => {
     const path = args[1] || '';

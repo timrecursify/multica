@@ -367,6 +367,16 @@ test('cap escalation binds one exact active source task in the current stage', a
   assert.equal(await retryEscalationSourceTask(client, issue, taskId), taskId);
 });
 
+test('terminal source accepts failed and completed provenance but rejects none', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
+  for (const status of ['failed', 'completed']) {
+    const client = { query: async sql => { assert.doesNotMatch(sql, /r\.status = 'pending'/); return { rows: [{ id: '223e4567-e89b-42d3-a456-426614174000' }] }; } };
+    assert.equal(await retryEscalationSourceTask(client, issue), '223e4567-e89b-42d3-a456-426614174000');
+  }
+  const none = { query: async () => ({ rows: [] }) };
+  assert.equal(await retryEscalationSourceTask(none, issue), null);
+});
+
 test('cap escalation fails closed when source lineage is ambiguous or invalid', async () => {
   const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
     workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
