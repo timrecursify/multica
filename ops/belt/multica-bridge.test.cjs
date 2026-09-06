@@ -367,6 +367,91 @@ test('cap escalation binds one exact active source task in the current stage', a
   assert.equal(await retryEscalationSourceTask(client, issue, taskId), taskId);
 });
 
+const ACTIVE_TASK_STATUS = new Set(
+  ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred']);
+const TERMINAL_TASK_STATUS = new Set(['completed', 'failed', 'cancelled']);
+
+// Evaluates the escalation source query against in-memory rows, so the test
+// proves the predicate instead of a canned answer: an active task qualifies on
+// its own to_stage, a terminal task only through a relay_run_log row bound to
+// the same task, issue and to_stage. matchedRelayStatuses records the status of
+// each row that carried the provenance.
+function escalationSourceClient(fixture) {
+  const matchedRelayStatuses = [];
+  return {
+    matchedRelayStatuses,
+    query: async (sql, values) => {
+      assert.match(sql, /t\.status IN \('queued','dispatched','running','waiting_local_directory','deferred'\)/);
+      assert.match(sql, /t\.context->>'to_stage' = \$3::text/);
+      assert.match(sql, /t\.status IN \('completed','failed','cancelled'\) AND EXISTS/);
+      assert.match(sql, /r\.task_id = t\.id AND r\.issue_id = t\.issue_id/);
+      assert.match(sql, /AND r\.to_stage = \$3::text\s*\)\)/);
+      assert.doesNotMatch(sql, /r\.status = 'pending'/);
+      assert.match(sql, /\(\$4::uuid IS NULL OR t\.id = \$4::uuid\)/);
+      assert.match(sql, /LIMIT 2 FOR UPDATE OF t/);
+      const [issueId, workspaceId, stage, requested] = values;
+      const rows = [];
+      for (const t of fixture.tasks) {
+        if (t.issue_id !== issueId || t.workspace_id !== workspaceId) continue;
+        if (requested != null && t.id !== requested) continue;
+        if (ACTIVE_TASK_STATUS.has(t.status) && t.to_stage === stage) {
+          rows.push({ id: t.id });
+          continue;
+        }
+        if (!TERMINAL_TASK_STATUS.has(t.status)) continue;
+        const provenance = fixture.relay.find(r =>
+          r.task_id === t.id && r.issue_id === t.issue_id && r.to_stage === stage);
+        if (!provenance) continue;
+        matchedRelayStatuses.push(provenance.status);
+        rows.push({ id: t.id });
+      }
+      return { rows: rows.slice(0, 2) };
+    }
+  };
+}
+
+test('terminal source accepts failed and completed relay provenance, refuses none', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const task = { id: taskId, issue_id: issue.id, workspace_id: issue.workspace_id,
+    status: 'failed', to_stage: 'Spec' };
+  const otherStage = { task_id: taskId, issue_id: issue.id, to_stage: 'Spec',
+    status: 'failed' };
+  for (const relayStatus of ['failed', 'completed']) {
+    const client = escalationSourceClient({ tasks: [task], relay: [
+      { task_id: taskId, issue_id: issue.id, to_stage: issue.status, status: relayStatus },
+      otherStage] });
+    assert.equal(await retryEscalationSourceTask(client, issue), taskId);
+    assert.equal(await retryEscalationSourceTask(client, issue, taskId), taskId);
+    assert.deepEqual(client.matchedRelayStatuses, [relayStatus, relayStatus]);
+  }
+  // The terminal task carries a relay log only at another stage: no provenance
+  // at the issue status, so the caller answers 409
+  // retry_escalation_source_task_required.
+  const orphan = escalationSourceClient({ tasks: [task], relay: [otherStage] });
+  assert.equal(await retryEscalationSourceTask(orphan, issue), null);
+  assert.equal(await retryEscalationSourceTask(orphan, issue, taskId), null);
+  assert.deepEqual(orphan.matchedRelayStatuses, []);
+  // A relay log row for a different task never lends provenance.
+  const foreign = escalationSourceClient({ tasks: [task], relay: [
+    { task_id: '423e4567-e89b-42d3-a456-426614174000', issue_id: issue.id,
+      to_stage: issue.status, status: 'failed' }] });
+  assert.equal(await retryEscalationSourceTask(foreign, issue), null);
+  // Two terminal tasks with provenance stay ambiguous under LIMIT 2.
+  const second = { ...task, id: '523e4567-e89b-42d3-a456-426614174000',
+    status: 'completed' };
+  const ambiguous = escalationSourceClient({ tasks: [task, second], relay: [
+    { task_id: taskId, issue_id: issue.id, to_stage: issue.status, status: 'failed' },
+    { task_id: second.id, issue_id: issue.id, to_stage: issue.status,
+      status: 'completed' }] });
+  assert.equal(await retryEscalationSourceTask(ambiguous, issue), null);
+  assert.deepEqual(ambiguous.matchedRelayStatuses, ['failed', 'completed']);
+  // UUID validation still short-circuits before any query.
+  const never = { query: async () => { throw new Error('must not query'); } };
+  assert.equal(await retryEscalationSourceTask(never, issue, 'not-a-uuid'), null);
+});
+
 test('cap escalation fails closed when source lineage is ambiguous or invalid', async () => {
   const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
     workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
