@@ -9,10 +9,23 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"time"
 
 	"github.com/multica-ai/multica/server/internal/runtimeapps"
 )
+
+var workspaceIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// ValidateWorkspaceID rejects malformed identifiers before they can become
+// directory names. Workspace IDs are RFC-4122 UUIDs; callers may apply their
+// own allow-list policy after this syntactic check.
+func ValidateWorkspaceID(id string) error {
+	if !workspaceIDPattern.MatchString(id) {
+		return fmt.Errorf("invalid workspace UUID %q", id)
+	}
+	return nil
+}
 
 // RepoContextForEnv describes a workspace repo available for checkout.
 type RepoContextForEnv struct {
@@ -271,6 +284,9 @@ func Prepare(params PrepareParams, logger *slog.Logger) (*Environment, error) {
 	}
 	if params.WorkspaceID == "" {
 		return nil, fmt.Errorf("execenv: workspace ID is required")
+	}
+	if err := ValidateWorkspaceID(params.WorkspaceID); err != nil {
+		return nil, fmt.Errorf("execenv: %w", err)
 	}
 	if params.TaskID == "" {
 		return nil, fmt.Errorf("execenv: task ID is required")
