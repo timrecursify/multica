@@ -61,6 +61,16 @@ status=$?
 set -e
 [ "$status" -eq 2 ] && grep -q 'PostgreSQL is unreachable' "$fixture/out"
 
+# A reachable PostgreSQL probe must not mask a missing Redis prerequisite.
+mkdir -p "$fixture/no-redis"
+cp "$fixture/bin/pg_isready" "$fixture/no-redis/pg_isready"
+ln -s /usr/bin/python3 "$fixture/no-redis/python3"
+set +e
+PATH="$fixture/no-redis" CALLS="$calls" /usr/bin/bash "$fixture/.sk/scripts/check-backend.sh" >"$fixture/out" 2>&1
+status=$?
+set -e
+[ "$status" -eq 2 ] && grep -q 'Redis is unreachable' "$fixture/out"
+
 printf 'bad.sh\n' >"$fixture/.sk/tracked-sh.txt"
 printf 'if then\n' >"$fixture/bad.sh"
 set +e
