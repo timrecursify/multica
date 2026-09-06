@@ -35,6 +35,25 @@ function qcLaneModelsSqlArray() {
   return [...QC_LANE_MODELS];
 }
 
+// QC escalation lane. Tim's standing rule (2026-09-06): two failed Luna QC
+// passes hand the review to Sol immediately, rather than running Luna a third
+// time or ending the ticket. gsp-qc-esc-1 is the Sol reviewer this selects.
+const DEFAULT_QC_ESCALATION_MODELS = "gpt-5.6-sol";
+const QC_ESCALATION_MODELS = new Set((process.env.QC_ESCALATION_MODELS || DEFAULT_QC_ESCALATION_MODELS)
+  .split(",").map((model) => model.trim()).filter(Boolean));
+
+// Two is Tim's number, not a derived one. Kept in env so the lane can be tuned
+// without a deploy.
+const QC_ESCALATION_BOUNCES = Number.parseInt(process.env.QC_ESCALATION_BOUNCES || "2", 10);
+
+function qcEscalationModels() {
+  return [...QC_ESCALATION_MODELS];
+}
+
+function isQcEscalationLane(model) {
+  return QC_ESCALATION_MODELS.has(model);
+}
+
 function isSpecLane(model, effort) {
   return SPEC_LANE_MODELS.has(model) && effort === QC_LANE_EFFORT;
 }
@@ -44,5 +63,6 @@ function specLaneModelsSqlArray() {
 }
 
 module.exports = { QC_LANE_MODELS, QC_LANE_EFFORT, SPEC_LANE_MODELS, BUILD_LANE_MODELS,
+  QC_ESCALATION_MODELS, QC_ESCALATION_BOUNCES,
   isQcLane, qcLaneModelsSqlArray, isSpecLane, specLaneModelsSqlArray,
-  isBuildLane, buildLaneModelsSqlArray };
+  isBuildLane, buildLaneModelsSqlArray, qcEscalationModels, isQcEscalationLane };

@@ -16,7 +16,7 @@ const {
   crossStageExecutionAdmission,
   resolveBuilderRoute
 } = require("./guardrails.cjs");
-const { isQcLane, isSpecLane } = require("./qc-lane.cjs");
+const { isQcLane, isSpecLane, qcEscalationModels, QC_ESCALATION_BOUNCES } = require("./qc-lane.cjs");
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvidenceReference } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
@@ -707,8 +707,29 @@ function escalationDeadline() {
   return new Date(Date.now() + minutes * 60 * 1000).toISOString();
 }
 
+// Tim's rule (2026-09-06): after two failed Luna QC passes the review goes to
+// Sol immediately. The count has to run before the owner is chosen, otherwise
+// the third Luna review is already dispatched by the time anyone notices.
+// Counting tasks (not verdicts) keeps a QC run that died without writing a
+// verdict from being invisible here.
+async function qcEscalationPreference(client, issue, toStage) {
+  if (toStage !== "In Review") return [];
+  const prior = await client.query(
+    `SELECT count(*)::int AS n FROM agent_task_queue
+      WHERE issue_id = $1::uuid AND context->>'to_stage' = 'In Review'
+        AND trigger_comment_id IS NULL
+        AND COALESCE(context->>'kind', '') <> 'retry_escalation'`,
+    [issue.id]
+  );
+  const bounces = Number(prior.rows[0]?.n || 0);
+  if (!Number.isInteger(QC_ESCALATION_BOUNCES) || QC_ESCALATION_BOUNCES < 1) return [];
+  return bounces >= QC_ESCALATION_BOUNCES ? qcEscalationModels() : [];
+}
+
 async function recordRetryEscalation(client, issue, escalation) {
-  const details = { ...escalation, target_stage: "Spec" };
+  // The target is whatever the caller actually routed to. Hard-coding "Spec"
+  // wrote a false audit record whenever the disposition differed.
+  const details = { target_stage: "Spec", ...escalation };
   await client.query(
     `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
           jsonb_build_object('retry_escalation', $2::jsonb, 'retry_escalation_at', to_jsonb(NOW())),
@@ -1259,7 +1280,7 @@ async function canonicalStageOwner(client, workspaceId, ownerStage) {
   return result.rows[0] || null;
 }
 
-async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
+async function selectPoolOwner(client, workspaceId, ownerStage, toStage, options = {}) {
   // Selection and the rotation update share the relay transaction. The advisory
   // lock makes equal-load choices stable under concurrent advances into this pool.
   await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))", [workspaceId, toStage]);
@@ -1297,12 +1318,21 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
   identityEligible.sort((left, right) => Number(left.active_task_count) - Number(right.active_task_count) ||
     ts(left.last_selected_at) - ts(right.last_selected_at) ||
     String(left.agent_id).localeCompare(String(right.agent_id)));
-  const eligible = identityEligible.filter((row) =>
+  // An escalation lane narrows the pool rather than replacing it. When no
+  // member of the preferred lane is eligible the normal pool still owns the
+  // stage, so a missing or offline escalation agent degrades to today's
+  // behaviour instead of stalling the advance.
+  const preferModels = Array.isArray(options.preferModels) ? options.preferModels : [];
+  const preferred = preferModels.length
+    ? identityEligible.filter((row) => preferModels.includes(row.model))
+    : [];
+  const candidates = preferred.length ? preferred : identityEligible;
+  const eligible = candidates.filter((row) =>
     Number(row.active_task_count) < Number(row.max_concurrent_tasks));
   // A pool is still a valid owner when every member is busy. Queue the task on
   // its least-loaded compatible member instead of rejecting the relay advance.
   // The SQL order preserves the normal round-robin choice for below-cap rows.
-  const selected = eligible[0] || identityEligible[0];
+  const selected = eligible[0] || candidates[0];
   await client.query(
     `UPDATE relay_stage_agent_pool SET last_selected_at = NOW()
       WHERE workspace_id = $1 AND stage_name = $2 AND agent_id = $3`,
@@ -1311,8 +1341,8 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage) {
   return selected;
 }
 
-async function selectStageOwner(client, workspaceId, ownerStage, toStage) {
-  const pooled = await selectPoolOwner(client, workspaceId, ownerStage, toStage);
+async function selectStageOwner(client, workspaceId, ownerStage, toStage, options = {}) {
+  const pooled = await selectPoolOwner(client, workspaceId, ownerStage, toStage, options);
   return pooled || canonicalStageOwner(client, workspaceId, ownerStage);
 }
 
@@ -2025,9 +2055,11 @@ async function relayAdvance(req, res, body) {
 
     const ownerStage = retryEscalation ? "Registered" :
       ownerStageForTransition(issue.status, to_stage);
+    const preferModels = (isNoDispatchArrivalStage(to_stage) || evidenceTransition || retryEscalation)
+      ? [] : await qcEscalationPreference(client, issue, to_stage);
     let stage = (isNoDispatchArrivalStage(to_stage) || evidenceTransition) ? {} : (retryEscalation
       ? await selectRetryEscalationOwner(client, issue)
-      : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage));
+      : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage, { preferModels }));
     if (retryEscalation) {
       retryEscalation = { ...retryEscalation, owner: stage.agent_name,
         model: stage.model, effort: stage.thinking_level,
@@ -2180,7 +2212,8 @@ async function relayAdvance(req, res, body) {
         retryEscalation = {
           reason: cycle.reason, trigger_stage: issue.status,
           attempts: history.rows[0]?.n || 0, ceiling: cycle.ceiling,
-          source_task_id: sourceTaskId, deadline: escalationDeadline()
+          source_task_id: sourceTaskId, deadline: escalationDeadline(),
+          target_stage: cycle.disposition
         };
         to_stage = cycle.disposition;
         stage = await selectRetryEscalationOwner(client, issue);
@@ -2662,6 +2695,7 @@ if (require.main === module) {
 
 module.exports = {
   assertRequiredEnvironment,
+  qcEscalationPreference,
   selectRetryEscalationOwner,
   recordRetryEscalation,
   existingStageTask,
