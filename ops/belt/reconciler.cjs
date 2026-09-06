@@ -346,6 +346,9 @@ async function reconcileIssue(client, issueId, options = {}) {
       if (eligibility.eligible && eligibility.reason === "advanced_stall") {
         console.log(`[reconcile] advanced_stall: issue=${issue.id} stage=${issue.status}`);
       }
+      if (eligibility.eligible && eligibility.reason === "unchanged_ttl_expired") {
+        console.log(`[reconcile] SENTINEL unchanged_outcome_over_1h: issue=${issue.id} stage=${issue.status}`);
+      }
       if (!eligibility.eligible) {
         // Nothing left to observe means nothing will ever re-open this stage, so the
         // issue leaves the belt for a human instead of resting invisibly in Queue.
