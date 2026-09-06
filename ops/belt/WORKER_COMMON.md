@@ -61,10 +61,10 @@ the SHA in `.sha`. Do not infer these values from the managed workdir.
 
 ## Search discipline
 
-Bound every search to the checkout you created. Never scan `/`, `/home/newadmin`,
+Bound every search to the checkout you created. Never scan `/`, the retired runtime home,
 or any path above your workdir: this box runs the whole belt and its CI on 12
 cores, and one unbounded sweep starves every other flight on it. Measured on
-2026-08-31: a single `grep -rln <symbol> /home/newadmin` from a workdir ran for
+2026-08-31: a single unbounded recursive search from a workdir ran for
 17 minutes at full core while the belt's completion rate fell from 49 flights an
 hour to 11.
 
