@@ -100,8 +100,11 @@ test('malformed, schema-invalid, and duplicate markers skip with one diagnostic 
     logger: { log: (line) => logs.push(line) }
   })], []);
   assert.equal(payloads.length, 0);
+  // schema-task's marker disagrees with itself on the SHA, and the reason names
+  // that specifically. The single coarse invalid-evidence reason told a QC
+  // author nothing about which field to correct.
   for (const [taskId, reason] of [['missing-task', 'missing-marker'], ['malformed-task', 'invalid-json'],
-    ['schema-task', 'invalid-evidence'], ['duplicate-task', 'duplicate-marker']]) {
+    ['schema-task', 'sha-binding-mismatch'], ['duplicate-task', 'duplicate-marker']]) {
     assert.equal(logs.filter((line) => line.includes(`[qc-evidence-skipped] task=${taskId} reason=${reason}`)).length, 1);
   }
 });
