@@ -6,19 +6,6 @@ and `belt-guard-check.sh` validate against. Any tracked file not listed here is
 a drift flag; any deployed path not resolvable back to a manifest entry is a
 guard failure.
 
-## Supervisor consolidation evidence
-
-The deployment inventory supplied for GSP-2255 records a supervisor migration
-from PM2 to systemd on `gsp`: the only remaining belt systemd units are
-`gsp-multica-worker` and `gsp-multica-bridge`. This is host inventory evidence,
-not a second source manifest; the release paths and runtime consumers above
-remain authoritative for the shipped files.
-
-The corresponding `noc2` inventory recorded six PM2 applications before the
-consolidation. Keep that historical count separate from this manifest's
-release-consumer table so a host-level supervisor change does not create
-duplicate source entries (in particular, do not add `manifests/gsp.txt`).
-
 ## Release layout
 
 An immutable release lives at `<release>/ops/gsp-belt` (same tree as this file).
