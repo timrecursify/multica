@@ -20,6 +20,17 @@ runtime_root="$tmp_dir"
 . "$root_dir/belt-manifest.sh"
 [[ "${#sources[@]}" -eq "${#targets[@]}" ]] || { echo 'manifest arrays are not index-aligned' >&2; exit 1; }
 
+# The wrapper sources helper scripts by absolute path, so a runtime missing one
+# cannot start -- belt-concurrency.sh was absent from a live worker for exactly
+# this reason. Anything the wrapper sources must therefore be a deployed target.
+while read -r sourced; do
+  [[ -n "$sourced" ]] || continue
+  printf '%s\n' "${targets[@]}" | grep -q "/gsp-multica-worker/$sourced\$" || {
+    echo "wrapper sources $sourced but the manifest never deploys it" >&2
+    exit 1
+  }
+done < <(grep -o '/[a-z-]*\.sh"$' "$root_dir/multica-daemon-wrapper.sh" | tr -d '/"')
+
 # These targets are absent beforehand, so a rollback must delete them outright
 # rather than restore a backup.
 is_new_target() {

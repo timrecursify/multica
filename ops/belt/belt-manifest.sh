@@ -13,6 +13,10 @@
 # /opt/gsp/multica-workers/<service>/. Ten files are deployed to more than one
 # service directory; transition-policy.cjs goes to three. Duplicate source rows
 # are intentional -- every apply/backup/rollback loop iterates by index.
+#
+# The wrapper sources belt-concurrency.sh and workspace-root.sh by absolute
+# path, so a runtime missing either cannot start at all. They belong here for
+# the same reason the wrapper does.
 
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
@@ -49,6 +53,8 @@ declare -a sources=(
   "$root_dir/multica-archiver.cjs"
   "$root_dir/multica-daemon-wrapper.sh"
   "$root_dir/scoping-claude-driver.sh"
+  "$root_dir/belt-concurrency.sh"
+  "$root_dir/workspace-root.sh"
 )
 
 declare -a targets=(
@@ -86,4 +92,6 @@ declare -a targets=(
   "$runtime_root/multica-archiver/multica-archiver.cjs"
   "$runtime_root/gsp-multica-worker/multica-daemon-wrapper.sh"
   "$runtime_root/gsp-multica-worker/scoping-claude-driver.sh"
+  "$runtime_root/gsp-multica-worker/belt-concurrency.sh"
+  "$runtime_root/gsp-multica-worker/workspace-root.sh"
 )
