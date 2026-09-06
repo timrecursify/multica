@@ -38,6 +38,8 @@ BODY="$(mktemp)"
 trap 'rm -f "$TMP_FILE" "$BODY" 2>/dev/null || true' EXIT
 
 RUN_ERRORS=0
+LANE_COUNT=0
+SUCCESS_COUNT=0
 
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
@@ -179,6 +181,7 @@ while IFS='|' read -r lane type repo envs opts; do
   [[ "${lane#\#}" != "$lane" ]] && continue
   lane="${lane// }"; type="${type// }"
   opts="${opts:-}"
+  LANE_COUNT=$((LANE_COUNT + 1))
 
   json=""; rc=0
   case "$type" in
@@ -199,6 +202,7 @@ while IFS='|' read -r lane type repo envs opts; do
   [[ "${epoch:-0}" =~ ^[0-9]+$ ]] || epoch=0
 
   if [[ $rc -eq 0 && "$epoch" -gt 0 ]]; then
+    SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
     printf 'backup_last_success_timestamp_seconds{box="%s",lane="%s",repo="%s"} %s\n' \
       "$BOX" "$lane" "$repo" "$epoch" >>"$BODY"
     printf 'backup_lane_query_ok{box="%s",lane="%s"} 1\n' "$BOX" "$lane" >>"$BODY"
@@ -226,6 +230,9 @@ DURATION="$(awk -v s="$START_TS" -v e="$(date +%s.%N)" 'BEGIN{printf "%.3f", e-s
   echo '# HELP backup_emitter_last_run_timestamp_seconds Unix epoch the emitter last completed.'
   echo '# TYPE backup_emitter_last_run_timestamp_seconds gauge'
   printf 'backup_emitter_last_run_timestamp_seconds{box="%s"} %s\n' "$BOX" "$(date +%s)"
+  echo '# HELP backup_emitter_lane_count Number of configured backup lanes seen in the last run.'
+  echo '# TYPE backup_emitter_lane_count gauge'
+  printf 'backup_emitter_lane_count{box="%s"} %s\n' "$BOX" "$LANE_COUNT"
   echo '# HELP backup_emitter_errors_total Cumulative lane query failures since state was created.'
   echo '# TYPE backup_emitter_errors_total counter'
   printf 'backup_emitter_errors_total{box="%s"} %s\n' "$BOX" "$TOTAL"
@@ -234,7 +241,10 @@ DURATION="$(awk -v s="$START_TS" -v e="$(date +%s.%N)" 'BEGIN{printf "%.3f", e-s
   printf 'backup_emitter_duration_seconds{box="%s"} %s\n' "$BOX" "$DURATION"
 } >"$TMP_FILE"
 
-install -m 644 "$TMP_FILE" "$OUT_FILE"
+WRITE_OK=1
+install -m 644 "$TMP_FILE" "$OUT_FILE" || WRITE_OK=0
 
-[[ $RUN_ERRORS -eq 0 ]] || exit 1
+# A partial lane failure is represented in metrics; only an inventory failure,
+# no successfully processed lanes, or a write failure makes the run fail.
+[[ "$WRITE_OK" -eq 1 && -r "$CONF" && "$LANE_COUNT" -gt 0 && "$SUCCESS_COUNT" -gt 0 ]] || exit 1
 exit 0
