@@ -45,7 +45,8 @@ rm -f "$HOST/ops/gsp-belt/worker/bad.cjs"
 
 echo "== guard flags stale documented provenance checksum =="
 PROVENANCE_OUT="$WORK/provenance.out"
-sed -i 's/640fca26677251ecf1168dad16188747e3d56640f93fb5262eb0b636aef2da75/0000000000000000000000000000000000000000000000000000000000000000/' "$HOST/ops/gsp-belt/MANIFEST.md"
+BRIDGE_SHA="$(sha256sum "$HOST/ops/gsp-belt/bridge/multica-bridge.cjs" | cut -d' ' -f1)"
+sed -i "s/$BRIDGE_SHA/0000000000000000000000000000000000000000000000000000000000000000/" "$HOST/ops/gsp-belt/MANIFEST.md"
 set +e
 "$GUARD" --checkout "$HOST" > "$PROVENANCE_OUT" 2>&1
 rc=$?
@@ -56,7 +57,7 @@ else
   echo "FAIL: provenance guard did not flag"; cat "$PROVENANCE_OUT"; exit 1
 fi
 # Restore a valid fixture before exercising the independent unmanaged-path case.
-sed -i 's/0000000000000000000000000000000000000000000000000000000000000000/640fca26677251ecf1168dad16188747e3d56640f93fb5262eb0b636aef2da75/' "$HOST/ops/gsp-belt/MANIFEST.md"
+sed -i "s/0000000000000000000000000000000000000000000000000000000000000000/$BRIDGE_SHA/" "$HOST/ops/gsp-belt/MANIFEST.md"
 
 echo "== guard flags unmanaged home-directory script reference =="
 UNMAN_OUT="$WORK/un.out"
