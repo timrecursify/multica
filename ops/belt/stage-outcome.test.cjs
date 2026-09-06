@@ -52,7 +52,7 @@ test("stageEligibility: no outcome -> eligible; same hash -> not; changed hash -
 test("recordStageOutcomes upserts one row per unrecorded completion", async () => {
   const c = fakeClient([[{ id: "t1", issue_id: "i1", stage: "In Review", output: "OUTCOME: ADVANCED" }], [{ input_hash: "h" }], []]);
   const r = await so.recordStageOutcomes(c, { logger: { log() {} } });
-  assert.deepEqual(r, { scanned: 1, recorded: 1 });
+  assert.deepEqual(r, { scanned: 1, recorded: 1, failed: 0 });
   assert.match(c.calls[2].sql, /INSERT INTO issue_stage_outcome/);
   assert.deepEqual(c.calls[2].params, ["i1", "In Review", "ADVANCED", null, "t1", "h"]);
 });
@@ -60,7 +60,7 @@ test("recordStageOutcomes upserts one row per unrecorded completion", async () =
 test("recordStageOutcomes persists relay evidence_missing as a non-ADVANCED outcome", async () => {
   const c = fakeClient([[{ id: "t2", issue_id: "i2", stage: "Queue", output: "relay rejected Queue -> In Progress evidence_missing" }], [{ input_hash: "h1" }], []]);
   const r = await so.recordStageOutcomes(c, { logger: { log() {} } });
-  assert.deepEqual(r, { scanned: 1, recorded: 1 });
+  assert.deepEqual(r, { scanned: 1, recorded: 1, failed: 0 });
   assert.equal(c.calls[2].params[2], "FAILED");
   assert.notEqual(c.calls[2].params[2], "ADVANCED");
 });
@@ -120,4 +120,66 @@ test("input hash ignores belt output and keys operator comments by content", () 
   assert.doesNotMatch(sql, /c\.id::text/);
   // Content, not identity, so an identical repeated operator note is not new input.
   assert.match(sql, /md5\(string_agg\(DISTINCT md5\(c\.content\)/);
+});
+
+test("typed line accepts a bare blocked_on token as well as blocked_on=", () => {
+  // Observed on the live belt: workers drop the `blocked_on=` key and write the
+  // reason alone. Both forms must land the same typed outcome.
+  assert.deepEqual(so.parseOutcome("work\nOUTCOME: BLOCKED sha"), { outcome: "BLOCKED", blockedOn: "sha", typed: true });
+  assert.deepEqual(so.parseOutcome("OUTCOME: BLOCKED dependency"), { outcome: "BLOCKED", blockedOn: "dependency", typed: true });
+  assert.equal(so.parseOutcome("OUTCOME: BLOCKED nonsense").blockedOn, null);
+  assert.equal(so.parseOutcome("OUTCOME: BLOCKED nonsense").typed, true);
+  // A multi-word tail is still malformed and must fall through to the heuristics.
+  assert.equal(so.parseOutcome("OUTCOME: BLOCKED human decision needed").typed, false);
+});
+
+test("unrecorded completions read only the newest completion per issue and stage", () => {
+  const sql = so.unrecordedCompletionsSql();
+  // Without this the pass rewrote one row between two sibling completions forever.
+  assert.match(sql, /DISTINCT ON \(t\.issue_id, t\.context->>'to_stage'\)/);
+  assert.match(sql, /ORDER BY t\.issue_id, t\.context->>'to_stage', t\.completed_at DESC/);
+  assert.match(sql, /WHERE NOT EXISTS \(SELECT 1 FROM issue_stage_outcome o WHERE o\.task_id = latest\.id\)/);
+});
+
+test("one refused write does not abort the pass or the rows behind it", async () => {
+  const logs = [];
+  const calls = [];
+  const client = {
+    query: async (sql, params) => {
+      calls.push({ sql, params });
+      if (sql.includes("FROM agent_task_queue")) {
+        return { rows: [
+          { id: "bad", issue_id: "i1", stage: "Queue", output: "OUTCOME: FAILED" },
+          { id: "good", issue_id: "i2", stage: "Spec", output: "OUTCOME: ADVANCED" }
+        ] };
+      }
+      if (sql.includes("md5")) return { rows: [{ input_hash: "h" }] };
+      if (params && params[4] === "bad") throw new Error("boom");
+      return { rows: [] };
+    }
+  };
+  const r = await so.recordStageOutcomes(client, { logger: { log: (line) => logs.push(line) } });
+  assert.deepEqual(r, { scanned: 2, recorded: 1, failed: 1 });
+  assert.ok(logs.some((line) => /record failed task=bad/.test(line)));
+  assert.ok(calls.some((c) => c.params && c.params[4] === "good"));
+});
+
+test("a blocked_on the database refuses is retried without it", async () => {
+  const logs = [];
+  const written = [];
+  const client = {
+    query: async (sql, params) => {
+      if (sql.includes("FROM agent_task_queue")) {
+        return { rows: [{ id: "t9", issue_id: "i9", stage: "Queue", output: "checkout timed out\nOUTCOME: BLOCKED blocked_on=checkout" }] };
+      }
+      if (sql.includes("md5")) return { rows: [{ input_hash: "h" }] };
+      if (params && params[3] === "checkout") throw new Error('violates check constraint "issue_stage_outcome_blocked_on_check"');
+      written.push(params);
+      return { rows: [] };
+    }
+  };
+  const r = await so.recordStageOutcomes(client, { logger: { log: (line) => logs.push(line) } });
+  assert.deepEqual(r, { scanned: 1, recorded: 1, failed: 0 });
+  assert.deepEqual(written[0], ["i9", "Queue", "BLOCKED", null, "t9", "h"]);
+  assert.ok(logs.some((line) => /blocked_on=checkout refused task=t9/.test(line)));
 });
