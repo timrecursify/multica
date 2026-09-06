@@ -34,11 +34,13 @@ if [ "$mode" = token ]; then
 else
   # git writes the request as KEY=VALUE lines on stdin. `path` is present only
   # when credential.usehttppath is true; without it fall back to the default.
-  while IFS='=' read -r key value; do
+  # The read is timed out because callers exist that invoke `get` with no
+  # request on stdin at all; an untimed read would hang them forever.
+  while IFS='=' read -r -t 2 key value; do
     [ "$key" = path ] || continue
     repo="${value##*/}"
     repo="${repo%.git}"
-  done
+  done || true
   [ -n "$repo" ] || repo=$DEFAULT_REPO
 fi
 
