@@ -194,7 +194,7 @@ test('no linked PR completion routes directly to Done and never In Review', () =
   assert.match(route, /FROM issue_pull_request/);
   assert.match(route, /FROM comment/);
   assert.match(route, /kind: 'no_pr', toStage: 'Done'/);
-  assert.doesNotMatch(route, /toStage: 'In Review'/);
+  assert.doesNotMatch(route.slice(0, route.indexOf("kind: 'no_pr'")), /toStage: 'In Review'/);
 });
 
 test('completion route falls back to a PR URL in recent comments', async () => {
@@ -219,6 +219,66 @@ test('completion route falls back to a PR URL in recent comments', async () => {
   assert.equal(route.pr_url, 'https://github.com/acme/widget/pull/42');
   assert.equal(githubCalls[0][2], 'https://github.com/acme/widget/pull/42');
   assert.equal(queries.length, 2);
+});
+
+function linkedPrClient(pr) {
+  return { release() {}, query: async (sql) => {
+    if (sql.includes('FROM issue_pull_request')) {
+      return { rows: [{ html_url: 'https://github.com/timrecursify/multica/pull/77',
+        repo_owner: 'timrecursify', repo_name: 'multica' }] };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  }, pr };
+}
+
+async function inProgressRoute(pr) {
+  return buildCompletionRoute(linkedPrClient(pr), {
+    issue_id: 'issue-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: () => JSON.stringify(pr) });
+}
+
+test('runtime PR completing In Progress routes through In Review, not straight to deploy', async () => {
+  const route = await inProgressRoute({ state: 'OPEN', files: [{ path: 'ops/belt/multica-bridge.cjs' }],
+    headRefOid: 'b'.repeat(40), mergeStateStatus: 'CLEAN', statusCheckRollup: [] });
+  assert.equal(route.kind, 'runtime');
+  assert.equal(route.toStage, 'In Review');
+  assert.equal(route.boundSha, 'b'.repeat(40));
+  assert.equal(route.repo, 'timrecursify/multica');
+});
+
+test('merged non-runtime PR completing In Progress reviews before Done', async () => {
+  const route = await inProgressRoute({ state: 'MERGED', files: [{ path: 'web/app.ts' }],
+    headRefOid: 'c'.repeat(40), mergeStateStatus: 'CLEAN', statusCheckRollup: [] });
+  assert.equal(route.kind, 'merge_only');
+  assert.equal(route.toStage, 'In Review');
+  assert.equal(route.boundSha, 'c'.repeat(40));
+});
+
+async function noPrDoneEvidence(noShaComment) {
+  const payloads = [];
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => ({ release() {}, query: async (sql) => {
+    if (sql.includes('FROM issue_stage_outcome')) {
+      return { rows: [{ issue_id: 'issue-1', to_stage: 'In Progress', outcome: 'NO_OP',
+        task_id: 'task-1', task_result: { output: 'doc edit' }, issue_title: 'work',
+        next_stage: 'In Review' }] };
+    }
+    if (sql.includes('NO-SHA')) return { rows: noShaComment ? [{ content: noShaComment }] : [] };
+    if (sql.includes('FROM comment')) return { rows: [] };
+    if (sql.includes('FROM issue_pull_request')) return { rows: [] };
+    return { rows: [] };
+  } }) }, postRelay: async (payload) => { payloads.push(payload); return { ok: true }; },
+  logger: { log() {} }, typedOutcomes: true });
+  return payloads[0];
+}
+
+test('no-PR Done evidence carries a NO-SHA comment when the task result lacks the token', async () => {
+  const withComment = await noPrDoneEvidence('NO-SHA: runbook edit only');
+  assert.equal(withComment.to_stage, 'Done');
+  assert.deepEqual(withComment.evidence,
+    { noDeployRoute: 'no_pr', workProductEvidence: 'NO-SHA: runbook edit only' });
+  const without = await noPrDoneEvidence(null);
+  assert.deepEqual(without.evidence,
+    { noDeployRoute: 'no_pr', workProductEvidence: 'task:task-1:result' });
 });
 
 test('assignment adoption inserts only the assigned configured QC task once and is workspace-safe', async () => {
