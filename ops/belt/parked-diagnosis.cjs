@@ -57,6 +57,10 @@ function parseRuntimeEvidenceReference(value) {
     return Number.isSafeInteger(id) && id >= 0 && id <= 2147483647
       ? { kind: 'qc', id } : null;
   }
+  // The diagnosis seat's instructions name `qc:<UUID>`: the id of the durable
+  // QC-GATE comment on the same issue (qc_verdict ids are never shown to it).
+  const qcComment = text.match(/^qc:([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i);
+  if (qcComment) return { kind: 'qc_comment', id: qcComment[1].toLowerCase() };
   const match = text.match(/^(task|activity):([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})$/i);
   return match ? { kind: match[1].toLowerCase(), id: match[2].toLowerCase() } : null;
 }
@@ -153,6 +157,8 @@ async function verifyRuntimeEvidence(client, issueId, evidence, excludeTaskId = 
                AND t.context->>'kind' IS DISTINCT FROM 'parked_diagnosis'
                AND t.status = 'completed'`,
     qc: `SELECT 1 FROM qc_verdict v WHERE v.id = $1::integer AND v.issue_id = $2::uuid`,
+    qc_comment: `SELECT 1 FROM comment c WHERE c.id = $1::uuid AND c.issue_id = $2::uuid
+                   AND c.content LIKE '<!-- multica-qc-gate -->%'`,
     activity: `SELECT 1 FROM activity_log WHERE id = $1::uuid AND issue_id = $2::uuid`
   };
   const values = kind === 'task' ? [id, issueId, excludeTaskId] : [id, issueId];

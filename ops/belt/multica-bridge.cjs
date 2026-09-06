@@ -120,6 +120,7 @@ async function verifiedParkedEvidenceRelease(client, issue, toStage, reason) {
   const sql = {
     task: `SELECT 1 FROM agent_task_queue WHERE id = $1::uuid AND issue_id = $2::uuid AND status = 'completed' AND context->>'kind' IS DISTINCT FROM 'parked_diagnosis'`,
     qc: `SELECT 1 FROM qc_verdict WHERE id = $1::integer AND issue_id = $2::uuid`,
+    qc_comment: `SELECT 1 FROM comment WHERE id = $1::uuid AND issue_id = $2::uuid AND content LIKE '<!-- multica-qc-gate -->%'`,
     activity: `SELECT 1 FROM activity_log WHERE id = $1::uuid AND issue_id = $2::uuid`
   };
   return (await client.query(sql[reference.kind], [reference.id, issue.id])).rowCount === 1;

@@ -389,6 +389,12 @@ test('Parked evidence QC return is a canonical consumed-release-only edge', () =
   assert.match(source, /parkedEvidenceQcRelease/);
   assert.match(source, /parkedRelease \|\| parkedEvidenceQcRelease/);
   assert.match(source, /context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
+  // The relay releases an already_fixed Parked ticket with
+  // runtime_evidence_verified:qc:<uuid>, and the bridge re-verifies it with its
+  // own copy of this map. Without the qc_comment row the release was a silent
+  // 409 (GSP-2308, GSP-2338).
+  assert.match(source, /qc_comment: `SELECT 1 FROM comment WHERE id = \$1::uuid AND issue_id = \$2::uuid/);
+  assert.match(source, /content LIKE '<!-- multica-qc-gate -->%'/);
 });
 
 test('Parked evidence return selects the canonical In Review QC owner', () => {
