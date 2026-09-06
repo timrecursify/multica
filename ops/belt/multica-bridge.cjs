@@ -49,14 +49,20 @@ function resolveSite(req) {
   return { host, ...site };
 }
 
-for (const [name, value] of Object.entries({
-  JWT_SECRET,
-  DATABASE_URL: MULTICA_DB,
-  RELAY_AGENT_SECRET,
-  ARCHIVER_AGENT_SECRET,
-  MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID
-})) {
-  if (!value) throw new Error(`Missing required environment variable: ${name}`);
+// Checked when the service starts, not when the module loads. Throwing at load
+// time made this file impossible to require without production secrets, which
+// is why its test suite could not run anywhere and stayed out of CI. The
+// service still refuses to listen without them -- start() calls this first.
+function assertRequiredEnvironment() {
+  for (const [name, value] of Object.entries({
+    JWT_SECRET,
+    DATABASE_URL: MULTICA_DB,
+    RELAY_AGENT_SECRET,
+    ARCHIVER_AGENT_SECRET,
+    MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID
+  })) {
+    if (!value) throw new Error(`Missing required environment variable: ${name}`);
+  }
 }
 if (OPERATOR_SECRET_DISABLED) {
   console.error("[relay] RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET; operator terminal exits disabled");
@@ -2627,6 +2633,7 @@ async function assertRoutableStagesHaveOwners() {
 }
 
 async function start() {
+  assertRequiredEnvironment();
   await assertRoutableStagesHaveOwners();
   server.listen(PORT, "127.0.0.1", () => {
   console.log(`GSP Multica relay bridge listening on 127.0.0.1:${PORT}`);
@@ -2644,6 +2651,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  assertRequiredEnvironment,
   existingStageTask,
   replaceStageTask,
   ownerStageForTransition,
