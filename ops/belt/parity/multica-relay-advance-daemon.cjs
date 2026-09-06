@@ -1050,6 +1050,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name AND rsc.workspace_id = i.workspace_id
       ${evidenceSql.joins}
       WHERE atq.status = 'completed'
+        AND (atq.relay_retired_at IS NULL OR atq.updated_at > atq.relay_retired_at)
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
       ORDER BY rrl.created_at ASC
