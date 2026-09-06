@@ -20,6 +20,12 @@ else
   exit 64
 fi
 
+# Production routing is an explicit wrapper contract.  Keep these assignments
+# after daemon.env sourcing so an ambient or stale env cannot silently redirect
+# the worker to another model/provider lane.
+export MULTICA_MODEL=gpt-5.6-luna
+export MULTICA_PROVIDER=openai
+
 # A belt task that restarts this worker leaks its own task context into pm2's
 # saved process definition. The daemon then refuses every start with
 # "daemon start is not available inside a daemon-managed task", and pm2
@@ -119,7 +125,7 @@ fi
 # silently renamed the running daemon, and a daemon-id that disagrees with its
 # token is rejected as "daemon_id does not match token".
 daemon_args=(daemon start --foreground
-  --daemon-id="${MULTICA_DAEMON_ID:-gsp-multica-worker}"
+  --daemon-id=gsp-codex
   --heartbeat-interval="${MULTICA_DAEMON_HEARTBEAT_INTERVAL:-30s}"
   --poll-interval="${MULTICA_DAEMON_POLL_INTERVAL:-2s}"
   --max-concurrent-tasks="$cap_raw")
@@ -143,12 +149,9 @@ for arg in "${daemon_args[@]:2}"; do
   fi
 done
 
-# --profile is accepted by the installed daemon but is absent from its help, so
-# it is appended after the help-driven check rather than being rejected by it.
-# It is opt-in: without it the daemon uses its own default profile.
-if [[ -n "${MULTICA_DAEMON_PROFILE-}" ]]; then
-  daemon_args+=(--profile="$MULTICA_DAEMON_PROFILE")
-fi
+# Profile is supported by the installed daemon but intentionally absent from
+# older help output, so append the production profile after capability checks.
+daemon_args+=(--profile=gsp-codex)
 
 # The Claude scoping driver runs beside the worker and is what scopes tickets.
 # It is supervised by this unit, so it starts here and not from a second unit.
