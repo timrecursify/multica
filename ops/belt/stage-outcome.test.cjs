@@ -101,6 +101,14 @@ test("stageEligibility re-arms an aged unchanged ADVANCED outcome only while sti
   }
 });
 
+test("stageEligibility re-arms any unchanged outcome after the one-hour bound", async () => {
+  const now = Date.parse("2026-09-05T21:01:00Z");
+  const prior = { outcome: "NO_OP", blocked_on: null, input_hash: "h1", outcome_at: "2026-09-05T20:00:00Z" };
+  const c = fakeClient([[prior], [{ input_hash: "h1", issue_status: "Queue" }]]);
+  const result = await so.stageEligibility(c, "i4", "Queue", { now, unchangedTtlMinutes: 60 });
+  assert.deepEqual({ eligible: result.eligible, reason: result.reason }, { eligible: true, reason: "unchanged_ttl_expired" });
+});
+
 test("recordStageOutcomes rejects an In Progress ADVANCED result without PR evidence", async () => {
   const logs = [];
   const c = fakeClient([
