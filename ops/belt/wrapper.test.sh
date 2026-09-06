@@ -8,6 +8,14 @@ export BELT_WRAPPER_TEST=1
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 fake="$(mktemp -d)"; trap 'rm -rf "$fake"' EXIT
 mkdir -p -- "$fake/ws" "$fake/new-workspaces"
+# Cases that assert an unrelated rejection (bad cap, bad cwd, probe failure)
+# pass neither MULTICA_DAEMON_WORKSPACES_ROOT nor MULTICA_WORKSPACES_ROOT, so
+# without this the root resolves to the canonical fleet path, which exists only
+# on the belt host.  The wrapper then rejects on the root before reaching the
+# behaviour under test.  This is the override the header comment refers to; it
+# applies only when both variables are unset, so the explicit-root cases below
+# still exercise the real validation.
+export BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws"
 cat >"$fake/daemon" <<'EOF'
 #!/bin/sh
 if [ "$*" = 'daemon start --help' ]; then
