@@ -32,7 +32,7 @@ Creates a function and conditional `qc_verdict` trigger. Existence query: `SELEC
 
 ### 305 — `relay_stage_pool_invocation_grant`
 
-Updates enabled, unarchived pool agents and inserts missing workspace invocation targets. Preflight queries `SELECT count(*) FROM agent WHERE enabled AND archived_at IS NULL;`, `SELECT count(*) FROM agent WHERE enabled AND archived_at IS NULL AND (invocation_permission IS DISTINCT FROM '...');`, and the migration's `NOT EXISTS` target query returned 36 enabled agents, 0 requiring permission/visibility changes, and 0 missing targets. Verdict: **SAFE TO APPLY** (semantic no-op; recheck immediately before execution).
+Updates enabled, unarchived pool agents and inserts missing workspace invocation targets. Preflight queries `SELECT count(*) FROM relay_stage_agent_pool WHERE enabled;`, `SELECT count(*) FROM agent a JOIN relay_stage_agent_pool p ON p.agent_id=a.id AND p.workspace_id=a.workspace_id WHERE p.enabled AND a.archived_at IS NULL AND (a.permission_mode IS DISTINCT FROM 'public_to' OR a.visibility IS DISTINCT FROM 'workspace');`, and `SELECT count(*) FROM agent a JOIN relay_stage_agent_pool p ON p.agent_id=a.id AND p.workspace_id=a.workspace_id WHERE p.enabled AND a.archived_at IS NULL AND NOT EXISTS (SELECT 1 FROM agent_invocation_target t WHERE t.agent_id=a.id AND t.target_type='workspace' AND t.target_id=a.workspace_id);` returned 36 enabled agents, 0 requiring permission/visibility changes, and 0 missing targets. Verdict: **SAFE TO APPLY** (semantic no-op; recheck immediately before execution).
 
 ### 306 — `agent_task_queue_updated_at_invariant`
 
