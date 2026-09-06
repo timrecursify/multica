@@ -13,7 +13,7 @@ process.env.RELAY_AGENT_SECRET ||= 'test';
 process.env.ARCHIVER_AGENT_SECRET ||= 'test';
 process.env.MULTICA_WORKSPACE_ID ||= '00000000-0000-0000-0000-000000000000';
 
-const { selectRetryEscalationOwner } = require('./multica-bridge.cjs');
+const { selectRetryEscalationOwner, recordRetryEscalation } = require('./multica-bridge.cjs');
 
 // selectPoolOwner takes an advisory lock, selects the pool, then stamps
 // last_selected_at. Only the second call returns the candidate row.
@@ -58,4 +58,18 @@ test('a model on neither lane is rejected', async () => {
 
 test('the right model at the wrong effort is rejected', async () => {
   assert.match(await outcomeFor('claude-opus-4-6', 'high'), /invalid lane/);
+});
+
+test('the escalation record names the lane that was actually selected', async () => {
+  const seen = [];
+  const client = { query: async (_sql, params) => { seen.push(params); return { rows: [] }; } };
+  await recordRetryEscalation(client, { id: 'i1', workspace_id: 'w1' }, {
+    reason: 'completion_empty', trigger_stage: 'Queue', owner: 'gsp-spec-sol-low-public',
+    model: 'claude-opus-4-6', effort: 'low', deadline: 'later', source_task_id: 't1',
+  });
+  const details = JSON.parse(seen[0][1]);
+  assert.equal(details.model, 'claude-opus-4-6');
+  assert.equal(details.effort, 'low');
+  assert.equal(details.target_stage, 'Spec');
+  assert.match(seen[1][3], /next_action: re-spec on claude-opus-4-6/);
 });

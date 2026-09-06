@@ -666,7 +666,7 @@ async function capEscalationVerified(client, issue, trigger, stage) {
   return Number(history.rows[0]?.n || 0) >= LIFETIME_TASK_LIMIT;
 }
 
-// One Sol-low re-spec is a bounded handoff. A second escalation for the same
+// One re-spec is a bounded handoff. A second escalation for the same
 // stage is evidence that the handoff did not break the cycle, so park it.
 function retryEscalationLoop(issue, stage) {
   return issue.metadata?.retry_escalation?.trigger_stage === stage;
@@ -708,14 +708,14 @@ function escalationDeadline() {
 }
 
 async function recordRetryEscalation(client, issue, escalation) {
-  const details = { ...escalation, target_stage: "Spec", model: "gpt-5.6-sol", effort: "low" };
+  const details = { ...escalation, target_stage: "Spec" };
   await client.query(
     `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
           jsonb_build_object('retry_escalation', $2::jsonb, 'retry_escalation_at', to_jsonb(NOW())),
         updated_at = NOW() WHERE id = $1::uuid`, [issue.id, JSON.stringify(details)]);
   const content = `<!-- multica-retry-escalation -->\nreason_code: ${details.reason}\n` +
     `failed_stage: ${details.trigger_stage}\nowner: ${details.owner}\ndeadline: ${details.deadline}\n` +
-    `source_task_id: ${details.source_task_id || "bridge_cap"}\nnext_action: Sol-low re-spec`;
+    `source_task_id: ${details.source_task_id || "bridge_cap"}\nnext_action: re-spec on ${details.model}`;
   await client.query(
     `INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
      SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
@@ -730,7 +730,7 @@ async function recordRetryEscalation(client, issue, escalation) {
 async function selectRetryEscalationOwner(client, issue) {
   const owner = await selectStageOwner(client, issue.workspace_id, "Registered", "Spec");
   if (!owner?.agent_id || !owner.owner_id || owner.archived_at || !owner.selected_runtime_id) {
-    throw new Error(`No active Sol-low re-spec owner for workspace ${issue.workspace_id}`);
+    throw new Error(`No active re-spec owner for workspace ${issue.workspace_id}`);
   }
   // A re-spec is a scoping run, so the spec lane is admissible here alongside
   // QC's. Hard-coding gpt-5.6-sol rejected the workspace's actual Spec owner --
@@ -743,7 +743,7 @@ async function selectRetryEscalationOwner(client, issue) {
   const preflight = spendPreflight(owner, { provider: owner.selected_runtime_provider });
   if (!compatibility.ok || !preflight.ok) {
     const reason = compatibility.ok ? preflight.reason : "instruction_incompatible";
-    throw new Error(`Sol-low re-spec owner refused: ${reason}`);
+    throw new Error(`re-spec owner refused: ${reason}`);
   }
   return owner;
 }
@@ -1866,7 +1866,7 @@ async function relayAdvance(req, res, body) {
     // and the review lane on every lap. GSP #151 ran 67 laps.
     // The ceiling is agent_task_queue.max_attempts (default 2) -- the belt's own
     // declared retry limit, applied to stage re-entry instead of to one task.
-    // Past it the ticket changes hands to a Sol-low re-spec, not another paid rebuild.
+    // Past it the ticket changes hands to a re-spec, not another paid rebuild.
     if (issue.status === "In Review" && to_stage === "In Progress" &&
         altStages.includes("Human Review")) {
       const decision = qcBounceDecision(await latestQcVerdict(client, issue_id), expectedStage);
@@ -2030,6 +2030,7 @@ async function relayAdvance(req, res, body) {
       : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage));
     if (retryEscalation) {
       retryEscalation = { ...retryEscalation, owner: stage.agent_name,
+        model: stage.model, effort: stage.thinking_level,
         deadline: escalationDeadline() };
     }
 
@@ -2144,7 +2145,7 @@ async function relayAdvance(req, res, body) {
       // A stage re-entry creates a fresh task, so per-task max_attempts does not
       // stop a QC FAIL loop. Count every historical task for this issue and
       // target stage before admitting another paid call; once the ceiling is
-      // reached the flight changes hands to a bounded Sol-low re-spec task.
+      // reached the flight changes hands to a bounded re-spec task.
       const history = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
           WHERE issue_id = $1 AND context->>'to_stage' = $2
@@ -2184,6 +2185,8 @@ async function relayAdvance(req, res, body) {
         to_stage = cycle.disposition;
         stage = await selectRetryEscalationOwner(client, issue);
         retryEscalation.owner = stage.agent_name;
+        retryEscalation.model = stage.model;
+        retryEscalation.effort = stage.thinking_level;
         console.warn(JSON.stringify({
           event: "relay_retry_escalated",
           reason: cycle.reason,
@@ -2231,6 +2234,8 @@ async function relayAdvance(req, res, body) {
         to_stage = lifetime.disposition;
         stage = await selectRetryEscalationOwner(client, issue);
         retryEscalation.owner = stage.agent_name;
+        retryEscalation.model = stage.model;
+        retryEscalation.effort = stage.thinking_level;
         console.warn(JSON.stringify({
           event: "relay_retry_escalated",
           reason: lifetime.reason,
@@ -2459,7 +2464,7 @@ async function relayAdvance(req, res, body) {
           reason: reason.trim()
         }) : null,
         triggerSummary: retryEscalation
-          ? `Sol-low re-spec escalation: ${retryEscalation.reason}`
+          ? `re-spec escalation: ${retryEscalation.reason}`
           : `Relay stage transition: ${issue.status} -> ${to_stage}`
       });
       taskId = successor.taskId;
@@ -2658,6 +2663,7 @@ if (require.main === module) {
 module.exports = {
   assertRequiredEnvironment,
   selectRetryEscalationOwner,
+  recordRetryEscalation,
   existingStageTask,
   replaceStageTask,
   ownerStageForTransition,
