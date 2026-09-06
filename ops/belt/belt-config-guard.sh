@@ -12,7 +12,7 @@
 # setting below is re-asserted on a schedule rather than trusted once.
 set -uo pipefail
 
-readonly RUNTIME_ROOT="${BELT_RUNTIME_ROOT:-/var/lib/gsp}"
+readonly RUNTIME_ROOT="${BELT_RUNTIME_ROOT:-/opt/gsp/multica-workers}"
 readonly PM2="${BELT_PM2:-$RUNTIME_ROOT/.npm-global/bin/pm2}"
 readonly SK="${BELT_SK:-$RUNTIME_ROOT/bin/sk}"
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
@@ -111,6 +111,18 @@ readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver 
 # pipeline services remain under the normal liveness guard.
 readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-$RUNTIME_ROOT/.local/state/multica-ai-hold}"
 readonly PSQL=(docker exec -i gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At)
+
+# A database probe that cannot execute is an infrastructure failure, not an
+# empty result.  Treat it as a hard stop so every DB-backed guard cannot turn a
+# Docker permission error into a fabricated configuration finding.
+guard_database_preflight() {
+  local probe
+  probe=$("${PSQL[@]}" -c 'SELECT 1;' 2>/dev/null </dev/null) || {
+    echo 'belt-config-guard: BLOCKED database preflight failed; refusing DB-backed repairs' >&2
+    return 1
+  }
+  [[ "$probe" == 1 ]]
+}
 
 fixed=(); unfixable=()
 RELAY_PREFLIGHT_OK=1
@@ -1558,6 +1570,9 @@ guard_unshipped_closures() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+if ! guard_database_preflight; then
+  exit 2
+fi
 # Validate relay authority before any guard can attempt a status mutation.
 guard_relay_preflight
 repair_source_runtime_parity
