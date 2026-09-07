@@ -1,7 +1,8 @@
 const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
-const { qcCompletionAdvance } = require('./parity/multica-relay-advance-daemon.cjs');
+const { qcCompletionAdvance, relayAdvanceConfirmation } =
+  require('./parity/multica-relay-advance-daemon.cjs');
 const { classifyStageRoute } = require('./stage-routing.cjs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
@@ -2332,6 +2333,45 @@ test('lifetime ceiling applies an auditable terminal rejection instead of a re-s
   assert.match(source, /task_count: taskCount, target_stage: to_stage/);
   assert.match(source, /disposition: lifetime\.disposition, disposition_applied: applied/);
   assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
+});
+
+test('relay success requires proof that the requested stage was reached', () => {
+  assert.deepEqual(relayAdvanceConfirmation({ ok: true, status: 200,
+    issue: { status: 'Spec' }, disposition: 'Spec', reason: 'lifetime_task_limit' }, 'Queue'), {
+    ok: false, reason: 'lifetime_task_limit', actualStage: 'Spec'
+  });
+  assert.deepEqual(relayAdvanceConfirmation({ ok: true, status: 200,
+    issue: { status: 'Queue' } }, 'Queue'), { ok: true, actualStage: 'Queue' });
+});
+
+test('both daemon accounting paths verify the returned issue stage', () => {
+  const source = fs.readFileSync(
+    require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.equal((source.match(/const confirmation = relayAdvanceConfirmation\(response, targetStage\)/g)
+    || []).length, 2);
+  assert.match(source, /REFUSED:.*requested=.*actual=.*reason=/s);
+  assert.match(source, /response\.status === 200 && !confirmation\.ok/);
+  assert.match(source, /recordRefusedAdvance\(client, row\)/);
+  assert.match(source, /SET outcome = 'FAILED', blocked_on = 'human'/);
+});
+
+test('a no-op disposition reports that no issue transition was applied', async () => {
+  const calls = [];
+  const client = { query: async (sql) => {
+    calls.push(sql);
+    return { rowCount: 0, rows: [] };
+  } };
+  assert.equal(await applyDisposition(client, { id: 'issue-1', workspace_id: 'workspace-1',
+    status: 'Spec' }, 'Spec', 'lifetime_task_limit'), false);
+  assert.equal(calls.length, 1);
+});
+
+test('the lifetime-cap response refuses an unapplied disposition', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const lifetimeCap = source.slice(source.indexOf('const lifetime = lifetimeTaskAdmission'),
+    source.indexOf('// Never advance an issue into another execution lane'));
+  assert.match(lifetimeCap, /if \(!applied\)[\s\S]*?writeHead\(409/);
+  assert.match(lifetimeCap, /error: ['"]disposition_not_applied['"]/);
 });
 
 test('operator Human Review releases record actor, target, and reason in the audit payload', () => {

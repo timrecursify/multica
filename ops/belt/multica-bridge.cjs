@@ -865,6 +865,7 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
       WHERE id = $2 AND status <> $1 RETURNING id`,
     [disposition, issue.id]
   );
+  if (changed.rowCount === 0) return false;
   if (changed.rowCount > 0 && disposition === 'Parked') {
     await recordParkedEntry(client, {
       issueId: issue.id,
@@ -2667,6 +2668,14 @@ async function relayAdvance(req, res, body) {
           trigger_stage: issue.status
         });
         await client.query("COMMIT");
+        if (!applied) {
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: false, error: "disposition_not_applied",
+            issue: { id: issue.id, status: issue.status }, disposition: lifetime.disposition,
+            disposition_applied: false, reason: lifetime.reason,
+            ceiling: lifetime.ceiling, task_count: taskCount }));
+          return;
+        }
         res.writeHead(200, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: lifetime.disposition },
           disposition: lifetime.disposition, disposition_applied: applied, reason: lifetime.reason,

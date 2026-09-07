@@ -203,12 +203,10 @@ test('bridge and daemon use the same budget predicate', () => {
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
   assert.deepEqual(lifetimeTaskAdmission(5), { ok: true, ceiling: 6 });
-  // Spec, not Rejected: the ceiling stops another paid run on this ticket, it
-  // does not terminate the work. Same defect class as the stage-cycle ceiling,
-  // which stopped disposing to a terminal stage in #580.
+  // Human Review ends automatic paid retries without throwing the ticket away.
   assert.deepEqual(lifetimeTaskAdmission(6), {
     ok: false, reason: 'lifetime_task_limit', ceiling: 6,
-    disposition: 'Spec'
+    disposition: 'Human Review'
   });
 });
 

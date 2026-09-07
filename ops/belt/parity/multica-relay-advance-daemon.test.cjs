@@ -145,7 +145,7 @@ test('typed re-advance moves recorded work through relay without an agent dispat
     postRelay: async (payload) => {
       assert.equal(payload.to_stage, 'In Progress');
       assert.equal(payload.relay_source_task_id, 'task-1');
-      return { ok: true };
+      return { ok: true, issue: { status: payload.to_stage } };
     }, logger: { log() {} }, typedOutcomes: true });
   assert.deepEqual(advanced, ['issue-1']);
   assert.equal(calls.some((sql) => sql.includes('INSERT INTO agent_task_queue')), false);
@@ -158,7 +158,8 @@ test('typed Spec NO_OP re-enters Spec disposition instead of creating a Queue ta
       next_stage: 'Queue' }] } : { rows: [] } };
   const payloads = [];
   await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
-    postRelay: async (payload) => { payloads.push(payload); return { ok: true }; },
+    postRelay: async (payload) => { payloads.push(payload);
+      return { ok: true, issue: { status: payload.to_stage } }; },
     logger: { log() {} }, typedOutcomes: true });
   assert.equal(payloads[0].to_stage, 'Spec');
   assert.equal(payloads[0].relay_source_task_id, 'task-1');
@@ -185,7 +186,8 @@ test('typed In Review re-advance supplies strict QC pass evidence', async () => 
     ? { rows: [typedReadvanceQcRow()] } : { rows: [] } };
   const payloads = [];
   const advanced = await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
-    postRelay: async (payload) => { payloads.push(payload); return { ok: true }; },
+    postRelay: async (payload) => { payloads.push(payload);
+      return { ok: true, issue: { status: payload.to_stage } }; },
     logger: { log() {} }, typedOutcomes: true });
   assert.deepEqual(advanced, ['issue-1']);
   assert.deepEqual(payloads[0].evidence, {

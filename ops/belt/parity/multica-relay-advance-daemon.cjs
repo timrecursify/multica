@@ -1278,7 +1278,8 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
       if (gate === 'returned') return false;
     }
     const response = await postRelay(payload);
-    if (response.ok) {
+    const confirmation = relayAdvanceConfirmation(response, targetStage);
+    if (confirmation.ok) {
       const proof = qcAdvance.ok ? ` sha=${qcAdvance.boundSha} md5=${qcAdvance.workProductMd5}` : '';
       logger.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${targetStage}' ` +
         `route=${route?.kind || 'configured'} (task-correlated log ${row.log_id})${proof}`);
@@ -1286,10 +1287,11 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
     } else if (response.deferred) {
       logger.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
     } else {
-      logger.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}` +
-        `${response.error ? ` reason=${response.error}` : ''}`);
+      logger.log(`${LOG_PREFIX} REFUSED: ${row.issue_id} requested='${targetStage}' ` +
+        `actual='${confirmation.actualStage || 'unknown'}' status=${response.status} ` +
+        `reason=${confirmation.reason}`);
       if (response.status === 409) relayRefusalMemo.set(row.issue_id, refusalFingerprint);
-      else await markRelayLogFailedById(client, row.log_id);
+      await recordRefusedAdvance(client, row);
     }
     return false;
   } catch (err) {
@@ -1446,7 +1448,8 @@ function postToRelay(payload) {
         try {
           const parsed = JSON.parse(data);
           resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
-            status: res.statusCode, error: parsed.error, body: data });
+            status: res.statusCode, error: parsed.error, reason: parsed.reason,
+            issue: parsed.issue, disposition: parsed.disposition, body: data });
         } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
           status: res.statusCode, body: data }); }
       });
@@ -2319,9 +2322,30 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
 function relayDenialDetail(response) {
   let parsed = {};
   try { parsed = JSON.parse(response.body || '{}') || {}; } catch (_) { parsed = {}; }
-  const parts = [response.error || parsed.error, parsed.reason, parsed.message]
+  const parts = [response.error || parsed.error, response.reason || parsed.reason, parsed.message]
     .filter((part) => typeof part === 'string' && part.trim());
   return [...new Set(parts)].join('; ') || String(response.body || '').trim() || 'unknown';
+}
+
+function relayAdvanceConfirmation(response, targetStage) {
+  let parsed = {};
+  try { parsed = JSON.parse(response?.body || '{}') || {}; } catch (_) { parsed = {}; }
+  const actualStage = response?.issue?.status || parsed.issue?.status || null;
+  if (response?.ok && actualStage === targetStage) return { ok: true, actualStage };
+  return { ok: false, reason: response?.reason || parsed.reason || response?.error ||
+    parsed.error || (response?.ok ? 'relay_stage_mismatch' : 'relay_request_failed'), actualStage };
+}
+
+async function recordRefusedAdvance(client, row) {
+  await markRelayLogFailedById(client, row.log_id);
+  if (!TYPED_OUTCOMES) return;
+  await client.query(
+    `INSERT INTO issue_stage_outcome
+       (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
+     VALUES ($1::uuid, $2::text, 'FAILED', 'human', $3::uuid, NULL, NOW())
+     ON CONFLICT (issue_id, stage) DO UPDATE SET outcome = 'FAILED', blocked_on = 'human',
+       task_id = EXCLUDED.task_id, input_hash = NULL, outcome_at = NOW()`,
+    [row.issue_id, row.to_stage, row.task_id]);
 }
 
 // Retry recorded successful work without creating another agent task.  A relay
@@ -2378,7 +2402,8 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
         evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
         ...(route ? { routing_classification: route } : {}) });
-      if (response.ok) {
+      const confirmation = relayAdvanceConfirmation(response, targetStage);
+      if (confirmation.ok) {
         advanced.push(row.issue_id);
         logger.log(`${LOG_PREFIX} [typed-readvance] advanced issue=${row.issue_id} ${row.to_stage}->${targetStage}`);
         continue;
@@ -2402,9 +2427,10 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       // cae70ef9 (task ce297efa, zero relay_run_log rows) was refused
       // `parked_release_required` on every cycle for hours on 2026-09-06 while
       // issues whose task did have a run log stopped at exactly three.
-      const refused = response.status >= 400 && response.status < 500;
+      const refused = (response.status >= 400 && response.status < 500) ||
+        (response.status === 200 && !confirmation.ok);
       if (refused || Number(denied.rows[0]?.denials || 0) >= 3) {
-        await client.query(`UPDATE issue_stage_outcome SET blocked_on = 'human'
+        await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = 'human'
           WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
       }
       logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);
@@ -2542,4 +2568,5 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup,
-  advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency };
+  advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency,
+  relayAdvanceConfirmation };
