@@ -31,13 +31,20 @@ metadata="$release_dir/.gsp-belt-release.json"
 commit_sha="$(python3 -c "import json; print(json.load(open('$metadata'))['commit_sha'])")"
 [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "status: invalid release commit SHA" >&2; exit 1; }
 
+fail=0
+capacity_query="SELECT workspace_slug, stage_name, capacity_budget, available_capacity, ready_count, waiting_count, running_count FROM public.relay_stage_capacity_status ORDER BY workspace_slug, stage_name;"
+echo "stage capacity: workspace|stage|budget|available|ready|waiting|running"
+if ! sudo -n /bin/bash -c "docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -c \"$capacity_query\""; then
+  echo "status: stage capacity view unavailable" >&2
+  fail=1
+fi
+
 apps="gsp-multica-bridge,gsp-multica-worker,multica-cicd-worker,multica-archiver,multica-relay-advance"
 snapshot="$(mktemp "${TMPDIR:-/tmp}/gsp-belt-status.XXXXXX")"
 trap 'rm -f "$snapshot"' EXIT
 "$PM2" jlist > "$snapshot"
 
 echo "release commit = $commit_sha"
-fail=0
 IFS=',' read -r -a app_arr <<< "$apps"
 for app in "${app_arr[@]}"; do
   read -r path status unstable restart_time err_path exit_code exit_signal < <(python3 - "$snapshot" "$app" <<'PY'
