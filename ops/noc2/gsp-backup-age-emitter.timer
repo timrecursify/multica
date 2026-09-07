@@ -1,0 +1,12 @@
+[Unit]
+Description=Hourly artifact-derived backup-age metric emitter (all lanes)
+Requires=gsp-backup-age-emitter.service
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=120
+Persistent=true
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

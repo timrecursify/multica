@@ -5,7 +5,7 @@ const { randomUUID } = require('node:crypto');
 const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
-  isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
+  isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
@@ -21,8 +21,10 @@ test('completion evidence satisfies every automatic transition policy row', () =
   ];
   for (const [from, to, actor] of cases) {
     const qc = from === 'In Review' ? { ok: true, evidenceTaskId: 'qc-task' } : { ok: false };
-    const route = { kind: to === 'In Review' ? 'risk' : 'runtime', pr_url: 'https://github.com/o/r/pull/1', boundSha: 'a'.repeat(40) };
-    assert.equal(evaluate({ from, to, actor, evidence: completionEvidence({ ...row, to_stage: from }, to, route, qc) }).ok, true,
+    const route = { kind: to === 'In Review' ? 'risk' : 'no_pr', pr_url: 'https://github.com/o/r/pull/1', boundSha: 'a'.repeat(40) };
+    const evidence = completionEvidence({ ...row, to_stage: from }, to, route, qc);
+    if (from === 'In Progress' && to === 'Done') evidence.workProductEvidence = 'NO-SHA: no deployable artifact';
+    assert.equal(evaluate({ from, to, actor, evidence }).ok, true,
       `${from} -> ${to}`);
   }
 });
@@ -41,6 +43,21 @@ test('guarded runner contains startup rejection and allows the next pass', async
   await runner();
   assert.equal(calls, 2);
   assert.match(errors[0], /startup-test.*injected startup rejection/);
+});
+
+test('provider quota aliases remain retryable infrastructure failures', () => {
+  for (const reason of [
+    'agent_error.provider_quota_limit',
+    'payment_required_402',
+    'upstream returned HTTP 402 payment required'
+  ]) {
+    assert.equal(isQuotaFailure(reason), true, reason);
+    assert.equal(isInfrastructureFailure(reason), true, reason);
+    assert.equal(selectReplayAttempt({
+      dead_task_id: 'task-1', dead_task_status: 'failed', attempt: 2,
+      failure_reason: reason
+    }), 2, reason);
+  }
 });
 
 test('guarded runner suppresses overlapping ticks', async () => {
@@ -177,7 +194,7 @@ test('no linked PR completion routes directly to Done and never In Review', () =
   assert.match(route, /FROM issue_pull_request/);
   assert.match(route, /FROM comment/);
   assert.match(route, /kind: 'no_pr', toStage: 'Done'/);
-  assert.doesNotMatch(route, /toStage: 'In Review'/);
+  assert.doesNotMatch(route.slice(0, route.indexOf("kind: 'no_pr'")), /toStage: 'In Review'/);
 });
 
 test('completion route falls back to a PR URL in recent comments', async () => {
@@ -202,6 +219,66 @@ test('completion route falls back to a PR URL in recent comments', async () => {
   assert.equal(route.pr_url, 'https://github.com/acme/widget/pull/42');
   assert.equal(githubCalls[0][2], 'https://github.com/acme/widget/pull/42');
   assert.equal(queries.length, 2);
+});
+
+function linkedPrClient(pr) {
+  return { release() {}, query: async (sql) => {
+    if (sql.includes('FROM issue_pull_request')) {
+      return { rows: [{ html_url: 'https://github.com/timrecursify/multica/pull/77',
+        repo_owner: 'timrecursify', repo_name: 'multica' }] };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  }, pr };
+}
+
+async function inProgressRoute(pr) {
+  return buildCompletionRoute(linkedPrClient(pr), {
+    issue_id: 'issue-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: () => JSON.stringify(pr) });
+}
+
+test('runtime PR completing In Progress routes through In Review, not straight to deploy', async () => {
+  const route = await inProgressRoute({ state: 'OPEN', files: [{ path: 'ops/belt/multica-bridge.cjs' }],
+    headRefOid: 'b'.repeat(40), mergeStateStatus: 'CLEAN', statusCheckRollup: [] });
+  assert.equal(route.kind, 'runtime');
+  assert.equal(route.toStage, 'In Review');
+  assert.equal(route.boundSha, 'b'.repeat(40));
+  assert.equal(route.repo, 'timrecursify/multica');
+});
+
+test('merged non-runtime PR completing In Progress reviews before Done', async () => {
+  const route = await inProgressRoute({ state: 'MERGED', files: [{ path: 'web/app.ts' }],
+    headRefOid: 'c'.repeat(40), mergeStateStatus: 'CLEAN', statusCheckRollup: [] });
+  assert.equal(route.kind, 'merge_only');
+  assert.equal(route.toStage, 'In Review');
+  assert.equal(route.boundSha, 'c'.repeat(40));
+});
+
+async function noPrDoneEvidence(noShaComment) {
+  const payloads = [];
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => ({ release() {}, query: async (sql) => {
+    if (sql.includes('FROM issue_stage_outcome')) {
+      return { rows: [{ issue_id: 'issue-1', to_stage: 'In Progress', outcome: 'NO_OP',
+        task_id: 'task-1', task_result: { output: 'doc edit' }, issue_title: 'work',
+        next_stage: 'In Review' }] };
+    }
+    if (sql.includes('NO-SHA')) return { rows: noShaComment ? [{ content: noShaComment }] : [] };
+    if (sql.includes('FROM comment')) return { rows: [] };
+    if (sql.includes('FROM issue_pull_request')) return { rows: [] };
+    return { rows: [] };
+  } }) }, postRelay: async (payload) => { payloads.push(payload); return { ok: true }; },
+  logger: { log() {} }, typedOutcomes: true });
+  return payloads[0];
+}
+
+test('no-PR Done evidence carries a NO-SHA comment when the task result lacks the token', async () => {
+  const withComment = await noPrDoneEvidence('NO-SHA: runbook edit only');
+  assert.equal(withComment.to_stage, 'Done');
+  assert.deepEqual(withComment.evidence,
+    { noDeployRoute: 'no_pr', workProductEvidence: 'NO-SHA: runbook edit only' });
+  const without = await noPrDoneEvidence(null);
+  assert.deepEqual(without.evidence,
+    { noDeployRoute: 'no_pr', workProductEvidence: 'task:task-1:result' });
 });
 
 test('assignment adoption inserts only the assigned configured QC task once and is workspace-safe', async () => {
@@ -1094,6 +1171,43 @@ test('Parked diagnosis releases clear retry escalation regardless of reason, whi
   assert.ok(!held.queries.some(({ sql }) => sql.includes("- 'retry_escalation'")));
 });
 
+test('a diagnosis that answered in a comment and returned nothing is still read', async () => {
+  // Every rerun diagnosis today posted its verdict as an issue comment and
+  // returned an empty final message (codex rollout: agent_message "" then
+  // turn_aborted), so the bare task result held no outcome.
+  const run = async (result) => {
+    const task = { id: randomUUID(), issue_id: randomUUID(), workspace_id: randomUUID(), number: 2351,
+      status: 'Parked', context: {}, result, agent_id: randomUUID(), created_at: '2026-09-06T19:40:00Z' };
+    const queries = [];
+    const relayPosts = [];
+    const client = { query: async (sql, values = []) => {
+      queries.push({ sql, values });
+      if (sql.includes('LIMIT 25')) return { rows: [{ id: task.id, workspace_id: task.workspace_id }] };
+      if (sql.includes('FOR UPDATE OF t SKIP LOCKED')) return { rows: [task] };
+      if (sql.includes('SELECT content FROM comment')) return { rows: [{ content: 'outcome: fixable' }] };
+      if (sql.includes("content LIKE '%## Spec%'")) return { rows: [{}], rowCount: 1 };
+      return { rows: [] };
+    }, release() {} };
+    await processParkedDiagnoses({ diagnosisPool: { connect: async () => client },
+      relayPost: async (body) => { relayPosts.push(body); return { ok: true, status: 200 }; } });
+    return { task, queries, relayPosts };
+  };
+
+  const bare = await run('');
+  const lookup = bare.queries.find(({ sql }) => sql.includes('SELECT content FROM comment'));
+  assert.ok(lookup, 'a bare task result must fall back to the seat\'s own comment');
+  assert.match(lookup.sql, /author_id = \$2::uuid AND created_at >= \$3::timestamptz/);
+  assert.deepEqual(lookup.values, [bare.task.issue_id, bare.task.agent_id, bare.task.created_at]);
+  const outcomeComment = bare.queries.find(({ sql }) => sql.includes('INSERT INTO comment'));
+  assert.match(outcomeComment.values[3], /outcome: fixable\./);
+  assert.deepEqual(bare.relayPosts.map((body) => body.to_stage), ['Queue']);
+
+  // A result that carries its own outcome is never overridden by a comment.
+  const spoken = await run('outcome: genuinely_blocked\nblocker: awaiting operator input');
+  assert.equal(spoken.queries.some(({ sql }) => sql.includes('SELECT content FROM comment')), false);
+  assert.deepEqual(spoken.relayPosts, []);
+});
+
 test('diagnosis release retries every non-2xx response and records the attempt', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /if \(!response\.ok\)/);
@@ -1241,4 +1355,166 @@ test('quota pause flips are timestamped and stale unbudgeted pauses self-clear',
   assert.match(source, /committedFlips\.push\(\{ agent_name: agent\.agent_name, timestamp, paused: false \}\)/);
   assert.match(source, /await client\.query\('COMMIT'\);\s+for \(const flip of committedFlips\) onFlip\(flip\)/);
   assert.match(source, /scheduleEvery\(reconcileQuotaPauses, 60000, 'reconcileQuotaPauses'\)/);
+});
+
+test('retry escalation handles Spec in place without posting a self-transition', async () => {
+  const { requestRetryEscalation } = require('./multica-relay-advance-daemon.cjs');
+  let posted = false;
+  const result = await requestRetryEscalation(
+    { issue_id: 'issue-1', to_stage: 'Spec', task_id: 'task-1' },
+    'completion_failed',
+    async () => { posted = true; return { ok: true, status: 200 }; }
+  );
+  assert.deepEqual(result, { ok: true, status: 200, handled: 'already_in_spec' });
+  assert.equal(posted, false);
+});
+
+// --- GitHub reads run on REST, not GraphQL (relay rate-limit migration) -----
+
+const { github: githubRest, restPrView , reconcileGithubCommand } = require('./multica-relay-advance-daemon.cjs');
+
+function stubGh(responses) {
+  const calls = [];
+  const run = (args) => {
+    calls.push(args.join(' '));
+    const key = Object.keys(responses).find((k) => args.join(' ').includes(k));
+    if (!key) throw new Error(`unexpected gh call: ${args.join(' ')}`);
+    return responses[key];
+  };
+  return { run, calls };
+}
+
+const OPEN_PR_RESPONSES = {
+  'pulls/42/files': JSON.stringify([{ filename: 'server/main.go' }, { filename: 'docs/x.md' }]),
+  'pulls/42': JSON.stringify({ state: 'open', merged: false, mergeable_state: 'clean',
+    head: { sha: 'a'.repeat(40) } }),
+  'check-runs': JSON.stringify({ check_runs: [{ name: 'ci', status: 'completed', conclusion: 'success' }] }),
+  '/status': JSON.stringify({ statuses: [{ context: 'legacy', state: 'success' }] })
+};
+
+test('pr view is rebuilt from REST with the GraphQL field names', () => {
+  const { run, calls } = stubGh(OPEN_PR_RESPONSES);
+  const pr = JSON.parse(restPrView('acme/widget', '42', run));
+  assert.equal(pr.state, 'OPEN');
+  assert.equal(pr.headRefOid, 'a'.repeat(40));
+  assert.equal(pr.mergeStateStatus, 'CLEAN');
+  assert.deepEqual(pr.files.map(({ path }) => path), ['server/main.go', 'docs/x.md']);
+  assert.deepEqual(pr.statusCheckRollup, [
+    { __typename: 'CheckRun', name: 'ci', status: 'COMPLETED', conclusion: 'SUCCESS' },
+    { __typename: 'StatusContext', context: 'legacy', state: 'SUCCESS' }
+  ]);
+  assert.equal(calls.every((c) => c.startsWith('api ')), true);
+  assert.equal(calls.some((c) => c.includes('graphql')), false);
+});
+
+test('a merged PR reads as MERGED and an unchecked commit rolls up to null', () => {
+  const { run } = stubGh({ ...OPEN_PR_RESPONSES,
+    'pulls/42': JSON.stringify({ state: 'closed', merged: true, mergeable_state: 'unknown',
+      head: { sha: 'b'.repeat(40) } }),
+    'check-runs': JSON.stringify({ check_runs: [] }),
+    '/status': JSON.stringify({ statuses: [] }) });
+  const pr = JSON.parse(restPrView('acme/widget', '42', run));
+  assert.equal(pr.state, 'MERGED');
+  assert.equal(pr.mergeStateStatus, 'UNKNOWN');
+  assert.equal(pr.statusCheckRollup, null);
+});
+
+// reconciler.cjs reads these exact names off the parsed result and writes them
+// straight into github_pull_request. A REST name reaching that insert is a
+// silently empty column, so the translation is asserted field by field.
+test('the reconciler PR read translates every REST name it consumes', () => {
+  const { run, calls } = stubGh({ 'pulls/42': JSON.stringify({
+    number: 42, title: 'Fix the belt', state: 'open', merged: false, html_url: 'https://github.com/acme/widget/pull/42',
+    head: { sha: 'c'.repeat(40), ref: 'fix/belt' }, user: { login: 'gsp-multica-belt' },
+    created_at: '2026-09-01T00:00:00Z', updated_at: '2026-09-02T00:00:00Z',
+    merged_at: null, closed_at: null, additions: 3, deletions: 1, changed_files: 2,
+    mergeable: true, mergeable_state: 'clean' }) });
+  const pr = JSON.parse(reconcileGithubCommand(['pr', 'view', 'https://github.com/acme/widget/pull/42',
+    '--json', 'number,title,state,url,headRefOid,createdAt,updatedAt,mergedAt,closedAt,author,headRefName,' +
+    'additions,deletions,changedFiles,mergeable,mergeStateStatus'], run));
+  assert.equal(pr.number, 42);
+  assert.equal(pr.title, 'Fix the belt');
+  assert.equal(pr.state, 'OPEN');
+  assert.equal(pr.url, 'https://github.com/acme/widget/pull/42');
+  assert.equal(pr.headRefOid, 'c'.repeat(40));
+  assert.equal(pr.headRefName, 'fix/belt');
+  assert.deepEqual(pr.author, { login: 'gsp-multica-belt' });
+  assert.equal(pr.createdAt, '2026-09-01T00:00:00Z');
+  assert.equal(pr.updatedAt, '2026-09-02T00:00:00Z');
+  assert.equal(pr.mergedAt, null);
+  assert.equal(pr.closedAt, null);
+  assert.equal(pr.additions, 3);
+  assert.equal(pr.deletions, 1);
+  assert.equal(pr.changedFiles, 2);
+  assert.equal(pr.mergeable, 'MERGEABLE');
+  assert.equal(pr.mergeStateStatus, 'CLEAN');
+  // An unrequested field costs no call: files and checks were never asked for.
+  assert.equal(calls.length, 1);
+});
+
+test('the reconciler merged-PR check sees MERGED through the same reader', () => {
+  const { run } = stubGh({ 'pulls/7': JSON.stringify({ state: 'closed', merged: true,
+    merged_at: '2026-09-03T00:00:00Z', html_url: 'https://github.com/acme/widget/pull/7',
+    head: { sha: 'd'.repeat(40) }, mergeable_state: 'unknown' }) });
+  const pr = JSON.parse(reconcileGithubCommand(['pr', 'view', 'https://github.com/acme/widget/pull/7',
+    '--json', 'state,mergedAt,headRefOid,url'], run));
+  assert.equal(pr.state, 'MERGED');
+  assert.equal(pr.mergedAt, '2026-09-03T00:00:00Z');
+  assert.equal(pr.url, 'https://github.com/acme/widget/pull/7');
+});
+
+test('the reconciler reader refuses a command it cannot serve', () => {
+  assert.throws(() => reconcileGithubCommand(['pr', 'merge', 'https://github.com/acme/widget/pull/7']),
+    /unsupported GitHub command/);
+  assert.throws(() => reconcileGithubCommand(['pr', 'view', 'not-a-pr-url', '--json', 'state']),
+    /unsupported pull request reference/);
+});
+
+test('pr merge becomes a REST squash merge and other gh verbs pass through', () => {
+  const { run, calls } = stubGh({ 'pulls/42/merge': '{"merged":true}', 'repo view': 'acme/widget' });
+  githubRest(['pr', 'merge', 'https://github.com/acme/widget/pull/42', '--squash', '--admin'], run);
+  assert.deepEqual(calls, ['api -X PUT repos/acme/widget/pulls/42/merge -f merge_method=squash']);
+  githubRest(['repo', 'view'], run);
+  assert.equal(calls[1], 'repo view');
+});
+
+test('a 409 relay refusal parks the outcome instead of re-posting it every cycle', async () => {
+  const calls = [];
+  const logs = [];
+  const client = { release() {}, query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1',
+      to_stage: 'Parked', outcome: 'ADVANCED', task_id: 'task-1', task_status: 'completed',
+      task_result: { output: 'done' }, issue_title: 'work', next_stage: 'Queue' }] };
+    // The completed task has no relay_run_log row, so the denial counter has
+    // nowhere to live and the UPDATE matches nothing.
+    return { rows: [] };
+  }};
+  let posts = 0;
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => { posts += 1; return { ok: false, status: 409,
+      error: 'parked_release_required',
+      body: '{"error":"parked_release_required","message":"a completed Sol-low diagnosis must authorize one deliberate release"}' }; },
+    logger: { log: (line) => logs.push(line) }, typedOutcomes: true });
+  assert.equal(posts, 1);
+  const parked = calls.find(({ sql }) => sql.includes("SET blocked_on = 'human'"));
+  assert.ok(parked, 'a 409 refusal must park the outcome, or the daemon re-posts it every cycle');
+  assert.deepEqual(parked.values, ['issue-1', 'Parked']);
+  assert.match(logs.join('\n'), /a completed Sol-low diagnosis must authorize one deliberate release/);
+});
+
+test('a transient relay denial keeps its three-strike allowance', async () => {
+  const calls = [];
+  const client = { release() {}, query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1',
+      to_stage: 'Queue', outcome: 'ADVANCED', task_id: 'task-1', task_status: 'completed',
+      task_result: { output: 'done' }, issue_title: 'work', next_stage: 'In Progress' }] };
+    if (sql.includes('typed_readvance_denials')) return { rows: [{ denials: 1 }] };
+    return { rows: [] };
+  }};
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => ({ ok: false, status: 500, error: 'No eligible stage owner in pool' }),
+    logger: { log() {} }, typedOutcomes: true });
+  assert.equal(calls.some(({ sql }) => sql.includes("SET blocked_on = 'human'")), false);
 });

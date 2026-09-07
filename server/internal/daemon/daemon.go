@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -324,7 +325,9 @@ type Daemon struct {
 	// command resolves; read by runTask to launch the custom command for a
 	// claimed task. Guarded by mu.
 	profileLaunchSpecs map[string]profileLaunchSpec
-	reloading          sync.Mutex         // prevents concurrent workspace syncs
+	reloading          sync.Mutex // prevents concurrent workspace syncs
+	authIncidentMu     sync.Mutex
+	authIncidentActive bool               // one durable authentication incident per outage
 	runtimeSet         *runtimeSetWatcher // multi-subscriber pub/sub for runtime-set changes
 
 	versionsMu    sync.RWMutex      // guards agentVersions
@@ -408,8 +411,12 @@ type Daemon struct {
 	// login-shell probe + version detection instead of one per task (MUL-4486).
 	healGroup singleflight.Group
 
-	wsHBMu      sync.RWMutex         // guards wsHBLastAck
-	wsHBLastAck map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
+	wsHBMu              sync.RWMutex         // guards wsHBLastAck
+	wsHBLastAck         map[string]time.Time // runtime_id -> last successful WS heartbeat ack timestamp
+	lastHeartbeatAt     atomic.Int64
+	lastTickCompletedAt atomic.Int64
+	tickCount           atomic.Uint64
+	lastTickOutcome     atomic.Pointer[string]
 
 	// reconcile fans out a "re-check server state now" signal to subscribers
 	// (watchTaskCancellation, workspaceSyncLoop) so the WS connect/reconnect
@@ -1636,6 +1643,7 @@ func (d *Daemon) recordWSHeartbeatAck(runtimeID string) {
 	d.wsHBMu.Lock()
 	d.wsHBLastAck[runtimeID] = time.Now()
 	d.wsHBMu.Unlock()
+	d.lastHeartbeatAt.Store(time.Now().UnixNano())
 }
 
 // wsHeartbeatRecentlyAcked reports whether the runtime received a WS
@@ -3320,8 +3328,21 @@ func (d *Daemon) syncWorkspacesFromAPI(ctx context.Context, reconcileProfiles bo
 
 	workspaces, err := d.client.ListWorkspaces(apiCtx)
 	if err != nil {
+		if isUnauthorizedError(err) {
+			d.authIncidentMu.Lock()
+			if !d.authIncidentActive {
+				// This structured log line is consumed by the belt sentinel and
+				// deliberately excludes the bearer token and response body.
+				d.logger.Error("AUTHENTICATION_INCIDENT: daemon workspace registration rejected; run multica login", "sentinel", "daemon_auth", "status", http.StatusUnauthorized)
+				d.authIncidentActive = true
+			}
+			d.authIncidentMu.Unlock()
+		}
 		return fmt.Errorf("list workspaces: %w", err)
 	}
+	d.authIncidentMu.Lock()
+	d.authIncidentActive = false
+	d.authIncidentMu.Unlock()
 	d.logger.Debug("workspace sync: fetched workspaces", "count", len(workspaces))
 
 	apiIDs := make(map[string]string, len(workspaces)) // id -> name
@@ -3626,6 +3647,7 @@ func (d *Daemon) runHeartbeatTick(ctx context.Context, rid string) bool {
 		return false
 	}
 	d.handleHeartbeatActions(ctx, rid, resp)
+	d.lastHeartbeatAt.Store(time.Now().UnixNano())
 	return false
 }
 
@@ -4436,6 +4458,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 
 		runtimeIDs := d.allRuntimeIDs()
 		if len(runtimeIDs) == 0 {
+			d.recordTick("idle")
 			if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
 				return
 			}
@@ -4452,6 +4475,12 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			if woke {
 				continue
 			}
+			// A full semaphore is a completed poll attempt that could not
+			// claim work. Keep the reason in the daemon log so a fresh
+			// heartbeat cannot hide a wedged dispatcher; this branch emits
+			// once for this tick and names the resource that blocked it.
+			d.logger.Warn("poll tick blocked", "reason", "task capacity exhausted",
+				"resource", "task_slots", "max_concurrent_tasks", d.cfg.MaxConcurrentTasks)
 			if err := sleepWithContextOrWakeup(pollerCtx, capacityBackoff(d.cfg.PollInterval), wakeup); err != nil {
 				return
 			}
@@ -4463,6 +4492,8 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		// the process (paired with the re-check in tryAutoUpdate).
 		if !d.tryEnterClaim() {
 			releaseSlots(slots)
+			d.logger.Warn("poll tick blocked", "reason", "auto-update barrier",
+				"resource", "claim_barrier", "ticket", "none")
 			if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
 				return
 			}
@@ -4471,6 +4502,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 
 		tasks, err := d.ClaimTasksWSFirst(pollerCtx, d.cfg.DaemonID, runtimeIDs, len(slots))
 		if err != nil {
+			d.recordTick("error")
 			d.exitClaim()
 			releaseSlots(slots)
 			if pollerCtx.Err() == nil {
@@ -4481,6 +4513,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			}
 			continue
 		}
+		d.recordTick("success")
 
 		// Dispatch each claimed task into a slot. activeTasks is incremented for
 		// every dispatched task BEFORE exitClaim so the auto-update barrier never

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 # Belt config guard.
 # shellcheck disable=SC2016 # Literal shell fragments are checked below.
 # shellcheck disable=SC2009 # The full command line is required for flag validation.
@@ -11,13 +12,50 @@
 # setting below is re-asserted on a schedule rather than trusted once.
 set -uo pipefail
 
-readonly PM2=/home/newadmin/.npm-global/bin/pm2
-readonly SK=/home/newadmin/bin/sk
+readonly RUNTIME_ROOT="${BELT_RUNTIME_ROOT:-/var/lib/gsp}"
+readonly PM2="${BELT_PM2:-$RUNTIME_ROOT/.npm-global/bin/pm2}"
+readonly SK="${BELT_SK:-$RUNTIME_ROOT/bin/sk}"
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
-readonly WRAPPER=/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh
-readonly ECOSYSTEM=/home/newadmin/gsp-multica/fleet/ecosystem.gsp-belt.config.js
-readonly WANT_CONCURRENCY="${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}"
-readonly WANT_WORKSPACES_ROOT=/home/newadmin/multica-workspaces-gsp
+readonly RELAY_ENV_FILE="${BELT_RELAY_ENV_FILE:-$RUNTIME_ROOT/gsp-multica/.env}"
+readonly RELAY_HEALTH_URL="${BELT_RELAY_HEALTH_URL:-}"
+readonly WRAPPER="$RUNTIME_ROOT/gsp-multica/fleet/multica-daemon-wrapper.sh"
+readonly SOURCE_ROOT="${BELT_SOURCE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)}"
+readonly GUARD_SOURCE="${BELT_SOURCE_GUARD:-${SOURCE_ROOT}/belt-config-guard.sh}"
+readonly WRAPPER_SOURCE="${BELT_SOURCE_WRAPPER:-${SOURCE_ROOT}/multica-daemon-wrapper.sh}"
+readonly RUNTIME_GUARD="${RUNTIME_ROOT}/tools/belt-config-guard.sh"
+readonly RUNTIME_WRAPPER="${RUNTIME_ROOT}/gsp-multica/fleet/multica-daemon-wrapper.sh"
+readonly RELEASE_ROOT="${BELT_RELEASE_ROOT:-$RUNTIME_ROOT/gsp-multica-runtime/releases}"
+readonly ECOSYSTEM="$RUNTIME_ROOT/gsp-multica/fleet/ecosystem.gsp-belt.config.js"
+# Keep release identity validation aligned with deploy-release.sh.  The
+# metadata digest is meaningful only when it covers the complete runtime
+# manifest, including both members of the parity pair.
+readonly RELEASE_MANIFEST=(
+  ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs
+  ops/belt/parked-diagnosis.cjs ops/belt/parked-entry-audit.cjs
+  ops/belt/parity/multica-relay-advance-daemon.cjs
+  ops/belt/parity/relay-dead-rows.cjs ops/belt/multica-cicd-worker.cjs
+  ops/belt/cicd-watchdog.cjs ops/belt/cicd-deploy-evidence.cjs
+  ops/belt/multica-archiver.cjs ops/belt/reconciler.cjs
+  ops/belt/stage-outcome.cjs ops/belt/transition-policy.cjs
+  ops/belt/stage-routing.cjs ops/belt/qc-strict-evidence.cjs
+  ops/belt/qc-verdict-policy.cjs ops/belt/belt-config-guard.sh
+  ops/belt/multica-daemon-wrapper.sh ops/belt/ecosystem.gsp-belt.config.js
+  ops/belt/workspace-root.sh
+  ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md
+  ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md
+  ops/belt/WORKER_COMMON.md ops/belt/relay-completion-admission.cjs
+)
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
+source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"
+# workspace-root.sh sets -e for its own direct use.  Sourcing it turns errexit
+# on here too, which contradicts the -uo pipefail chosen above: the repair
+# path assigns from probes that are expected to fail (a missing source
+# wrapper, an absent runtime file) and must continue to the release
+# fallback rather than abort the guard.
+set +e
+WANT_CONCURRENCY="$(belt_resolve_concurrency)"
+readonly WANT_CONCURRENCY
+readonly WANT_WORKSPACES_ROOT="$BELT_CANONICAL_WORKSPACES_ROOT"
 readonly BUILD_AGENT=gsp-build-deepseek-flash-1
 # 2026-08-31 14:20 UTC: global 12 -> 20, build capacity 3 -> 15, QC 4 each.
 # Tim's directive: 12-15 build employees, 3-4 QC.
@@ -71,10 +109,328 @@ readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver 
 # Operators may intentionally hold the AI worker while investigating spend or
 # deploying guardrails.  This marker suppresses only worker self-healing; all
 # pipeline services remain under the normal liveness guard.
-readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-/home/newadmin/.local/state/multica-ai-hold}"
+readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-$RUNTIME_ROOT/.local/state/multica-ai-hold}"
 readonly PSQL=(docker exec -i gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At)
 
 fixed=(); unfixable=()
+RELAY_PREFLIGHT_OK=1
+RELAY_PREFLIGHT_DIAGNOSTIC=''
+PARITY_OK=1
+PARITY_DIAGNOSTIC=''
+
+repair_failure() {
+  local diagnostic="$1"
+  PARITY_OK=0
+  PARITY_DIAGNOSTIC="$diagnostic"
+  unfixable+=("belt runtime/source parity repair failed: ${diagnostic}")
+}
+
+release_manifest_checksum() {
+  local release="$1" file
+  for file in "${RELEASE_MANIFEST[@]}"; do
+    [[ -f "$release/$file" ]] || return 1
+  done
+  (cd -- "$release" && sha256sum "${RELEASE_MANIFEST[@]}" | sha256sum | awk '{print $1}')
+}
+
+# A deployed guard can live outside the source tree, so recover the paired
+# wrapper from a complete release when the source wrapper is not installed.
+validated_release_wrapper() {
+  local guard_sha="$1" candidate_guard release candidate_wrapper metadata source_sha manifest_sha256
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || return 1
+  while IFS= read -r candidate_guard; do
+    release="${candidate_guard%/ops/belt/belt-config-guard.sh}"
+    candidate_wrapper="$release/ops/belt/multica-daemon-wrapper.sh"
+    [[ -d "$release" && ! -L "$release" && -r "$candidate_wrapper" ]] || continue
+    # A release is identified by its immutable commit directory.  Merely
+    # finding two matching blobs is insufficient: a copied/misnamed release
+    # could otherwise supply an unreviewed wrapper.
+    [[ "$(basename -- "$release")" =~ ^[0-9a-f]{40}$ ]] || continue
+    [[ "$(sha256sum -- "$candidate_guard" 2>/dev/null | awk '{print $1}')" == "$guard_sha" ]] || continue
+    metadata="$release/.gsp-belt-release.json"
+    [[ -r "$metadata" ]] || continue
+    source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
+    manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
+    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ &&
+       "${source_sha,,}" == "$(basename -- "$release")" &&
+       "$manifest_sha256" == "$(release_manifest_checksum "$release")" ]] || continue
+    printf '%s\n' "$candidate_wrapper"
+    return 0
+  done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
+  return 1
+}
+
+# Resolve an authenticated release containing the complete parity pair.  The
+# caller may provide either expected digest (or an empty value when that
+# source member is absent); metadata and the complete manifest remain
+# mandatory, so a lone copied blob can never become an authority.
+validated_release_pair() {
+  local expected_guard_sha="${1:-}" expected_wrapper_sha="${2:-}"
+  local candidate_guard release candidate_wrapper metadata source_sha manifest_sha256
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || return 1
+  while IFS= read -r candidate_guard; do
+    release="${candidate_guard%/ops/belt/belt-config-guard.sh}"
+    candidate_wrapper="$release/ops/belt/multica-daemon-wrapper.sh"
+    [[ -d "$release" && ! -L "$release" && -r "$candidate_guard" && -r "$candidate_wrapper" ]] || continue
+    [[ "$(basename -- "$release")" =~ ^[0-9a-f]{40}$ ]] || continue
+    [[ -x "$candidate_guard" && -x "$candidate_wrapper" ]] || continue
+    [[ -z "$expected_guard_sha" || "$(sha256sum -- "$candidate_guard" | awk '{print $1}')" == "$expected_guard_sha" ]] || continue
+    [[ -z "$expected_wrapper_sha" || "$(sha256sum -- "$candidate_wrapper" | awk '{print $1}')" == "$expected_wrapper_sha" ]] || continue
+    metadata="$release/.gsp-belt-release.json"
+    [[ -r "$metadata" ]] || continue
+    source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
+    manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
+    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ &&
+       "${source_sha,,}" == "$(basename -- "$release")" &&
+       "$manifest_sha256" == "$(release_manifest_checksum "$release")" ]] || continue
+    printf '%s\n' "$release"
+    return 0
+  done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
+  return 1
+}
+
+# Recover a missing member of the guard/wrapper pair only from a complete,
+# immutable release that contains the exact source blobs.  Validation happens
+# before either destination is touched; installation is protected by a lock
+# and rolls back if the second rename fails.
+repair_source_runtime_parity() {
+  local guard_sha wrapper_sha release candidate_guard candidate_wrapper lock staging old_guard old_wrapper metadata source_sha manifest_sha256 wrapper_source guard_source guard_mode wrapper_mode final_guard_sha final_wrapper_sha
+  local guard_present=0 wrapper_present=0 needs_repair=0
+  guard_source="$GUARD_SOURCE"
+  guard_sha=$(sha256sum -- "$guard_source" 2>/dev/null | awk '{print $1}')
+  wrapper_source="$WRAPPER_SOURCE"
+  wrapper_sha=$(sha256sum -- "$wrapper_source" 2>/dev/null | awk '{print $1}')
+  if [[ ! "$guard_sha" =~ ^[0-9a-f]{64}$ || ! "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    release=$(validated_release_pair "$guard_sha" "$wrapper_sha" 2>/dev/null || true)
+    if [[ -n "$release" ]]; then
+      guard_source="$release/ops/belt/belt-config-guard.sh"
+      wrapper_source="$release/ops/belt/multica-daemon-wrapper.sh"
+      guard_sha=$(sha256sum -- "$guard_source" | awk '{print $1}')
+      wrapper_sha=$(sha256sum -- "$wrapper_source" | awk '{print $1}')
+    fi
+  fi
+  if [[ ! "$guard_sha" =~ ^[0-9a-f]{64}$ || ! "$wrapper_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    repair_failure 'phase=repair missing=source-pair'
+    return 0
+  fi
+  if [[ -r "$RUNTIME_GUARD" ]]; then
+    guard_present=1
+    [[ "$(sha256sum -- "$RUNTIME_GUARD" | awk '{print $1}')" == "$guard_sha" ]] || needs_repair=1
+  else
+    needs_repair=1
+  fi
+  if [[ -r "$RUNTIME_WRAPPER" ]]; then
+    wrapper_present=1
+    [[ "$(sha256sum -- "$RUNTIME_WRAPPER" | awk '{print $1}')" == "$wrapper_sha" ]] || needs_repair=1
+  else
+    needs_repair=1
+  fi
+  (( needs_repair )) || return 0
+  [[ -d "$RELEASE_ROOT" && ! -L "$RELEASE_ROOT" ]] || {
+    repair_failure 'phase=repair incomplete-release=release-root'
+    return 0
+  }
+  release=''
+  while IFS= read -r candidate_guard; do
+    release="${candidate_guard%/ops/belt/belt-config-guard.sh}"
+    [[ -d "$release" && ! -L "$release" ]] || { release=''; continue; }
+    [[ "$(basename -- "$release")" =~ ^[0-9a-f]{40}$ ]] || { release=''; continue; }
+    candidate_wrapper="$release/ops/belt/multica-daemon-wrapper.sh"
+    [[ -r "$candidate_wrapper" ]] || { release=''; continue; }
+    [[ "$(sha256sum -- "$candidate_guard" | awk '{print $1}')" == "$guard_sha" ]] || { release=''; continue; }
+    [[ "$(sha256sum -- "$candidate_wrapper" | awk '{print $1}')" == "$wrapper_sha" ]] || { release=''; continue; }
+    metadata="$release/.gsp-belt-release.json"
+    [[ -r "$metadata" ]] || { release=''; continue; }
+    source_sha=$(sed -n 's/.*"source_sha"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{40\}\)".*/\1/p' "$metadata" | head -1)
+    manifest_sha256=$(sed -n 's/.*"manifest_sha256"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]\{64\}\)".*/\1/p' "$metadata" | head -1)
+    [[ "$source_sha" =~ ^[0-9a-fA-F]{40}$ && "$manifest_sha256" =~ ^[0-9a-fA-F]{64}$ &&
+       "${source_sha,,}" == "$(basename -- "$release")" &&
+       "$manifest_sha256" == "$(release_manifest_checksum "$release")" ]] || { release=''; continue; }
+    break
+  done < <(printf '%s\n' "$RELEASE_ROOT"/*/ops/belt/belt-config-guard.sh 2>/dev/null)
+  [[ -n "$release" ]] || {
+    repair_failure 'phase=repair incomplete-release=matching-blobs-or-ref'
+    return 0
+  }
+  if ! mkdir -p -- "$(dirname -- "$RUNTIME_GUARD")" "$(dirname -- "$RUNTIME_WRAPPER")"; then
+    repair_failure 'phase=repair class=permission mkdir-failed'
+    return 0
+  fi
+  lock="${RUNTIME_ROOT}/.belt-config-parity.lock"
+  if ! exec 8>"$lock" || ! flock -n 8; then
+    repair_failure 'phase=repair class=permission lock-failed'
+    return 0
+  fi
+  staging="$(mktemp -d "${RUNTIME_ROOT}/.belt-config-parity.XXXXXX")" || {
+    repair_failure 'phase=repair class=permission staging-failed'
+    return 0
+  }
+  old_guard="$staging/old-guard"; old_wrapper="$staging/old-wrapper"
+  if ! cp -- "$release/ops/belt/belt-config-guard.sh" "$staging/guard" ||
+     ! cp -- "$release/ops/belt/multica-daemon-wrapper.sh" "$staging/wrapper" ||
+     [[ "$(sha256sum -- "$staging/guard" | awk '{print $1}')" != "$guard_sha" ]] ||
+     [[ "$(sha256sum -- "$staging/wrapper" | awk '{print $1}')" != "$wrapper_sha" ]]; then
+    rm -rf -- "$staging"
+    repair_failure 'phase=repair class=permission staging-copy-failed'
+    return 0
+  fi
+  # Keep the source executable modes.  The runtime copies are installed as a
+  # pair, so a mode change must be prepared before either rename occurs.
+  guard_mode=$(stat -c '%a' -- "$release/ops/belt/belt-config-guard.sh" 2>/dev/null) || guard_mode=''
+  wrapper_mode=$(stat -c '%a' -- "$release/ops/belt/multica-daemon-wrapper.sh" 2>/dev/null) || wrapper_mode=''
+  if [[ ! "$guard_mode" =~ ^[0-7]{3,4}$ || ! "$wrapper_mode" =~ ^[0-7]{3,4}$ ]] ||
+     ! chmod -- "$guard_mode" "$staging/guard" || ! chmod -- "$wrapper_mode" "$staging/wrapper"; then
+    rm -rf -- "$staging"
+    repair_failure 'phase=repair class=permission staging-mode-failed'
+    return 0
+  fi
+  [[ "$guard_present" == 1 ]] && cp -- "$RUNTIME_GUARD" "$old_guard"
+  [[ "$wrapper_present" == 1 ]] && cp -- "$RUNTIME_WRAPPER" "$old_wrapper"
+  if ! mv -f -- "$staging/guard" "$RUNTIME_GUARD" || ! mv -f -- "$staging/wrapper" "$RUNTIME_WRAPPER"; then
+    if [[ "$guard_present" == 1 ]]; then cp -- "$old_guard" "$RUNTIME_GUARD"; else rm -f -- "$RUNTIME_GUARD"; fi
+    if [[ "$wrapper_present" == 1 ]]; then cp -- "$old_wrapper" "$RUNTIME_WRAPPER"; else rm -f -- "$RUNTIME_WRAPPER"; fi
+    rm -rf -- "$staging"
+    repair_failure 'phase=repair class=permission atomic-rename-failed'
+    return 0
+  fi
+  rm -rf -- "$staging"
+  final_guard_sha=$(sha256sum -- "$RUNTIME_GUARD" 2>/dev/null | awk '{print $1}')
+  final_wrapper_sha=$(sha256sum -- "$RUNTIME_WRAPPER" 2>/dev/null | awk '{print $1}')
+  if [[ "$final_guard_sha" != "$guard_sha" || "$final_wrapper_sha" != "$wrapper_sha" ]]; then
+    if [[ "$guard_present" == 1 ]]; then cp -- "$old_guard" "$RUNTIME_GUARD"; else rm -f -- "$RUNTIME_GUARD"; fi
+    if [[ "$wrapper_present" == 1 ]]; then cp -- "$old_wrapper" "$RUNTIME_WRAPPER"; else rm -f -- "$RUNTIME_WRAPPER"; fi
+    repair_failure 'phase=repair class=post-write-digest-mismatch'
+    return 0
+  fi
+  fixed+=("belt runtime/source parity repaired from release")
+}
+
+# The guard and its daemon wrapper are deployed as a pair.  A stale runtime
+# copy can execute an obsolete direct-status recovery path, so fail closed
+# before any relay transition when either digest differs.  Paths are fixed to
+# the source tree and the two expected runtime locations; no broad filesystem
+# search is performed.
+guard_source_runtime_parity() {
+  local source_file runtime_file source_sha runtime_sha label runtime_dir staging fallback guard_source wrapper_source release
+  guard_source="$GUARD_SOURCE"; wrapper_source="$WRAPPER_SOURCE"
+  if [[ ! -r "$guard_source" || ! -r "$wrapper_source" ]]; then
+    release=$(validated_release_pair "$(sha256sum -- "$guard_source" 2>/dev/null | awk '{print $1}')" "$(sha256sum -- "$wrapper_source" 2>/dev/null | awk '{print $1}')" 2>/dev/null || true)
+    if [[ -n "$release" ]]; then
+      guard_source="$release/ops/belt/belt-config-guard.sh"
+      wrapper_source="$release/ops/belt/multica-daemon-wrapper.sh"
+    fi
+  fi
+  for label in guard wrapper; do
+    if [[ "$label" == guard ]]; then
+      source_file="$guard_source"; runtime_file="$RUNTIME_GUARD"
+    else
+      source_file="$wrapper_source"; runtime_file="$RUNTIME_WRAPPER"
+    fi
+    if [[ ! -r "$source_file" && "$label" == wrapper ]]; then
+      fallback=$(validated_release_wrapper "$(sha256sum -- "$GUARD_SOURCE" 2>/dev/null | awk '{print $1}')" 2>/dev/null || true)
+      [[ -n "$fallback" ]] && source_file="$fallback"
+    fi
+    if [[ ! -r "$source_file" ]]; then
+      PARITY_OK=0
+      PARITY_DIAGNOSTIC="phase=parity ${label}=missing"
+      unfixable+=("belt runtime/source digest drift: ${PARITY_DIAGNOSTIC}")
+      continue
+    fi
+    source_sha=$(sha256sum -- "$source_file" 2>/dev/null | awk '{print $1}')
+    runtime_sha=$(sha256sum -- "$runtime_file" 2>/dev/null | awk '{print $1}')
+    if [[ "$source_sha" =~ ^[0-9a-f]{64}$ && "$source_sha" != "$runtime_sha" ]]; then
+      # Runtime copies are disposable deployment artifacts. Repair a missing
+      # or stale member directly from the readable source, using a temporary
+      # file in the runtime directory so readers never observe a partial copy.
+      runtime_dir=$(dirname -- "$runtime_file")
+      staging=''
+      if mkdir -p -- "$runtime_dir" 2>/dev/null &&
+         staging=$(mktemp "${runtime_dir}/.parity.XXXXXX" 2>/dev/null) &&
+         cp -- "$source_file" "$staging" 2>/dev/null &&
+         chmod 0755 -- "$staging" 2>/dev/null &&
+         mv -f -- "$staging" "$runtime_file" 2>/dev/null &&
+         runtime_sha=$(sha256sum -- "$runtime_file" 2>/dev/null | awk '{print $1}') &&
+         [[ "$runtime_sha" == "$source_sha" ]]; then
+        fixed+=("belt runtime/source parity repaired from source")
+        continue
+      fi
+      [[ -z "$staging" ]] || rm -f -- "$staging"
+      PARITY_OK=0
+      PARITY_DIAGNOSTIC="phase=parity ${label}=digest-mismatch"
+      unfixable+=("belt runtime/source digest drift: ${PARITY_DIAGNOSTIC}")
+    elif [[ ! "$source_sha" =~ ^[0-9a-f]{64}$ || "$source_sha" != "$runtime_sha" ]]; then
+      PARITY_OK=0
+      PARITY_DIAGNOSTIC="phase=parity ${label}=digest-mismatch"
+      unfixable+=("belt runtime/source digest drift: ${PARITY_DIAGNOSTIC}")
+    fi
+  done
+}
+
+# Status writes are relay-owned.  Check the relay contract before attempting
+# any recovery so a missing/invalid secret cannot look like a successful repair.
+# Diagnostics deliberately report names and failure phases only; secret values
+# and connection strings never enter the guard output or the P0 ticket.
+guard_relay_preflight() {
+  local missing=() duplicate=() key value agent operator workspace sso database count
+  if [[ ! -r "$RELAY_ENV_FILE" ]]; then
+    RELAY_PREFLIGHT_OK=0
+    RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight config=unreadable"
+    unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+    return 0
+  fi
+  # Keep this list in lockstep with the relay launcher/fleet manifest.  The
+  # guard must reject a file that can start the bridge but cannot authenticate
+  # the relay daemon, before it attempts any stage mutation.
+  for key in DATABASE_URL RELAY_AGENT_SECRET RELAY_OPERATOR_SECRET GSP_WORKSPACE_ID MULTICA_WORKSPACE_ID; do
+    count=$(grep -Ec "^[[:space:]]*${key}=" "$RELAY_ENV_FILE" 2>/dev/null || true)
+    [[ "$count" == 1 ]] || duplicate+=("$key")
+    value=$(sed -n "s/^${key}=//p" "$RELAY_ENV_FILE" | tail -1)
+    [[ -n "$value" ]] || missing+=("$key")
+  done
+  agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
+  operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
+  workspace=$(sed -n 's/^GSP_WORKSPACE_ID=//p' "$RELAY_ENV_FILE" | tail -1)
+  sso=$(sed -n 's/^MULTICA_WORKSPACE_ID=//p' "$RELAY_ENV_FILE" | tail -1)
+  database=$(sed -n 's/^DATABASE_URL=//p' "$RELAY_ENV_FILE" | tail -1)
+  if (( ${#missing[@]} > 0 )); then
+    RELAY_PREFLIGHT_OK=0
+    RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight missing=${missing[*]}"
+  elif (( ${#duplicate[@]} > 0 )); then
+    RELAY_PREFLIGHT_OK=0
+    RELAY_PREFLIGHT_DIAGNOSTIC="phase=preflight duplicate=${duplicate[*]}"
+  elif [[ "$agent" == "$operator" || "$agent" =~ [[:space:]] || "$operator" =~ [[:space:]] ||
+          "$agent" == CHANGE_ME* || "$operator" == CHANGE_ME* ||
+          ! "$workspace" =~ ^[0-9a-fA-F-]{36}$ || "$workspace" != "$GSP_WS" ||
+          "$sso" != "$GSP_WS" || ! "$database" =~ ^(postgres|postgresql)://[^[:space:]]+$ ]]; then
+    RELAY_PREFLIGHT_OK=0
+    RELAY_PREFLIGHT_DIAGNOSTIC='phase=preflight invalid=relay-credentials-workspace-or-database'
+  fi
+  if (( RELAY_PREFLIGHT_OK == 0 )); then
+    unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+    return 0
+  fi
+  # When configured, verify the live bridge before any transition.  The probe
+  # is deliberately opt-in for offline fixture runs; production sets the URL
+  # in the guard service environment.  Only bounded, redacted fields are
+  # accepted from the health endpoint.
+  if [[ -n "$RELAY_HEALTH_URL" ]]; then
+    local health
+    health=$(curl --fail --silent --show-error --max-time 3 \
+      -H "X-Relay-Agent-Secret: ${agent}" "$RELAY_HEALTH_URL" 2>&1) || {
+      RELAY_PREFLIGHT_OK=0
+      RELAY_PREFLIGHT_DIAGNOSTIC='phase=health transport=unavailable'
+      unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+      return 0
+    }
+    if ! jq -e --arg ws "$GSP_WS" \
+      '(.status == "ok" or .status == "healthy") and (.workspace_id == $ws) and (.authority == "ready")' \
+      >/dev/null 2>&1 <<<"$health"; then
+      RELAY_PREFLIGHT_OK=0
+      RELAY_PREFLIGHT_DIAGNOSTIC='phase=health invalid=workspace-or-authority'
+      unfixable+=("relay recovery ${RELAY_PREFLIGHT_DIAGNOSTIC}")
+    fi
+  fi
+}
 
 ai_hold_active() {
   [[ -f "$AI_HOLD_FILE" ]]
@@ -86,11 +442,10 @@ file_p0() {
   if [[ $rc -eq 0 ]]; then
     return 0
   fi
-  # sk refuses a second open ticket with the same title (active_duplicate_issue).
-  # That is the escalation ALREADY being filed, not a failure to escalate, but it
-  # was logged as FAILED on every run, so the guard's only error line was noise
-  # and stopped meaning anything. Report it as what it is.
-  if [[ "$out" == *active_duplicate_issue* ]]; then
+  # Equivalent duplicate responses have had several API spellings. They all
+  # mean an equivalent open P0 already exists; auth and transport failures do
+  # not match and remain actionable errors.
+  if [[ "$out" =~ active_duplicate_issue|duplicate_issue|already[[:space:]_-]+exists|canonical_duplicate|equivalent[[:space:]_-]+open ]]; then
     echo "belt-config-guard: P0 already open for: $title" >&2
     return 0
   fi
@@ -119,17 +474,23 @@ running_tasks() {
   "${PSQL[@]}" -c "SELECT count(*) FROM agent_task_queue WHERE status='running';" 2>/dev/null || echo 99
 }
 
-# 1. Tower concurrency and root must remain PM2-configurable. Empty values are
-# invalid rather than defaults so a broken ecosystem cannot silently widen work.
+# 1. Tower concurrency and root must remain PM2-configurable, so the environment
+# still wins when it is set. The guard runs from belt-config-guard.service, a
+# systemd oneshot with no PM2 environment, so an unset cap must fall back to the
+# declared fleet value rather than to the empty string: an empty cap makes
+# tower_concurrency_state report "mismatched" against every running Tower and
+# restarts gsp-multica-worker on each 5-minute tick. 32 is the fleet cap asserted
+# by ops/belt/deploy-daemon-artifact.sh health().
 daemon_launch_config() {
-  printf '%s|%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-}" \
+  printf '%s|%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS-"$WANT_CONCURRENCY"}" \
     "${MULTICA_DAEMON_WORKSPACES_ROOT-"$WANT_WORKSPACES_ROOT"}"
 }
 
 validate_daemon_launch_config() {
   local cap root
   IFS='|' read -r cap root < <(daemon_launch_config)
-  [[ "$cap" =~ ^[1-9][0-9]*$ ]] && [[ -n "$root" && "$root" == /* ]]
+  [[ "$cap" =~ ^[1-9][0-9]*$ ]] && (( cap <= $(belt_cpu_count) )) || return 1
+  workspace_root_validate >/dev/null
 }
 
 wrapper_has_explicit_concurrency_flag() {
@@ -142,10 +503,10 @@ wrapper_has_explicit_concurrency_flag() {
 
 guard_wrapper() {
   if ! validate_daemon_launch_config; then
-    unfixable+=("invalid PM2 daemon launch config: cap must be a positive integer and workspaces root an absolute path")
+    unfixable+=("invalid PM2 daemon launch config: cap must be a positive integer and workspace root must be canonical with valid children")
   elif [[ ! -x "$WRAPPER" ]] ||
        ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS-' "$WRAPPER" ||
-       ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT-/home/newadmin/multica-workspaces-gsp' "$WRAPPER" ||
+       ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT-' "$WRAPPER" ||
        ! grep -q 'MULTICA_DAEMON_MAX_CONCURRENT_TASKS' "$ECOSYSTEM" ||
        ! grep -q 'MULTICA_DAEMON_WORKSPACES_ROOT' "$ECOSYSTEM" ||
        ! wrapper_has_explicit_concurrency_flag "$WRAPPER"; then
@@ -300,7 +661,15 @@ guard_autopilot() {
 guard_build_capacity() {
   local current
   current=$("${PSQL[@]}" -c "SELECT max_concurrent_tasks FROM agent WHERE name='${BUILD_AGENT}' AND archived_at IS NULL;" 2>/dev/null)
-  [[ -z "$current" ]] && { unfixable+=("build agent ${BUILD_AGENT} is missing or archived"); return; }
+  if [[ -z "$current" ]]; then
+    # 2026-09-03: the single deepseek build agent is archived; the build lane is
+    # now gsp-build-terra-low-NN (Luna). Per-agent caps on that lane are gated by
+    # GSP-1849, so the guard only verifies the lane exists and never rewrites caps.
+    local lane
+    lane=$("${PSQL[@]}" -c "SELECT count(*) FROM agent WHERE name LIKE 'gsp-build-%' AND archived_at IS NULL;" 2>/dev/null)
+    [[ "${lane:-0}" -gt 0 ]] && return 0
+    unfixable+=("build lane empty: no non-archived agent named gsp-build-%"); return
+  fi
   [[ "$current" == "$WANT_BUILD_CAPACITY" ]] && return 0
   if "${PSQL[@]}" -c "UPDATE agent SET max_concurrent_tasks=${WANT_BUILD_CAPACITY}, updated_at=now() WHERE name='${BUILD_AGENT}' AND archived_at IS NULL;" >/dev/null 2>&1; then
     fixed+=("build capacity re-applied ${current} -> ${WANT_BUILD_CAPACITY} on ${BUILD_AGENT}")
@@ -474,8 +843,15 @@ guard_relay_config() {
     else
       set_clause="agent_id=(SELECT id FROM agent WHERE name='${expected}'), agent_name='${expected}'"
     fi
+    # psql returns success for an UPDATE that matched zero rows.  Re-read the
+    # row so a missing/duplicate workspace configuration cannot be reported as
+    # repaired (and so a concurrent guard tick remains idempotent).
     if "${PSQL[@]}" -c "UPDATE relay_stage_config SET ${set_clause}
-         WHERE id=${row%%:*} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1; then
+         WHERE id=${row%%:*} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1 &&
+       actual=$("${PSQL[@]}" -c "SELECT coalesce(a.name,'(none)') FROM relay_stage_config r
+         LEFT JOIN agent a ON a.id=r.agent_id
+         WHERE r.id=${row%%:*} AND r.workspace_id='${GSP_WS}'::uuid;" 2>/dev/null) &&
+       [[ "$actual" == "$expected" ]]; then
       fixed+=("relay row ${row%%:*} owner restored to ${expected} (was ${actual:-unset})")
     else
       unfixable+=("relay row ${row%%:*} has owner ${actual:-unset}, expected ${expected}")
@@ -534,7 +910,10 @@ guard_relay_config() {
     [[ "$actual" == "$want" ]] && continue
     if "${PSQL[@]}" -c "UPDATE relay_stage_config
          SET alt_next_stages=CASE WHEN '${want}' = '' THEN NULL ELSE string_to_array('${want}', ',') END
-       WHERE id=${id} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1; then
+       WHERE id=${id} AND workspace_id='${GSP_WS}'::uuid;" >/dev/null 2>&1 &&
+       actual=$("${PSQL[@]}" -c "SELECT array_to_string(alt_next_stages,',') FROM relay_stage_config
+         WHERE id=${id} AND workspace_id='${GSP_WS}'::uuid;" 2>/dev/null) &&
+       [[ "$actual" == "$want" ]]; then
       fixed+=("relay row ${id} successors restored to [${want}] (was [${actual:-unset}]): ${why}")
     else
       unfixable+=("relay row ${id} has successors [${actual:-unset}], expected [${want}]: ${why}")
@@ -583,24 +962,26 @@ guard_workspace_repos() {
 # costs nothing until a slot frees. Every stranded flight
 # is work Tim asked to see finished, so the correct batch size is "all of them".
 guard_stranded_review() {
-  local number board ws
+  if queue_backed_up; then
+    unfixable+=("guard_stranded_review skipped: queue already backed up past half the 120-minute TTL; re-driving now would only create expiry victims")
+    return 0
+  fi
+  local number board
   while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
-    # Direct status write, then the relay exit that dispatches the reviewer:
-    # the review task fires on row 4's In Progress -> In Review exit.
-    "${PSQL[@]}" -c "UPDATE issue SET status='In Progress'
-       WHERE number=${number} AND workspace_id ${ws} AND status='In Review';" >/dev/null 2>&1 </dev/null || continue
-    if "$SK" multica advance "$number" --to "In Review" --board "$board" >/dev/null 2>&1 </dev/null; then
+    # Both stage changes use the shared relay helper; the review task fires on
+    # row 4's In Progress -> In Review exit.
+    if relay_transition "$number" "In Progress" "$board" >/dev/null 2>&1 &&
+       relay_transition "$number" "In Review" "$board" >/dev/null 2>&1 &&
+       increment_reflight_metadata "$number" "$board" review_reflies; then
       fixed+=("${board}#${number} re-driven to a reviewer after being stranded in In Review")
     else
-      "${PSQL[@]}" -c "UPDATE issue SET status='In Review'
-         WHERE number=${number} AND workspace_id ${ws} AND status='In Progress';" >/dev/null 2>&1 </dev/null
-      unfixable+=("${board}#${number} is stranded in In Review and could not be re-driven")
+      unfixable+=("${board}#${number} is stranded in In Review and could not be re-driven (retry state was not recorded)")
     fi
   done < <("${PSQL[@]}" -F'|' -c "
     SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END
       FROM issue i WHERE i.status='In Review'
+       AND coalesce(i.metadata->>'review_reflies','0')::int < 3
        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
                         WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
      ORDER BY i.updated_at ASC;" 2>/dev/null)
@@ -612,34 +993,35 @@ guard_stranded_review() {
 # Re-drive it through the normal path so QC judges the work; QC returns it if the
 # build is not real. Bounded by the same headroom as guard_stranded_review.
 guard_stranded_queue() {
-  local number board ws
+  if queue_backed_up; then
+    unfixable+=("guard_stranded_queue skipped: queue already backed up past half the 120-minute TTL; re-driving now would only create expiry victims")
+    return 0
+  fi
+  local number board
   while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
     # The BUILDER is dispatched on row 2's Spec -> Queue exit, so a rework must
     # leave from Spec. Routing In Progress -> Queue instead fires row 4's QC
     # worker and leaves the flight stranded again; that mistake was made and
     # corrected on 2026-08-31.
-    "${PSQL[@]}" -c "UPDATE issue SET status='Spec'
-       WHERE number=${number} AND workspace_id ${ws} AND status='Queue';" >/dev/null 2>&1 </dev/null || continue
-    if "$SK" multica advance "$number" --to "Queue" --board "$board" >/dev/null 2>&1 </dev/null; then
+    if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
+       relay_transition "$number" "Queue" "$board" >/dev/null 2>&1 &&
+       increment_reflight_metadata "$number" "$board" queue_reflies; then
       fixed+=("${board}#${number} re-driven to the builder after being stranded in Queue")
     else
       # Usually spec_required: no scoper ever wrote a spec comment. Send it to
       # the scoper instead of leaving it parked.
-      "${PSQL[@]}" -c "UPDATE issue SET status='Registered'
-         WHERE number=${number} AND workspace_id ${ws} AND status='Spec';" >/dev/null 2>&1 </dev/null
-      if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
+      if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
+         increment_reflight_metadata "$number" "$board" queue_reflies; then
         fixed+=("${board}#${number} had no spec; sent to the scoper instead of the builder")
       else
-        "${PSQL[@]}" -c "UPDATE issue SET status='Queue'
-           WHERE number=${number} AND workspace_id ${ws} AND status IN ('Spec','Registered');" >/dev/null 2>&1 </dev/null
         unfixable+=("${board}#${number} is stranded in Queue and could not be re-driven")
       fi
     fi
   done < <("${PSQL[@]}" -F'|' -c "
     SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END
       FROM issue i WHERE i.status='Queue'
+       AND coalesce(i.metadata->>'queue_reflies','0')::int < 3
        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
                         WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
      ORDER BY i.updated_at ASC;" 2>/dev/null)
@@ -664,25 +1046,29 @@ guard_stranded_inprogress() {
   while IFS='|' read -r number board last; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     [[ "$board" == gsp ]] && ws="='${GSP_WS}'" || ws="<>'${GSP_WS}'"
-    "${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
-         jsonb_build_object('ip_reflies', (coalesce(metadata->>'ip_reflies','0')::int + 1)::text)
-       WHERE number=${number} AND workspace_id ${ws};" >/dev/null 2>&1 </dev/null
     if [[ "$last" == completed ]]; then
-      if "$SK" multica advance "$number" --to "In Review" --board "$board" >/dev/null 2>&1 </dev/null; then
-        fixed+=("${board}#${number} stranded in In Progress with a completed build; sent forward to QC")
+      if relay_transition "$number" "In Review" "$board" >/dev/null 2>&1; then
+        if increment_reflight_metadata "$number" "$board" ip_reflies; then
+          fixed+=("${board}#${number} stranded in In Progress with a completed build; sent forward to QC")
+        else
+          unfixable+=("${board}#${number} reached In Review but retry metadata could not be recorded")
+        fi
       else
         unfixable+=("${board}#${number} is stranded in In Progress and could not be sent to QC")
       fi
-    else
-      "${PSQL[@]}" -c "UPDATE issue SET status='Spec'
-         WHERE number=${number} AND workspace_id ${ws} AND status='In Progress';" >/dev/null 2>&1 </dev/null || continue
-      if "$SK" multica advance "$number" --to "Queue" --board "$board" >/dev/null 2>&1 </dev/null; then
-        fixed+=("${board}#${number} stranded in In Progress with no build; re-driven to the builder")
+    elif [[ "$last" == failed ]]; then
+      if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1 &&
+         relay_transition "$number" "Queue" "$board" >/dev/null 2>&1; then
+        if increment_reflight_metadata "$number" "$board" ip_reflies; then
+          fixed+=("${board}#${number} stranded in In Progress with no build; re-driven to the builder")
+        else
+          unfixable+=("${board}#${number} reached Queue but retry metadata could not be recorded")
+        fi
       else
-        "${PSQL[@]}" -c "UPDATE issue SET status='In Progress'
-           WHERE number=${number} AND workspace_id ${ws} AND status='Spec';" >/dev/null 2>&1 </dev/null
         unfixable+=("${board}#${number} is stranded in In Progress and could not be re-driven")
       fi
+    else
+      unfixable+=("${board}#${number} is stranded in In Progress with unknown task history; left unchanged")
     fi
   done < <("${PSQL[@]}" -F'|' -c "
     SELECT i.number,
@@ -698,10 +1084,44 @@ guard_stranded_inprogress() {
      ORDER BY i.updated_at ASC LIMIT 15;" 2>/dev/null)
 }
 
+# Retry counters are guarded in the same statement that writes them.  The
+# workspace predicate and RETURNING receipt make this idempotent when two guard
+# ticks overlap, while the cap prevents an endlessly expiring flight loop. The
+# caller updates the counter after a relay transition, so an active task is
+# expected and must not make the accounting update fail.
+increment_reflight_metadata() {
+  local number="$1" board="${2:-gsp}" key="${3:-spec_reflies}"
+  [[ "$key" =~ ^[a-z_]+$ ]] || return 1
+  local updated
+  # psql exits zero when an UPDATE matches no rows.  Require the RETURNING
+  # receipt so a concurrent guard or an exhausted retry budget is reported as
+  # unfixable instead of claiming a re-flight that was never recorded.
+  updated=$("${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+    jsonb_build_object('${key}', (coalesce(metadata->>'${key}','0')::int + 1)::text)
+    WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END
+      AND coalesce(metadata->>'${key}','0')::int < 3
+    RETURNING number;" 2>/dev/null </dev/null) || return 1
+  [[ "$(printf '%s' "$updated" | tr -d '[:space:]')" == "$number" ]]
+}
+
 # A bundled child is closed by its mega flight's change, but nothing moves the
 # child itself, so without this it sits open forever after the work has shipped —
 # the same "nothing ever closes" failure the bundling rule exists to prevent.
 # The child is dispositioned, not built: it never had a specification of its own.
+relay_cancel_child() {
+  local child_id="$1" parent_number="$2" agent operator body receipt
+  [[ "${RELAY_PREFLIGHT_OK:-1}" == 1 ]] || return 1
+  agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
+  operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
+  [[ -z "$agent" || -z "$operator" ]] && return 1
+  body=$(printf '{"issue_id":"%s","to_stage":"Cancelled","agent_token":"%s","reason":"Folded into mega flight gsp#%s (Done), which carried the specification and the change for this report.","evidence":{"boardOwnerAuthority":"belt-config-guard bundled-child rule","reason":"child of completed mega gsp#%s"}}' \
+    "$child_id" "$agent" "$parent_number" "$parent_number")
+  receipt=$(curl -sS -X POST http://127.0.0.1:5005/relay/advance -H 'content-type: application/json' \
+    -H "x-relay-operator-secret: $operator" -d "$body" 2>&1) || return 1
+  jq -e '(.success == true) and ((.issue.status // .current_status // .status) == "Cancelled")' \
+    >/dev/null 2>&1 <<<"$receipt"
+}
+
 guard_bundled_children() {
   local child_id number parent_number
   while IFS='|' read -r child_id number parent_number; do
@@ -709,7 +1129,10 @@ guard_bundled_children() {
     "$SK" multica issue-comment-add "$child_id" --content \
       "Closed by mega flight gsp#${parent_number}, which carried the specification and the change for this report." \
       >/dev/null 2>&1 </dev/null
-    if "$SK" multica issue-update "$child_id" --status Done --no-start >/dev/null 2>&1 </dev/null; then
+    # 2026-09-03: terminal statuses are relay-owned (sk issue-update refuses
+    # Done) and Queue->Cancelled needs the operator actor + cancelled evidence
+    # (transition-policy.cjs:24,61). Fold the child as Cancelled via the relay.
+    if relay_cancel_child "$child_id" "$parent_number"; then
       fixed+=("gsp#${number} closed: its mega flight gsp#${parent_number} is done")
     else
       unfixable+=("gsp#${number} is a child of completed gsp#${parent_number} but could not be closed")
@@ -729,9 +1152,8 @@ guard_bundled_children() {
 # NO_OP build, which is cheaper than a stranded ticket.
 guard_freed_children() {
   local child_id number parent_number parent_status board
-  while IFS='|' read -r child_id number parent_number parent_status; do
+  while IFS='|' read -r child_id number parent_number parent_status board; do
     [[ -z "$child_id" ]] && continue
-    board=gsp; [[ "$number" -gt 20000 ]] && board=prod
     if "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
          UPDATE issue SET parent_issue_id=NULL, updated_at=NOW() WHERE id='${child_id}'::uuid;" >/dev/null 2>&1; then
       "$SK" multica comment --board "$board" --number "$number" --body \
@@ -741,7 +1163,8 @@ guard_freed_children() {
     else
       unfixable+=("#${number} is a child of ${parent_status} rollup #${parent_number} and could not be detached")
     fi
-  done < <("${PSQL[@]}" -F'|' -c "SELECT c.id, c.number, p.number, p.status
+  done < <("${PSQL[@]}" -F'|' -c "SELECT c.id, c.number, p.number, p.status,
+       CASE WHEN c.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END
      FROM issue c JOIN issue p ON p.id = c.parent_issue_id
     WHERE c.status NOT IN ('Done','Archived','Cancelled')
       AND (p.status = 'Cancelled'
@@ -761,8 +1184,8 @@ guard_freed_children() {
 # (107 found on 2026-08-31, arriving at ~25/hour). GSP-836 fixes the CLI; this
 # keeps the board draining until that lands.
 # Routing the flight out of Spec any other way would fire row 2's PAID builder,
-# so the status is written directly and the relay is then used for the exit that
-# dispatches the scoper. That exit is free: row 1's source stage is Registered.
+# so both stage changes use the relay helper and preserve the free row-1 scoper
+# dispatch from Registered -> Spec.
 # Nothing advances a flight out of Registered. The relay dispatches the agent of
 # the row a flight LEAVES, and row 1 is Registered -> Spec, so a flight parked in
 # Registered has no agent, no task and no timer: it waits forever for a push that
@@ -777,17 +1200,17 @@ guard_stranded_registered() {
     return 0
   fi
   local number board
-  while read -r number; do
+  while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    board=gsp; [[ "$number" -gt 20000 ]] && board=prod
-    if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
+    if relay_transition "$number" "Spec" "$board" >/dev/null 2>&1; then
       fixed+=("#${number} was parked in Registered with nothing to advance it; sent to Spec for scoping")
     else
       unfixable+=("#${number} is stuck in Registered and could not be advanced to Spec")
     fi
   done < <("${PSQL[@]}" -c "
-    SELECT i.number FROM issue i
+    SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END FROM issue i
      WHERE i.status='Registered'
+       AND i.workspace_id IN ('${GSP_WS}','da3c5c5c-a123-4567-b999-c3ed1820da00')
        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
                         WHERE q.issue_id=i.id AND q.status IN ('queued','running','dispatched'))
      ORDER BY i.created_at LIMIT 40;" 2>/dev/null)
@@ -803,24 +1226,24 @@ guard_stranded_registered() {
 # is anything whose latest comment says a human must decide.
 guard_human_review_release() {
   local number board
-  while read -r number; do
+  while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    board=gsp; [[ "$number" -gt 20000 ]] && board=prod
-    "${PSQL[@]}" -c "UPDATE issue SET status='Registered',
-       metadata = coalesce(metadata,'{}'::jsonb) ||
-         jsonb_build_object('hr_releases',
-           (coalesce(metadata->>'hr_releases','0')::int + 1)::text)
-       WHERE number=${number} AND status='Human Review';" >/dev/null 2>&1 </dev/null || continue
-    if "$SK" multica advance "$number" --to "Spec" --board "$board" >/dev/null 2>&1 </dev/null; then
+    if relay_transition "$number" "Registered" "$board" >/dev/null 2>&1 &&
+       "${PSQL[@]}" -c "SELECT set_config('multica.relay_authorized','on',true);
+         UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+         jsonb_build_object('hr_releases', (coalesce(metadata->>'hr_releases','0')::int + 1)::text)
+         WHERE number=${number} AND status='Registered';" >/dev/null 2>&1 </dev/null &&
+       relay_transition "$number" "Spec" "$board" >/dev/null 2>&1; then
       fixed+=("#${number} released from Human Review for scoping (not a money or structural call)")
     else
       unfixable+=("#${number} could not be released from Human Review")
     fi
   done < <("${PSQL[@]}" -c "
-    SELECT i.number FROM issue i
+    SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END FROM issue i
     LEFT JOIN LATERAL (SELECT content FROM comment
                         WHERE issue_id=i.id ORDER BY created_at DESC LIMIT 1) c ON true
      WHERE i.status='Human Review'
+       AND i.workspace_id IN ('${GSP_WS}','da3c5c5c-a123-4567-b999-c3ed1820da00')
        AND coalesce(i.metadata->>'hr_releases','0')::int < 2
        AND i.title !~* 'money|billing|payment|invoice|charge|spend|cost|refund|zelle|stripe'
        AND coalesce(c.content,'') !~* 'human approval required|Tim to |Tim must|money authorization|requires Tim'
@@ -835,6 +1258,74 @@ spec_receipt_task_id() {
   jq -e -r '.task_id // .pending_task_id // .selected_task_id // .task.id // .task.task_id // .result.task_id // .result.pending_task_id // empty' 2>/dev/null
 }
 
+# All recovery status changes go through this single relay entry point.  Keeping
+# the board and target together prevents a gsp number from being accidentally
+# advanced on prod (and vice versa), while the captured receipt lets callers
+# distinguish a relay refusal from a successful, idempotent no-op.
+relay_transition() {
+  local number="$1" target="$2" board="${3:-gsp}" md5="${4:-}"
+  # Keep this boundary deliberately strict: callers must not be able to turn
+  # a recovery row into an arbitrary board/transition (or inject CLI flags).
+  [[ "$number" =~ ^[0-9]+$ ]] || {
+    RELAY_TRANSITION_OUTPUT='invalid ticket number'; RELAY_TRANSITION_RC=64
+    RELAY_TRANSITION_CLASS=configuration; return 64
+  }
+  [[ "$board" == gsp || "$board" == prod ]] || {
+    RELAY_TRANSITION_OUTPUT='invalid board'; RELAY_TRANSITION_RC=64
+    RELAY_TRANSITION_CLASS=configuration; return 64
+  }
+  case "$target" in
+    Spec|Queue|In\ Progress|In\ Review|Registered|Human\ Review|CI/CD\ \&\ Deploy|Done|Cancelled|Archived) ;;
+    *) RELAY_TRANSITION_OUTPUT='invalid target stage'; RELAY_TRANSITION_RC=64
+       RELAY_TRANSITION_CLASS=configuration; return 64 ;;
+  esac
+  if [[ -n "$md5" && ! "$md5" =~ ^[0-9a-fA-F]{32}$ ]]; then
+    RELAY_TRANSITION_OUTPUT='invalid work-product digest'; RELAY_TRANSITION_RC=64
+    RELAY_TRANSITION_CLASS=configuration; return 64
+  fi
+  if [[ "${RELAY_PREFLIGHT_OK:-1}" != 1 ]]; then
+    RELAY_TRANSITION_OUTPUT="relay preflight refused: ${RELAY_PREFLIGHT_DIAGNOSTIC:-invalid configuration}"
+    RELAY_TRANSITION_RC=78; RELAY_TRANSITION_CLASS=configuration
+    return "$RELAY_TRANSITION_RC"
+  fi
+  if [[ "${PARITY_OK:-1}" != 1 ]]; then
+    RELAY_TRANSITION_OUTPUT="runtime/source parity refused: ${PARITY_DIAGNOSTIC:-digest mismatch}"
+    RELAY_TRANSITION_RC=78; RELAY_TRANSITION_CLASS=configuration
+    return "$RELAY_TRANSITION_RC"
+  fi
+  local -a args=(multica advance "$number" --to "$target" --board "$board")
+  [[ -n "$md5" ]] && args+=(--current-work-product-md5 "$md5")
+  RELAY_TRANSITION_OUTPUT=$("$SK" "${args[@]}" 2>&1 </dev/null)
+  RELAY_TRANSITION_RC=$?
+  RELAY_TRANSITION_CLASS=$(relay_failure_class "$RELAY_TRANSITION_OUTPUT" "$RELAY_TRANSITION_RC")
+  return "$RELAY_TRANSITION_RC"
+}
+
+# Classify only bounded, redacted text.  This is used for operator diagnostics
+# and never changes retry behavior: authority/configuration and transport
+# failures remain fail-closed, while ordinary transition refusals are distinct.
+relay_failure_class() {
+  local message
+  message=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  if [[ "$message" =~ (malformed|not-json|parse|invalid[[:space:]]+json) ]]; then
+    printf 'malformed-receipt'
+  elif [[ "$2" == 64 || "$2" == 78 || "$message" =~ (authority|permission|forbidden|unauthori|credential|secret|workspace|configuration|invalid) ]]; then
+    printf 'authority/configuration'
+  elif [[ "$message" =~ (transport|timeout|connection|unavailable|relay[[:space:]]+post|network) ]]; then
+    printf 'transport'
+  else
+    printf 'transition-refusal'
+  fi
+}
+
+relay_transition_diagnostic() {
+  local output="${1:-${RELAY_TRANSITION_OUTPUT:-}}"
+  printf '%s' "$output" | tr '\n' ' ' \
+    | sed -E -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' \
+             -e 's/((token|password|secret|api[_-]?key)[=:])[[:space:]]*[^[:space:]]+/\1[REDACTED]/Ig' \
+    | cut -c1-400
+}
+
 guard_stranded_spec() {
 
   if queue_backed_up; then
@@ -847,13 +1338,13 @@ guard_stranded_spec() {
   # original guard only caught tickets with ZERO tasks ever, so every expiry
   # victim was invisible to it. Catch "no ACTIVE task" instead, and cap re-flies
   # at 3 per ticket so a ticket that keeps expiring cannot become a paid loop.
-  local number
-  while read -r number; do
+  local number board
+  while IFS='|' read -r number board; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
-    recover_stranded_spec_flight "$number"
-  done < <("${PSQL[@]}" -c "
-    SELECT i.number FROM issue i
-    WHERE i.status='Spec' AND i.workspace_id='${GSP_WS}'
+    recover_stranded_spec_flight "$number" "$board"
+  done < <("${PSQL[@]}" -F'|' -c "
+    SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END FROM issue i
+    WHERE i.status='Spec' AND i.workspace_id IN ('${GSP_WS}','da3c5c5c-a123-4567-b999-c3ed1820da00')
       AND i.parent_issue_id IS NULL
       AND coalesce(i.metadata->>'spec_reflies','0')::int < 3
       AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
@@ -861,59 +1352,86 @@ guard_stranded_spec() {
     ORDER BY i.created_at LIMIT 25;" 2>/dev/null)
 }
 
-spec_refly_reset() {
-  SPEC_REFLOW_OUTPUT=$("${PSQL[@]}" -c "WITH reset AS (
-      UPDATE issue AS i SET status='Registered',
-        metadata = coalesce(metadata,'{}'::jsonb) ||
-          jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
-      WHERE number=${1} AND workspace_id='${GSP_WS}' AND status='Spec'
-        AND parent_issue_id IS NULL
-        AND coalesce(metadata->>'spec_reflies','0')::int < 3
-        AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
-                        WHERE q.issue_id=i.id AND q.status IN ('queued','running'))
-      RETURNING id
-    ) SELECT count(*) FROM reset;" 2>&1 </dev/null)
-  SPEC_REFLOW_RC=$?
-}
-
-spec_refly_advance() {
-  SPEC_REFLOW_OUTPUT=$("$SK" multica advance "$1" --to "Spec" --board gsp 2>&1 </dev/null)
-  SPEC_REFLOW_RC=$?
+# A stranded flight is already in Spec.  The only supported recovery exit is
+# Spec -> Queue, which dispatches the builder through the relay.  Older code
+# tried Spec -> Registered -> Spec to obtain a scoper task; that edge is not in
+# the stage policy and is rejected by the relay-authority guard.
+spec_refly_queue() {
+  relay_transition "$1" "Queue" "${2:-gsp}"; SPEC_REFLOW_RC=$?
+  SPEC_REFLOW_OUTPUT="$RELAY_TRANSITION_OUTPUT"
 }
 
 redact_spec_refly_diagnostic() {
   printf '%s' "$1" | tr '\n' ' ' | sed -E -e 's/(Bearer[[:space:]]+)[^[:space:]]+/\1[REDACTED]/Ig' -e 's/((token|password|secret|api[_-]?key)[=:])[[:space:]]*[^[:space:]]+/\1[REDACTED]/Ig' | cut -c1-400
 }
 
+spec_refly_failure_class() {
+  local message
+  message=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  case "$message" in
+    *relay\ authority*|*relay_authorized*|*authority*|*permission*|*forbidden*|*unauthori*) printf 'relay-authority' ;;
+    *credential*|*bearer*|*api[_-]key*|*token*) printf 'credential' ;;
+    *malformed*|*not-json*|*parse*) printf 'malformed-receipt' ;;
+    *transport*|*timeout*|*connection*|*unavailable*|*relay\ post*) printf 'transport' ;;
+    *) printf 'relay' ;;
+  esac
+}
+
 spec_refly_receipt_valid() {
-  jq -e '(.success == true) and (.issue.status == "Spec") and ((.task_id | type) == "string") and (.task_id | length > 0)' >/dev/null 2>&1 <<<"$1"
+  jq -e '(.success == true) and (.issue.status == "Queue") and ((.task_id | type) == "string") and (.task_id | length > 0)' >/dev/null 2>&1 <<<"$1"
+}
+
+spec_refly_increment_metadata() {
+  local number="$1" board="${2:-gsp}"
+  local updated
+  # Treat an exhausted/concurrent retry gate as a refusal.  psql exits zero
+  # for UPDATE 0, which previously made a second guard run claim a repair even
+  # though no counter changed (and made the success report non-idempotent).
+  updated=$("${PSQL[@]}" -c "UPDATE issue SET metadata = coalesce(metadata,'{}'::jsonb) ||
+    jsonb_build_object('spec_reflies', (coalesce(metadata->>'spec_reflies','0')::int + 1)::text)
+    WHERE number=${number} AND workspace_id = CASE WHEN '${board}'='gsp' THEN '${GSP_WS}' ELSE 'da3c5c5c-a123-4567-b999-c3ed1820da00' END AND status='Queue'
+      AND parent_issue_id IS NULL AND coalesce(metadata->>'spec_reflies','0')::int < 3
+    RETURNING number;" 2>/dev/null </dev/null) || return 1
+  [[ "$(printf '%s' "$updated" | tr -d '[:space:]')" == "$number" ]]
+}
+
+done_receipt_valid() {
+  jq -e '(.success == true) and ((.issue.status // .current_status // .status) == "Done")' >/dev/null 2>&1 <<<"$1"
+}
+
+# A PASS can mention more than one pull request.  Do not ship a flight with no
+# parseable PR, and do not ship until every referenced PR is actually merged.
+all_referenced_prs_merged() {
+  local urls="$1" repo num state found=0 u
+  for u in ${urls//,/ }; do
+    [[ "$u" =~ ^https://github\.com/[^/[:space:]]+/[^/[:space:]]+/pull/[0-9]+$ ]] || return 1
+    repo=$(printf '%s' "$u" | sed -E 's|https://github.com/([^/]+/[^/]+)/pull/[0-9]+|\1|')
+    num=$(printf '%s' "$u" | sed -E 's|.*/pull/([0-9]+)|\1|')
+    state=$(gh pr view "$num" -R "$repo" --json state -q .state 2>/dev/null </dev/null)
+    [[ "$state" == MERGED ]] || return 1
+    found=1
+  done
+  (( found ))
 }
 
 recover_stranded_spec_flight() {
-  local number="$1" reset_output relay_output diagnostic
-  spec_refly_reset "$number"; reset_output="$SPEC_REFLOW_OUTPUT"
+  local number="$1" board="${2:-gsp}" relay_output diagnostic
+  spec_refly_queue "$number" "$board"; relay_output="$SPEC_REFLOW_OUTPUT"
   if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
-    diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=reset exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
-    return 0
-  fi
-  if [[ "$(tr -d '[:space:]' <<<"$reset_output")" != "1" ]]; then
-    diagnostic=$(redact_spec_refly_diagnostic "$reset_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=reset-row-count exit=0 diagnostic=${diagnostic}")
-    return 0
-  fi
-  spec_refly_advance "$number"; relay_output="$SPEC_REFLOW_OUTPUT"
-  if [[ "$SPEC_REFLOW_RC" -ne 0 ]]; then
-    diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=relay exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
+    diagnostic=$(relay_transition_diagnostic "$relay_output")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=relay class=${RELAY_TRANSITION_CLASS:-$(spec_refly_failure_class "$relay_output")} exit=${SPEC_REFLOW_RC} diagnostic=${diagnostic}")
     return 0
   fi
   if ! spec_refly_receipt_valid "$relay_output"; then
     diagnostic=$(redact_spec_refly_diagnostic "$relay_output")
-    unfixable+=("gsp#${number} stranded-Spec recovery failed phase=receipt exit=0 diagnostic=${diagnostic}")
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=receipt exit=0 diagnostic=${diagnostic}")
     return 0
   fi
-  fixed+=("gsp#${number} had no live scoper task; reset exactly once and re-flown to Spec with a scoper task receipt")
+  if ! spec_refly_increment_metadata "$number" "$board"; then
+    unfixable+=("${board}#${number} stranded-Spec recovery failed phase=metadata exit=1 diagnostic=retry counter update refused; issue left in Queue")
+    return 0
+  fi
+  fixed+=("${board}#${number} had no live builder task; re-flown to Queue with a builder task receipt")
 }
 
 # Row 7 (CI/CD & Deploy -> Done) has NO agent, so nothing ever performs the last
@@ -924,7 +1442,7 @@ recover_stranded_spec_flight() {
 # pull request is actually MERGED. A flight whose PR is still open is left alone;
 # guard_unshipped_closures already handles that direction.
 guard_ship_passed() {
-  local number board md5 urls url repo num state unmerged
+  local number board md5 urls url
   # Every PR the flight references must be merged, not just the most recently
   # mentioned one. gsp#83 cites sk-cli#316 (merged) and #498 (open): checking a
   # single URL shipped it to Done, guard_unshipped_closures dragged it back on
@@ -932,19 +1450,10 @@ guard_ship_passed() {
   while IFS='|' read -r number board md5 urls; do
     [[ "$number" =~ ^[0-9]+$ ]] || continue
     [[ "$md5" =~ ^[0-9a-f]{32}$ ]] || continue
-    unmerged=0
-    url=""
-    for u in ${urls//,/ }; do
-      [[ -n "$u" ]] || continue
-      repo=$(printf '%s' "$u" | sed -E 's|https://github.com/([^/]+/[^/]+)/pull/[0-9]+|\1|')
-      num=$(printf '%s' "$u" | sed -E 's|.*/pull/([0-9]+)|\1|')
-      state=$(gh pr view "$num" -R "$repo" --json state -q .state 2>/dev/null </dev/null)
-      [[ "$state" == MERGED ]] || { unmerged=1; break; }
-      url="$u"
-    done
-    (( unmerged )) && continue
-    if "$SK" multica advance "$number" --to Done \
-         --current-work-product-md5 "$md5" --board "$board" >/dev/null 2>&1 </dev/null; then
+    all_referenced_prs_merged "$urls" || continue
+    url="${urls##*,}"
+    relay_transition "$number" Done "$board" "$md5" >/dev/null 2>&1
+    if [[ "$RELAY_TRANSITION_RC" -eq 0 ]] && done_receipt_valid "$RELAY_TRANSITION_OUTPUT"; then
       fixed+=("${board}#${number} shipped to Done on its PASS verdict${url:+ after ${url##*/} merged}")
     else
       unfixable+=("${board}#${number} passed QC and its work is merged but it would not advance to Done")
@@ -1038,7 +1547,7 @@ guard_unshipped_closures() {
     num=$(printf '%s' "$url" | sed -E 's|.*/pull/([0-9]+)|\1|')
     state=$(gh pr view "$num" -R "$repo" --json state -q .state 2>/dev/null </dev/null)
     [[ "$state" != OPEN ]] && continue
-    if "$SK" multica advance "$number" --to "CI/CD & Deploy" --board gsp >/dev/null 2>&1 </dev/null; then
+    if relay_transition "$number" "CI/CD & Deploy" gsp >/dev/null 2>&1; then
       fixed+=("gsp#${number} was ${status} while ${repo}#${num} is still open; returned to CI/CD & Deploy")
       moved=$(( moved + 1 ))
     else
@@ -1049,20 +1558,33 @@ guard_unshipped_closures() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+# Validate relay authority before any guard can attempt a status mutation.
+guard_relay_preflight
+repair_source_runtime_parity
+guard_source_runtime_parity
 guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
-for f in "${fixed[@]:-}";     do [[ -n "$f" ]] && echo "belt-config-guard: FIXED $f"; done
-for u in "${unfixable[@]:-}"; do [[ -n "$u" ]] && echo "belt-config-guard: UNFIXABLE $u" >&2; done
+# Several guards can observe the same flight in one tick. Emit each exact
+# finding once so the P0 is stable and one-run idempotent.
+declare -A _seen_fixed=() _seen_unfixable=()
+for f in "${fixed[@]:-}"; do
+  [[ -n "$f" && -z "${_seen_fixed[$f]+x}" ]] || continue
+  _seen_fixed[$f]=1; echo "belt-config-guard: FIXED $f"
+done
+for u in "${unfixable[@]:-}"; do
+  [[ -n "$u" && -z "${_seen_unfixable[$u]+x}" ]] || continue
+  _seen_unfixable[$u]=1; echo "belt-config-guard: UNFIXABLE $u" >&2
+done
 
 if (( ${#unfixable[@]} > 0 )) && [[ -n "${unfixable[0]:-}" ]]; then
   file_p0 "belt config drift the guard could not repair" \
 "Automated by belt-config-guard.sh on gsp-noc2 at $(date -Is).
 
 Could not repair:
-$(printf '  - %s\n' "${unfixable[@]}")
+$(printf '%s\n' "${!_seen_unfixable[@]}" | sort | sed 's/^/  - /')
 
 Repaired automatically this run:
-$(printf '  - %s\n' "${fixed[@]:-none}")"
+$(if ((${#_seen_fixed[@]})); then printf '%s\n' "${!_seen_fixed[@]}" | sort | sed 's/^/  - /'; else printf '  - none\n'; fi)"
 fi
 echo "belt-config-guard: fixed=${#fixed[@]} unfixable=${#unfixable[@]}"
 fi

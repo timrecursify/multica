@@ -1,0 +1,1 @@
+-- Intentionally non-destructive: grants may predate or outlive pool membership.

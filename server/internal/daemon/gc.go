@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -58,6 +59,10 @@ func (d *Daemon) gcLoop(ctx context.Context) {
 
 // gcStats accumulates byte counts and per-pattern hit counts for one GC cycle.
 type gcStats struct {
+	eligible        int // candidates meeting a configured cleanup rule
+	skippedLive     int // candidates excluded because a task/process is active
+	skippedRecent   int // candidates retained because their completion is recent
+	removed         int // whole task directories removed
 	cleaned         int // whole task dirs removed (issue done/cancelled)
 	orphaned        int // whole task dirs removed (no meta / unreachable issue)
 	skipped         int // task dirs left untouched
@@ -67,9 +72,10 @@ type gcStats struct {
 	// hermesMemoryStoresReclaimed is counted separately from storesReclaimed:
 	// the two stores hold different things on different TTLs, so folding them
 	// into one number would make either figure unreadable for an operator.
-	hermesMemoryStoresReclaimed int            // per-agent Hermes memory stores reclaimed past their TTL
-	repoCachesReclaimed         int            // bare repo caches under .repos evicted past their TTL
-	bytesReclaimed              int64          // total bytes freed in this cycle
+	hermesMemoryStoresReclaimed int   // per-agent Hermes memory stores reclaimed past their TTL
+	repoCachesReclaimed         int   // bare repo caches under .repos evicted past their TTL
+	bytesReclaimed              int64 // total bytes freed in this cycle
+	pressureTriggered           bool
 	byPattern                   map[string]int // configured basename or managed path label -> reclaim count
 }
 
@@ -105,6 +111,7 @@ func (d *Daemon) runGC(ctx context.Context) {
 	// caches nothing needs anymore. These live outside any workspace directory
 	// and are never reclaimed by the task walk above.
 	d.pruneRepoWorktrees(root, stats)
+	d.reclaimUnderPressure(ctx, root, stats)
 
 	// Reclaim per-issue Codex session stores idle past their TTL. These live
 	// under the shared ~/.codex home (outside WorkspacesRoot) so resume survives
@@ -123,8 +130,12 @@ func (d *Daemon) runGC(ctx context.Context) {
 		stats.bytesReclaimed += storeBytes
 	}
 
-	if stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 {
+	if stats.pressureTriggered || stats.cleaned > 0 || stats.orphaned > 0 || stats.artifactDirs > 0 || stats.storesReclaimed > 0 || stats.hermesMemoryStoresReclaimed > 0 || stats.repoCachesReclaimed > 0 {
 		d.logger.Info("gc: cycle complete",
+			"eligible", stats.eligible,
+			"skipped_live", stats.skippedLive,
+			"skipped_recent", stats.skippedRecent,
+			"removed", stats.removed,
 			"cleaned", stats.cleaned,
 			"orphaned", stats.orphaned,
 			"skipped", stats.skipped,
@@ -137,6 +148,68 @@ func (d *Daemon) runGC(ctx context.Context) {
 			"by_pattern", stats.byPattern,
 		)
 	}
+}
+
+// reclaimUnderPressure is the GC safety valve. It intentionally uses only
+// locally completed metadata and never consults issue status, so an open issue
+// cannot pin a finished worktree when the filesystem is running out of space.
+func (d *Daemon) reclaimUnderPressure(ctx context.Context, root string, stats *gcStats) {
+	if d.cfg.GCFreeSpaceFloor == 0 {
+		return
+	}
+	free, ok := filesystemFreeBytes(root)
+	if !ok || free >= d.cfg.GCFreeSpaceFloor {
+		return
+	}
+	stats.pressureTriggered = true
+	target := d.cfg.GCFreeSpaceTarget
+	if target < d.cfg.GCFreeSpaceFloor {
+		target = d.cfg.GCFreeSpaceFloor
+	}
+	type candidate struct {
+		dir       string
+		completed time.Time
+	}
+	var candidates []candidate
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, ws := range entries {
+		if !ws.IsDir() || strings.HasPrefix(ws.Name(), ".") {
+			continue
+		}
+		wsDir := filepath.Join(root, ws.Name())
+		tasks, _ := os.ReadDir(wsDir)
+		for _, task := range tasks {
+			if !task.IsDir() {
+				continue
+			}
+			dir := filepath.Join(wsDir, task.Name())
+			if d.isActiveEnvRoot(dir) || processUsesPath(dir) {
+				continue
+			}
+			meta, err := execenv.ReadGCMeta(dir)
+			if err != nil || meta.CompletedAt.IsZero() {
+				continue
+			}
+			candidates = append(candidates, candidate{dir: dir, completed: meta.CompletedAt})
+		}
+	}
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].completed.Before(candidates[j].completed) })
+	for _, c := range candidates {
+		if ctx.Err() != nil || free >= target {
+			break
+		}
+		before := dirSize(c.dir)
+		if d.applyGCAction(c.dir, gcActionClean, stats) == 0 {
+			continue
+		}
+		if before > 0 {
+			free += uint64(before)
+		}
+	}
+	d.logger.Info("gc: pressure pass", "triggered", true, "free_bytes", free, "floor_bytes", d.cfg.GCFreeSpaceFloor, "target_bytes", target, "candidates", len(candidates))
 }
 
 // gcWorkspace scans task directories inside a single workspace directory.
@@ -161,6 +234,7 @@ func (d *Daemon) gcWorkspace(ctx context.Context, wsDir string, stats *gcStats) 
 			taskDir := filepath.Join(wsDir, entry.Name())
 			if d.isActiveEnvRoot(taskDir) {
 				stats.skipped++
+				stats.skippedLive++
 				continue
 			}
 			meta, metaErr := execenv.ReadGCMeta(taskDir)
@@ -251,6 +325,9 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 		}
 		action := d.gcDecisionIssueResult(candidate.taskDir, candidate.meta, result)
 		action = d.applyLocalDirectoryGCOverride(candidate.meta, action)
+		if action == gcActionSkip && !candidate.meta.CompletedAt.IsZero() && time.Since(candidate.meta.CompletedAt) <= d.cfg.GCTTL {
+			stats.skippedRecent++
+		}
 		cleaned += d.applyGCAction(candidate.taskDir, action, stats)
 	}
 	return cleaned
@@ -261,6 +338,7 @@ func (d *Daemon) gcWorkspaceIssues(ctx context.Context, workspaceID string, cand
 // reconciliation request is in flight.
 func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) int {
 	if action != gcActionSkip {
+		stats.eligible++
 		release, ok := d.reserveEnvRootForGC(taskDir)
 		if !ok {
 			stats.skipped++
@@ -277,6 +355,7 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		bytes := dirSize(taskDir)
 		d.cleanTaskDir(taskDir)
 		stats.cleaned++
+		stats.removed++
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionOrphan:
@@ -287,6 +366,7 @@ func (d *Daemon) applyGCAction(taskDir string, action gcAction, stats *gcStats) 
 		bytes := dirSize(taskDir)
 		d.cleanTaskDir(taskDir)
 		stats.orphaned++
+		stats.removed++
 		stats.bytesReclaimed += bytes
 		return 1
 	case gcActionCleanArtifacts:
@@ -497,6 +577,14 @@ func (d *Daemon) gcDecisionIssue(ctx context.Context, taskDir string, meta *exec
 }
 
 func (d *Daemon) gcDecisionIssueResult(taskDir string, meta *execenv.GCMeta, result IssueGCCheckResult) gcAction {
+	// Completion is a local lifecycle fact. Do not retain a finished task solely
+	// because its server-side issue remains open. This full-cleanup clock is
+	// independent of GCArtifactTTL: disabling artifact cleanup must not disable
+	// reclamation of completed task directories.
+	if !meta.CompletedAt.IsZero() && time.Since(meta.CompletedAt) > d.cfg.GCTTL {
+		d.logger.Info("gc: eligible for cleanup", "dir", filepath.Base(taskDir), "kind", "issue", "issue", meta.IssueID, "reason", "local completion")
+		return gcActionClean
+	}
 	if !result.Found {
 		return d.orphanByMTime(taskDir, "issue not accessible")
 	}

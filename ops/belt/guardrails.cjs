@@ -13,7 +13,34 @@ const NON_EXECUTION_STAGES = new Set([
 ]);
 const EXTERNAL_TRANSITION_STAGES = new Set(['Done']);
 const QUOTA_PAUSE_MAX_AGE_MS = 15 * 60 * 1000;
-const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('./qc-lane.cjs');
+const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray,
+  isSpecLane, specLaneModelsSqlArray,
+  isBuildLane, buildLaneModelsSqlArray } = require('./qc-lane.cjs');
+
+// The route admitted for a builder is immutable task input.  Keep this pure so
+// relay admission, daemon claim and tests all use the same contract.
+const BUILDER_ROUTE_RESOLVER_VERSION = 'builder-route-v1';
+function resolveBuilderRoute(agent = {}, runtime = {}) {
+  const name = String(agent.name || agent.agent_name || '').toLowerCase();
+  if (!name.includes('build')) return { ok: true, route: null, resolver_version: BUILDER_ROUTE_RESOLVER_VERSION };
+  const cfg = agent.runtime_config && typeof agent.runtime_config === 'object' ? agent.runtime_config : {};
+  const models = [agent.model, cfg.model, runtime.model].map(v => String(v || '').trim()).filter(Boolean);
+  const uniqueModels = [...new Set(models)];
+  if (!uniqueModels.length) return { ok: false, reason: 'builder_route_unavailable' };
+  if (uniqueModels.length > 1) return { ok: false, reason: 'builder_route_mismatch', models: uniqueModels };
+  const model = uniqueModels[0];
+  // agent_runtime.provider identifies the Codex transport; model_provider is
+  // the billable route and may intentionally be OpenRouter for a Codex runtime.
+  const providerValues = [cfg.model_provider, cfg.provider, runtime.model_provider].map(v => String(v || '').trim().toLowerCase()).filter(Boolean);
+  const uniqueProviders = [...new Set(providerValues)];
+  const provider = uniqueProviders[0] || (/^deepseek[/:]/i.test(model) ? 'openrouter' : 'codex');
+  if (uniqueProviders.length > 1 || (provider === 'openrouter' && !/^deepseek[/:]/i.test(model)) ||
+      (provider === 'codex' && /^deepseek[/:]/i.test(model))) {
+    return { ok: false, reason: 'builder_route_mismatch', providers: uniqueProviders, model };
+  }
+  return { ok: true, resolver_version: BUILDER_ROUTE_RESOLVER_VERSION,
+    route: { provider, model, resolver_version: BUILDER_ROUTE_RESOLVER_VERSION } };
+}
 
 function canonicalStage(stage) {
   return STAGE_ALIASES.get(stage) || stage;
@@ -54,6 +81,28 @@ function instructionCompatibility(instructions, targetStage) {
     stage,
     allowed: [...allowed].sort()
   };
+}
+
+function agentRegistryDefects(agents = [], pool = []) {
+  const defects = [];
+  const names = new Map();
+  for (const agent of agents) {
+    const name = String(agent.name || '').trim();
+    if (!name) continue;
+    const list = names.get(name) || [];
+    list.push(agent); names.set(name, list);
+    if (!String(agent.instructions || '').trim()) defects.push(`${agent.id || '?'}:${name}:blank_instructions`);
+  }
+  for (const [name, list] of names) {
+    if (list.length > 1 && !list.every(a => a.archived_at != null)) defects.push(`${name}:duplicate_name:${list.map(a => a.id || '?').join(',')}`);
+  }
+  for (const member of pool) {
+    if (member.enabled === false) continue;
+    const agent = agents.find(a => String(a.id) === String(member.agent_id));
+    if (!agent) { defects.push(`${member.agent_id || '?'}:${member.stage_name}:missing_agent`); continue; }
+    if (instructionStages(agent.instructions).size === 0) defects.push(`${agent.id}:${agent.name}:${member.stage_name}:zero_permitted_stages`);
+  }
+  return defects.sort();
 }
 
 function hasActiveTaskForIssueStage(tasks, issueId, stage) {
@@ -147,8 +196,14 @@ function beltRoutingAdmission(agent, selectedRuntime = {}) {
   const qcOrSpec = name.includes('qc') || name.includes('spec');
   if (!build && !qcOrSpec) return { ok: true };
   if (effort !== QC_LANE_EFFORT) return { ok: false, reason: 'belt_low_reasoning_effort_required', ...details };
-  if (build && !(/^deepseek[/:]/.test(model) || model === 'gpt-5.6-terra')) return { ok: false, reason: 'builder_requires_deepseek_or_terra', ...details, expected_model: 'deepseek/*|gpt-5.6-terra' };
-  if (qcOrSpec && !isQcLane(model, effort)) return { ok: false, reason: 'qc_spec_requires_qc_lane', ...details, expected_model: qcLaneModelsSqlArray().join('|') };
+  if (build && !isBuildLane(model)) return { ok: false, reason: 'builder_requires_build_lane', ...details, expected_model: ['deepseek/*', ...buildLaneModelsSqlArray()].join('|') };
+  // A *spec* agent scopes tickets and may run the opus spec lane; a *qc* agent
+  // may not. Both still require the low-effort belt setting checked above.
+  const spec = name.includes('spec') && !name.includes('qc');
+  if (qcOrSpec && !isQcLane(model, effort) && !(spec && isSpecLane(model, effort))) {
+    return { ok: false, reason: 'qc_spec_requires_qc_lane', ...details,
+      expected_model: [...qcLaneModelsSqlArray(), ...(spec ? specLaneModelsSqlArray() : [])].join('|') };
+  }
   return { ok: true };
 }
 
@@ -170,9 +225,13 @@ function stageCycleAdmission(taskCount, limit = 2) {
   const count = Number(taskCount);
   const ceiling = Number(limit);
   if (!Number.isInteger(ceiling) || ceiling < 1) return { ok: false, reason: 'invalid_stage_cycle_limit' };
+  // Reaching the ceiling stops another paid run at this stage; it does not end
+  // the ticket. Rejecting here killed work whose only fault was that the belt
+  // itself was broken while the cycles accrued. Hand the flight to the
+  // escalation lane instead, which is what qc_bounce_ceiling already does.
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Rejected' };
+    : { ok: false, reason: 'stage_cycle_limit', ceiling, disposition: 'Spec' };
 }
 
 function budgetCountPredicate(taskAlias = '') {
@@ -195,9 +254,13 @@ function lifetimeTaskAdmission(taskCount, limit = 6) {
   if (!Number.isInteger(ceiling) || ceiling < 1) {
     return { ok: false, reason: 'invalid_lifetime_task_limit' };
   }
+  // Reaching the ceiling stops another paid run on this ticket; it does not end
+  // the ticket. Rejecting here threw the work away, the same defect already
+  // fixed for stage_cycle_limit above. Hand the flight to the escalation lane
+  // instead, which is what qc_bounce_ceiling and the cycle ceiling both do.
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Rejected' };
+    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Spec' };
 }
 
 function isExecutionStage(stage) {
@@ -248,10 +311,13 @@ function quotaCircuitAdmission(failures, limit = 3, { now = Date.now(),
 }
 
 module.exports = {
+  resolveBuilderRoute,
+  BUILDER_ROUTE_RESOLVER_VERSION,
   NONTERMINAL_TASK_STATES,
   canonicalStage,
   isBundledChild,
   instructionStages,
+  agentRegistryDefects,
   instructionCompatibility,
   hasActiveTaskForIssueStage,
   isActiveExecutionTask,

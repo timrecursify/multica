@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -153,6 +154,34 @@ func TestUpdateWorkspaceOperatorAgentMaxConcurrent(t *testing.T) {
 	testHandler.UpdateWorkspaceOperatorAgent(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("invalid-value status = %d, want 400", rr.Code)
+	}
+}
+
+func TestUpdateWorkspaceOperatorAgentValidationIsAtomic(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("no test database")
+	}
+	agentID := createHandlerTestAgent(t, "operator-update-atomic", nil)
+	t.Cleanup(func() { testPool.Exec(context.Background(), `DELETE FROM agent WHERE id = $1`, agentID) })
+
+	// The model is valid, but the later max-concurrency value is invalid. No
+	// part of the request may be persisted when validation fails.
+	req := newRequest("PATCH", "/api/operator/workspaces/{workspaceId}/agents/{ref}", map[string]any{
+		"model":                "would-not-persist",
+		"max_concurrent_tasks": 99999,
+	})
+	req = withURLParams(req, "workspaceId", testWorkspaceID, "ref", agentID)
+	rr := httptest.NewRecorder()
+	testHandler.UpdateWorkspaceOperatorAgent(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %s)", rr.Code, rr.Body.String())
+	}
+	var model sql.NullString
+	if err := testPool.QueryRow(context.Background(), `SELECT model FROM agent WHERE id = $1`, agentID).Scan(&model); err != nil {
+		t.Fatalf("read agent model: %v", err)
+	}
+	if model.Valid && model.String == "would-not-persist" {
+		t.Fatal("valid field was persisted despite later validation failure")
 	}
 }
 

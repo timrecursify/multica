@@ -4589,7 +4589,20 @@ func (s *TaskService) RerunIssue(ctx context.Context, issueID pgtype.UUID, sourc
 			isLeader = true
 			squadID = issue.AssigneeID
 		default:
-			return nil, fmt.Errorf("issue is not assigned to an agent or squad")
+			// Spec-stage issues are intentionally unassigned. Resolve their
+			// rerun target from the workspace/stage pool before any mutation;
+			// the existing canInvoke gate below remains authoritative.
+			poolAgent, poolErr := s.Queries.SelectRelayStageRerunAgent(ctx, db.SelectRelayStageRerunAgentParams{
+				WorkspaceID: issue.WorkspaceID,
+				StageName:   issue.Status,
+			})
+			if poolErr != nil {
+				if errors.Is(poolErr, pgx.ErrNoRows) {
+					return nil, fmt.Errorf("no eligible agent in the %s stage pool", issue.Status)
+				}
+				return nil, fmt.Errorf("select %s stage pool agent: %w", issue.Status, poolErr)
+			}
+			agentID = poolAgent.ID
 		}
 	}
 

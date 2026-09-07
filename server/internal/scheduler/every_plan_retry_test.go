@@ -40,6 +40,9 @@ import (
 // actually measuring.
 func TestManagerEveryPlanRetriesFailedSamePlanTime(t *testing.T) {
 	pool := integrationPool(t)
+	// Keep both ticks exactly on an hour boundary so this regression remains
+	// deterministic even when the test runs across a real hour rollover.
+	fixedNow := time.Date(2026, time.September, 4, 9, 0, 0, 0, time.UTC)
 	job := newTestJobSpec(uniqueJobName(t, "every_plan_retry"))
 	t.Cleanup(func() { cleanupExecutions(t, pool, job.Name) })
 
@@ -63,7 +66,12 @@ func TestManagerEveryPlanRetriesFailedSamePlanTime(t *testing.T) {
 		return HandlerResult{}, errors.New("simulated handler failure")
 	}
 
-	mgr := NewManager(pool, Options{RunnerID: "retry-runner"})
+	mgr := NewManager(pool, Options{
+		RunnerID: "retry-runner",
+		DBNow: func(context.Context, *pgxpool.Pool) (time.Time, error) {
+			return fixedNow, nil
+		},
+	})
 	if err := mgr.Register(*job); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -93,15 +101,13 @@ func TestManagerEveryPlanRetriesFailedSamePlanTime(t *testing.T) {
 
 	planT := r1.PlanTime
 
-	// Force next_retry_at into the past so the second tick sees the
-	// retry as due. We deliberately use the DB's clock so this stays
-	// independent of the app process clock (consistent with the rest
-	// of the scheduler's time handling).
+	// Force next_retry_at into the past relative to the injected clock so
+	// the second tick sees the retry as due without waiting for backoff.
 	if _, err := pool.Exec(ctx, `
 		UPDATE sys_cron_executions
-		   SET next_retry_at = now() - INTERVAL '1 minute'
+		   SET next_retry_at = $2
 		 WHERE id = $1
-	`, r1.ID); err != nil {
+	`, r1.ID, fixedNow.Add(-time.Minute)); err != nil {
 		t.Fatalf("force next_retry_at into the past: %v", err)
 	}
 

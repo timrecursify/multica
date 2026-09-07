@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -66,7 +67,7 @@ const (
 	DefaultHealthPort                     = 19514
 	DefaultMaxConcurrentTasks             = 20
 	DefaultGCInterval                     = 2 * time.Hour
-	DefaultGCTTL                          = 24 * time.Hour      // 1 day — AI-coding issues rarely stay open long
+	DefaultGCTTL                          = 6 * time.Hour       // 6h — below the observed workspace fill time; locally completed tasks are reclaimable regardless of issue status
 	DefaultGCOrphanTTL                    = 72 * time.Hour      // 3 days — orphans with no meta (crashes, pre-GC leftovers)
 	DefaultGCArtifactTTL                  = 12 * time.Hour      // 12h — drop regenerable artifacts on completed but still-open issues
 	DefaultGCCodexSessionTTL              = 14 * 24 * time.Hour // 14 days — reclaim per-issue Codex session stores untouched this long
@@ -101,11 +102,13 @@ type Config struct {
 	MaxConcurrentTasks             int                   // max tasks running in parallel (default: 20)
 	GCEnabled                      bool                  // enable periodic workspace garbage collection (default: true)
 	GCInterval                     time.Duration         // how often the GC loop runs (default: 2h)
-	GCTTL                          time.Duration         // clean dirs whose issue is done/cancelled and updated_at < now()-TTL (default: 24h)
+	GCTTL                          time.Duration         // clean locally completed dirs after this TTL, regardless of issue status (default: 6h)
 	GCOrphanTTL                    time.Duration         // clean orphan dirs with no meta, or dirs whose issue gc-check returns 404, once they exceed this age (default: 72h). The 404 path uses the same TTL — a scoped-down token can't instantly wipe live workspaces.
 	GCArtifactTTL                  time.Duration         // when a task has been completed for at least this long but its issue is still open, drop regenerable artifacts (default: 12h, set 0 to disable)
 	GCArtifactPatterns             []string              // basename patterns whose subtrees are removed during artifact cleanup (default: node_modules, .next, .turbo)
 	GCRepoTTL                      time.Duration         // evict a cached bare repo under .repos once no task has created a worktree from it for this long, it has no worktrees left, and it is no longer attached to any watched workspace (default: 30d, set 0 to disable)
+	GCFreeSpaceFloor               uint64                // reclaim completed tasks when filesystem free bytes fall below this floor (0 = disabled)
+	GCFreeSpaceTarget              uint64                // pressure cleanup target; defaults to floor
 	GCCodexSessionTTL              time.Duration         // reclaim a per-issue Codex session store (~/.codex/multica-sessions/<agent>/<issue>) untouched for at least this long, so a done/abandoned issue's conversation history does not accumulate forever (default: 14d, set 0 to disable)
 	GCHermesMemoryTTL              time.Duration         // reclaim a per-agent Hermes memory store (<profile dir>/hermes-state/<agent>/<profile>) untouched for at least this long, so a deleted agent's memory does not sit on disk forever (default: 90d, set 0 to disable)
 	TaskTempOrphanTTL              time.Duration         // reclaim interrupted task temp directories older than this age (default: 2h)
@@ -432,6 +435,14 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	gcFreeSpaceFloor, err := uint64FromEnv("MULTICA_GC_FREE_SPACE_FLOOR", 0)
+	if err != nil {
+		return Config{}, err
+	}
+	gcFreeSpaceTarget, err := uint64FromEnv("MULTICA_GC_FREE_SPACE_TARGET", gcFreeSpaceFloor)
+	if err != nil {
+		return Config{}, err
+	}
 	taskTempOrphanTTL, err := durationFromEnv("MULTICA_TASK_TEMP_ORPHAN_TTL", DefaultTaskTempOrphanTTL)
 	if err != nil {
 		return Config{}, err
@@ -487,6 +498,8 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		GCArtifactTTL:                  gcArtifactTTL,
 		GCArtifactPatterns:             gcArtifactPatterns,
 		GCRepoTTL:                      gcRepoTTL,
+		GCFreeSpaceFloor:               gcFreeSpaceFloor,
+		GCFreeSpaceTarget:              gcFreeSpaceTarget,
 		TaskTempOrphanTTL:              taskTempOrphanTTL,
 		GCCodexSessionTTL:              gcCodexSessionTTL,
 		GCHermesMemoryTTL:              gcHermesMemoryTTL,
@@ -622,6 +635,18 @@ func patternsFromEnv(name string, defaults []string) []string {
 		out = append(out, p)
 	}
 	return out
+}
+
+func uint64FromEnv(name string, fallback uint64) (uint64, error) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", name, raw, err)
+	}
+	return v, nil
 }
 
 func shellArgsFromEnv(name string) ([]string, error) {

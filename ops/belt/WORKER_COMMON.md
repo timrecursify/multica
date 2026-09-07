@@ -95,6 +95,8 @@ Delete a test you wrote that turned out to prove nothing.
   checkout.
 - Use a branch and pull request. Never push to `main` or force-push.
 - Push first, then run `gh pr create` as its own separate command (never chained with `&&` or in a script). The daemon reads the pull request URL from that command's output alone; any other text in the same output marks the task failed even though the PR exists.
+- `gh` has no ambient credential on the belt. Mint one for the repository you are in, on the same command line, so the output stays the pull request URL and nothing else:
+  `GH_TOKEN=$(gsp-belt-git-credential token <repo>) gh pr create --title '...' --body '...'`, where `<repo>` is `multica`, `sk-cli`, or `ppp`. Every other `gh` call needs the same prefix.
 - Never print secrets. Money, auth, migrations, secrets, and production flags
   require Sol-low QC before merge or deployment.
 
@@ -115,4 +117,11 @@ OUTCOME: FAILED
 - `NO_OP`: the deliverable already exists (already merged, already deployed). Say where.
 - `FAILED`: you stopped for any other reason.
 
-The relay records this line against the issue and stage. A stage with a recorded outcome is not re-dispatched until its inputs change (PR head SHA, CI state, newest comment, dependency state, spec body). Missing or malformed line is recorded as `FAILED`.
+Write `blocked_on=` in full. `OUTCOME: BLOCKED sha` is read as `blocked_on=sha`, but
+the `blocked_on=` form is the one contract; anything else on the line is malformed.
+
+The relay records this line against the issue and stage, keeping one row per issue
+and stage: the newest completed run of a stage is the one recorded. A stage with a
+recorded outcome is not re-dispatched until its inputs change (PR head SHA, CI state,
+newest comment, dependency state, spec body). Missing or malformed line is recorded
+as `FAILED`.

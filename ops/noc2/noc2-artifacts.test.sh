@@ -31,4 +31,6 @@ set -e
 
 grep -Fq 'if-no-files-found: error' "$root/../../.github/workflows/noc2-artifacts.yml"
 grep -Fq 'fetch-depth: 0' "$root/../../.github/workflows/noc2-artifacts.yml"
+grep -Fq 'cp ops/noc2/multica-scratch.conf dist/multica-scratch.conf' "$root/../../.github/workflows/noc2-artifacts.yml"
+"$root/multica-scratch-tmpfiles.test.sh"
 printf 'noc2 immutable artifact provenance contract passed\n'

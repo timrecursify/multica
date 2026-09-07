@@ -134,6 +134,7 @@ func init() {
 	df.String("output", "table", "Output format: table or json")
 	df.String("workspaces-root", "", "Override the workspaces root path (default: same as the daemon)")
 	df.Bool("all-profiles", false, "Scan every workspace root (default root + all ~/.multica/profiles/* roots, incl. the Desktop app's) and report a combined total")
+	df.Bool("allow-in-task", false, "Diagnostic override: allow an explicit --workspaces-root inside a daemon-managed task")
 
 	daemonCmd.AddCommand(daemonStartCmd)
 	daemonCmd.AddCommand(daemonStopCmd)
@@ -1417,10 +1418,14 @@ func runDaemonDiskUsage(cmd *cobra.Command, _ []string) error {
 	top, _ := cmd.Flags().GetInt("top")
 	output, _ := cmd.Flags().GetString("output")
 	allProfiles, _ := cmd.Flags().GetBool("all-profiles")
+	allowInTask, _ := cmd.Flags().GetBool("allow-in-task")
 
 	if taskContext {
-		if err := checkTaskDiskUsageScope(profile, rootOverride, allProfiles); err != nil {
+		if err := checkTaskDiskUsageScope(profile, rootOverride, allProfiles, allowInTask); err != nil {
 			return err
+		}
+		if allowInTask {
+			fmt.Fprintf(os.Stderr, "diagnostic override: --allow-in-task enabled for explicit --workspaces-root (context: %s)\n", daemonTaskContextTrigger())
 		}
 	}
 	if byWorkspace && byTask {
@@ -1437,7 +1442,7 @@ func runDaemonDiskUsage(cmd *cobra.Command, _ []string) error {
 		return runDaemonDiskUsageAggregate(cmd, byWorkspace, top, output)
 	}
 
-	workspacesRoot, err := resolveDiskUsageRoot(taskContext, profile, rootOverride)
+	workspacesRoot, err := resolveDiskUsageRoot(taskContext, profile, rootOverride, allowInTask)
 	if err != nil {
 		return fmt.Errorf("resolve workspaces root: %w", err)
 	}
@@ -1483,16 +1488,33 @@ func runDaemonDiskUsage(cmd *cobra.Command, _ []string) error {
 // boundary: --all-profiles enumerates ~/.multica/profiles and discloses the
 // Owner's profile names, while --workspaces-root and --profile aim the scan at
 // a directory this daemon does not manage.
-func checkTaskDiskUsageScope(profile, rootOverride string, allProfiles bool) error {
+func checkTaskDiskUsageScope(profile, rootOverride string, allProfiles, allowInTask bool) error {
+	context := daemonTaskContextTrigger()
 	switch {
 	case allProfiles:
-		return fmt.Errorf("daemon disk-usage --all-profiles is not available inside a daemon-managed task")
-	case rootOverride != "":
-		return fmt.Errorf("daemon disk-usage --workspaces-root is not available inside a daemon-managed task")
+		return fmt.Errorf("daemon disk-usage --all-profiles is not available inside a daemon-managed task (context: %s); this is a contextual restriction, not a capability limit", context)
+	case rootOverride != "" && !allowInTask:
+		return fmt.Errorf("daemon disk-usage --workspaces-root is not available inside a daemon-managed task (context: %s); this is a contextual restriction, not a capability limit; use --allow-in-task for an explicit diagnostic root", context)
+	case rootOverride == "" && allowInTask:
+		return fmt.Errorf("--allow-in-task requires an explicit --workspaces-root inside a daemon-managed task (context: %s)", context)
 	case profile != "":
-		return fmt.Errorf("daemon disk-usage --profile is not available inside a daemon-managed task")
+		return fmt.Errorf("daemon disk-usage --profile is not available inside a daemon-managed task (context: %s); this is a contextual restriction, not a capability limit", context)
 	}
 	return nil
+}
+
+// daemonTaskContextTrigger identifies the non-secret signal that put the CLI
+// inside the managed-task boundary.
+func daemonTaskContextTrigger() string {
+	for _, name := range []string{"MULTICA_AGENT_ID", "MULTICA_TASK_ID", "MULTICA_DAEMON_PORT"} {
+		if strings.TrimSpace(os.Getenv(name)) != "" {
+			return name
+		}
+	}
+	if marker := daemonTaskContextMarkerPath(); marker != "" {
+		return "marker " + marker
+	}
+	return "managed-task context"
 }
 
 // resolveDiskUsageRoot picks the directory to scan. A managed task reads the
@@ -1500,9 +1522,12 @@ func checkTaskDiskUsageScope(profile, rootOverride string, allProfiles bool) err
 // profile-derived default, which for a task hosted by a named-profile daemon
 // resolves to the default root and reports a tree the task has nothing to do
 // with. Failing closed on a missing value keeps that guess out of the output.
-func resolveDiskUsageRoot(taskContext bool, profile, rootOverride string) (string, error) {
+func resolveDiskUsageRoot(taskContext bool, profile, rootOverride string, override ...bool) (string, error) {
 	if !taskContext {
 		return daemon.ResolveWorkspacesRoot(profile, rootOverride)
+	}
+	if len(override) > 0 && override[0] && strings.TrimSpace(rootOverride) != "" {
+		return filepath.Clean(rootOverride), nil
 	}
 	root := strings.TrimSpace(os.Getenv(daemon.TaskWorkspacesRootEnv))
 	if root == "" {

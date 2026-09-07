@@ -85,7 +85,8 @@ CREATE TABLE public.qc_verdict (
     work_product_md5 text NOT NULL,
     notes text,
     created_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT qc_verdict_verdict_check CHECK ((verdict = ANY (ARRAY['PASS'::text, 'FAIL'::text, 'NEEDS_WORK'::text])))
+    CONSTRAINT qc_verdict_verdict_check CHECK ((verdict = ANY (ARRAY['PASS'::text, 'FAIL'::text, 'NEEDS_WORK'::text]))),
+    CONSTRAINT qc_verdict_work_product_md5_check CHECK (work_product_md5 ~* '^[0-9a-f]{32}$')
 );
 
 
@@ -122,7 +123,7 @@ CREATE TABLE public.relay_run_log (
     task_id uuid,
     status text DEFAULT 'pending'::text,
     created_at timestamp with time zone DEFAULT now(),
-    CONSTRAINT relay_run_log_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'completed'::text, 'failed'::text])))
+    CONSTRAINT relay_run_log_status_check CHECK ((status = ANY (ARRAY['pending'::text, 'completed'::text, 'failed'::text, 'noop'::text])))
 );
 
 
@@ -432,3 +433,12 @@ ALTER TABLE ONLY public.workflow_state
 
 \unrestrict i1ZB9Rl9BjMeoVYgdJSBjCoH8E8OSvrpekY2q1jemhVyA22n8olQ3yndbrFesZi
 
+CREATE TABLE IF NOT EXISTS public.cicd_deploy_attempt (
+    issue_id uuid PRIMARY KEY REFERENCES public.issue(id) ON DELETE CASCADE,
+    status text NOT NULL CHECK (status IN ('running','advanced','held','failed')),
+    reason text,
+    started_at timestamp with time zone,
+    last_attempt_at timestamp with time zone,
+    lease_until timestamp with time zone,
+    updated_at timestamp with time zone NOT NULL DEFAULT now()
+);

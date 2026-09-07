@@ -1,34 +1,168 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-repo_root="$(cd -- "$root_dir/../.." && pwd)"
 node "$root_dir/multica-cicd-worker.test.cjs"
-node "$root_dir/deploy-decision.test.cjs"
-bash -n "$root_dir/deploy.sh"
-tmp_dir="$(mktemp -d)"; trap 'rm -rf -- "$tmp_dir"' EXIT
-main_sha="$(git -C "$repo_root" rev-parse origin/main)"
-old_sha="$(git -C "$repo_root" log -n 2 --format=%H origin/main -- ops/belt/multica-bridge.cjs | tail -1)"
-[[ "$old_sha" != "$main_sha" ]] || { echo 'test needs an older bridge revision' >&2; exit 1; }
-mkdir -p "$tmp_dir/gsp-multica/parity" "$tmp_dir/gsp-multica/fleet" "$tmp_dir/tools" "$tmp_dir/multica-doctrine"
-declare -a files=('gsp-multica/multica-bridge.cjs' 'gsp-multica/guardrails.cjs' 'gsp-multica/parked-diagnosis.cjs' 'gsp-multica/parked-entry-audit.cjs' 'gsp-multica/parity/multica-relay-advance-daemon.cjs' 'gsp-multica/parity/relay-dead-rows.cjs' 'multica-cicd-worker.cjs' 'cicd-deploy-evidence.cjs' 'multica-archiver.cjs' 'tools/belt-config-guard.sh' 'gsp-multica/fleet/multica-daemon-wrapper.sh' 'gsp-multica/fleet/ecosystem.gsp-belt.config.js' 'tools/multica-bundle.py' 'multica-doctrine/RUNBOOK_SPEC_WORKER.md' 'multica-doctrine/RUNBOOK_BUILD_WORKER.md' 'multica-doctrine/RUNBOOK_QC_WORKER.md' 'multica-doctrine/WORKER_COMMON.md' 'gsp-multica/relay-completion-admission.cjs' 'gsp-multica/qc-lane.cjs' 'gsp-multica/reconciler.cjs' 'gsp-multica/stage-outcome.cjs' 'gsp-multica/transition-policy.cjs' 'gsp-multica/stage-routing.cjs' 'gsp-multica/qc-strict-evidence.cjs' 'gsp-multica/stage-routing.json' 'gsp-multica/qc-verdict-policy.cjs')
-declare -a sources=('ops/belt/multica-bridge.cjs' 'ops/belt/guardrails.cjs' 'ops/belt/parked-diagnosis.cjs' 'ops/belt/parked-entry-audit.cjs' 'ops/belt/parity/multica-relay-advance-daemon.cjs' 'ops/belt/parity/relay-dead-rows.cjs' 'ops/belt/multica-cicd-worker.cjs' 'ops/belt/cicd-deploy-evidence.cjs' 'ops/belt/multica-archiver.cjs' 'ops/belt/belt-config-guard.sh' 'ops/belt/multica-daemon-wrapper.sh' 'ops/belt/ecosystem.gsp-belt.config.js' 'ops/belt/multica-bundle.py' 'ops/belt/RUNBOOK_SPEC_WORKER.md' 'ops/belt/RUNBOOK_BUILD_WORKER.md' 'ops/belt/RUNBOOK_QC_WORKER.md' 'ops/belt/WORKER_COMMON.md' 'ops/belt/relay-completion-admission.cjs' 'ops/belt/qc-lane.cjs' 'ops/belt/reconciler.cjs' 'ops/belt/stage-outcome.cjs' 'ops/belt/transition-policy.cjs' 'ops/belt/stage-routing.cjs' 'ops/belt/qc-strict-evidence.cjs' 'ops/belt/stage-routing.json' 'ops/belt/qc-verdict-policy.cjs')
-# The seeded runtime must be one consistent deploy: every file at old_sha, the
-# receipt naming old_sha. Seeding from main with only the bridge held back made
-# deploy.sh refuse (live_runtime_diverged) whenever any other runtime file had
-# changed since the previous bridge commit. Files that did not exist yet at
-# old_sha are left absent; deploy.sh admits them as new targets.
-for i in "${!files[@]}"; do git -C "$repo_root" show "$old_sha:${sources[$i]}" > "$tmp_dir/${files[$i]}" 2>/dev/null || rm -f -- "$tmp_dir/${files[$i]}"; done
-mkdir -p "$tmp_dir/gsp-multica/deploy-receipts"
-printf '{"repo":"timrecursify/multica","source_sha":"%s","outcome":"deployed"}\n' "$old_sha" > "$tmp_dir/gsp-multica/deploy-receipts/belt-old.json"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --source-commit 0000000000000000000000000000000000000000 > "$tmp_dir/deploy.log"
-git -C "$repo_root" show "$main_sha:ops/belt/multica-bridge.cjs" | cmp -s - "$tmp_dir/gsp-multica/multica-bridge.cjs"
-grep -Fq "Copied ops/belt/multica-bridge.cjs@$main_sha" "$tmp_dir/deploy.log"
-grep -Fq "\"source_sha\":\"$main_sha\"" "$(sed -n 's/^Receipt: //p' "$tmp_dir/deploy.log")"
-printf 'unexplained local edit\n' >> "$tmp_dir/gsp-multica/multica-bridge.cjs"
-if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --source-commit "$main_sha" > "$tmp_dir/refuse.log" 2>&1; then echo 'expected divergent runtime refusal' >&2; exit 1; fi
-grep -Fq 'refused: live_runtime_diverged' "$tmp_dir/refuse.log"
-grep -Fq '"refused":"live_runtime_diverged"' "$(sed -n 's/^Receipt: //p' "$tmp_dir/refuse.log")"
-git -C "$repo_root" show "$main_sha:ops/belt/multica-bridge.cjs" > "$tmp_dir/gsp-multica/multica-bridge.cjs"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --source-commit "$old_sha" > "$tmp_dir/noop.log"
-grep -Fq 'No-op: live runtime already equals origin/main.' "$tmp_dir/noop.log"
-echo 'deploy guard test passed'
+
+# Regression: an operator hold must suppress only the AI worker's self-healing
+# path; the other pipeline services must remain in the liveness set.
+guard_source="$root_dir/belt-config-guard.sh"
+grep -q 'AI_HOLD_FILE=' "$guard_source"
+grep -q 'gsp-multica-worker.*held by' "$guard_source"
+grep -q 'readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver gsp-multica-worker multica-relay-advance)' "$guard_source"
+bash -n "$guard_source"
+
+tmp_dir="$(mktemp -d)"
+trap 'rm -rf -- "$tmp_dir"' EXIT
+
+# Expectations come from the canonical manifest, never a second copy of it.
+runtime_root="$tmp_dir"
+. "$root_dir/belt-manifest.sh"
+[[ "${#sources[@]}" -eq "${#targets[@]}" ]] || { echo 'manifest arrays are not index-aligned' >&2; exit 1; }
+
+# The wrapper sources helper scripts by absolute path, so a runtime missing one
+# cannot start -- belt-concurrency.sh was absent from a live worker for exactly
+# this reason. Anything the wrapper sources must therefore be a deployed target.
+while read -r sourced; do
+  [[ -n "$sourced" ]] || continue
+  printf '%s\n' "${targets[@]}" | grep -q "/gsp-multica-worker/$sourced\$" || {
+    echo "wrapper sources $sourced but the manifest never deploys it" >&2
+    exit 1
+  }
+done < <(grep -o '/[a-z-]*\.sh"$' "$root_dir/multica-daemon-wrapper.sh" | tr -d '/"')
+
+# Same failure, one directory over: a file under parity/ reaches its siblings
+# with require('../name.cjs'), which resolves outside parity/. Shipping such a
+# file into parity/ leaves the require unresolved and the daemon dies at start.
+# Resolve each one against the deployed layout instead of trusting the path.
+for parity_file in "$root_dir"/parity/*.cjs; do
+  [[ -e "$parity_file" ]] || continue
+  # Test files stay in the repository, so their requires say nothing about the
+  # deployed layout.
+  case "$parity_file" in *.test.cjs) continue ;; esac
+  while read -r required; do
+    [[ -n "$required" ]] || continue
+    printf '%s\n' "${targets[@]}" | grep -q "/app/$required\$" || {
+      echo "parity/$(basename "$parity_file") requires ../$required, which the manifest does not deploy to app/" >&2
+      exit 1
+    }
+  done < <(grep -o "require('\.\./[a-z-]*\.cjs')" "$parity_file" | sed "s|require('\.\./||; s|')||")
+done
+
+# These targets are absent beforehand, so a rollback must delete them outright
+# rather than restore a backup.
+is_new_target() {
+  case "${1##*/}" in
+    guardrails.cjs|parked-diagnosis.cjs|parked-entry-audit.cjs|relay-dead-rows.cjs|relay-completion-admission.cjs) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+for index in "${!targets[@]}"; do
+  mkdir -p -- "$(dirname -- "${targets[$index]}")"
+  is_new_target "${targets[$index]}" && continue
+  cp -- "${sources[$index]}" "${targets[$index]}"
+done
+
+bridge_dir="$tmp_dir/gsp-multica-bridge"
+relay_dir="$tmp_dir/multica-relay-advance/app"
+worker_dir="$tmp_dir/gsp-multica-worker"
+cicd_dir="$tmp_dir/multica-cicd-worker"
+
+dry_log="$tmp_dir/dry-run.log"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run >"$dry_log"
+grep -q "Would copy .*/parked-diagnosis.cjs to $bridge_dir/parked-diagnosis.cjs" "$dry_log"
+grep -q "Would copy .*/parked-diagnosis.cjs to $relay_dir/parked-diagnosis.cjs" "$dry_log"
+grep -q "Would copy .*/parity/relay-dead-rows.cjs to .*/parity/relay-dead-rows.cjs" "$dry_log"
+# transition-policy.cjs ships to three service directories from one source row.
+[[ "$(grep -c 'Would copy .*/transition-policy.cjs' "$dry_log")" -eq 3 ]]
+
+# An unscoped apply rewrites every managed target, so it must be requested by name.
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$tmp_dir/unscoped.log" 2>&1; then
+  echo 'expected refusal of an unscoped --apply' >&2
+  exit 1
+fi
+grep -q 'Refusing an unscoped --apply' "$tmp_dir/unscoped.log"
+
+# A partial rollout can leave the wrapper absent. It is a named parity target and
+# must be recreated by a selective deployment.
+rm -f -- "$worker_dir/multica-daemon-wrapper.sh"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-daemon-wrapper.sh >"$tmp_dir/missing-wrapper.log"
+cmp -s -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
+grep -q "Copied .*/multica-daemon-wrapper.sh to $worker_dir/multica-daemon-wrapper.sh" "$tmp_dir/missing-wrapper.log"
+
+# Remove a dependency from a disposable manifest copy. Validation must fail
+# before copy, proving the deploy cannot restart with an incomplete runtime.
+manifest_dir="$tmp_dir/manifest"
+cp -a -- "$root_dir/." "$manifest_dir/"
+sed -i '/parked-diagnosis\.cjs/d' "$manifest_dir/belt-manifest.sh"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$manifest_dir/deploy.sh" --apply --all >"$tmp_dir/missing-dependency.log" 2>&1; then
+  echo 'expected missing runtime dependency rejection' >&2
+  exit 1
+fi
+grep -q 'Missing manifest runtime dependency:' "$tmp_dir/missing-dependency.log"
+if grep -q 'Would\|Copied\|Backed up' "$tmp_dir/missing-dependency.log"; then
+  echo 'manifest validation ran after deployment work' >&2
+  exit 1
+fi
+
+# An injected mid-deploy failure must restore every original and delete every
+# target the deploy created.
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" BELT_DEPLOY_FAIL_INDEX=2 \
+   "$root_dir/deploy.sh" --apply --all >"$tmp_dir/fail.log" 2>&1; then
+  echo 'expected injected deployment failure' >&2
+  exit 1
+fi
+for index in "${!targets[@]}"; do
+  target="${targets[$index]}"
+  if is_new_target "$target"; then
+    [[ ! -e "$target" ]] || { echo "new target survived rollback: $target" >&2; exit 1; }
+  else
+    cmp -s -- "${sources[$index]}" "$target" || { echo "target not restored: $target" >&2; exit 1; }
+  fi
+done
+
+apply_log="$tmp_dir/apply.log"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --all >"$apply_log"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" "$(git -C "$root_dir/../.." rev-parse HEAD)" >"$tmp_dir/verify.log"
+grep -q "Match: $cicd_dir/multica-cicd-worker.cjs" "$tmp_dir/verify.log"
+receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$apply_log")"
+[[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" >/dev/null
+for suffix in guardrails.cjs parked-diagnosis.cjs parked-entry-audit.cjs relay-completion-admission.cjs; do
+  [[ ! -e "$bridge_dir/$suffix" ]] || { echo "rollback did not remove $suffix" >&2; exit 1; }
+  [[ ! -e "$relay_dir/$suffix" ]] || { echo "rollback did not remove relay copy of $suffix" >&2; exit 1; }
+done
+[[ ! -e "$relay_dir/parity/relay-dead-rows.cjs" ]] || { echo 'rollback did not remove relay dead rows target' >&2; exit 1; }
+
+# A selective deploy touches only what it names.
+before_bridge="$(sha256sum "$bridge_dir/multica-bridge.cjs")"
+printf '\nstale-runtime\n' >> "$cicd_dir/multica-cicd-worker.cjs"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-cicd-worker >"$tmp_dir/selective.log"
+cmp -s -- "$root_dir/multica-cicd-worker.cjs" "$cicd_dir/multica-cicd-worker.cjs"
+[[ "$before_bridge" == "$(sha256sum "$bridge_dir/multica-bridge.cjs")" ]]
+grep -q 'Backed up .*/multica-cicd-worker.cjs' "$tmp_dir/selective.log"
+if grep -q 'relay-dead-rows.cjs' "$tmp_dir/selective.log"; then
+  echo '--only multica-cicd-worker selected relay-dead-rows.cjs' >&2
+  exit 1
+fi
+[[ "$(grep -c '^Backed up ' "$tmp_dir/selective.log")" -eq 1 ]]
+selective_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-cicd-worker$/\1/p' "$tmp_dir/selective.log")"
+[[ "$selective_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$selective_receipt" --only multica-cicd-worker >/dev/null
+
+# A selected wrapper is repaired even when runtime drifted; omitting it keeps
+# the fail-closed parity guard.
+printf '\nwrapper-drift\n' >> "$worker_dir/multica-daemon-wrapper.sh"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --all >"$tmp_dir/wrapper-drift.log"
+cmp -s -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
+wrapper_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$tmp_dir/wrapper-drift.log")"
+[[ "$wrapper_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$wrapper_receipt" >/dev/null
+printf '\nwrapper-drift-again\n' >> "$worker_dir/multica-daemon-wrapper.sh"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$tmp_dir/wrapper-selective.log" 2>&1; then
+  echo 'expected drifted unselected wrapper rejection' >&2
+  exit 1
+fi
+grep -q 'Wrapper preflight: source/runtime parity mismatch (wrapper not selected)' "$tmp_dir/wrapper-selective.log"
+echo 'deploy rollback test passed'

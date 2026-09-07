@@ -216,8 +216,10 @@ Daemon behavior is configured via flags or environment variables:
 | Workspaces root | — | `MULTICA_WORKSPACES_ROOT` | `~/multica_workspaces` |
 | GC enabled | — | `MULTICA_GC_ENABLED` | `true` (set `false`/`0` to disable) |
 | GC scan interval | — | `MULTICA_GC_INTERVAL` | `2h` |
-| GC TTL (done/cancelled issues) | — | `MULTICA_GC_TTL` | `24h` |
+| GC TTL (locally completed tasks) | — | `MULTICA_GC_TTL` | `6h` |
 | GC orphan TTL (no `.gc_meta.json`) | — | `MULTICA_GC_ORPHAN_TTL` | `72h` |
+| GC free-space floor (bytes) | — | `MULTICA_GC_FREE_SPACE_FLOOR` | `0` (disabled) |
+| GC free-space target (bytes) | — | `MULTICA_GC_FREE_SPACE_TARGET` | floor |
 | GC artifact TTL (open issues) | — | `MULTICA_GC_ARTIFACT_TTL` | `12h` (set `0` to disable) |
 | GC artifact patterns | — | `MULTICA_GC_ARTIFACT_PATTERNS` | `node_modules,.next,.turbo` |
 | GC repo cache TTL (`.repos`) | — | `MULTICA_GC_REPO_TTL` | `720h` (30d; set `0` to disable) |
@@ -227,9 +229,15 @@ Daemon behavior is configured via flags or environment variables:
 
 The daemon periodically scans `MULTICA_WORKSPACES_ROOT` and reclaims disk space in four modes:
 
-- **Full task cleanup** — when an issue's status is `done` or `cancelled` and has been idle for `MULTICA_GC_TTL`, the entire task directory is removed.
+When `MULTICA_GC_FREE_SPACE_FLOOR` is set and filesystem free space falls below it,
+the daemon immediately reclaims locally completed task directories, oldest completion
+first, until the target is restored. This pressure pass is independent of issue status.
+
+- **Full task cleanup** — after a task's local `.gc_meta.json.completed_at` exceeds `MULTICA_GC_TTL` (default `6h`), the entire task directory is removed regardless of the server-side issue status. Live-process/cwd exclusion is checked first; missing or malformed completion metadata is never eligible for this path.
 - **Orphan cleanup** — task directories with no `.gc_meta.json` (e.g. left over from a daemon crash) are removed once they exceed `MULTICA_GC_ORPHAN_TTL`.
-- **Artifact-only cleanup** — when a task has been completed for at least `MULTICA_GC_ARTIFACT_TTL` but the issue is still open, regenerable build outputs whose directory basename matches `MULTICA_GC_ARTIFACT_PATTERNS` are removed. The daemon also reclaims the exact managed path `codex-home/.sandbox-bin`; old task metadata without `completed_at` becomes eligible for this managed-only cleanup after its `.gc_meta.json` file has been idle for `MULTICA_GC_ORPHAN_TTL`. The rest of the task (source, `.git`, `output/`, `logs/`, `.gc_meta.json`, Codex auth/config/session state) is preserved so the agent can resume it.
+- **Artifact-only cleanup** — before the full-completed-task TTL, when a task has been completed for at least `MULTICA_GC_ARTIFACT_TTL` but remains potentially resumable, regenerable build outputs whose directory basename matches `MULTICA_GC_ARTIFACT_PATTERNS` are removed. The daemon also reclaims the exact managed path `codex-home/.sandbox-bin`; old task metadata without `completed_at` becomes eligible for this managed-only cleanup after its `.gc_meta.json` file has been idle for `MULTICA_GC_ORPHAN_TTL`. The rest of the task (source, `.git`, `output/`, `logs/`, `.gc_meta.json`, Codex auth/config/session state) is preserved so the agent can resume it.
+
+Cleanup precedence is: exclude live task roots/process working directories first; apply the local completion TTL for full cleanup; then, when disk pressure is below the configured floor, reclaim the oldest locally completed tasks until the target is reached. Orphan and artifact-only cleanup remain separate bounded fallbacks.
 
 - **Repo cache eviction** — the bare git clones under `.repos/` are shared object stores: each task workdir is a `git worktree` off one of them rather than its own clone, so a task's `.git` is only a pointer file. They are evicted only when all of the following hold: the repo is no longer attached to any workspace this daemon watches, it has no worktrees left, and no task has created a worktree from it for `MULTICA_GC_REPO_TTL`. A cache created before this stamp existed is not treated as ancient — its clock starts at the first GC cycle that sees it, so upgrading does not wipe every cache. Evicting is safe by construction: the next task that needs the repo re-clones it on demand, so a wrong eviction costs a clone, not a failure.
 
@@ -238,6 +246,8 @@ The daemon periodically scans `MULTICA_WORKSPACES_ROOT` and reclaims disk space 
 Configured patterns are basename-only — entries containing `/` or `\` are silently dropped — and `.git` subtrees are never descended into. The managed Codex cache is matched by its exact relative path, so a repository's own `.sandbox-bin` is not removed unless an operator explicitly adds that basename to `MULTICA_GC_ARTIFACT_PATTERNS`. The default list (`node_modules`, `.next`, `.turbo`) is intentionally narrow; extend it per deployment if your repos consistently produce other regenerable directories (for example, `MULTICA_GC_ARTIFACT_PATTERNS=node_modules,.next,.turbo,target,__pycache__`). To disable artifact cleanup entirely, including the managed Codex cache, set `MULTICA_GC_ARTIFACT_TTL=0`.
 
 `multica daemon disk-usage` reports the `.repos` footprint on its own line rather than folding it into the per-task totals — every task in a workspace checks out from that shared cache, so attributing it to individual task directories would double-count it. Note that the repo cache is reclaimed on the schedule above and not by any per-issue status change, so it is normal for it to persist after every task directory is gone.
+
+When reproducing disk-GC from a daemon-managed task, the task-local safety boundary rejects profile, all-profile, and root overrides by default. Use the explicit diagnostic escape `multica daemon disk-usage --allow-in-task --workspaces-root /absolute/root`; the root is required and profile/all-profile enumeration remains disabled. The command identifies the env variable or `.multica/daemon_task_context.json` marker that triggered the contextual restriction. The systemd daemon itself runs with `cwd=/`, so service-side scans do not require this escape.
 
 Agent-specific overrides:
 

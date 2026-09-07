@@ -1146,6 +1146,12 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		})
 	})
 
+	// Native issue-stage relay; distinct from the existing task-routing relay.
+	r.Route("/api/relay/advance-stage", func(r chi.Router) {
+		r.Use(operatorAuth)
+		r.Post("/", h.RelayAdvanceStage)
+	})
+
 	// Protected API routes
 	r.Group(func(r chi.Router) {
 		r.Use(middleware.Auth(queries, patCache, cloudPATVerifier))

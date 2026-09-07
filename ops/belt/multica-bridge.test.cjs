@@ -31,6 +31,7 @@ const {
   replaceStageTask,
   ownerStageForTransition,
   ensureCompletedRelayLog,
+  recordWithheldArrival,
   completedTerminalRelayLog,
   isBookkeepingTransition,
   recordBookkeepingHandoff,
@@ -43,6 +44,8 @@ const {
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
+  writeJsonResponse,
+  admitConfiguredTransition,
   setTestClientFactory,
   isCicdReturn,
   consumeCicdReturnAuthorization,
@@ -58,17 +61,94 @@ const {
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
+  directDeployQcAdmission,
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
   capEscalationVerified,
   retryEscalationLoop,
+  consumesRetryEscalation,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
+  diagnosisRerunErrorStatus,
+  operatorRespec,
   relayDiagnosisRerun,
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
+
+test('relay error response does not write headers after a response has ended', () => {
+  const writes = [];
+  const res = {
+    headersSent: false,
+    writableEnded: false,
+    writeHead(status) { this.headersSent = true; writes.push(['head', status]); },
+    end(body) { this.writableEnded = true; writes.push(['body', body]); }
+  };
+
+  assert.equal(writeJsonResponse(res, 409, { error: 'lifetime_task_limit' }), true);
+  assert.equal(writeJsonResponse(res, 500, { error: 'internal_error' }), false);
+  assert.deepEqual(writes, [
+    ['head', 409],
+    ['body', JSON.stringify({ error: 'lifetime_task_limit' })]
+  ]);
+});
+
+test('relay transition admission is a single pre-mutation decision', () => {
+  const admitted = admitConfiguredTransition({ fromStage: 'Human Review', toStage: 'Queue',
+    expectedStage: 'Queue' });
+  assert.equal(admitted.ok, true);
+  // A later read of the committed issue sees Queue; it must not be used to
+  // overwrite the original authorization result.
+  assert.deepEqual(admitted, { fromStage: 'Human Review', toStage: 'Queue', ok: true });
+  assert.equal(admitConfiguredTransition({ fromStage: 'Queue', toStage: 'Archived',
+    expectedStage: 'In Progress' }).ok, false);
+});
+
+test('operator respec validates requests and replays the same receipt', async () => {
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+  const payload = { issue_id: issueId, reason: 'lifetime cap exhausted', idempotency_key: 'respec-0001' };
+  let calls = 0;
+  const invalid = await operatorRespec({ query: async () => { calls += 1; } }, { ...payload, reason: ' ' });
+  assert.deepEqual(invalid, { ok: false, status: 400, error: 'invalid_request' });
+  assert.equal(calls, 0);
+
+  const replayClient = { query: async (sql) => {
+    if (sql.includes('FROM issue WHERE')) return { rows: [{ id: issueId, status: 'Spec', metadata: {} }] };
+    if (sql.includes('FROM relay_run_log')) return { rows: [{ id: 77,
+      parked_audit: { operator_respec: { reason: payload.reason, accounting_baseline: '2026-09-03T00:00:00.000Z' } } }] };
+    return { rows: [] };
+  } };
+  const replay = await operatorRespec(replayClient, payload);
+  assert.equal(replay.ok, true);
+  assert.equal(replay.replay, true);
+  assert.equal(replay.receipt.audit_row_id, 77);
+  const conflict = await operatorRespec(replayClient, { ...payload, reason: 'different reason' });
+  assert.deepEqual(conflict, { ok: false, status: 409, error: 'idempotency_conflict' });
+});
+
+test('operator respec atomically resets a capped Human Review issue and audits authorization', async () => {
+  const issueId = '223e4567-e89b-42d3-a456-426614174000';
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue WHERE')) return { rows: [{ id: issueId, status: 'Human Review',
+      metadata: { parked_release_at: '2026-01-01T00:00:00Z' } }] };
+    if (sql.includes('FROM relay_run_log')) return { rows: [] };
+    if (sql.includes('SELECT count(*)')) return { rows: [{ n: 6 }] };
+    if (sql.includes('INSERT INTO relay_run_log')) return { rows: [{ id: 88 }] };
+    return { rows: [] };
+  } };
+  const result = await operatorRespec(client, { issue_id: issueId,
+    reason: 'operator approved fresh review', idempotency_key: 'respec-0002' });
+  assert.equal(result.ok, true);
+  assert.equal(result.receipt.prior_stage, 'Human Review');
+  assert.equal(result.receipt.new_stage, 'Spec');
+  assert.equal(result.receipt.audit_row_id, 88);
+  assert.match(calls.find(c => c.sql.includes('UPDATE issue')).sql, /- 'retry_escalation'/);
+  const auditCall = calls.find(c => c.sql.includes('INSERT INTO relay_run_log'));
+  assert.match(auditCall.values[1], /operator_respec/);
+});
 
 test('relay receipts identify a changed destination and preserve its cause', () => {
   assert.equal(relayRedirect('CI/CD & Deploy', 'CI/CD & Deploy', null), null);
@@ -151,6 +231,35 @@ test('Parked diagnosis rerun is idempotent and refuses a non-Parked issue', asyn
   assert.match(calls[0].sql, /pg_advisory_xact_lock/);
 });
 
+test('bundled parked diagnosis rerun is a stable conflict without queue work', async () => {
+  const calls = [];
+  const result = await rerunParkedDiagnosis({ query: async (sql) => {
+    calls.push(sql);
+    if (sql.includes('FROM issue WHERE')) return { rowCount: 1, rows: [{
+      id: '2c2298c1-1a5a-42bd-ad21-6805be7a3f3e', workspace_id: '223e4567-e89b-42d3-a456-426614174000',
+      status: 'Parked', priority: 'high', metadata: { bundled_into_id: 'dd5b20a4-65fa-4a98-976e-6887d7cfa4fe' }
+    }] };
+    return { rowCount: 0, rows: [] };
+  } }, { issue_id: '2c2298c1-1a5a-42bd-ad21-6805be7a3f3e', idempotency_key: 'rerun-0001' });
+  assert.deepEqual(result, { ok: false, error: 'bundled_issue_requires_canonical_parent' });
+  assert.equal(diagnosisRerunErrorStatus(result.error), 409);
+  assert.equal(calls.some(sql => sql.includes('agent_task_queue')), false);
+});
+
+test('legacy bundled child marker is rejected before diagnosis queue work', async () => {
+  const calls = [];
+  const result = await rerunParkedDiagnosis({ query: async (sql) => {
+    calls.push(sql);
+    if (sql.includes('FROM issue WHERE')) return { rowCount: 1, rows: [{
+      id: '3c2298c1-1a5a-42bd-ad21-6805be7a3f3e', workspace_id: '323e4567-e89b-42d3-a456-426614174000',
+      status: 'Parked', priority: 'low', parent_issue_id: '4d2298c1-1a5a-42bd-ad21-6805be7a3f3e', metadata: {}
+    }] };
+    return { rowCount: 0, rows: [] };
+  } }, { issue_id: '3c2298c1-1a5a-42bd-ad21-6805be7a3f3e', idempotency_key: 'rerun-0002' });
+  assert.deepEqual(result, { ok: false, error: 'bundled_issue_requires_canonical_parent' });
+  assert.equal(calls.some(sql => sql.includes('agent_task_queue')), false);
+});
+
 test('Parked diagnosis rerun logs classified and unexpected database exceptions', async (t) => {
   const issueId = '123e4567-e89b-42d3-a456-426614174000';
   const payload = { agent_token: 'test-relay-secret', issue_id: issueId, idempotency_key: 'rerun-0001' };
@@ -189,9 +298,10 @@ test('Parked diagnosis rerun logs classified and unexpected database exceptions'
       assert.equal(response.status, scenario.status);
       assert.deepEqual(response.body, scenario.body);
       assert.deepEqual(calls.slice(-2), ['ROLLBACK', 'end']);
-      assert.deepEqual(logs, [{ event: 'relay_parked_diagnosis_rerun_failed', issue_id: issueId,
-        message: scenario.error.message, stack: scenario.error.stack, code: scenario.error.code,
-        constraint: scenario.error.constraint }]);
+      assert.deepEqual(logs, [{ event: 'parked_diagnosis_rerun_error', issue_id: issueId,
+        workspace_id: null, error_name: scenario.error.name, error_message: scenario.error.message,
+        error_code: scenario.error.code, error_constraint: scenario.error.constraint,
+        stack: scenario.error.stack }]);
     });
   }
 });
@@ -230,6 +340,13 @@ test('a second retry escalation for one stage is parked', () => {
     trigger_stage: 'Spec' } } }, 'Spec'), true);
   assert.equal(retryEscalationLoop({ metadata: { retry_escalation: {
     trigger_stage: 'Queue' } } }, 'Spec'), false);
+});
+
+test('successful departure consumes active retry escalation metadata', () => {
+  const issue = { status: 'Queue', metadata: { retry_escalation: { trigger_stage: 'Queue' } } };
+  assert.equal(consumesRetryEscalation(issue, 'In Progress'), true);
+  assert.equal(consumesRetryEscalation(issue, 'Queue'), false);
+  assert.equal(consumesRetryEscalation({ status: 'Queue', metadata: {} }, 'In Progress'), false);
 });
 
 test('completion escalation is bound to one exact completed failed task', async () => {
@@ -276,6 +393,91 @@ test('cap escalation binds one exact active source task in the current stage', a
   assert.equal(await retryEscalationSourceTask(client, issue, taskId), taskId);
 });
 
+const ACTIVE_TASK_STATUS = new Set(
+  ['queued', 'dispatched', 'running', 'waiting_local_directory', 'deferred']);
+const TERMINAL_TASK_STATUS = new Set(['completed', 'failed', 'cancelled']);
+
+// Evaluates the escalation source query against in-memory rows, so the test
+// proves the predicate instead of a canned answer: an active task qualifies on
+// its own to_stage, a terminal task only through a relay_run_log row bound to
+// the same task, issue and to_stage. matchedRelayStatuses records the status of
+// each row that carried the provenance.
+function escalationSourceClient(fixture) {
+  const matchedRelayStatuses = [];
+  return {
+    matchedRelayStatuses,
+    query: async (sql, values) => {
+      assert.match(sql, /t\.status IN \('queued','dispatched','running','waiting_local_directory','deferred'\)/);
+      assert.match(sql, /t\.context->>'to_stage' = \$3::text/);
+      assert.match(sql, /t\.status IN \('completed','failed','cancelled'\) AND EXISTS/);
+      assert.match(sql, /r\.task_id = t\.id AND r\.issue_id = t\.issue_id/);
+      assert.match(sql, /AND r\.to_stage = \$3::text\s*\)\)/);
+      assert.doesNotMatch(sql, /r\.status = 'pending'/);
+      assert.match(sql, /\(\$4::uuid IS NULL OR t\.id = \$4::uuid\)/);
+      assert.match(sql, /LIMIT 2 FOR UPDATE OF t/);
+      const [issueId, workspaceId, stage, requested] = values;
+      const rows = [];
+      for (const t of fixture.tasks) {
+        if (t.issue_id !== issueId || t.workspace_id !== workspaceId) continue;
+        if (requested != null && t.id !== requested) continue;
+        if (ACTIVE_TASK_STATUS.has(t.status) && t.to_stage === stage) {
+          rows.push({ id: t.id });
+          continue;
+        }
+        if (!TERMINAL_TASK_STATUS.has(t.status)) continue;
+        const provenance = fixture.relay.find(r =>
+          r.task_id === t.id && r.issue_id === t.issue_id && r.to_stage === stage);
+        if (!provenance) continue;
+        matchedRelayStatuses.push(provenance.status);
+        rows.push({ id: t.id });
+      }
+      return { rows: rows.slice(0, 2) };
+    }
+  };
+}
+
+test('terminal source accepts failed and completed relay provenance, refuses none', async () => {
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
+  const taskId = '223e4567-e89b-42d3-a456-426614174000';
+  const task = { id: taskId, issue_id: issue.id, workspace_id: issue.workspace_id,
+    status: 'failed', to_stage: 'Spec' };
+  const otherStage = { task_id: taskId, issue_id: issue.id, to_stage: 'Spec',
+    status: 'failed' };
+  for (const relayStatus of ['failed', 'completed']) {
+    const client = escalationSourceClient({ tasks: [task], relay: [
+      { task_id: taskId, issue_id: issue.id, to_stage: issue.status, status: relayStatus },
+      otherStage] });
+    assert.equal(await retryEscalationSourceTask(client, issue), taskId);
+    assert.equal(await retryEscalationSourceTask(client, issue, taskId), taskId);
+    assert.deepEqual(client.matchedRelayStatuses, [relayStatus, relayStatus]);
+  }
+  // The terminal task carries a relay log only at another stage: no provenance
+  // at the issue status, so the caller answers 409
+  // retry_escalation_source_task_required.
+  const orphan = escalationSourceClient({ tasks: [task], relay: [otherStage] });
+  assert.equal(await retryEscalationSourceTask(orphan, issue), null);
+  assert.equal(await retryEscalationSourceTask(orphan, issue, taskId), null);
+  assert.deepEqual(orphan.matchedRelayStatuses, []);
+  // A relay log row for a different task never lends provenance.
+  const foreign = escalationSourceClient({ tasks: [task], relay: [
+    { task_id: '423e4567-e89b-42d3-a456-426614174000', issue_id: issue.id,
+      to_stage: issue.status, status: 'failed' }] });
+  assert.equal(await retryEscalationSourceTask(foreign, issue), null);
+  // Two terminal tasks with provenance stay ambiguous under LIMIT 2.
+  const second = { ...task, id: '523e4567-e89b-42d3-a456-426614174000',
+    status: 'completed' };
+  const ambiguous = escalationSourceClient({ tasks: [task, second], relay: [
+    { task_id: taskId, issue_id: issue.id, to_stage: issue.status, status: 'failed' },
+    { task_id: second.id, issue_id: issue.id, to_stage: issue.status,
+      status: 'completed' }] });
+  assert.equal(await retryEscalationSourceTask(ambiguous, issue), null);
+  assert.deepEqual(ambiguous.matchedRelayStatuses, ['failed', 'completed']);
+  // UUID validation still short-circuits before any query.
+  const never = { query: async () => { throw new Error('must not query'); } };
+  assert.equal(await retryEscalationSourceTask(never, issue, 'not-a-uuid'), null);
+});
+
 test('cap escalation fails closed when source lineage is ambiguous or invalid', async () => {
   const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
     workspace_id: '323e4567-e89b-42d3-a456-426614174000', status: 'In Review' };
@@ -298,6 +500,12 @@ test('Parked evidence QC return is a canonical consumed-release-only edge', () =
   assert.match(source, /parkedEvidenceQcRelease/);
   assert.match(source, /parkedRelease \|\| parkedEvidenceQcRelease/);
   assert.match(source, /context->>'kind' IS DISTINCT FROM 'parked_diagnosis'/);
+  // The relay releases an already_fixed Parked ticket with
+  // runtime_evidence_verified:qc:<uuid>, and the bridge re-verifies it with its
+  // own copy of this map. Without the qc_comment row the release was a silent
+  // 409 (GSP-2308, GSP-2338).
+  assert.match(source, /qc_comment: `SELECT 1 FROM comment WHERE id = \$1::uuid AND issue_id = \$2::uuid/);
+  assert.match(source, /content LIKE '<!-- multica-qc-gate -->%'/);
 });
 
 test('Parked evidence return selects the canonical In Review QC owner', () => {
@@ -526,6 +734,21 @@ test('verdict validation accepts the sanctioned CLI checker field and rejects fo
   assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
+});
+
+test('the QC lane admits every configured reviewer model, not Sol alone', async () => {
+  // qc-lane.cjs configures the lane as gpt-5.6-sol or gpt-5.6-luna at low
+  // effort. The bridge hardcoded gpt-5.6-sol, so every Luna verdict was
+  // refused invalid_qc_lane once the standing order moved QC to Luna.
+  assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-luna' }), null);
+  assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
+  assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-luna', effort: 'high' }), 'invalid_qc_lane');
+
+  const qcRow = (model) => ({ query: async () => ({ rows: [{ verdict: 'PASS', qualifying: true,
+    model, effort: 'low', bound_sha: validVerdict.bound_sha, observed_head: validVerdict.bound_sha }] }) });
+  assert.equal(await directDeployQcAdmission(qcRow('gpt-5.6-luna'), validVerdict.issue_id), true);
+  assert.equal(await directDeployQcAdmission(qcRow('gpt-5.6-sol'), validVerdict.issue_id), true);
+  assert.equal(await directDeployQcAdmission(qcRow('gpt-5.6-terra'), validVerdict.issue_id), false);
 });
 
 test('routing rejections expose only bounded agent routing fields', () => {
@@ -942,7 +1165,14 @@ test('configured stage pool fails closed when its members are incompatible', asy
   const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
     ? { rows: [] } : { rows: [scoper({ instructions: 'Own Queue tickets only.' })] } };
   await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
-    /No eligible stage owner in pool/);
+    /No eligible stage owner in pool: workspace-1\/Spec \(archived=0,status=0,runtime=0,instructions=1\)/);
+});
+
+test('configured stage pool reports an offline runtime as the eligibility defect', async () => {
+  const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
+    ? { rows: [] } : { rows: [scoper({ selected_runtime_id: null })] } };
+  await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
+    /runtime=1/);
 });
 
 test('configured stage pool queues on the least-loaded member when every member is at capacity', async () => {
@@ -972,6 +1202,33 @@ test('empty stage pool preserves the canonical relay owner fallback', async () =
   } };
   assert.equal(await selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'), fallback);
   assert.match(calls[2], /FROM relay_stage_config/);
+});
+
+// A Claude-modelled owner bound to a Claude runtime was dispatched onto the
+// newest online *codex* runtime, because both the own-runtime join and the
+// fallback lateral hard-coded provider = 'codex'. Codex on a ChatGPT account
+// rejects a Claude model with HTTP 400, so the task was billed and thrown away:
+// 16 tasks burned that way on gsp on 2026-09-06 against agent
+// gsp-spec-sol-low-public (model claude-opus-4-6, runtime "Claude (gsp-codex)").
+// The provider must be derived from the owner's model, as reconciler.cjs does.
+test('pool owner runtime resolution derives the provider from the agent model', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+    if (/FROM relay_stage_agent_pool p/.test(sql)) {
+      return { rows: [scoper({ agent_id: 'agent-claude', model: 'claude-opus-4-6',
+        instructions: 'Own Spec tickets only.' })] };
+    }
+    return { rows: [] };
+  } };
+  await selectPoolOwner(client, 'workspace-1', 'Spec', 'Spec');
+  const poolSql = calls.find((call) => /FROM relay_stage_agent_pool p/.test(call.sql)).sql;
+  const derived = /provider = CASE WHEN a\.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END/g;
+  // Both the agent's own bound runtime and the workspace fallback must be
+  // constrained to a runtime the model can actually run on.
+  assert.equal((poolSql.match(derived) || []).length, 2);
+  assert.equal(/provider = 'codex'/.test(poolSql), false);
 });
 
 test('pool selection applies to Queue and rotates equal-load agents', async () => {
@@ -1253,6 +1510,36 @@ test('bookkeeping handoff refuses a Queue shortcut without a builder predecessor
   assert.doesNotMatch(calls[0].sql, /INSERT INTO relay_run_log/);
 });
 
+test('a withheld bundled-child dispatch still records the stage arrival', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [{ id: 'arrival-log' }] };
+  } };
+
+  const first = await recordWithheldArrival(client, 'issue-1', 'Spec', 'Queue');
+  const second = await recordWithheldArrival(client, 'issue-1', 'Spec', 'Queue');
+
+  assert.equal(first, 'arrival-log');
+  assert.equal(second, 'arrival-log');
+  assert.equal(calls.length, 2);
+  for (const call of calls) {
+    assert.match(call.sql, /INSERT INTO relay_run_log/);
+    assert.deepEqual(call.values, ['issue-1', 'Spec', 'Queue']);
+    // from_stage <> to_stage is what makes the row an arrival for the
+    // reconciler's per-stage-entry budget window.
+    assert.notEqual(call.values[1], call.values[2]);
+    // A repeat traversal of the same edge must open a NEW window, so this
+    // insert must not carry ensureCompletedRelayLog's all-time de-duplication.
+    assert.doesNotMatch(call.sql, /NOT EXISTS/);
+  }
+});
+
+test('the bundled-child branch records an arrival before withholding the task', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /\} else if \(bundledChild && result\.rowCount > 0\) \{\s*\n\s*relayLogId = await recordWithheldArrival\(client, issue_id, issue\.status, to_stage\);/);
+});
+
 test('relay dispatch gates bypass paid admission only for the bookkeeping hop', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /isExecutionStage\(to_stage\) && !parkedRelease && !bookkeepingTransition/);
@@ -1499,14 +1786,18 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
       author_type text, author_id uuid, content text, type text, created_at timestamptz DEFAULT now());
       CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, checker_id uuid, verdict text,
-      work_product_md5 text, created_at timestamptz DEFAULT now());`);
+      work_product_md5 text, created_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".activity_log (id bigserial PRIMARY KEY, workspace_id uuid NOT NULL,
+      issue_id uuid NOT NULL, actor_type text NOT NULL, actor_id uuid, action text NOT NULL,
+      details jsonb, created_at timestamptz DEFAULT now());`);
     await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
     await admin.query(`INSERT INTO "${schema}".agent (id, workspace_id, name, runtime_id, status, instructions, model, thinking_level, max_concurrent_tasks)
-      VALUES ($1, $2, 'builder', $3, 'idle', 'In Progress\nCI/CD & Deploy', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
+      VALUES ($1, $2, 'builder', $3, 'idle', 'Queue\nIn Progress\nCI/CD & Deploy', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_pool VALUES
-      ($1, 'In Progress', true), ($1, 'CI/CD & Deploy', true)`, [workspaceId]);
+      ($1, 'Queue', true), ($1, 'In Progress', true), ($1, 'CI/CD & Deploy', true)`, [workspaceId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_agent_pool VALUES
-      ($1, 'In Progress', $2, true, NULL), ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
+      ($1, 'Queue', $2, true, NULL), ($1, 'In Progress', $2, true, NULL),
+      ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage) VALUES
       ($1, 'Human Review', 'In Progress'), ($1, 'Done', 'CI/CD & Deploy'),
       ($1, 'CI/CD & Deploy', 'Done'), ($1, 'In Progress', 'In Review'),
@@ -1653,8 +1944,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
         reason: 'reopen', current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' }, { 'x-relay-operator-secret': 'test-operator-secret' });
       assert.equal(res.status, 409);
     });
-    await t.test('authenticated operator release exits Parked and audits the reason', async () => {
+    await t.test('authenticated operator release from Parked bypasses an exhausted cap and audits the reason', async () => {
       const issueId = '88888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
+      await admin.query(`UPDATE "${schema}".issue SET metadata = '{"parked_release_once": true}'::jsonb WHERE id = $1`, [issueId]);
       await admin.query(`INSERT INTO "${schema}".agent_task_queue
         (agent_id, issue_id, workspace_id, status, priority, context)
         SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"Queue"}'
@@ -1666,6 +1958,18 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
       assert.deepEqual(audit.rows[0].parked_audit, { parked_release: { operator_marker: true,
         reason: 'approved' }, operator_cap_bypass: true, reason: 'approved' });
+    });
+    await t.test('Parked operator release without the secret remains forbidden at an exhausted cap', async () => {
+      const issueId = '89898989-8989-8989-8989-898989898989'; await insertIssue(issueId, 'Parked');
+      await admin.query(`UPDATE "${schema}".issue SET metadata = '{"parked_release_once": true}'::jsonb WHERE id = $1`, [issueId]);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context)
+        SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"Queue"}'
+          FROM generate_series(1, 7)`, [agentId, issueId, workspaceId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true, reason: 'approved' });
+      assert.equal(res.status, 403);
+      assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'Parked');
     });
   } finally {
     setTestClientFactory(null);
@@ -1682,6 +1986,13 @@ test('lifetime ceiling applies an auditable terminal rejection instead of a re-s
   assert.match(source, /task_count: taskCount, target_stage: to_stage/);
   assert.match(source, /disposition: lifetime\.disposition, disposition_applied: applied/);
   assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
+});
+
+test('operator Human Review releases record actor, target, and reason in the audit payload', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /operator_release:\s*\{[\s\S]*?actor:\s*"operator"/);
+  assert.match(source, /operator_release:\s*\{[\s\S]*?target_stage:\s*to_stage/);
+  assert.match(source, /operator_release:\s*\{[\s\S]*?reason:\s*reason\.trim\(\)/);
 });
 
 test('operator cap release requires the current PASS work-product hash', async () => {
@@ -1776,14 +2087,24 @@ test('QC bounce ceiling changes hands to an exact Sol-low Spec task, never Parke
 test('retry escalation requires an explicit Sol-low owner and never stores null lineage', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /!isQcLane\(owner\.model, owner\.thinking_level\)/);
-  assert.doesNotMatch(source, /source_task_id: null/);
+  // Read the escalation records, not the whole file. The qc_bounce_ceiling path
+  // logs source_task_id: null to state honestly that no source task survived,
+  // and a file-wide regex counted that log line as stored lineage.
+  const records = source.match(/retryEscalation = \{[\s\S]*?\};/g) || [];
+  assert.ok(records.length > 0, 'no retryEscalation record found to check');
+  for (const record of records) assert.doesNotMatch(record, /source_task_id: null/);
 });
 
 test('relay request maps snake-case stage into successor task input', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /replaceStageTask\(client, \{[\s\S]*toStage: to_stage,/);
-  assert.doesNotMatch(source, /\n\s*toStage,\n/);
+  // Only the relay's own replaceStageTask call is in scope. Forbidding the
+  // shorthand file-wide also caught an unrelated function that legitimately
+  // holds a variable of that name.
+  const call = source.match(/replaceStageTask\(client, \{[\s\S]*?\}\)/);
+  assert.ok(call, 'replaceStageTask call not found');
+  assert.match(call[0], /toStage: to_stage,/);
+  assert.doesNotMatch(call[0], /\n\s*toStage,\n/);
 });
 
 test('relay stage lookups bind configuration and owners to the issue workspace', () => {
@@ -1857,6 +2178,19 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
   assert.deepEqual(persisted.agent_task_queue, []);
   assert.equal(persisted.issue.status, 'Parked');
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
+  // Parking must retire stale work as part of the same locked transition.
+  assert.ok(queries.some(({ sql }) => /UPDATE agent_task_queue/i.test(sql) && /cancel|retir/i.test(sql)),
+    'parking did not retire in-flight tasks');
+  assert.ok(queries.some(({ sql }) => /UPDATE relay_run_log/i.test(sql) && /pending|retir/i.test(sql)),
+    'parking did not retire pending relay rows');
+});
+
+test('parked admission skips stale system exits while retaining operator release', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /relay_parked_skipped/);
+  assert.match(source, /issue\.status === "Parked"/);
+  assert.match(source, /explicitOperatorRelease|explicitHumanReviewRelease|parkedDiagnosis/);
+  assert.match(source, /Parked.*operator.*diagnos|operator.*diagnos/s);
 });
 
 test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {
@@ -1884,4 +2218,80 @@ test('identical relay and operator secrets disable explicit terminal exits', () 
   assert.match(source, /OPERATOR_SECRET_DISABLED/);
   assert.match(source, /RELAY_OPERATOR_SECRET duplicates RELAY_AGENT_SECRET/);
   assert.match(source, /terminal_stage_operator_secret_conflict/);
+});
+
+// relay_run_log.status is constrained to pending/completed/failed/rejected in
+// production. The same-stage fast path used to insert 'noop', so every
+// same-stage replay of /relay/advance died on the check constraint and the
+// caller saw a 500 instead of a clean no-op (9 ppp-production tickets in one
+// run: 24052, 24057, 24064, 24095, 24126, 24146, 24174, 24181, 24183).
+test('a same-stage replay records an allowed status and returns a clean no-op', async () => {
+  const RELAY_RUN_LOG_STATUSES = ['pending', 'completed', 'failed', 'rejected'];
+  const issueId = '00000000-0000-4000-8000-0000000024052';
+  const inserted = [];
+  const client = {
+    async connect() {},
+    async end() {},
+    async query(sql, values = []) {
+      if (/INSERT INTO relay_run_log/.test(sql)) {
+        // Stand in for relay_run_log_status_check: reject any status literal the
+        // production constraint would reject, exactly as Postgres does.
+        const status = (sql.match(/'(\w+)',\s*jsonb_build_object/) || [])[1];
+        if (status && !RELAY_RUN_LOG_STATUSES.includes(status)) {
+          const error = new Error('new row for relation "relay_run_log" ' +
+            'violates check constraint "relay_run_log_status_check"');
+          error.code = '23514';
+          error.constraint = 'relay_run_log_status_check';
+          throw error;
+        }
+        inserted.push({ sql, values, status });
+        return { rows: [], rowCount: 1 };
+      }
+      if (/FROM "issue"\s+WHERE id = \$1\s+FOR UPDATE/.test(sql)) {
+        return { rows: [{ id: issueId, status: 'Spec', workspace_id: 'test-workspace',
+          description: '', parent_issue_id: null, title: 'same-stage replay',
+          priority: 'none', metadata: {} }] };
+      }
+      if (/SELECT stage_name FROM relay_stage_config/.test(sql)) return { rows: [{ stage_name: values[1] }] };
+      if (/SELECT next_stage, alt_next_stages/.test(sql)) {
+        return { rows: [{ next_stage: 'Queue', alt_next_stages: [] }] };
+      }
+      return { rows: [] };
+    }
+  };
+  const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayAdvance({ headers: {} }, res,
+      { issue_id: issueId, to_stage: 'Spec', agent_token: 'test-relay-secret' });
+  } finally { setTestClientFactory(null); }
+
+  assert.equal(res.status, 200);
+  const json = JSON.parse(res.body);
+  assert.equal(json.success, true);
+  assert.equal(json.transition, 'already_applied');
+  assert.equal(json.issue.status, 'Spec');
+  assert.equal(inserted.length, 1);
+  assert.ok(RELAY_RUN_LOG_STATUSES.includes(inserted[0].status),
+    `same-stage no-op wrote an illegal status: ${inserted[0].status}`);
+  // The 'same_stage' reason, not the status, is what identifies and dedupes the
+  // no-op row now that its status is shared with real transitions.
+  assert.match(inserted[0].sql, /jsonb_build_object\('reason', 'same_stage'\)/);
+  assert.match(inserted[0].sql, /parked_audit->>'reason' = 'same_stage'/);
+});
+
+// Every status literal written into relay_run_log anywhere in the bridge must
+// be one the production check constraint admits.
+test('every relay_run_log status literal in the bridge is an allowed status', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  const allowed = new Set(['pending', 'completed', 'failed', 'rejected']);
+  const illegal = [];
+  for (const match of source.matchAll(/INSERT INTO relay_run_log[\s\S]{0,600}?(?=`)/g)) {
+    for (const literal of match[0].matchAll(/'([a-z_]+)'(?=\s*,|\s*\))/g)) {
+      if (/^(pending|completed|failed|rejected)$/.test(literal[1]) || allowed.has(literal[1])) continue;
+      if (!/status/i.test(match[0])) continue;
+      illegal.push(literal[1]);
+    }
+  }
+  assert.deepEqual(illegal.filter((s) => s === 'noop'), []);
 });

@@ -4,6 +4,7 @@ import (
 	"math"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -11,6 +12,26 @@ import (
 	"github.com/multica-ai/multica/server/internal/analytics"
 	"github.com/multica-ai/multica/server/pkg/taskfailure"
 )
+
+func TestOrchestratorHeartbeatMetric(t *testing.T) {
+	m := NewBusinessMetrics()
+	if got := testutil.ToFloat64(m.orchestratorHeartbeat); got != 0 {
+		t.Fatalf("initial heartbeat timestamp = %v, want 0", got)
+	}
+	m.RecordOrchestratorHeartbeat()
+	first := testutil.ToFloat64(m.orchestratorHeartbeat)
+	if first < float64(time.Now().Add(-time.Second).Unix()) {
+		t.Fatalf("heartbeat timestamp = %v, appears stale", first)
+	}
+	time.Sleep(time.Millisecond)
+	m.RecordOrchestratorHeartbeat()
+	if got := testutil.ToFloat64(m.orchestratorHeartbeat); got < first {
+		t.Fatalf("heartbeat timestamp regressed: %v < %v", got, first)
+	}
+	if got := testutil.CollectAndCount(m.orchestratorHeartbeat); got != 1 {
+		t.Fatalf("heartbeat series count = %d, want 1", got)
+	}
+}
 
 func TestBusinessMetricsLifecycleCountersAndGauge(t *testing.T) {
 	m := NewBusinessMetrics()

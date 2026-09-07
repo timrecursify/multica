@@ -16,7 +16,7 @@ ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
 
 DO $$
 BEGIN
-    IF to_regclass('public.relay_run_log') IS NOT NULL THEN
+    IF to_regclass('relay_run_log') IS NOT NULL THEN
         IF EXISTS (SELECT 1 FROM relay_run_log WHERE status = 'rejected') THEN
             RAISE EXCEPTION 'cannot remove Rejected relay logs while rows use that status';
         END IF;

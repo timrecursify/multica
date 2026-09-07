@@ -1,0 +1,30 @@
+{
+  "title": "Ticket delivery funnel",
+  "tags": ["multica", "funnel", "sla"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "panels": [
+    {
+      "title": "Stage duration percentiles (last 500 tickets)",
+      "type": "table",
+      "targets": [{"format": "table", "rawSql": "WITH last_500 AS (SELECT id FROM issue WHERE workspace_id = '$workspace_id' ORDER BY created_at DESC LIMIT 500) SELECT stage, percentile_cont(0.50) WITHIN GROUP (ORDER BY duration_seconds) AS p50_seconds, percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_seconds) AS p95_seconds, percentile_cont(0.99) WITHIN GROUP (ORDER BY duration_seconds) AS p99_seconds FROM issue_funnel_stage_duration WHERE issue_id IN (SELECT id FROM last_500) GROUP BY stage ORDER BY stage"}]
+    },
+    {
+      "title": "Stage flow rate",
+      "type": "timeseries",
+      "targets": [{"format": "time_series", "rawSql": "SELECT entered_at AS time, stage AS metric, count(*)::double precision AS value FROM issue_funnel_stage_duration WHERE workspace_id = '$workspace_id' AND $__timeFilter(entered_at) GROUP BY 1, 2 ORDER BY 1"}]
+    },
+    {
+      "title": "Open-stage outliers (>7d)",
+      "type": "table",
+      "targets": [{"format": "table", "rawSql": "SELECT issue_number, stage, entered_at, duration_seconds FROM issue_funnel_stage_duration WHERE workspace_id = '$workspace_id' AND is_open AND duration_seconds > 604800 ORDER BY duration_seconds DESC"}]
+    },
+    {
+      "title": "Stage duration histogram",
+      "type": "histogram",
+      "targets": [{"format": "table", "rawSql": "SELECT stage, duration_seconds FROM issue_funnel_stage_duration WHERE workspace_id = '$workspace_id' AND $__timeFilter(entered_at)"}]
+    }
+  ],
+  "templating": {"list": [{"name": "workspace_id", "type": "textbox", "label": "Workspace ID", "query": ""}]}
+}

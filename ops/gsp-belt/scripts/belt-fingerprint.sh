@@ -24,7 +24,29 @@ manifest_release="$release_dir/$MANIFEST_REL"
 manifest_src="$checkout_root/$MANIFEST_REL"
 [[ -f "$manifest_release" ]] || { echo "fingerprint: release manifest missing: $manifest_release" >&2; exit 1; }
 
-mapfile -t src_files < <(sed -nE 's/^\| `([^`]*)` .*/\1/p' "$manifest_src" | sort -u)
+manifest_paths() {
+  local raw rel match found
+  while IFS='|' read -r _ raw _; do
+    rel="$(echo "$raw" | sed 's/[ `]//g')"
+    [[ "$rel" == ops/* ]] || continue
+    if [[ "$rel" = /* || "$rel" == *..* ]]; then
+      echo "fingerprint: unsafe manifest path: $rel"
+      continue
+    fi
+    if [[ "$rel" == *'*'* || "$rel" == *'?'* || "$rel" == *'['* ]]; then
+      found=0
+      while IFS= read -r match; do
+        found=1
+        printf '%s\n' "${match#"$checkout_root/"}"
+      done < <(compgen -G "$checkout_root/$rel" || true)
+      [[ $found -eq 1 ]] || echo "fingerprint: source missing (untracked): $rel"
+    else
+      printf '%s\n' "$rel"
+    fi
+  done < "$manifest_src"
+}
+
+mapfile -t src_files < <(manifest_paths | sort -u)
 
 fail=0
 for rel in "${src_files[@]}"; do

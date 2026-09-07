@@ -14,17 +14,30 @@ while [[ $# -gt 0 ]]; do case "$1" in
   *) usage ;;
 esac; shift; done
 checkout="${MULTICA_CHECKOUT_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)}"
-release_root="${MULTICA_RELEASE_ROOT:-/home/newadmin/gsp-multica-runtime/releases}"
-receipt_root="${MULTICA_RECEIPT_ROOT:-/home/newadmin/gsp-multica-runtime/receipts}"
+release_root="${MULTICA_RELEASE_ROOT:-/var/lib/gsp/gsp-multica-runtime/releases}"
+receipt_root="${MULTICA_RECEIPT_ROOT:-/var/lib/gsp/gsp-multica-runtime/receipts}"
 pm2_bin="${PM2_BIN:-pm2}"
 actual_sha="$(git -C "$checkout" rev-parse HEAD)"
 [[ "$actual_sha" == "$requested_sha" ]] || { echo "checkout SHA is $actual_sha, expected $requested_sha" >&2; exit 65; }
 git -C "$checkout" diff --quiet && git -C "$checkout" diff --cached --quiet || { echo 'tracked checkout must be clean' >&2; exit 65; }
 release="$release_root/$requested_sha"; ecosystem="$release/ops/belt/ecosystem.gsp-belt.config.js"
-manifest=(ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs ops/belt/parked-diagnosis.cjs ops/belt/parked-entry-audit.cjs ops/belt/parity/multica-relay-advance-daemon.cjs ops/belt/parity/relay-dead-rows.cjs ops/belt/multica-cicd-worker.cjs ops/belt/cicd-deploy-evidence.cjs ops/belt/multica-archiver.cjs ops/belt/belt-config-guard.sh ops/belt/multica-daemon-wrapper.sh ops/belt/ecosystem.gsp-belt.config.js ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md ops/belt/WORKER_COMMON.md ops/belt/relay-completion-admission.cjs)
-health() { "$pm2_bin" jlist | node -e 'let s="";process.stdin.on("data",x=>s+=x);process.stdin.on("end",()=>{let a=JSON.parse(s),n=["gsp-multica-bridge","multica-relay-advance","multica-archiver"];if(process.argv[2]==="1")n.push("gsp-multica-worker");if(process.argv[3]!=="1")n.push("multica-cicd-worker");process.exit(n.every(x=>{let p=a.find(y=>y.name===x);return p&&p.pm2_env.status==="online"&&p.pm2_env.pm_cwd===process.argv[1]})?0:1)})' "$release" "$include_worker" "$skip_cicd_worker"; }
+manifest=(ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs ops/belt/parked-diagnosis.cjs ops/belt/parked-entry-audit.cjs ops/belt/parity/multica-relay-advance-daemon.cjs ops/belt/parity/relay-dead-rows.cjs ops/belt/multica-cicd-worker.cjs ops/belt/cicd-watchdog.cjs ops/belt/cicd-deploy-evidence.cjs ops/belt/multica-archiver.cjs ops/belt/reconciler.cjs ops/belt/stage-outcome.cjs ops/belt/transition-policy.cjs ops/belt/stage-routing.cjs ops/belt/qc-strict-evidence.cjs ops/belt/qc-verdict-policy.cjs ops/belt/belt-config-guard.sh ops/belt/multica-daemon-wrapper.sh ops/belt/ecosystem.gsp-belt.config.js ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md ops/belt/WORKER_COMMON.md ops/belt/relay-completion-admission.cjs ops/gsp-belt/relay/multica-relay-advance-launcher.cjs ops/gsp-belt/relay/multica-relay-advance-wrapper.sh ops/gsp-belt/relay/multica-relay-advance-daemon.cjs)
+health() {
+  local snapshot
+  snapshot="$($pm2_bin jlist)" || { echo 'health: pm2 jlist failed' >&2; return 1; }
+  RELEASE="$release" INCLUDE_WORKER="$include_worker" SKIP_CICD="$skip_cicd_worker" PM2_SNAPSHOT="$snapshot" node -e '
+    const apps=JSON.parse(process.env.PM2_SNAPSHOT), release=process.env.RELEASE;
+    const required=["gsp-multica-bridge","multica-relay-advance","multica-archiver"];
+    if(process.env.INCLUDE_WORKER==="1") required.push("gsp-multica-worker");
+    if(process.env.SKIP_CICD!=="1") required.push("multica-cicd-worker");
+    const expected=`${release}/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh`, byName=new Map(apps.map(a=>[a.name,a])); let ok=true;
+    for(const name of required){const app=byName.get(name),e=app?.pm2_env||{}, pathOk=name!=="multica-relay-advance"||e.pm_exec_path===expected;
+      if(!app||e.status!=="online"||e.pm_cwd!==release||!pathOk){console.error(`health: app=${name} status=${e.status||"missing"} pid=${app?.pid??"unknown"} exit_code=${e.exit_code??"unknown"} exit_signal=${e.exit_signal||"unknown"} restarts=${e.unstable_restarts??"unknown"} error_log=${e.pm_err_log_path||"unknown"} expected_script=${name==="multica-relay-advance"?expected:"release cwd"}`);ok=false;}}
+    process.exit(ok?0:1);'
+}
 require_graph() { local tree="$1" src dep rel; for src in "${manifest[@]}"; do [[ "$src" == *.cjs ]] || continue; while IFS= read -r dep; do [[ "$dep" == ./* || "$dep" == ../* ]] || continue; rel="$(realpath -m --relative-to="$tree" "$tree/$(dirname "$src")/$dep")"; [[ -f "$tree/$rel" ]] || rel+='.cjs'; [[ -f "$tree/$rel" ]] || { echo "Missing manifest runtime dependency: $src requires $rel" >&2; return 65; }; done < <(grep -oE "require\\([[:space:]]*[\"'][^\"']+[\"'][[:space:]]*\\)" "$tree/$src" | sed -E "s/^require\\([[:space:]]*[\"']([^\"']+)[\"'][[:space:]]*\\)$/\\1/"); done; }
-preflight() { local tree="$1"; [[ -x "$tree/ops/belt/build-daemon-artifact.sh" ]] || { echo 'required belt files missing' >&2; exit 65; }; for file in "${manifest[@]}"; do [[ -f "$tree/$file" ]] || { echo "missing release manifest file: $file" >&2; exit 65; }; done; require_graph "$tree"; node --input-type=module -e 'let a=(await import(process.argv[1])).default.apps;if(a.length!==5||a.some(x=>!x.script.startsWith(process.argv[2])))process.exit(1)' "file://$tree/ops/belt/ecosystem.gsp-belt.config.js" "$tree"; }
+manifest_checksum() { local tree="$1"; (cd "$tree" && sha256sum "${manifest[@]}" | sha256sum | awk '{print $1}'); }
+preflight() { local tree="$1"; [[ -x "$tree/ops/belt/build-daemon-artifact.sh" ]] || { echo 'required belt files missing' >&2; exit 65; }; for file in "${manifest[@]}"; do [[ -f "$tree/$file" ]] || { echo "missing release manifest file: $file" >&2; exit 65; }; done; require_graph "$tree"; node -e 'const fs=require("fs");const s=fs.readFileSync(process.argv[1],"utf8");if((s.match(/script:/g)||[]).length!==6 || !s.includes("multica-relay-advance-wrapper.sh"))process.exit(1)' "$tree/ops/belt/ecosystem.gsp-belt.config.js"; }
 if [[ "$mode" == --rollback ]]; then
   [[ -f "$ecosystem" ]] || { echo "release missing: $release" >&2; exit 66; }
   MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env
@@ -37,8 +50,10 @@ preflight "$checkout"
 mkdir -p -- "$release_root" "$receipt_root"
 git -C "$checkout" worktree add --detach "$release" "$requested_sha"
 preflight "$release"
+manifest_sha256="$(manifest_checksum "$release")"
+printf '{"source_sha":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"]}\n' "$requested_sha" "$manifest_sha256" > "$release/.gsp-belt-release.json"
 "$release/ops/belt/build-daemon-artifact.sh" "artifacts"
-chmod -R a-w "$release"
+"$checkout/ops/belt/normalize-release-permissions.sh" "$release"
 if ! MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env || ! health; then
   prior_sha="${MULTICA_PRIOR_SHA:-}"
   if [[ "$prior_sha" =~ ^[0-9a-f]{40}$ && -f "$release_root/$prior_sha/ops/belt/ecosystem.gsp-belt.config.js" ]]; then
@@ -46,5 +61,5 @@ if ! MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_ci
   fi
   echo 'apply health failed; prior release reload attempted' >&2; exit 67
 fi
-printf '{"source_sha":"%s","release":"%s","health":"ok"}\n' "$requested_sha" "$release" > "$receipt_root/belt-$requested_sha.json"
+printf '{"source_sha":"%s","release":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"],"health":"ok"}\n' "$requested_sha" "$release" "$manifest_sha256" > "$receipt_root/belt-$requested_sha.json"
 echo "$receipt_root/belt-$requested_sha.json"

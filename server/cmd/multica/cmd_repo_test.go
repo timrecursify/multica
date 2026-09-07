@@ -1,14 +1,60 @@
 package main
 
 import (
+	"io"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
+
+func TestRepoCheckoutTimeoutFloorAndSingleRetry(t *testing.T) {
+	if got := repoCheckoutTimeout(); got < 5*time.Minute {
+		t.Fatalf("checkout timeout = %s, want at least 5m", got)
+	}
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		return nil, timeoutTestError{}
+	})}
+	_, err := repoCheckoutWithRetry(client, "http://checkout.invalid/repo", []byte(`{}`))
+	if err == nil || !strings.Contains(err.Error(), "one retry") {
+		t.Fatalf("error = %v, want exhausted checkout timeout", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want exactly 2", attempts)
+	}
+}
+
+func TestRepoCheckoutRetrySucceedsOnSecondAttempt(t *testing.T) {
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, timeoutTestError{}
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{"path":"/work/repo"}`))}, nil
+	})}
+	resp, err := repoCheckoutWithRetry(client, "http://checkout.invalid/repo", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("retry error = %v", err)
+	}
+	defer resp.Body.Close()
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want exactly 2", attempts)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+type timeoutTestError struct{}
+func (timeoutTestError) Error() string { return "checkout timeout" }
+func (timeoutTestError) Timeout() bool { return true }
+func (timeoutTestError) Temporary() bool { return true }
 
 func newRepoRegistryTestCmd(serverURL string) *cobra.Command {
 	cmd := &cobra.Command{Use: "repo-test"}

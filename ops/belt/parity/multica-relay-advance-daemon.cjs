@@ -1,6 +1,7 @@
 const http = require('http');
 const { Pool } = require('pg');
 const { execFileSync } = require('child_process');
+const { createGithubApi } = require('../github-api-adapter.cjs');
 const { classifyStageRoute } = require('../stage-routing.cjs');
 const {
   instructionCompatibility,
@@ -22,6 +23,7 @@ const { deploymentCompletionAdmission } = require('../relay-completion-admission
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
+const { runQcGate, getHardChecks } = require('../qc-gate.cjs');
 const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
 const { reconcileCycle } = require('../reconciler.cjs');
 const { recordStageOutcomes } = require('../stage-outcome.cjs');
@@ -34,6 +36,11 @@ const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 
 const LOG_PREFIX = '[relay-advance-daemon]';
 const RECONCILE_INTERVAL_MS = 30000;
+const QC_GATE_PENDING_RECHECK_MS = Number.parseInt(process.env.QC_GATE_PENDING_RECHECK_MS || '300000', 10);
+const QC_GATE_GH_COOLDOWN_MS = Number.parseInt(process.env.QC_GATE_GH_COOLDOWN_MS || '600000', 10);
+const qcGatePending = new Map();
+let qcGateGhCooldownUntil = 0;
+let lastCooldownLog = 0;
 function scheduleEvery(fn, ms, label) {
   return setInterval(
     () => Promise.resolve().then(fn)
@@ -98,7 +105,7 @@ async function recordOutcomesPass({ dbPool = pool, logger = console } = {}) {
   if (!TYPED_OUTCOMES) return null;
   const client = await dbPool.connect();
   try {
-    const result = await recordStageOutcomes(client, { logger });
+    const result = await recordStageOutcomes(client, { logger, githubCommand: reconcileGithubCommand });
     if (result.recorded) logger.log(`${LOG_PREFIX} [stage-outcome] recorded=${result.recorded}`);
     return result;
   } finally { client.release(); }
@@ -112,7 +119,8 @@ async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } 
   // GSP-1826 item 5: one provider quota failure holds all dispatch for the breaker window.
   if (QUOTA_BREAKER_MINUTES > 0) {
     const probe = await dbPool.query(
-      `SELECT completed_at FROM agent_task_queue WHERE failure_reason = 'agent_error.provider_quota_limit'
+      `SELECT completed_at FROM agent_task_queue
+        WHERE failure_reason ~* '(402|provider_quota_limit|payment[ _-]?required)'
          AND completed_at > NOW() - ($1::int * interval '1 minute') ORDER BY completed_at DESC LIMIT 1`, [QUOTA_BREAKER_MINUTES]);
     if (probe.rows[0]) {
       logger.log(`Reconcile cycle: held (provider quota failure at ${new Date(probe.rows[0].completed_at).toISOString()}, breaker ${QUOTA_BREAKER_MINUTES}m)`);
@@ -121,7 +129,8 @@ async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } 
   }
   const client = await dbPool.connect();
   try {
-    const results = await reconcileCycle(client, { maxCreatePerCycle: reconcileCreateLimit(maxCreate) });
+    const results = await reconcileCycle(client,
+      { maxCreatePerCycle: reconcileCreateLimit(maxCreate), githubCommand: reconcileGithubCommand });
     logger.log(`${LOG_PREFIX} reconciled ${results.length} ticket(s)`);
     return results;
   } finally {
@@ -129,8 +138,158 @@ async function runReconcileCycle({ dbPool = pool, maxCreate, logger = console } 
   }
 }
 
-function github(args) {
-  return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
+// GraphQL (gh pr view / gh pr merge) shares one per-user quota with every
+// operator session on this box. It was exhausted overnight on 2026-09-03 and
+// every completion route failed with
+// "GraphQL: API rate limit already exceeded for user ID 93534907" (168 times in
+// multica-relay-advance-error.log) while REST callers kept working. Both calls
+// are routed through REST here, the same way multica-cicd-worker.cjs does.
+const PR_URL_RE = /github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i;
+
+// The relay unit carries no GH_TOKEN, so every `gh` call answered "To get
+// started with GitHub CLI, please run: gh auth login" and the QC gate took its
+// tool_error path. Mint a scoped GitHub App installation token through the
+// canonical credential helper instead. The helper owns the cache (file-backed,
+// refreshed with five minutes to spare), so nothing here holds a token that
+// could outlive its hour on a daemon that runs for days.
+const GIT_CREDENTIAL_HELPER = process.env.GSP_BELT_GIT_CREDENTIAL || '/usr/local/bin/gsp-belt-git-credential';
+const DEFAULT_GH_REPO = 'multica';
+let credentialHelperFailureLogged = false;
+function scrubToken(text) { return String(text).replace(/password=\S+/g, 'password=[redacted]'); }
+function logCredentialHelperFailure(detail) {
+  if (credentialHelperFailureLogged) return;
+  credentialHelperFailureLogged = true;
+  console.error(`${LOG_PREFIX} [github-token] ${GIT_CREDENTIAL_HELPER} ${scrubToken(detail).slice(0, 200)}`);
+}
+
+// Returns '' when the helper is absent or fails. That degrades exactly the way
+// a missing token already degraded, and never throws out of ghExec.
+function mintGithubToken(repo) {
+  try {
+    const output = execFileSync(GIT_CREDENTIAL_HELPER, ['token', repo], { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
+    const token = String(output).trim().split(/\r?\n/)[0] || '';
+    if (token) { credentialHelperFailureLogged = false; return token; }
+    logCredentialHelperFailure(`returned no token for ${repo}`);
+  } catch (error) {
+    logCredentialHelperFailure(`mint failed for ${repo}: ${error && error.message ? error.message : error}`);
+  }
+  return '';
+}
+
+// The helper scopes a token to one repository, so the repository has to come
+// from the call itself. Every gh call this daemon makes names it in a REST
+// path; a call that names none falls back to the helper's own default, which
+// is what the single-repository token used to be.
+const GH_REPO_RE = /(?:^|\/)repos\/[\w.-]+\/([\w.-]+)(?:\/|$)/;
+function repoFromGhArgs(args) {
+  for (const arg of args || []) {
+    const match = GH_REPO_RE.exec(String(arg));
+    if (match) return match[1];
+  }
+  return DEFAULT_GH_REPO;
+}
+
+// Built per call, never cached in module scope: a captured installation token
+// dies after an hour and the daemon outlives that many times over.
+function beltGithub(repo = DEFAULT_GH_REPO) {
+  const token = mintGithubToken(repo);
+  return createGithubApi({
+    env: token ? { ...process.env, GITHUB_APP_INSTALLATION_TOKEN: token } : process.env,
+    alert: ({ remaining, reset }) => console.error(`${LOG_PREFIX} [github-quota] sentinel remaining=${remaining} reset=${reset}`)
+  });
+}
+function ghExec(args) { return beltGithub(repoFromGhArgs(args)).command(args); }
+
+// gh returns statusCheckRollup as one flat list of check contexts. REST splits
+// the same facts across check-runs and the combined commit status, so both are
+// read and renamed to the GraphQL field names greenChecks() consumes. A commit
+// with no checks stays null, which is what GraphQL returns for that case.
+function restStatusCheckRollup(repo, sha, run = ghExec) {
+  const runs = JSON.parse(run(['api', `repos/${repo}/commits/${sha}/check-runs?per_page=100`])).check_runs || [];
+  const statuses = JSON.parse(run(['api', `repos/${repo}/commits/${sha}/status`])).statuses || [];
+  const rollup = [
+    ...runs.map((r) => ({ __typename: 'CheckRun', name: r.name,
+      status: String(r.status || '').toUpperCase(), conclusion: String(r.conclusion || '').toUpperCase() })),
+    ...statuses.map((s) => ({ __typename: 'StatusContext', context: s.context,
+      state: String(s.state || '').toUpperCase() }))
+  ];
+  return rollup.length ? rollup : null;
+}
+
+// The REST rebuild of `gh pr view --json
+// state,files,headRefOid,mergeStateStatus,statusCheckRollup`. GraphQL selects
+// files(first: 100); per_page=100 is the same window. REST reports a merged PR
+// as state=closed plus merged=true, so MERGED is restored here.
+function restPrView(repo, num, run = ghExec) {
+  return restPrViewFields(repo, num, GATE_PR_FIELDS, run);
+}
+
+// The gate's fixed selection. reconciler.cjs asks for a wider one, so the field
+// list is honoured per call and both callers share one REST rebuild.
+const GATE_PR_FIELDS = ['state', 'files', 'headRefOid', 'mergeStateStatus', 'statusCheckRollup'];
+
+// REST answers a merged PR as state=closed plus merged=true, and answers
+// mergeable as a boolean where GraphQL answers MERGEABLE/CONFLICTING/UNKNOWN.
+// Both are restored to the GraphQL spelling the callers already consume.
+// files(first: 100) in GraphQL is per_page=100 here.
+function restPrViewFields(repo, num, fields, run = ghExec) {
+  const want = new Set(fields);
+  const pr = JSON.parse(run(['api', `repos/${repo}/pulls/${num}`]));
+  const sha = pr.head && pr.head.sha;
+  const out = {};
+  if (want.has('number')) out.number = pr.number;
+  if (want.has('title')) out.title = pr.title;
+  if (want.has('state')) out.state = pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase();
+  if (want.has('url')) out.url = pr.html_url;
+  if (want.has('headRefOid')) out.headRefOid = sha;
+  if (want.has('headRefName')) out.headRefName = pr.head && pr.head.ref;
+  if (want.has('author')) out.author = pr.user ? { login: pr.user.login } : null;
+  if (want.has('createdAt')) out.createdAt = pr.created_at;
+  if (want.has('updatedAt')) out.updatedAt = pr.updated_at;
+  if (want.has('mergedAt')) out.mergedAt = pr.merged_at;
+  if (want.has('closedAt')) out.closedAt = pr.closed_at;
+  if (want.has('additions')) out.additions = pr.additions;
+  if (want.has('deletions')) out.deletions = pr.deletions;
+  if (want.has('changedFiles')) out.changedFiles = pr.changed_files;
+  if (want.has('mergeable')) {
+    out.mergeable = pr.mergeable === true ? 'MERGEABLE' : pr.mergeable === false ? 'CONFLICTING' : 'UNKNOWN';
+  }
+  if (want.has('mergeStateStatus')) out.mergeStateStatus = String(pr.mergeable_state || 'unknown').toUpperCase();
+  if (want.has('files')) {
+    out.files = JSON.parse(run(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]))
+      .map((f) => ({ path: f.filename }));
+  }
+  if (want.has('statusCheckRollup')) out.statusCheckRollup = restStatusCheckRollup(repo, sha, run);
+  return JSON.stringify(out);
+}
+
+// reconciler.cjs shells `gh pr view <url> --json <fields>` directly. That call
+// carried no token, so every reconcile cycle failed it: linkObservedPullRequest
+// logged and left pr_url empty, and mergedPullRequestNoop swallowed the error
+// whole, which is why a merged PR never completed its ticket. Hand the
+// reconciler this authenticated REST reader instead.
+function reconcileGithubCommand(args, run = ghExec) {
+  if (args[0] !== 'pr' || args[1] !== 'view') {
+    throw new Error(`unsupported GitHub command: ${args.join(' ')}`);
+  }
+  const match = PR_URL_RE.exec(String(args[2] || ''));
+  if (!match) throw new Error(`unsupported pull request reference: ${args[2]}`);
+  const index = args.indexOf('--json');
+  const fields = index === -1 ? []
+    : String(args[index + 1] || '').split(',').map((f) => f.trim()).filter(Boolean);
+  return restPrViewFields(`${match[1]}/${match[2]}`, Number(match[3]), fields, run);
+}
+
+function github(args, run = ghExec) {
+  const target = args[0] === 'pr' ? PR_URL_RE.exec(String(args[2] || '')) : null;
+  if (target) {
+    const repo = `${target[1]}/${target[2]}`;
+    if (args[1] === 'view') return restPrView(repo, target[3], run);
+    if (args[1] === 'merge') {
+      return run(['api', '-X', 'PUT', `repos/${repo}/pulls/${target[3]}/merge`, '-f', 'merge_method=squash']);
+    }
+  }
+  return run(args);
 }
 
 function resultPointer(row) {
@@ -156,17 +315,38 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
     return { reviewRequiredRoute: route?.kind || 'review', pr: route?.pr_url || pointer,
       boundSha: route?.boundSha || pointer };
   }
-  if (row.to_stage === 'In Progress' && targetStage === 'CI/CD & Deploy') {
-    return { noReviewRoute: route?.kind || 'deploy', pr: route?.pr_url || pointer,
-      boundSha: route?.boundSha || pointer };
-  }
   if (row.to_stage === 'In Progress' && targetStage === 'Done') {
-    return { noDeployRoute: route?.kind || 'no_pr', workProductEvidence: pointer };
+    const resultText = typeof row.task_result === 'string' ? row.task_result : JSON.stringify(row.task_result || '');
+    return { noDeployRoute: route?.kind || 'no_pr',
+      workProductEvidence: /\bNO-SHA\b/i.test(resultText) ? resultText : pointer };
   }
   if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
     return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };
   }
   return {};
+}
+
+// RUNBOOK_BUILD_WORKER.md tells a builder to record NO-SHA in its comment for
+// no-code work, while the bridge reads NO-SHA from the posted work product.
+// Carry the newest NO-SHA comment when the task result itself lacks the token.
+async function completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance) {
+  const evidence = completionEvidence(row, targetStage, route, qcAdvance);
+  if (route?.kind !== 'no_pr' || targetStage !== 'Done' ||
+      /\bNO-SHA\b/i.test(String(evidence.workProductEvidence || ''))) return evidence;
+  const comment = await client.query(
+    `SELECT content FROM comment WHERE issue_id = $1::uuid AND content ~* '\\mNO-SHA\\M'
+      ORDER BY created_at DESC LIMIT 1`, [row.issue_id]);
+  return comment.rows[0] ? { ...evidence, workProductEvidence: comment.rows[0].content } : evidence;
+}
+
+// Gate by ticket transition and PR evidence, never by the stage row that
+// happened to record the worker completion. Queue-produced PRs can skip the
+// In Progress outcome entirely.
+function qcGateRequired(row, targetStage, route) {
+  if (targetStage === 'In Review') return true;
+  if (targetStage !== 'Done') return false;
+  const prUrl = route?.pr_url || resultPointer(row);
+  return PR_URL_RE.test(String(prUrl || ''));
 }
 
 function greenChecks(checks) {
@@ -195,6 +375,16 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   const pr = JSON.parse(githubCommand(['pr', 'view', prUrl, '--json',
     'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
   const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
+  // The bridge (#528) refuses In Progress -> CI/CD & Deploy unless a qualifying
+  // Sol-low QC pass exists, and only In Review produces one, so a runtime
+  // route posted straight from the build stage is refused every time and the
+  // ticket is rebuilt after cooldown. Send it through review; QC advances it
+  // to deploy (qcCompletionAdvance).
+  // The same applies to a merged non-runtime PR: In Progress -> Done is
+  // reserved for NO-SHA work products, so a code-bearing route reviews first.
+  if (row.to_stage === 'In Progress' && route.kind !== 'no_pr' && route.toStage && route.toStage !== 'In Review') {
+    return { ...route, toStage: 'In Review', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
+  }
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
       greenChecks(pr.statusCheckRollup)) {
     githubCommand(['pr', 'merge', prUrl, '--squash', '--admin']);
@@ -749,6 +939,117 @@ async function advanceTick() {
   }
 }
 
+async function enqueueQcGateRework(client, row, failed, postRelay) {
+  let source = row;
+  if (source.attempt == null || source.max_attempts == null) {
+    const sourceResult = await client.query(
+      'SELECT attempt, max_attempts FROM agent_task_queue WHERE id = $1::uuid', [row.task_id]);
+    source = { ...row, ...(sourceResult.rows[0] || {}) };
+  }
+  const config = await client.query(`SELECT rsc.agent_id,
+      COALESCE((SELECT ar.id FROM agent_runtime ar WHERE ar.id = a.runtime_id
+        AND ar.workspace_id = rsc.workspace_id AND ar.status = 'online'),
+        (SELECT ar.id FROM agent_runtime ar WHERE ar.workspace_id = rsc.workspace_id
+          AND ar.status = 'online' AND ar.provider = CASE WHEN a.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END
+          ORDER BY ar.updated_at DESC LIMIT 1)) AS runtime_id
+    FROM relay_stage_config rsc JOIN agent a ON a.id = rsc.agent_id
+      AND a.workspace_id = rsc.workspace_id AND a.archived_at IS NULL
+    WHERE rsc.workspace_id = $1 AND rsc.next_stage = $2
+      AND a.runtime_config->>'quota_paused' IS DISTINCT FROM 'true' LIMIT 1`,
+    [row.workspace_id, 'In Progress']);
+  const selected = config.rows[0];
+  const attempt = Number(source.attempt || 0) + 1;
+  const maxAttempts = Number(source.max_attempts || 3);
+  if (attempt > maxAttempts || !selected?.agent_id) {
+    await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review', agent_token: RELAY_AGENT_SECRET,
+      relay_source_task_id: row.task_id, reason: attempt > maxAttempts ? 'QC-GATE FAIL attempts exhausted' : 'QC-GATE FAIL no In Progress stage owner' });
+    return null;
+  }
+  const checks = failed.map(c => ({ name: c.name, detail: c.detail }));
+  const context = JSON.stringify({ source: 'qc-gate-fail', from_stage: 'In Progress', to_stage: 'In Progress',
+    requeue_of_task: row.task_id, gate_checks: checks });
+  const summary = `QC-GATE FAIL: ${checks.map(c => `${c.name}: ${c.detail}`).join('; ')}`.slice(0, 500);
+  const task = await client.query(`INSERT INTO agent_task_queue (
+      agent_id, issue_id, status, runtime_id, context, trigger_summary,
+      force_fresh_session, originator_source, trigger_evidence_kind, attempt, max_attempts, retry_of_task_id)
+    VALUES ($1, $2, 'queued', $3, $4::jsonb, $5, TRUE, 'unattributed', 'relay_stage_transition', $6, $7, $8)
+    RETURNING id`, [selected.agent_id, row.issue_id, selected.runtime_id, context, summary, attempt, maxAttempts, row.task_id]);
+  return task.rows[0]?.id || null;
+}
+async function applyQcGate(client, row, postRelay, logger, gateRunner = runQcGate, now = Date.now) {
+  const issueResult = await client.query('SELECT id, number, workspace_id, metadata FROM issue WHERE id = $1::uuid', [row.issue_id]);
+  const issue = issueResult.rows[0] || { id: row.issue_id, workspace_id: row.workspace_id, metadata: {} };
+  const hintedSha = row.qc_attempt_bound_sha || row.qc_attempt_observed_sha || '';
+  const hintedKey = `${row.issue_id}:${hintedSha}`;
+  const cached = qcGatePending.get(hintedKey) || [...qcGatePending].find(([key]) => key.startsWith(`${row.issue_id}:`))?.[1];
+  const current = now();
+  if (current < qcGateGhCooldownUntil) {
+    if (current - lastCooldownLog >= 60000) {
+      logger.log(`${LOG_PREFIX} [qc-gate] COOLDOWN until=${new Date(qcGateGhCooldownUntil).toISOString()}`);
+      lastCooldownLog = current;
+    }
+    return 'pending';
+  }
+  if (cached && current - cached.at < QC_GATE_PENDING_RECHECK_MS) return 'pending';
+  let gate;
+  try {
+    gate = await gateRunner({ issue, workspace: { id: issue.workspace_id || row.workspace_id }, evidence: issue.metadata || {}, gh: ghExec, db: client });
+  } catch (err) {
+    const message = String(err?.message || err);
+    const transient = /rate limit|secondary rate|abuse|timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|502|503|504/i.test(message);
+    const cls = transient ? 'transient' : 'tool_error';
+    logger.log(`${LOG_PREFIX} [qc-gate] ERROR issue=${row.issue_id} class=${cls} ${message.slice(0, 160)}`);
+    if (transient) qcGateGhCooldownUntil = current + QC_GATE_GH_COOLDOWN_MS;
+    const key = `${row.issue_id}:${hintedSha}`;
+    const prior = qcGatePending.get(key);
+    qcGatePending.set(key, prior || { at: current, firstAt: current });
+    while (qcGatePending.size > 500) qcGatePending.delete(qcGatePending.keys().next().value);
+    if (process.env.QC_GATE_FAIL_OPEN === '1' && !transient) {
+      const content = `<!-- multica-qc-gate -->\nQC-GATE SKIPPED (tool_error): ${message.slice(0, 500)}`;
+      await client.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type) VALUES ($1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system')`, [issue.id, issue.workspace_id || row.workspace_id, '00000000-0000-0000-0000-000000000000', content]);
+      return 'pass';
+    }
+    return 'pending';
+  }
+  const sha = gate.bound_sha || 'none';
+  if (gate.verdict === 'PASS') {
+    for (const key of qcGatePending.keys()) if (key.startsWith(`${row.issue_id}:`)) qcGatePending.delete(key);
+    const soft = gate.checks.filter(c => !getHardChecks().includes(c.name) && !c.ok)
+      .map(c => `soft: ${c.name}: ${c.detail}`).join('; ');
+    const content = `<!-- multica-qc-gate -->\nQC-GATE PASS (${gate.checks.length} checks)${soft ? ` ${soft}` : ''} sha=${gate.bound_sha} pr=#${gate.pr_number}`;
+    await client.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+      SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
+      WHERE NOT EXISTS (SELECT 1 FROM comment WHERE issue_id=$1::uuid AND content LIKE '<!-- multica-qc-gate -->%' AND content LIKE $5::text)`,
+      [issue.id, issue.workspace_id || row.workspace_id, '00000000-0000-0000-0000-000000000000', content, `%sha=${sha}%`]);
+    return 'pass';
+  }
+  const pending = gate.verdict === 'FAIL' && process.env.QC_GATE_CI_ADVISORY === '0' && gate.checks.some(c => c.name === 'ci_complete' && !c.ok && c.detail === 'ci_pending');
+  if (pending) {
+    const key = `${row.issue_id}:${gate.bound_sha || hintedSha}`;
+    const prior = qcGatePending.get(key);
+    const entry = prior && current - prior.at >= QC_GATE_PENDING_RECHECK_MS
+      ? { at: current, firstAt: prior.firstAt } : prior || { at: current, firstAt: current };
+    qcGatePending.set(key, entry);
+    while (qcGatePending.size > 500) qcGatePending.delete(qcGatePending.keys().next().value);
+    logger.log(`${LOG_PREFIX} [qc-gate] PENDING issue=${row.issue_id} ci_pending since=${new Date(entry.firstAt).toISOString()}`);
+    return 'pending';
+  }
+  for (const key of qcGatePending.keys()) if (key.startsWith(`${row.issue_id}:`)) qcGatePending.delete(key);
+  const hardChecks = getHardChecks();
+  const failed = gate.checks.filter(c => hardChecks.includes(c.name) && !c.ok);
+  const soft = gate.checks.filter(c => !hardChecks.includes(c.name) && !c.ok);
+  const detail = failed.map(c => `${c.name}: ${c.detail}`).concat(soft.map(c => `soft: ${c.name}: ${c.detail}`)).join('; ');
+  const content = `<!-- multica-qc-gate -->\nQC-GATE FAIL: ${detail}`;
+  await client.query(`INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type)
+    SELECT $1::uuid, $2::uuid, 'system', $3::uuid, $4::text, 'system'
+    WHERE NOT EXISTS (SELECT 1 FROM comment WHERE issue_id=$1::uuid AND content LIKE '<!-- multica-qc-gate -->%' AND content LIKE $5::text)`,
+    [issue.id, issue.workspace_id || row.workspace_id, '00000000-0000-0000-0000-000000000000', content, `%sha=${sha}%`]);
+  if (row.log_id) await markRelayLogCompletedById(client, row.log_id);
+  const taskId = await enqueueQcGateRework(client, row, failed, postRelay);
+  if (taskId) logger.log(`${LOG_PREFIX} [qc-gate] FAIL issue=${row.issue_id} checks=${failed.map(c => c.name).join(',')} -> requeued task ${taskId}`);
+  return 'returned';
+}
+
 async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
   logger = console } = {}) {
   const client = await dbPool.connect();
@@ -873,9 +1174,13 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
         const payload = { issue_id: row.issue_id, to_stage: targetStage,
           agent_token: RELAY_AGENT_SECRET,
           relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
-          evidence: completionEvidence(row, targetStage, route, qcAdvance),
+          evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
           ...(route ? { routing_classification: route } : {}),
           ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
+        if (process.env.QC_GATE_ENABLED === '1' && qcGateRequired(row, targetStage, route)) {
+          const gate = await applyQcGate(client, row, postRelay, logger);
+          if (gate === 'pending' || gate === 'returned') continue;
+        }
         const response = await postRelay(payload);
 
         if (response.ok) {
@@ -1035,6 +1340,12 @@ function postToPath(path, payload) {
 function requestRetryEscalation(row, reason, relay = postToRelay) {
   const taskId = row.task_id || row.dead_task_id;
   const triggerStage = row.to_stage || row.stage;
+  // Spec is already the re-scoping lane.  Do not emit a meaningless
+  // Spec -> Spec request that the relay cannot execute; report an explicit
+  // handled result so the failed source row can be closed by the caller.
+  if (triggerStage === 'Spec') {
+    return Promise.resolve({ ok: true, status: 200, handled: 'already_in_spec' });
+  }
   return relay({
     issue_id: row.issue_id,
     to_stage: 'Spec',
@@ -1135,8 +1446,14 @@ const INFRA_FAILURE_REASONS = [
   'agent_error.provider_quota_limit'
 ];
 
+const QUOTA_FAILURE_RE = /\b402\b|provider_quota_limit|payment[ _-]?required/i;
+
+function isQuotaFailure(reason) {
+  return QUOTA_FAILURE_RE.test(String(reason || ''));
+}
+
 function isInfrastructureFailure(reason) {
-  return INFRA_FAILURE_REASONS.includes(reason || 'cancelled');
+  return INFRA_FAILURE_REASONS.includes(reason || 'cancelled') || isQuotaFailure(reason);
 }
 
 function selectReplayAttempt(row) {
@@ -1500,6 +1817,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           const recentFailures = await client.query(
             `SELECT failure_reason, updated_at FROM agent_task_queue
               WHERE agent_id = $1::uuid AND status = 'failed'
+                AND failure_reason ~* '(402|provider_quota_limit|payment[ _-]?required)'
                 AND updated_at > NOW() - ($3::bigint * INTERVAL '1 millisecond')
               ORDER BY created_at DESC LIMIT $2::integer`,
             [row.agent_id, QUOTA_FAILURE_LIMIT, QUOTA_PAUSE_MAX_AGE_MS]
@@ -1510,14 +1828,16 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           const quotaPause = circuit.pause
             ? await pauseQuotaLane(client, row, circuit.consecutive)
             : null;
+          // Quota exhaustion is a retryable provider condition, not a human
+          // decision. Keep the issue in its executable stage and let the
+          // breaker/pause window clear; the next recovery pass can enqueue it
+          // again without creating a Human Review transition or audit.
           await client.query('COMMIT');
-          const moved = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
-            agent_token: RELAY_AGENT_SECRET, reason: 'payment_required_402' });
           if (quotaPause) {
             logQuotaPauseFlip({ agent_name: quotaPause.agent_name,
               timestamp: quotaPause.paused_at, paused: true });
           }
-          console.log(`${LOG_PREFIX} [requeue] MONEY-BLOCKED #${row.number}: 402 -> Human Review; relay=${moved.status}; lane_paused=${Boolean(quotaPause)}`);
+          console.log(`${LOG_PREFIX} [requeue] HELD #${row.number}: provider quota breaker; lane_paused=${Boolean(quotaPause)}`);
           continue;
         }
         const releaseAt = row.metadata?.parked_release_at ||
@@ -1642,6 +1962,17 @@ function diagnosisText(result) {
     .filter(Boolean).join('\n');
 }
 
+async function diagnosisTextWithComment(client, task) {
+  const text = diagnosisText(task.result);
+  if (parseDiagnosisOutcome(text) || !task.agent_id) return text;
+  const comment = await client.query(
+    `SELECT content FROM comment
+      WHERE issue_id = $1::uuid AND author_id = $2::uuid AND created_at >= $3::timestamptz
+        AND content ~* '(outcome|diagnosis)\\s*[:=]\\s*(fixable|already_fixed|duplicate|genuinely_blocked)'
+      ORDER BY created_at DESC LIMIT 1`, [task.issue_id, task.agent_id, task.created_at]);
+  return comment.rows[0] ? comment.rows[0].content : text;
+}
+
 async function recordDiagnosisReleaseFailure(client, taskId, context, failure) {
   const attempts = Number.parseInt(context?.diagnosis_release_attempts || '0', 10) || 0;
   const nextAttempts = attempts + 1;
@@ -1694,7 +2025,7 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
       // may tick together; SKIP LOCKED prevents duplicate outcomes/comments.
       await client.query('BEGIN');
       const locked = await client.query(
-        `SELECT t.id, t.issue_id, t.result, t.context,
+        `SELECT t.id, t.issue_id, t.result, t.context, t.agent_id, t.created_at,
                 i.workspace_id, i.status, i.number
            FROM agent_task_queue t
            JOIN issue i ON i.id = t.issue_id
@@ -1721,7 +2052,10 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
         continue;
       }
       const task = locked.rows[0];
-      const text = diagnosisText(task.result);
+      // The diagnosis seat posts its verdict as an issue comment and then
+      // returns an empty final message, so the task result is bare. Read the
+      // newest outcome comment it wrote for this task in that case.
+      const text = await diagnosisTextWithComment(client, task);
       const parsedOutcome = parseDiagnosisOutcome(text);
       const evidence = diagnosisEvidence(text);
       const blocker = namedBlocker(text);
@@ -1833,8 +2167,21 @@ async function processParkedDiagnoses({ diagnosisPool = pool, relayPost = postTo
   }
 }
 
+// The bridge puts the discriminating half of a refusal in `reason` or
+// `message`, not in `error`: `retry_escalation_source_task_required` alone does
+// not say which of the two task budgets tripped, and reading the bridge source
+// was the only way to find out. Carry every field the body offers into the log.
+function relayDenialDetail(response) {
+  let parsed = {};
+  try { parsed = JSON.parse(response.body || '{}') || {}; } catch (_) { parsed = {}; }
+  const parts = [response.error || parsed.error, parsed.reason, parsed.message]
+    .filter((part) => typeof part === 'string' && part.trim());
+  return [...new Set(parts)].join('; ') || String(response.body || '').trim() || 'unknown';
+}
+
 // Retry recorded successful work without creating another agent task.  A relay
-// denial is retried at most three times, then the durable outcome becomes human-owned.
+// refusal (4xx) parks the outcome for a human at once; a denial that can clear
+// by itself is retried at most three times, then the outcome becomes human-owned.
 async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRelay,
   logger = console, typedOutcomes = TYPED_OUTCOMES } = {}) {
   if (!typedOutcomes) return [];
@@ -1854,9 +2201,10 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         ORDER BY o.outcome_at ASC LIMIT 100`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
     const advanced = [];
     for (const row of result.rows) {
-      const route = row.outcome === 'NO_OP' && row.to_stage === 'In Progress'
-        ? { kind: 'no_pr', toStage: 'Done' }
-        : await buildCompletionRoute(client, row);
+      // A NO_OP build with a linked or commented PR still carries code: let
+      // buildCompletionRoute decide; it returns the no_pr -> Done route itself
+      // when no PR exists.
+      const route = await buildCompletionRoute(client, row);
       const targetStage = route?.toStage || row.next_stage;
       if (!targetStage) continue;
       const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
@@ -1868,16 +2216,25 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         logger.log(`${LOG_PREFIX} [typed-readvance] skipped issue=${row.issue_id} reason=${qcAdvance.reason}`);
         continue;
       }
+      if (process.env.QC_GATE_ENABLED === '1' && qcGateRequired(row, targetStage, route)) {
+        const gate = await applyQcGate(client, row, postRelay, logger);
+        if (gate === 'pending') continue;
+        if (gate === 'returned') {
+          await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = NULL
+            WHERE issue_id = $1::uuid AND stage = 'In Progress'`, [row.issue_id]);
+          continue;
+        }
+      }
       const response = await postRelay({ issue_id: row.issue_id, to_stage: targetStage,
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
-        evidence: completionEvidence(row, targetStage, route, qcAdvance),
+        evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
         ...(route ? { routing_classification: route } : {}) });
       if (response.ok) {
         advanced.push(row.issue_id);
         logger.log(`${LOG_PREFIX} [typed-readvance] advanced issue=${row.issue_id} ${row.to_stage}->${targetStage}`);
         continue;
       }
-      const error = `status=${response.status}; error=${response.error || response.body || 'unknown'}`;
+      const error = `status=${response.status}; error=${relayDenialDetail(response)}`;
       const denied = await client.query(
         `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
              jsonb_build_object('typed_readvance_denials',
@@ -1885,7 +2242,19 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
                'typed_readvance_error', $2::text)
           WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)
         RETURNING COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) AS denials`, [row.task_id, error]);
-      if (Number(denied.rows[0]?.denials || 0) >= 3) {
+      // A 4xx is the relay refusing on policy, not failing: the identical POST
+      // earns the identical refusal until something outside this loop changes
+      // the ticket, so retrying it is pure waste. The three-strike allowance is
+      // for a denial that can clear by itself (202 deferred, 5xx no-owner).
+      //
+      // The counter alone did not bound the 4xx case: it lives on the task's
+      // newest relay_run_log row, and a completed task that never produced one
+      // makes the UPDATE match nothing, so `denials` reads 0 forever. Issue
+      // cae70ef9 (task ce297efa, zero relay_run_log rows) was refused
+      // `parked_release_required` on every cycle for hours on 2026-09-06 while
+      // issues whose task did have a run log stopped at exactly three.
+      const refused = response.status >= 400 && response.status < 500;
+      if (refused || Number(denied.rows[0]?.denials || 0) >= 3) {
         await client.query(`UPDATE issue_stage_outcome SET blocked_on = 'human'
           WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
       }
@@ -1907,12 +2276,26 @@ async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
   const client = await dbPool.connect();
   try {
     const result = await client.query(
-      `SELECT o.issue_id, o.task_id, v.work_product_md5, v.created_at AS verdict_at
+      `SELECT o.issue_id, o.task_id, v.work_product_md5, v.created_at AS verdict_at,
+              (v.verdict IS NULL AND EXISTS (
+                SELECT 1 FROM agent_task_queue ng
+                 WHERE ng.issue_id = o.issue_id AND ng.status = 'completed'
+                   AND ng.result::text ILIKE '%QC-BLOCKED NO-GATE%'
+                   AND ng.completed_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
+                     WHERE l.issue_id = o.issue_id AND l.to_stage = 'In Review'), '-infinity')
+              )) AS no_gate
          FROM issue_stage_outcome o
          JOIN issue i ON i.id = o.issue_id AND i.status = 'In Review'
-         JOIN LATERAL (SELECT verdict, work_product_md5, created_at FROM qc_verdict
+         LEFT JOIN LATERAL (SELECT verdict, work_product_md5, created_at FROM qc_verdict
                         WHERE issue_id = o.issue_id ORDER BY created_at DESC LIMIT 1) v ON TRUE
-        WHERE o.stage = 'In Review' AND o.outcome IN ('ADVANCED', 'FAILED') AND v.verdict = 'FAIL'
+        WHERE o.stage = 'In Review' AND o.outcome IN ('ADVANCED', 'FAILED')
+          AND (v.verdict = 'FAIL' OR (v.verdict IS NULL AND EXISTS (
+            SELECT 1 FROM agent_task_queue ng
+             WHERE ng.issue_id = o.issue_id AND ng.status = 'completed'
+               AND ng.result::text ILIKE '%QC-BLOCKED NO-GATE%'
+               AND ng.completed_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
+                 WHERE l.issue_id = o.issue_id AND l.to_stage = 'In Review'), '-infinity')
+          )))
           AND v.created_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
                                         WHERE l.issue_id = o.issue_id AND l.to_stage = 'In Review'), '-infinity')
           AND NOT EXISTS (SELECT 1 FROM agent_task_queue q
@@ -1920,11 +2303,39 @@ async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
         ORDER BY o.outcome_at ASC LIMIT 40`);
     const returned = [];
     for (const row of result.rows) {
-      const cause = `QC FAIL ${row.work_product_md5 || 'no-md5'} at ${new Date(row.verdict_at).toISOString()}; rework required`;
+      const cause = row.no_gate
+        ? 'QC-BLOCKED NO-GATE; rework required'
+        : `QC FAIL ${row.work_product_md5 || 'no-md5'} at ${new Date(row.verdict_at).toISOString()}; rework required`;
+      // Count durable relay bounces before each return.  The bridge applies the
+      // same limit, but enforcing it here prevents this daemon from repeatedly
+      // enqueueing a fresh builder task when a relay request is rejected.
+      const bounce = await client.query(
+        `SELECT count(*)::int AS n FROM relay_run_log
+          WHERE issue_id = $1::uuid AND from_stage = 'In Review' AND to_stage = 'In Progress'`,
+        [row.issue_id]);
+      const count = Number(bounce.rows[0]?.n || 0);
+      if (count >= STAGE_CYCLE_LIMIT) {
+        const response = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
+          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+          reason: `QC bounce ceiling reached (${count}/${STAGE_CYCLE_LIMIT}); human review required`,
+          evidence: { implementationFail: cause, qcBounceCeiling: { count, ceiling: STAGE_CYCLE_LIMIT } },
+          parked_audit: { reason: 'qc_bounce_ceiling', bounce_count: count, ceiling: STAGE_CYCLE_LIMIT,
+            issue_id: row.issue_id, disposition: 'Human Review' } });
+        if (response.ok) {
+          await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = 'human'
+            WHERE issue_id = $1::uuid AND stage = 'In Review'`, [row.issue_id]);
+          returned.push(row.issue_id);
+          logger.log(`${LOG_PREFIX} [qc-fail-return] capped issue=${row.issue_id} bounces=${count}/${STAGE_CYCLE_LIMIT}`);
+        } else {
+          logger.log(`${LOG_PREFIX} [qc-fail-return] cap denied issue=${row.issue_id} status=${response.status}; error=${response.error || response.body || 'unknown'}`);
+        }
+        continue;
+      }
       const response = await postRelay({ issue_id: row.issue_id, to_stage: 'In Progress',
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
         reason: `RETURN:In Progress — ${cause}`,
-        evidence: { implementationFail: cause, retryRemaining: true } });
+        evidence: { implementationFail: cause, retryRemaining: true,
+          qcBounceCount: count, qcBounceCeiling: STAGE_CYCLE_LIMIT } });
       if (response.ok) {
         await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = NULL
           WHERE issue_id = $1::uuid AND stage = 'In Review'`, [row.issue_id]);
@@ -1977,7 +2388,8 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence,
+module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestRetryEscalation,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
-  INFRA_FAILURE_REASONS, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
-  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner };
+  INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
+  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
+  github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup };

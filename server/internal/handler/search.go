@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -22,14 +24,14 @@ import (
 // enough that the frontend Loader2 spinner appears to hang forever
 // ("搜索卡死没有任何反应", MUL-4059).
 //
-// The 3 s cap is generous compared to a properly indexed search (typically
+// The 15 s default is generous compared to a properly indexed search (typically
 // <50 ms) and short enough that the frontend's implicit request timeout
 // (browser default, ~30 s) never kicks in. On timeout the caller sees a
 // 503 with a descriptive error rather than a stalled connection —
 // SearchIssues / SearchProjects map SQLSTATE 57014 to
 // http.StatusServiceUnavailable so the frontend can distinguish this
 // from a generic 500.
-const searchStatementTimeout = 3 * time.Second
+const searchStatementTimeout = 15 * time.Second
 
 // searchStatementTimeoutOverride, when non-zero, replaces
 // searchStatementTimeout for the duration of a test. Never read outside
@@ -40,7 +42,22 @@ func effectiveSearchStatementTimeout() time.Duration {
 	if searchStatementTimeoutOverride > 0 {
 		return searchStatementTimeoutOverride
 	}
-	return searchStatementTimeout
+	return parseSearchStatementTimeout(os.Getenv("SEARCH_TIMEOUT"))
+}
+
+// parseSearchStatementTimeout returns the configured statement timeout. An
+// invalid, empty, or non-positive value is intentionally treated as unset so a
+// bad deployment setting cannot disable the search safety limit.
+func parseSearchStatementTimeout(value string) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return searchStatementTimeout
+	}
+	timeout, err := time.ParseDuration(value)
+	if err != nil || timeout <= 0 {
+		return searchStatementTimeout
+	}
+	return timeout
 }
 
 // runSearchQuery executes a search SQL query inside a short-lived read-only

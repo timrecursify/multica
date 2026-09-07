@@ -10,6 +10,30 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+func TestParseSearchStatementTimeout(t *testing.T) {
+	const wantDefault = 15 * time.Second
+	for _, tc := range []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "unset", want: wantDefault},
+		{name: "blank", value: "   ", want: wantDefault},
+		{name: "valid", value: "750ms", want: 750 * time.Millisecond},
+		{name: "invalid", value: "not-a-duration", want: wantDefault},
+		{name: "zero", value: "0", want: wantDefault},
+		{name: "negative", value: "-2s", want: wantDefault},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("SEARCH_TIMEOUT", tc.value)
+			searchStatementTimeoutOverride = 0
+			if got := effectiveSearchStatementTimeout(); got != tc.want {
+				t.Fatalf("effectiveSearchStatementTimeout() with SEARCH_TIMEOUT=%q = %s, want %s", tc.value, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestIsSearchStatementTimeout(t *testing.T) {
 	tests := []struct {
 		name string

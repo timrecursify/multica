@@ -182,6 +182,50 @@ func TestActivityIssueUpdated_AssigneeChanged(t *testing.T) {
 	}
 }
 
+func TestIssueFunnelTransitionsRecordDeliveryStages(t *testing.T) {
+	issueID := createTestIssue(t, testWorkspaceID, testUserID)
+	t.Cleanup(func() { cleanupTestIssue(t, issueID) })
+
+	assigneeID := createTestUser(t, "funnel-assignee-test@multica.ai")
+	t.Cleanup(func() { cleanupTestUser(t, "funnel-assignee-test@multica.ai") })
+	ctx := context.Background()
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET assignee_type = 'member', assignee_id = $2, status = 'in_progress' WHERE id = $1`, issueID, assigneeID); err != nil {
+		t.Fatalf("assign and start issue: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'in_review' WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("send issue to review: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'Done' WHERE id = $1`, issueID); err != nil {
+		t.Fatalf("complete issue: %v", err)
+	}
+
+	rows, err := testPool.Query(ctx, `SELECT stage FROM issue_funnel_stage_duration WHERE issue_id = $1 ORDER BY transition_sequence`, issueID)
+	if err != nil {
+		t.Fatalf("query funnel durations: %v", err)
+	}
+	defer rows.Close()
+	var stages []string
+	for rows.Next() {
+		var stage string
+		if err := rows.Scan(&stage); err != nil {
+			t.Fatalf("scan stage: %v", err)
+		}
+		stages = append(stages, stage)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate stages: %v", err)
+	}
+	want := []string{"created", "assigned", "in_progress", "review", "done"}
+	if len(stages) != len(want) {
+		t.Fatalf("stage count = %d, want %d (%v)", len(stages), len(want), stages)
+	}
+	for i, stage := range want {
+		if stages[i] != stage {
+			t.Fatalf("stage[%d] = %q, want %q", i, stages[i], stage)
+		}
+	}
+}
+
 func TestActivityIssueUpdated_NoChangeFlags(t *testing.T) {
 	queries := db.New(testPool)
 	bus := events.New()

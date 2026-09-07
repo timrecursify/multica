@@ -44,8 +44,8 @@ func repairTaskFixture(t *testing.T, ctx context.Context, pool *pgxpool.Pool, st
 	var agentID string
 	if err := pool.QueryRow(ctx, `
 		INSERT INTO agent (workspace_id, name, description, runtime_mode, runtime_config, runtime_id, visibility, max_concurrent_tasks, owner_id)
-		VALUES ($1, 'Repair Agent', '', 'cloud', '{}'::jsonb, $2, 'private', 5, $3)
-		RETURNING id`, workspaceID, runtimeID, userID).Scan(&agentID); err != nil {
+		VALUES ($1, $2, '', 'cloud', '{}'::jsonb, $3, 'private', 5, $4)
+		RETURNING id`, workspaceID, fmt.Sprintf("Repair Agent %d", suffix), runtimeID, userID).Scan(&agentID); err != nil {
 		t.Fatalf("create agent: %v", err)
 	}
 	var issueID string

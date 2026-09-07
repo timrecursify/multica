@@ -29,15 +29,20 @@ const TRANSITIONS = Object.freeze([
   ['Registered', 'Spec', ['system', 'operator'], 'registered'],
   ['Spec', 'Queue', ['worker', 'operator'], 'scoped'],
   ['Queue', 'In Progress', ['system'], 'queued'],
+  ['Queue', 'Spec', ['system'], 'retryEscalation'],
   ['In Progress', 'In Review', ['worker', 'system'], 'reviewed'],
-  ['In Progress', 'CI/CD & Deploy', ['worker', 'system'], 'deploy'],
-  ['In Progress', 'Done', ['worker', 'system'], 'complete'],
+  // A build worker may only hand implementation work to In Review.  Done is
+  // the no-deploy terminal path and is admitted by the relay/system after it
+  // has independently checked the work product; allowing `worker` here made
+  // the worker's own noDeployRoute assertion self-authenticating.
+  ['In Progress', 'Done', ['system'], 'complete'],
   ['In Progress', 'Spec', ['system'], 'retryEscalation'],
   ['In Review', 'CI/CD & Deploy', ['system'], 'pass'],
   ['In Review', 'In Progress', ['system'], 'retry'],
   ['In Review', 'Spec', ['system'], 'retryEscalation'],
   ['CI/CD & Deploy', 'Done', ['system'], 'shipped'],
   ['CI/CD & Deploy', 'In Progress', ['system'], 'return'],
+  ['CI/CD & Deploy', 'Parked', ['system'], 'retryEscalation'],
   ['CI/CD & Deploy', 'Spec', ['system'], 'retryEscalation'],
   ['Spec', 'Human Review', ['operator'], 'review'],
   ['Queue', 'Human Review', ['operator'], 'review'],
@@ -85,6 +90,25 @@ function evaluate({ from, to, actor, evidence = {}, ...request } = {}) {
   const transition = TRANSITIONS.find((row) => row.from === from && row.to === to);
   if (!transition) return { ok: false, code: 'transition_denied' };
   if (!transition.actors.includes(actor)) return { ok: false, code: 'actor_denied' };
+  if (from === 'In Progress' && to === 'Done') {
+    // The no-deploy route is valid only for an independently verified clean
+    // checkout.  Keep the offending paths in the result so the relay audit
+    // can explain why a self-asserted bypass was refused.
+    const changedFiles = Array.isArray(evidence.changedFiles)
+      ? evidence.changedFiles
+      : Array.isArray(evidence.checkout?.changedFiles) ? evidence.checkout.changedFiles : [];
+    if (evidence.checkoutClean === false || changedFiles.length > 0) {
+      return { ok: false, code: 'no_deploy_route_ineligible', files: changedFiles };
+    }
+    if (evidence.pr || evidence.boundSha ||
+        (typeof evidence.noDeployRoute === 'string' && evidence.noDeployRoute !== 'no_pr')) {
+      return { ok: false, code: 'code_work_requires_review' };
+    }
+    if (typeof evidence.workProductEvidence !== 'string' ||
+        !/\bNO-SHA\b/i.test(evidence.workProductEvidence)) {
+      return { ok: false, code: 'no_sha_evidence_required' };
+    }
+  }
   const requiredEvidence = transition.evidence.filter((field) => field !== 'completedSolLowTask');
   if (transition.evidence.includes('completedSolLowTask') &&
       !(evidence.completedSolLowTask || evidence.externalReviewReceipt)) {

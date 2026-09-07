@@ -24,6 +24,7 @@ func TestHealthHandlerReportsCLIVersionAndTaskCounts(t *testing.T) {
 			DaemonID:      "daemon-test",
 			DeviceName:    "dev",
 			ServerBaseURL: "http://localhost:8080",
+			HealthPort:    20464,
 		},
 		workspaces: map[string]*workspaceState{},
 		logger:     slog.Default(),
@@ -66,6 +67,9 @@ func TestHealthHandlerReportsCLIVersionAndTaskCounts(t *testing.T) {
 	if got, want := raw["status"], "running"; got != want {
 		t.Errorf("status key: got %v, want %q", got, want)
 	}
+	if got, want := raw["health_port"], float64(20464); got != want {
+		t.Errorf("health_port key: got %v, want %v", got, want)
+	}
 	// The desktop relies on the `os` key (runtime.GOOS) to detect a daemon it
 	// can't manage (e.g. Linux-in-WSL behind a Windows desktop). A rename or
 	// drop would silently re-break #3916, so lock both the key and its value.
@@ -90,6 +94,32 @@ func TestHealthHandlerReportsCLIVersionAndTaskCounts(t *testing.T) {
 	}
 	if resp.ResourceWaitTaskCount != 1 {
 		t.Errorf("ResourceWaitTaskCount: got %d, want 1", resp.ResourceWaitTaskCount)
+	}
+}
+
+func TestHealthHandlerReportsCompletedTickTelemetry(t *testing.T) {
+	t.Parallel()
+
+	d := &Daemon{workspaces: map[string]*workspaceState{}, logger: slog.Default()}
+	handler := d.healthHandler(time.Now())
+	read := func() HealthResponse {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+		var got HealthResponse
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode health: %v", err)
+		}
+		return got
+	}
+
+	initial := read()
+	if initial.TickCount != 0 || initial.LastTickCompletedAt != "" || initial.LastTickOutcome != "" {
+		t.Fatalf("initial tick telemetry = %#v, want zero values", initial)
+	}
+	d.recordTick("error")
+	got := read()
+	if got.TickCount != 1 || got.LastTickCompletedAt == "" || got.LastTickOutcome != "error" {
+		t.Fatalf("completed tick telemetry = %#v, want count=1 timestamp and error outcome", got)
 	}
 }
 

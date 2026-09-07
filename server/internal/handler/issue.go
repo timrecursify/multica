@@ -448,9 +448,15 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 
 	wsParam := nextArg(nil) // $4 — workspace_id, will be filled by caller position
 
-	// Build per-term LIKE conditions only for multi-word search.
+	// Build per-term LIKE conditions for text searches. The candidate CTE below
+	// evaluates each term once over workspace-scoped issue/comment relations,
+	// rather than repeatedly probing comments for every outer issue row.
 	var termContainsParams []string
-	if len(terms) > 1 {
+	if len(terms) == 1 {
+		// Reuse the phrase contains parameter so single-term searches retain
+		// the established argument layout (important for numeric-bound paths).
+		termContainsParams = append(termContainsParams, phraseContainsParam)
+	} else if len(terms) > 1 {
 		for _, t := range terms {
 			et := escapeLike(t)
 			termContainsParams = append(termContainsParams, nextArg("%"+et+"%"))
@@ -460,45 +466,54 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	// --- WHERE clause ---
 	var whereParts []string
 
-	// Full phrase match: title, description, or comment.
-	//
-	// The comment EXISTS subquery is deliberately correlated on BOTH
-	// c.issue_id = i.id AND c.workspace_id = wsParam. The workspace_id
-	// filter is not strictly necessary for correctness (comment.workspace_id
-	// is FK-consistent with its issue's workspace), but it is critical for
-	// the planner. Without it, Postgres rewrites the correlated EXISTS
-	// into a hashed subplan that materializes every comment in the entire
-	// `comment` table matching the LIKE — for common tokens like "search"
-	// this can be hundreds of thousands of rows, blowing out work_mem into
-	// a lossy bitmap and taking 30+ seconds. With the workspace_id
-	// constant duplicated into the subquery, the hashed set collapses to
-	// this workspace's comments and the plan uses the supporting
-	// idx_comment_workspace (migration 135). See MUL-4059 EXPLAIN reports.
-	phraseMatch := fmt.Sprintf(
-		"(LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s OR EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s))",
-		phraseContainsParam, phraseContainsParam, wsParam, phraseContainsParam,
-	)
-	// For multi-word queries the all-terms predicate below logically includes
-	// a full-phrase match: a phrase containing every term necessarily satisfies
-	// every per-term condition. Keeping both predicates makes Postgres execute
-	// one additional correlated comment search across the workspace without
-	// changing the result set. Retain the phrase predicate only for the
-	// single-term path; phrase relevance is still preserved in ORDER BY.
-	if len(termContainsParams) <= 1 {
-		whereParts = append(whereParts, phraseMatch)
-	}
-
-	// Multi-word AND match (each term must appear somewhere). Same
-	// workspace_id-in-subquery contract as above.
-	if len(termContainsParams) > 1 {
-		var termConditions []string
-		for _, tp := range termContainsParams {
-			termConditions = append(termConditions, fmt.Sprintf(
-				"(LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s OR EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s))",
-				tp, tp, wsParam, tp,
-			))
+	// Select candidate issue IDs before ranking. This applies to both single- and
+	// multi-word searches: common free-text terms must not trigger a correlated
+	// comment scan for every issue in the workspace. INTERSECT preserves AND
+	// semantics for multi-word queries, while the single-term CTE is simply the
+	// union of title, description, and comment matches.
+	ctePrefix := ""
+	commentJoin := ""
+	// Materialize the latest matching comment once per issue.  The previous
+	// ranking and snippet expressions each ran a correlated scan over comment
+	// for every candidate issue, which made broad workspaces hit the statement
+	// timeout even after candidate narrowing.  Keep the workspace predicate in
+	// the CTE so the planner can use the workspace/content indexes.
+	if len(termContainsParams) > 0 {
+		commentMatch := fmt.Sprintf("LOWER(c.content) LIKE %s", phraseContainsParam)
+		allTerms := "false"
+		if len(termContainsParams) > 1 {
+			var parts []string
+			for _, tp := range termContainsParams {
+				parts = append(parts, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
+			}
+			allTerms = "(" + strings.Join(parts, " AND ") + ")"
+			commentMatch += " OR " + allTerms
 		}
-		whereParts = append(whereParts, "("+strings.Join(termConditions, " AND ")+")")
+		commentJoin = " LEFT JOIN matching_comments mc ON mc.issue_id = i.id"
+		ctePrefix = fmt.Sprintf(`WITH matching_comments AS MATERIALIZED (
+			SELECT DISTINCT ON (c.issue_id) c.issue_id, c.content, %s AS matches_all_terms
+			FROM comment c
+			WHERE c.workspace_id = %s AND (%s)
+			ORDER BY c.issue_id, c.created_at DESC
+		), matching_issue_ids AS MATERIALIZED (`, allTerms, wsParam, commentMatch)
+	}
+	if len(termContainsParams) > 0 {
+		var termCandidates []string
+		for _, tp := range termContainsParams {
+			termCandidates = append(termCandidates, fmt.Sprintf(`SELECT id FROM (
+				SELECT i.id FROM issue i
+				WHERE i.workspace_id = %s
+				  AND (LOWER(i.title) LIKE %s OR LOWER(COALESCE(i.description, '')) LIKE %s)
+				UNION
+				SELECT c.issue_id FROM comment c
+				WHERE c.workspace_id = %s AND LOWER(c.content) LIKE %s
+			) AS term_candidates`, wsParam, tp, tp, wsParam, tp))
+		}
+		if ctePrefix == "" {
+			ctePrefix = "WITH matching_issue_ids AS MATERIALIZED ("
+		}
+		ctePrefix += strings.Join(termCandidates, " INTERSECT ") + ") "
+		whereParts = append(whereParts, "i.id IN (SELECT id FROM matching_issue_ids)")
 	}
 
 	// Number match
@@ -555,15 +570,11 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 
 	// Tier 7: Comment contains phrase. Same workspace_id-in-subquery
 	// contract as the WHERE clause; see the phraseMatch comment above.
-	rankCases = append(rankCases, fmt.Sprintf("WHEN EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s) THEN 7", wsParam, phraseContainsParam))
+	rankCases = append(rankCases, "WHEN mc.issue_id IS NOT NULL THEN 7")
 
 	// Tier 8: Comment matches all words (multi-word only)
 	if len(termContainsParams) > 1 {
-		var commentTerms []string
-		for _, tp := range termContainsParams {
-			commentTerms = append(commentTerms, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
-		}
-		rankCases = append(rankCases, fmt.Sprintf("WHEN EXISTS (SELECT 1 FROM comment c WHERE c.issue_id = i.id AND c.workspace_id = %s AND (%s)) THEN 8", wsParam, strings.Join(commentTerms, " AND ")))
+		rankCases = append(rankCases, "WHEN mc.matches_all_terms THEN 8")
 	}
 
 	rankExpr := "CASE " + strings.Join(rankCases, " ") + " ELSE 9 END"
@@ -634,30 +645,12 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	// The c.workspace_id filter mirrors the WHERE clause: without it,
 	// the planner can pick a global comment scan that ignores workspace
 	// scoping.
-	commentSubquery := fmt.Sprintf(`COALESCE(
-		(SELECT c.content FROM comment c
-		 WHERE c.issue_id = i.id AND c.workspace_id = %s AND LOWER(c.content) LIKE %s
-		 ORDER BY c.created_at DESC LIMIT 1),
-		''
-	)`, wsParam, phraseContainsParam)
-
-	if len(termContainsParams) > 1 {
-		var commentTerms []string
-		for _, tp := range termContainsParams {
-			commentTerms = append(commentTerms, fmt.Sprintf("LOWER(c.content) LIKE %s", tp))
-		}
-		commentSubquery = fmt.Sprintf(`COALESCE(
-			(SELECT c.content FROM comment c
-			 WHERE c.issue_id = i.id AND c.workspace_id = %s AND (LOWER(c.content) LIKE %s OR (%s))
-			 ORDER BY c.created_at DESC LIMIT 1),
-			''
-		)`, wsParam, phraseContainsParam, strings.Join(commentTerms, " AND "))
-	}
+	commentSubquery := "COALESCE(mc.content, '')"
 
 	limitParam := nextArg(nil)  // placeholder
 	offsetParam := nextArg(nil) // placeholder
 
-	query := fmt.Sprintf(`SELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
+	query := fmt.Sprintf(`%sSELECT i.id, i.workspace_id, i.title, i.description, i.status, i.priority,
 		i.assignee_type, i.assignee_id, i.creator_type, i.creator_id,
 		i.parent_issue_id, i.acceptance_criteria, i.context_refs, i.position,
 		i.start_date, i.due_date, i.created_at, i.updated_at, i.number, i.project_id,
@@ -668,6 +661,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 	WHERE i.workspace_id = %s AND %s
 	ORDER BY %s, %s, %s, i.updated_at DESC
 	LIMIT %s OFFSET %s`,
+		ctePrefix,
 		matchSourceExpr,
 		commentSubquery,
 		wsParam,
@@ -678,6 +672,7 @@ func buildSearchQuery(contract *IssueStatusContract, phrase string, terms []stri
 		limitParam,
 		offsetParam,
 	)
+	query = strings.Replace(query, "FROM issue i\n\tWHERE", "FROM issue i"+commentJoin+"\n\tWHERE", 1)
 
 	return query, args
 }
@@ -768,7 +763,7 @@ func (h *Handler) SearchIssues(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("search issues timed out",
 				"workspace_id", workspaceID,
 				"query", q,
-				"timeout", searchStatementTimeout)
+				"timeout", effectiveSearchStatementTimeout())
 			writeError(w, http.StatusServiceUnavailable, "search timed out; please refine your query or try again")
 			return
 		}

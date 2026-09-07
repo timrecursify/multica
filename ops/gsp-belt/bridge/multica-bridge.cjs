@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const JWT_SECRET = process.env.JWT_SECRET;
 const MULTICA_DB = process.env.DATABASE_URL;
 const RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET;
+const ARCHIVER_AGENT_SECRET = process.env.ARCHIVER_AGENT_SECRET;
 const SSO_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID;
 
 // One canonical login (Cloudflare Access) serving several isolated client
@@ -27,11 +28,23 @@ function resolveSite(req) {
   return { host, ...site };
 }
 
+function validArchiveReceipt(issueId, receipt) {
+  if (typeof receipt !== 'string' || !ARCHIVER_AGENT_SECRET) return false;
+  const payload = `archiver:${issueId}:Done->Archived`;
+  const prefix = `${payload}:`;
+  if (!receipt.startsWith(prefix)) return false;
+  const supplied = receipt.slice(prefix.length);
+  if (!/^[a-f0-9]{64}$/i.test(supplied)) return false;
+  const expected = crypto.createHmac('sha256', ARCHIVER_AGENT_SECRET).update(payload).digest('hex');
+  return crypto.timingSafeEqual(Buffer.from(supplied, 'hex'), Buffer.from(expected, 'hex'));
+}
+
 for (const [name, value] of Object.entries({
   JWT_SECRET,
   DATABASE_URL: MULTICA_DB,
   RELAY_AGENT_SECRET,
-  MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID
+  ARCHIVER_AGENT_SECRET,
+  MULTICA_WORKSPACE_ID: SSO_WORKSPACE_ID,
 })) {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
 }
@@ -133,28 +146,56 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
   }));
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// A capped QC return must carry the task that paid for the failed build.  The
+// lookup is deliberately locked with the issue row, so a replay cannot create
+// a second Sol-low handoff for the same source task.
+async function retryEscalationSourceTask(client, issue, requestedTaskId = null) {
+  if (requestedTaskId != null && !UUID_RE.test(String(requestedTaskId))) return null;
+  const source = await client.query(
+    `SELECT t.id
+       FROM agent_task_queue t
+      WHERE t.issue_id = $1
+        AND ($2::uuid IS NULL OR t.id = $2::uuid)
+        AND (t.context->>'to_stage' = 'In Progress'
+          OR EXISTS (SELECT 1 FROM relay_run_log r
+                       WHERE r.task_id = t.id AND r.issue_id = t.issue_id
+                         AND r.to_stage = 'In Progress'))
+      ORDER BY t.created_at DESC, t.id DESC
+      LIMIT 1 FOR UPDATE OF t`,
+    [issue.id, requestedTaskId || null]
+  );
+  return source.rows.length === 1 ? source.rows[0].id : null;
+}
+
+function escalationDeadline() {
+  const minutes = Number.parseInt(process.env.RELAY_RETRY_ESCALATION_DEADLINE_MINUTES || "20", 10);
+  return new Date(Date.now() + (Number.isFinite(minutes) && minutes > 0 ? minutes : 20) * 60 * 1000).toISOString();
+}
+
 async function ssoBridge(req, res) {
   try {
     // Read CF Access authenticated user email from header
     const userEmail = req.headers["cf-access-authenticated-user-email"];
-    
+
     if (!userEmail) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Not authenticated via CF Access" }));
       return;
     }
-    
+
     const site = resolveSite(req);
 
     const client = new Client({ connectionString: MULTICA_DB });
     await client.connect();
-    
+
     // Get or create user
     let userResult = await client.query(
       "SELECT id FROM \"user\" WHERE email = $1",
       [userEmail]
     );
-    
+
     let userId;
     if (userResult.rows.length === 0) {
       // Create new user
@@ -163,7 +204,7 @@ async function ssoBridge(req, res) {
         [userEmail.split("@")[0], userEmail]
       );
       userId = createResult.rows[0].id;
-      
+
       // Add to workspace as admin
       await client.query(
         "INSERT INTO member (id, user_id, workspace_id, role, created_at) VALUES (gen_random_uuid(), $1, $2, $3, NOW())",
@@ -184,16 +225,16 @@ async function ssoBridge(req, res) {
         [userId, site.workspaceId]
       );
     }
-    
+
     await client.end();
-    
+
     // Create JWT token
     const token = jwt.sign(
       { sub: userId, email: userEmail, workspace_id: site.workspaceId },
       JWT_SECRET,
       { expiresIn: "7d" }
     );
-    
+
     // Generate CSRF token: nonce.signature where signature = HMAC-SHA256(nonce, authToken)
     // This matches the server's ValidateCSRF expectation: hex(nonce).hex(HMAC-SHA256(nonce, authToken))
     const nonce = crypto.randomBytes(16);
@@ -201,7 +242,7 @@ async function ssoBridge(req, res) {
     mac.update(nonce);
     const sig = mac.digest("hex");
     const csrfToken = nonce.toString("hex") + "." + sig;
-    
+
     // Set secure HttpOnly cookie for auth and CSRF cookie for POST requests
     res.writeHead(302, {
       "Location": `/${site.slug}/issues`,
@@ -221,10 +262,12 @@ async function ssoBridge(req, res) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token } = body;
-    
+    let { issue_id, to_stage, agent_token, relay_source_task_id } = body;
+
     // Validate agent token
-    if (agent_token !== RELAY_AGENT_SECRET) {
+    const archiverRequest = body.actor === 'archiver' && to_stage === 'Archived' &&
+      req.headers['x-relay-archiver-secret'] === ARCHIVER_AGENT_SECRET;
+    if (agent_token !== RELAY_AGENT_SECRET && !archiverRequest) {
       res.writeHead(401, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Unauthorized" }));
       return;
@@ -237,7 +280,7 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayStage(res, to_stage);
       return;
     }
-    
+
     client = new Client({ connectionString: MULTICA_DB });
     await client.connect();
     await client.query("BEGIN");
@@ -268,6 +311,13 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    if (archiverRequest && (issue.status !== 'Done' ||
+        !validArchiveReceipt(issue.id, body.evidence?.signedArchivePlanReceipt))) {
+      await client.query('ROLLBACK');
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_archiver_evidence' }));
+      return;
+    }
     if (issue.status === to_stage) {
       await client.query("COMMIT");
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -299,6 +349,10 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
     }
+    // Preserve the admission made against the locked source stage. Once the
+    // UPDATE commits, a fresh read would see the destination and could
+    // incorrectly report transition_denied for this successful request.
+    const admittedTransition = { fromStage: issue.status, toStage: to_stage };
 
     // A QC FAIL sends the ticket back to the builder, and nothing counted how
     // often. Each bounce is a fresh task at attempt 1, so max_attempts never
@@ -306,7 +360,8 @@ async function relayAdvance(req, res, body) {
     // and the review lane on every lap. GSP #151 ran 67 laps.
     // The ceiling is agent_task_queue.max_attempts (default 2) -- the belt's own
     // declared retry limit, applied to stage re-entry instead of to one task.
-    // Past it the ticket is a human's problem, not another paid rebuild.
+    // Past it the ticket changes hands to one controlled Sol-low Spec task.
+    let retryEscalation = null;
     if (issue.status === "In Review" && to_stage === "In Progress" &&
         altStages.includes("Human Review")) {
       const bounced = await client.query(
@@ -321,14 +376,28 @@ async function relayAdvance(req, res, body) {
       );
       const { n, ceiling } = bounced.rows[0];
       if (n >= ceiling) {
+        const sourceTaskId = await retryEscalationSourceTask(client, issue, relay_source_task_id);
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required", reason: "qc_bounce_ceiling" }));
+          return;
+        }
+        retryEscalation = {
+          reason: "qc_bounce_ceiling", trigger_stage: issue.status,
+          attempts: n, ceiling, source_task_id: sourceTaskId,
+          deadline: escalationDeadline()
+        };
+        to_stage = "Spec";
         console.warn(JSON.stringify({
           event: "qc_bounce_ceiling",
           issue_id,
           bounces: n,
           ceiling,
-          redirected_to: "Human Review"
+          redirected_to: "Spec",
+          source_task_id: sourceTaskId
         }));
-        to_stage = "Human Review";
+        admittedTransition.toStage = to_stage;
       }
     }
 
@@ -411,7 +480,32 @@ async function relayAdvance(req, res, body) {
       throw new Error(`Missing relay configuration for stage: ${to_stage}`);
     }
 
-    const stage = stageResult.rows[0];
+    let stage = stageResult.rows[0];
+    if (retryEscalation) {
+      const specOwner = await client.query(
+        `SELECT rsc.agent_id, rsc.agent_name, a.runtime_id, a.archived_at,
+                COALESCE(a.model, a.runtime_config->>'model') AS model,
+                COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') AS thinking_level,
+                COALESCE(a.runtime_id, (
+                  SELECT ar.id FROM agent_runtime ar
+                   WHERE ar.workspace_id = $1 AND ar.provider = 'codex' AND ar.status = 'online'
+                   ORDER BY ar.updated_at DESC LIMIT 1
+                )) AS selected_runtime_id
+           FROM relay_stage_config rsc
+           LEFT JOIN agent a ON a.id = rsc.agent_id
+          WHERE rsc.workspace_id = $1 AND rsc.stage_name = 'Spec'`,
+        [issue.workspace_id]
+      );
+      const owner = specOwner.rows[0];
+      if (!owner || !owner.agent_id || owner.archived_at ||
+          owner.model !== "gpt-5.6-sol" || owner.thinking_level !== "low" || !owner.selected_runtime_id) {
+        await client.query("ROLLBACK");
+        res.writeHead(503, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "sol_low_spec_owner_unavailable" }));
+        return;
+      }
+      stage = owner;
+    }
     if (stage.agent_id && stage.archived_at) {
       throw new Error(`Relay owner is archived: ${stage.agent_name} (${stage.agent_id}) for ${issue.status} -> ${to_stage}`);
     }
@@ -457,7 +551,14 @@ async function relayAdvance(req, res, body) {
         agent_name: stage.agent_name,
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
-        ...(bindingSpec ? { spec: bindingSpec } : {})
+        ...(bindingSpec ? { spec: bindingSpec } : {}),
+        ...(retryEscalation ? {
+          kind: "retry_escalation",
+          escalation_reason: retryEscalation.reason,
+          escalation_owner: stage.agent_name,
+          escalation_deadline: retryEscalation.deadline,
+          escalation_source_task_id: retryEscalation.source_task_id
+        } : {})
       });
       // A pending task will pick the issue up at its current stage, so a second
       // task is redundant; the stage transition must not be sacrificed to it.
@@ -477,7 +578,9 @@ async function relayAdvance(req, res, body) {
           issue.workspace_id,
           stage.selected_runtime_id,
           context,
-          `Relay stage transition: ${issue.status} -> ${to_stage}`
+          retryEscalation
+            ? `Sol-low re-spec escalation: ${retryEscalation.reason}`
+            : `Relay stage transition: ${issue.status} -> ${to_stage}`
         ]
       );
       if (taskResult.rows.length === 0) {
@@ -497,12 +600,22 @@ async function relayAdvance(req, res, body) {
       }
     }
 
+    if (retryEscalation) {
+      await client.query(
+        `UPDATE "issue" SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+          jsonb_build_object('retry_escalation', $2::jsonb), updated_at = NOW()
+         WHERE id = $1`,
+        [issue.id, JSON.stringify(retryEscalation)]
+      );
+    }
+
     await client.query("COMMIT");
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       success: true,
       issue: result.rows[0],
+      transition: admittedTransition,
       task_id: taskId,
       relay_log_id: relayLogId
     }));

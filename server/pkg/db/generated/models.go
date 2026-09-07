@@ -156,13 +156,14 @@ type AgentTaskQueue struct {
 	// The row id referenced by trigger_evidence_kind (a comment id, autopilot_run id, rule_version id, source task id, ...). No FK; resolvable per-kind in the app layer (MUL-4302 §2).
 	TriggerEvidenceRefID pgtype.UUID `json:"trigger_evidence_ref_id"`
 	// The one human accountable for this run, for audit / visibility / cost only — NEVER consulted for authorization (that is originator_user_id). Invariant: when originator_user_id IS NOT NULL, this equals it; the two diverge only when originator_user_id IS NULL (autopilot rule_owner / degraded owner_fallback name an accountable human while authorization carries none). No FK, no cascade (MUL-4302 §1/§7). NULL means no accountable human was resolved: a pre-migration row, OR a NEW row whose audit source is not-yet-resolved / unattributed (e.g. run_only autopilot until rule_owner lands) — NOT pre-migration only.
-	AccountableUserID         pgtype.UUID `json:"accountable_user_id"`
-	SessionRolloutMissing     bool        `json:"session_rollout_missing"`
-	RetiredSessionID          pgtype.Text `json:"retired_session_id"`
-	QuickActionsDisabled      bool        `json:"quick_actions_disabled"`
-	RegenerateQuickActionsFor pgtype.UUID `json:"regenerate_quick_actions_for"`
-	DaemonID                  pgtype.Text `json:"daemon_id"`
-	WorkspaceID               pgtype.UUID `json:"workspace_id"`
+	AccountableUserID         pgtype.UUID        `json:"accountable_user_id"`
+	SessionRolloutMissing     bool               `json:"session_rollout_missing"`
+	RetiredSessionID          pgtype.Text        `json:"retired_session_id"`
+	QuickActionsDisabled      bool               `json:"quick_actions_disabled"`
+	RegenerateQuickActionsFor pgtype.UUID        `json:"regenerate_quick_actions_for"`
+	DaemonID                  pgtype.Text        `json:"daemon_id"`
+	WorkspaceID               pgtype.UUID        `json:"workspace_id"`
+	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
 }
 
 type AgentToLabel struct {
@@ -662,6 +663,27 @@ type IssueDependency struct {
 	Type             string      `json:"type"`
 }
 
+type IssueFunnelStageDuration struct {
+	WorkspaceID        pgtype.UUID        `json:"workspace_id"`
+	IssueID            pgtype.UUID        `json:"issue_id"`
+	IssueNumber        int32              `json:"issue_number"`
+	Stage              string             `json:"stage"`
+	TransitionSequence int64              `json:"transition_sequence"`
+	EnteredAt          pgtype.Timestamptz `json:"entered_at"`
+	ExitedAt           interface{}        `json:"exited_at"`
+	DurationSeconds    int64              `json:"duration_seconds"`
+	IsOpen             interface{}        `json:"is_open"`
+}
+
+type IssueFunnelTransition struct {
+	ID          pgtype.UUID        `json:"id"`
+	Sequence    int64              `json:"sequence"`
+	WorkspaceID pgtype.UUID        `json:"workspace_id"`
+	IssueID     pgtype.UUID        `json:"issue_id"`
+	Stage       string             `json:"stage"`
+	OccurredAt  pgtype.Timestamptz `json:"occurred_at"`
+}
+
 type IssueLabel struct {
 	ID           pgtype.UUID        `json:"id"`
 	WorkspaceID  pgtype.UUID        `json:"workspace_id"`
@@ -925,6 +947,17 @@ type QuickAction struct {
 	CreatedByID   pgtype.UUID        `json:"created_by_id"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RelayRunLog struct {
+	ID        int64              `json:"id"`
+	IssueID   pgtype.UUID        `json:"issue_id"`
+	FromStage string             `json:"from_stage"`
+	ToStage   pgtype.Text        `json:"to_stage"`
+	AgentID   pgtype.UUID        `json:"agent_id"`
+	TaskID    pgtype.UUID        `json:"task_id"`
+	Status    string             `json:"status"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type RelayStageAgentPool struct {

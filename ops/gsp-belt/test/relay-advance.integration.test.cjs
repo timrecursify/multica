@@ -5,6 +5,7 @@ const Module = require("module");
 process.env.JWT_SECRET = "test-jwt-secret";
 process.env.DATABASE_URL = "postgres://test.invalid/multica";
 process.env.RELAY_AGENT_SECRET = "test-relay-secret";
+process.env.ARCHIVER_AGENT_SECRET = "test-archiver-secret";
 process.env.MULTICA_WORKSPACE_ID = "test-workspace";
 
 const issueId = "00000000-0000-4000-8000-000000000085";

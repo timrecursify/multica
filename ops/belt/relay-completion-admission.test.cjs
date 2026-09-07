@@ -35,6 +35,13 @@ test('holds explicit FAIL completion evidence', () => {
   }
 });
 
+test('classifies missing executable and ENOENT results as failures', () => {
+  for (const output of ['vitest: not found', 'command not found: pnpm', 'spawn pnpm ENOENT']) {
+    assert.deepEqual(completionAdmission({ output }),
+      { ok: false, reason: 'completion_failed', disposition: 'Spec', escalation: 'sol_low_respec' });
+  }
+});
+
 test('holds missing result and explicit no-work-product result', () => {
   assert.deepEqual(completionAdmission(null),
     { ok: false, reason: 'missing_result', disposition: 'Spec', escalation: 'sol_low_respec' });

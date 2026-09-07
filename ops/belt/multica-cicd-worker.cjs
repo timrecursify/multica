@@ -10,14 +10,16 @@ const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
 const { evaluate } = require('./transition-policy.cjs');
-const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/home/newadmin/gsp-multica-runtime/receipts';
+const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
+const { mintGithubToken, repoFromGhArgs } = require('./github-token.cjs');
+const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multica-runtime/receipts';
 let pool;
 let relayToken;
 let readReceipt = (sha) => JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/belt-${sha}.json`, 'utf8'));
 
 function initializeRuntime() {
   const { Pool } = require('pg');
-  const envPath = process.env.MULTICA_REMOTE_BRIDGE_ENV || '/home/newadmin/.secrets/multica-remote/remote-bridge.env';
+  const envPath = process.env.MULTICA_REMOTE_BRIDGE_ENV || '/var/lib/gsp/.secrets/multica-remote/remote-bridge.env';
   const env = fs.readFileSync(envPath, 'utf8');
   relayToken = env.split('\n').find(l => l.startsWith('RELAY_AGENT_SECRET=')).split('=')[1];
   pool = new Pool({ connectionString: env.split('\n').find(l => l.startsWith('DATABASE_URL=')).slice(13).trim() });
@@ -25,6 +27,8 @@ function initializeRuntime() {
 const POLL_MS = parseInt(process.env.CICD_POLL_MS || '120000', 10);
 const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
 const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
+const DEPLOY_CANCEL_RETRY_LIMIT = parseInt(process.env.CICD_DEPLOY_CANCEL_RETRY_LIMIT || '3', 10);
+const deployCancelRetries = new Map();
 // Retroactive CI (Tim 2026-09-02 16:16Z: admin merge + admin deploy with
 // retroactive CI/CD for speed; risk paths still wait). Repos listed here merge
 // a mergeable PR while its CI is still pending unless the diff touches a risk
@@ -44,16 +48,17 @@ function retroactiveEligible(repo, num) {
 // only for repositories this fleet owns.
 const MERGE_ENABLED = process.env.CICD_MERGE_ENABLED !== '0';
 const ciFailureCounts = new Map();
+let watchdog = createWatchdog({ file: process.env.CICD_WATCHDOG_STATE || `${RECEIPT_ROOT}/cicd-watchdog.json` });
 
-const log = (...a) => console.log(new Date().toISOString(), ...a);
+let log = (...a) => console.log(new Date().toISOString(), ...a);
 
 let gh = function github(args) {
+  if (ghBackoffUntil > Date.now()) { const e = new Error('GitHub API rate limit backoff'); e.rateLimited = true; throw e; }
   // GraphQL (gh pr view/merge) shares one per-user quota with every operator
   // session and was exhausted at 02:19Z on 2026-09-03; route both through REST.
   if (args[0] === 'pr' && args[1] === 'view' && args[3] === '-R') {
-    const raw = execFileSync('gh', ['api', `repos/${args[4]}/pulls/${args[2]}`],
-      { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 });
-    const pr = JSON.parse(raw);
+    const raw = execFileSync('gh', ['api', '-i', `repos/${args[4]}/pulls/${args[2]}`], ghOptions(args));
+    const pr = JSON.parse(rateLimitBody(raw));
     return JSON.stringify({
       state: pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase(),
       mergeable: pr.mergeable === true ? 'MERGEABLE' : pr.mergeable === false ? 'CONFLICTING' : 'UNKNOWN',
@@ -62,29 +67,70 @@ let gh = function github(args) {
     });
   }
   if (args[0] === 'pr' && args[1] === 'merge' && args[3] === '-R') {
-    return execFileSync('gh', ['api', '-X', 'PUT', `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'],
-      { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
+    try {
+      const raw = execFileSync('gh', ['api', '-i', '-X', 'PUT', `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'], ghOptions(args));
+      return rateLimitBody(raw).trim();
+    } catch (e) {
+      const text = `${e.stdout || ''}\n${e.stderr || ''}`;
+      if (/API rate limit exceeded/i.test(text) || /x-ratelimit-remaining:\s*0/i.test(text)) { ghBackoffUntil = rateLimitReset(text); e.rateLimited = true; }
+      throw e;
+    }
   }
-  return execFileSync('gh', args, { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6 }).trim();
+  try {
+    const command = args[0] === 'api' && !args.includes('-i') ? ['api', '-i', ...args.slice(1)] : args;
+    const raw = execFileSync('gh', command, ghOptions(args));
+    return args[0] === 'api' ? rateLimitBody(raw).trim() : raw.trim();
+  } catch (e) {
+    const text = `${e.stdout || ''}\n${e.stderr || ''}`;
+    if (/API rate limit exceeded/i.test(text) || /x-ratelimit-remaining:\s*0/i.test(text)) {
+      ghBackoffUntil = rateLimitReset(text); e.rateLimited = true;
+    }
+    throw e;
+  }
 };
+function ghOptions(args) { const token = mintGithubToken(repoFromGhArgs(args)); return { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6, ...(token ? { env: { ...process.env, GH_TOKEN: token } } : {}) }; }
+let ghBackoffUntil = 0;
+function rateLimitReset(raw) {
+  const m = raw.match(/x-ratelimit-reset:\s*(\d+)/i); return m ? Number(m[1]) * 1000 : Date.now() + 3600000;
+}
+function rateLimitBody(raw) {
+  const split = raw.split(/\r?\n\r?\n/); const headers = split.slice(0, -1).join('\n');
+  if (/x-ratelimit-remaining:\s*0/i.test(headers)) ghBackoffUntil = rateLimitReset(headers);
+  return split[split.length - 1];
+}
 
-let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence) {
+let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence, relaySourceTaskId) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ issue_id: issueId, to_stage: toStage, agent_token: relayToken,
       ...(currentWorkProductMd5 ? { current_work_product_md5: currentWorkProductMd5 } : {}),
       ...(reason ? { reason } : {}),
       ...(parkedAudit ? { parked_audit: parkedAudit } : {}),
-      ...(evidence ? { evidence } : {}) });
+      ...(evidence ? { evidence } : {}),
+      ...(relaySourceTaskId ? { relay_source_task_id: relaySourceTaskId } : {}) });
     const req = http.request('http://127.0.0.1:5005/relay/advance',
       { method: 'POST', headers: { 'Content-Type': 'application/json' }, timeout: 20000 }, res => {
         let d = ''; res.on('data', c => d += c);
-        res.on('end', () => res.statusCode >= 400 ? reject(new Error(`${res.statusCode} ${d.slice(0,140)}`)) : resolve(d));
+        res.on('end', () => {
+          if (res.statusCode >= 400) return reject(new Error(`${res.statusCode} ${d.slice(0,140)}`));
+          try { resolve(parseRelayResponse(d, toStage)); }
+          catch (error) { reject(error); }
+        });
       });
     req.on('error', reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('relay timeout')); });
     req.write(body); req.end();
   });
 };
+function parseRelayResponse(raw, toStage) {
+  let body;
+  try { body = JSON.parse(raw); } catch (_) {
+    throw new Error('relay malformed response');
+  }
+  if (body?.success !== true) {
+    throw new Error(`relay rejected ${toStage}: ${body?.error || 'unsuccessful response'}`);
+  }
+  return body;
+}
 
 async function latestVerdict(issueId) {
   const result = await pool.query(
@@ -109,14 +155,59 @@ async function humanReview(issue, reason) {
   log(`HUMAN REVIEW #${issue.number} — ${reason}`);
 }
 
+async function retryEscalation(issue, toStage, reason, evidence = {}) {
+  const retryEvidence = { retry_escalation: true, blocker: reason, ...evidence };
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: toStage, actor: 'system', evidence: retryEvidence });
+  if (!verdict.ok) throw new Error(`transition policy rejected ${toStage}: ${verdict.code}`);
+  await relay(issue.id, toStage, null, reason, null, retryEvidence, issue.cicd_task_id || issue.metadata?.cicd_task_id);
+}
+
+async function watchdogFailure(issue, error, sha = '') {
+  const row = watchdog.observe(issue.id, { sha, outcome: 'retrying', error });
+  // The sentinel is a wall-clock bound independent of poll count. Sparse or
+  // failed polls must still produce an auditable human-review hold on time.
+  if (watchdog.stalled(row)) {
+    const stalled = watchdog.markAlerted(row);
+    const detail = `deploy_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
+    const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
+    const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
+    if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
+    await relay(issue.id, 'Spec', null, detail, null, evidence);
+    log(`ESCALATE #${issue.number} — ${detail}`);
+    return { stalled: true, audit: stalled };
+  }
+  if (!watchdog.retryAllowed(row)) {
+    const detail = `deploy_retry_exhausted issue=${issue.id} stage=${row.stage} attempts=${row.attempts} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
+    log(`TERMINAL #${issue.number} retry limit exhausted before sentinel; escalating correlation_key=${row.correlation_key}`);
+    const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
+    const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
+    if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
+    await relay(issue.id, 'Spec', null, detail, null, evidence);
+    log(`ESCALATE #${issue.number} — ${detail}`);
+    return { stalled: true, audit: row };
+  }
+  log(`RETRY #${issue.number} attempt=${row.attempts}/${RETRY_LIMIT} backoff_ms=${watchdog.backoffMs(row)} correlation_key=${row.correlation_key}`);
+  return { stalled: false, audit: row };
+}
+
 function receiptEvidence(sha) {
   try {
     const receipt = readReceipt(sha);
     if (receipt?.source_sha === sha && receipt.health === 'ok' && typeof receipt.release === 'string') {
       return { receipt, mismatch: false };
     }
-    return { receipt: null, mismatch: true };
+    return { receipt, mismatch: true };
   } catch (_) { return { receipt: null, mismatch: false }; }
+}
+
+function receiptSummary(receipt) {
+  if (!receipt || typeof receipt !== 'object') return { present: false };
+  return {
+    present: true,
+    source_sha: typeof receipt.source_sha === 'string' ? receipt.source_sha : null,
+    release: typeof receipt.release === 'string' ? receipt.release : null,
+    health: typeof receipt.health === 'string' ? receipt.health : null
+  };
 }
 
 function deployWorkflowNames(repo, sha) {
@@ -137,21 +228,181 @@ function noWorkflowCi(repo, sha) {
 function successfulDeployRun(repo, sha, workflow) {
   try {
     const runs = JSON.parse(gh(['run', 'list', '--repo', repo, '--commit', sha, '--workflow', workflow,
-      '--status', 'success', '--json', 'databaseId,conclusion,name']));
-    const run = runs.find(candidate => candidate.conclusion === 'success');
+      '--status', 'success', '--json', 'databaseId,conclusion,name,event,path']));
+    const run = runs.find(candidate => candidate.conclusion === 'success'
+      && (candidate.event === undefined || candidate.event === 'workflow_dispatch'));
     return run ? { kind: 'github_deploy_run', sha, workflow, run } : null;
   } catch (_) { return null; }
 }
 
-function mergeDeployEvidence(repo, sha) {
+// GitHub creates a workflow run within seconds of a push, so a merge whose
+// deploy workflows produced no run at all matched none of their `on.push.paths`
+// filters: it deploys nothing and is already finished. That is the same
+// conclusion this function draws for a repository with no deploy workflows.
+// Demanding a successful deploy run regardless held 11 tickets in CI/CD & Deploy
+// indefinitely (2026-09-03; gsp#1149 merged timrecursify/ppp@0df2727ec36c, which
+// touched only docs/ and tests/, so none of ppp's 18 deploy-*.yml ever ran).
+// The grace window keeps a just-merged sha pending until GitHub has created its
+// runs, so a real deploy is never mistaken for an absent one.
+// Upstream: timrecursify/multica PR #422.
+const DEPLOY_TRIGGER_GRACE_MINUTES = parseInt(process.env.CICD_DEPLOY_TRIGGER_GRACE_MINUTES || '10', 10);
+
+function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
+  const ageMinutes = (now - Date.parse(mergedAt || '')) / 60000;
+  if (!Number.isFinite(ageMinutes) || ageMinutes < DEPLOY_TRIGGER_GRACE_MINUTES) return false;
+  try {
+    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]));
+    return !(runs.workflow_runs || []).some(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || '')
+      && (r.event === undefined || r.event === 'workflow_dispatch'));
+  } catch (_) { return false; }
+}
+
+// A deploy workflow run that has reached a terminal, non-success conclusion
+// never becomes successful on its own, so treating it as "still pending" pins
+// the ticket in CI/CD & Deploy forever with no escalation path. Measured
+// 2026-09-04: 23 of the 24 tickets held on `deploy run pending` had only
+// failed/cancelled deploy runs, the oldest stuck 23h. Report the terminal
+// failure so routeFinishedPR returns the ticket to build instead of holding
+// it silently. A run still queued/in_progress (conclusion null), or any
+// success, keeps the old pending behaviour.
+const TERMINAL_DEPLOY_CONCLUSIONS = new Set([
+  'failure', 'timed_out', 'startup_failure', 'stale', 'action_required',
+]);
+
+function laterSuccessfulDeploy(repo, cancelled, sourceSha) {
+  try {
+    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?status=success&per_page=100`]))
+      .workflow_runs || [];
+    const later = runs.filter(run => run.path === cancelled.path && run.conclusion === 'success'
+      && String(run.created_at || '') > String(cancelled.created_at || '')
+      && /^[0-9a-f]{40}$/i.test(run.head_sha || ''))
+      .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
+    for (const run of later) {
+      const comparison = JSON.parse(gh(['api', `repos/${repo}/compare/${sourceSha}...${run.head_sha}`]));
+      if (comparison.status === 'ahead' || comparison.status === 'identical') return run;
+    }
+  } catch (_) { /* REST errors conservatively leave the cancellation unresolved. */ }
+  return null;
+}
+
+function terminalDeployEvaluation(repo, sha) {
+  try {
+    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]))
+      .workflow_runs || [];
+    const deployRuns = runs.filter(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || '')
+      && (r.event === undefined || r.event === 'workflow_dispatch'));
+    if (!deployRuns.length) return null;
+    const attempted = [];
+    const failedGates = [];
+    for (const run of deployRuns) {
+      let jobs = null;
+      try {
+        if (run.id || run.database_id) {
+          const payload = JSON.parse(gh(['api', `repos/${repo}/actions/runs/${run.id || run.database_id}/jobs?per_page=100`]));
+          jobs = payload.jobs || [];
+        }
+      } catch (_) { jobs = null; }
+      if (Array.isArray(jobs) && jobs.length === 0) continue;
+      if (Array.isArray(jobs)) {
+        const deployJob = jobs.find(job => /^(?:deploy\b)|\/\s*deploy\b/i.test(job.name || job.id || ''));
+        const failed = jobs.filter(job => job !== deployJob && job.conclusion === 'failure');
+        if (deployJob?.conclusion === 'skipped' && failed.length) {
+          failedGates.push(...failed.map(job => job.name || job.id || 'unknown gate'));
+          continue;
+        }
+      }
+      attempted.push(run);
+    }
+    if (failedGates.length) {
+      return { failed: [...new Set(failedGates)].sort().map(name =>
+        `blocked_on=ci failing_gate=${name}`).join(', ') };
+    }
+    if (!attempted.length) return { noAttempt: true };
+    const superseded = attempted.filter(run => run.conclusion === 'cancelled'
+      && laterSuccessfulDeploy(repo, run, sha));
+    const unresolved = attempted.filter(run => !superseded.includes(run));
+    if (unresolved.some(run => run.conclusion !== 'cancelled' && !TERMINAL_DEPLOY_CONCLUSIONS.has(run.conclusion))) return null;
+    if (unresolved.length) {
+      const cancelled = unresolved.filter(run => run.conclusion === 'cancelled');
+      const failed = unresolved.filter(run => run.conclusion !== 'cancelled');
+      return {
+        ...(failed.length ? { failed: [...new Set(failed.map(r =>
+          `${(r.path || '').replace(/^.*\//, '')}=${r.conclusion}`))].sort().join(', ') } : {}),
+        ...(cancelled.length ? { cancelled: [...new Set(cancelled.map(r =>
+          `${(r.path || '').replace(/^.*\//, '')}=cancelled`))].sort().join(', ') } : {}),
+        ...(cancelled.length ? { cancelledRuns: cancelled } : {}),
+        superseded
+      };
+    }
+    return superseded.length ? { superseded } : null;
+  } catch (_) { return null; }
+}
+
+async function retriggerCancelledDeploys(issue, repo, sha, cancelledRuns) {
+  const workflows = [...new Set((cancelledRuns || []).map(run => run.path).filter(Boolean))];
+  let dispatched = 0;
+  for (const workflowPath of workflows) {
+    const workflow = workflowPath.replace(/^.*\//, '');
+    const key = `${issue.id}:${sha}:${workflow}`;
+    let attempts = deployCancelRetries.get(key);
+    if (attempts === undefined) {
+      try {
+        const row = (await pool?.query('SELECT metadata FROM issue WHERE id=$1', [issue.id]))?.rows?.[0];
+        attempts = Number(row?.metadata?.deploy_cancel_retries?.[key]) || 0;
+      } catch (_) { attempts = 0; }
+      deployCancelRetries.set(key, attempts);
+    }
+    if (attempts >= DEPLOY_CANCEL_RETRY_LIMIT) {
+      log(`DEPLOY-CANCEL-CAP #${issue.number} ${sha} workflow=${workflow} attempts=${attempts}`);
+      continue;
+    }
+    try {
+      const run = (cancelledRuns || []).find(candidate => candidate.path === workflowPath);
+      const runId = run?.id || run?.database_id;
+      if (!runId) throw new Error('cancelled deploy run has no id');
+      // Rerun the cancelled run itself. workflow_dispatch --ref accepts only a
+      // branch or tag, not the merge commit SHA, and would therefore fail.
+      gh(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
+      deployCancelRetries.set(key, attempts + 1);
+      dispatched += 1;
+      try { await pool?.query("update issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('deploy_cancel_retries', COALESCE(metadata->'deploy_cancel_retries', '{}'::jsonb) || jsonb_build_object($2, $3::int)) WHERE id=$1", [issue.id, key, attempts + 1]); } catch (_) { /* degraded/test DB */ }
+      log(`DEPLOY-RETRIGGER #${issue.number} ${sha} workflow=${workflow} attempt=${attempts + 1}/${DEPLOY_CANCEL_RETRY_LIMIT}`);
+    } catch (e) {
+      const nextAttempts = attempts + 1;
+      deployCancelRetries.set(key, nextAttempts);
+      try { await pool?.query("update issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('deploy_cancel_retries', COALESCE(metadata->'deploy_cancel_retries', '{}'::jsonb) || jsonb_build_object($2, $3::int)) WHERE id=$1", [issue.id, key, nextAttempts]); } catch (_) { /* degraded/test DB */ }
+      log(`DEPLOY-RETRIGGER-FAIL #${issue.number} ${sha} workflow=${workflow} ${String(e.message).split('\n')[0]}`);
+    }
+  }
+  return { dispatched, capped: workflows.filter(path => (deployCancelRetries.get(`${issue.id}:${sha}:${path.replace(/^.*\//, '')}`) || 0) >= DEPLOY_CANCEL_RETRY_LIMIT).length };
+}
+
+function terminalFailedDeployRuns(repo, sha) {
+  return terminalDeployEvaluation(repo, sha)?.failed || null;
+}
+
+function mergeDeployEvidence(repo, sha, mergedAt) {
   const receipt = receiptEvidence(sha);
-  if (receipt.mismatch) return { mismatch: true };
+  if (receipt.mismatch) return { mismatch: true, receipt: receipt.receipt };
   if (receipt.receipt) return { evidence: receipt.receipt };
   const workflows = deployWorkflowNames(repo, sha);
   if (!workflows.length) return { evidence: { kind: 'merge_is_deploy', sha } };
   for (const workflow of workflows) {
     const run = successfulDeployRun(repo, sha, workflow);
     if (run) return { evidence: run };
+  }
+  if (noDeployRunTriggered(repo, sha, mergedAt)) {
+    return { evidence: { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true } };
+  }
+  const terminal = terminalDeployEvaluation(repo, sha);
+  if (terminal?.noAttempt) {
+    return { evidence: { kind: 'github_deploy_run_no_attempt', sha } };
+  }
+  if (terminal?.failed) return { failed: terminal.failed };
+  if (terminal?.cancelled) return { cancelled: terminal.cancelled, cancelledRuns: terminal.cancelledRuns };
+  if (terminal?.superseded?.length) {
+    return { evidence: { kind: 'github_deploy_run_superseded', sha,
+      superseded: terminal.superseded.map(run => ({ workflow: run.path, run: run.id || run.database_id })) } };
   }
   return { pending: true };
 }
@@ -163,31 +414,75 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     ci = 'green';
     log(`CI N/A #${issue.number} ${pr.repo} has no workflows or check suites`);
   }
-  if (ci !== 'green') {
-    if (ci === 'absent' || ['red', 'mixed', 'unknown'].includes(ci)) {
+  // A merge may have been authorized retroactively while CI was still queued.
+  // Re-check that authorization here, then continue to the deploy-evidence
+  // gate; CI queue state alone must not strand an already deployed ticket.
+  const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && pr.num != null
+    ? retroactiveEligible(pr.repo, pr.num) : null;
+  // A merged PR with no checks or only cancelled checks is already terminal:
+  // retroactive eligibility authorizes a merge, but cannot veto one that
+  // happened. Keep the risk-path veto for pending, pre-merge authorization.
+  const terminalMergedCi = ci === 'no_checks' || ci === 'cancelled_only';
+  const retroactiveMerge = terminalMergedCi || Boolean(retro?.ok);
+  if (ci !== 'green' && !retroactiveMerge) {
+    if (ci === 'absent' || ['red', 'mixed'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
-    } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}`);
-    return;
+    } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}${retro?.why ? ` retro=${retro.why}` : ''}`);
+    return { status: 'returned' };
   }
   if (latest && latest.verdict !== 'PASS') {
     await returnIssueToBuild(issue, `${note}; latest QC PASS evidence is absent`);
-    return;
+    return { status: 'returned' };
   }
-  const deploy = mergeDeployEvidence(pr.repo, mergedSha);
+  const deploy = mergeDeployEvidence(pr.repo, mergedSha, pr.mergedAt);
   if (deploy.mismatch) {
-    await humanReview(issue, `${note}; release receipt exists but does not match ${mergedSha}`);
-    return;
+    const reason = `retry_escalation:release_receipt_mismatch issue=${issue.id} merged_sha=${mergedSha}`;
+    await retryEscalation(issue, 'Parked', reason, {
+      anomaly: 'release_receipt_mismatch', merged_sha: mergedSha,
+      receipt: receiptSummary(deploy.receipt)
+    });
+    return { status: 'returned' };
   }
-  if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return; }
+  if (deploy.failed) {
+    await returnIssueToBuild(issue, `${note}; deploy run failed for ${mergedSha} (${deploy.failed})`);
+    return { status: 'returned' };
+  }
+  if (deploy.cancelled) {
+    const retry = await retriggerCancelledDeploys(issue, pr.repo, mergedSha, deploy.cancelledRuns);
+    if (!retry.dispatched && retry.capped) {
+      await returnIssueToBuild(issue, `${note}; deploy cancelled retry cap reached for ${mergedSha} (${deploy.cancelled})`);
+      return { status: 'returned', sha: mergedSha };
+    }
+    log(`DEPLOY-CANCELLED #${issue.number} ${mergedSha} (${deploy.cancelled}); deploy was cancelled and is undeployed`);
+    return { status: 'pending', sha: mergedSha };
+  }
+  if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return { status: 'pending', sha: mergedSha }; }
   const noVerdict = !latest;
   const reviewedSha = noVerdict ? mergedSha : latest.bound_sha || mergedSha;
-  const evidence = { ciSuccess: true, mergeDeployReceipt: deploy.evidence, reviewedSha,
+  const evidence = { ciSuccess: retroactiveMerge ? 'retroactive' : true,
+    ...(retroactiveMerge ? { retroactiveMerge: true } : {}),
+    mergeDeployReceipt: deploy.evidence, reviewedSha,
     qualifyingPass: !noVerdict, ...(noVerdict ? { noVerdict: true } : {}) };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Done', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Done: ${verdict.code}`);
   await relay(issue.id, 'Done', latest?.work_product_md5 || null, null, null, evidence);
   log(noVerdict ? `NO-VERDICT #${issue.number} accepted merged+green sha=${mergedSha}` :
     `DONE #${issue.number} — ${note}`);
+  return { status: 'done', sha: mergedSha };
+}
+
+async function closureWatchdog(issue, result, sha) {
+  if (!result || result.status !== 'pending') return false;
+  const row = watchdog.observe(issue.id, { sha, outcome: 'closure_pending' });
+  if (!watchdog.stalled(row)) return false;
+  const alerted = watchdog.markAlerted(row, 'closure_stalled');
+  const elapsed = Date.now() - Date.parse(row.first_seen_at);
+  const reason = `retry_escalation:closure_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed} last_error=${row.last_error || 'deploy pending'} correlation_key=${row.correlation_key}`;
+  await retryEscalation(issue, 'Spec', reason, {
+    trigger_reason: 'closure_stalled', stage: row.stage, elapsed_ms: elapsed,
+    last_error: row.last_error || 'deploy pending', correlation_key: row.correlation_key
+  });
+  return Boolean(alerted);
 }
 
 async function escalateCi(issue, pr, ci) {
@@ -195,12 +490,60 @@ async function escalateCi(issue, pr, ci) {
 }
 
 async function returnIssueToBuild(issue, reason) {
+  const recorded = await recordReturn(issue, reason);
+  if (recorded.count >= 3) {
+    if (recorded.firstEscalation) {
+      const detail = `return_loop issue=${issue.id} reason=${normalizeReturnReason(reason)} count=${recorded.count}`;
+      const sourceSha = issue.source_sha || (String(reason).match(/[0-9a-f]{40}/i) || [])[0] || null;
+      const evidence = { retry_escalation: true, source_sha: sourceSha, blocker: detail };
+      const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Parked', actor: 'system', evidence });
+      if (!verdict.ok) throw new Error(`transition policy rejected Parked: ${verdict.code}`);
+      await relay(issue.id, 'Parked', null, detail, { trigger: 'cicd_return_loop', intendedStage: 'Queue', attempts: recorded.count, reason: detail, source_sha: sourceSha }, evidence);
+      log(`HOLD #${issue.number} return loop escalated reason=${normalizeReturnReason(reason)} count=${recorded.count}`);
+    } else log(`HOLD #${issue.number} return loop already escalated reason=${normalizeReturnReason(reason)} count=${recorded.count}`);
+    return { escalated: true };
+  }
   const evidence = { ciFailureOrAbsent: true, mergeConflictEvidence: reason };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'In Progress', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected In Progress: ${verdict.code}`);
   await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${reason}`, null, evidence);
   noteReturn(issue, reason);
   log(`RETURN #${issue.number} ${reason}`);
+}
+
+function normalizeReturnReason(reason) {
+  const text = String(reason || '').toLowerCase();
+  if (text.includes('cancelled_only')) return 'merged_ci_cancelled_only';
+  if (text.includes('deploy run failed')) return 'deploy_failure';
+  if (text.includes('merge conflict')) return 'merge_conflict';
+  if (text.includes('no ci runs')) return 'ci_absent';
+  if (text.includes('ci=')) return 'ci_failure';
+  return text.replace(/https?:\/\/\S+/g, 'pr').replace(/\d+/g, '#').slice(0, 120);
+}
+
+async function recordReturn(issue, reason) {
+  const key = normalizeReturnReason(reason);
+  try {
+    const result = await pool.query(
+      `update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['return_counts', $2],
+        to_jsonb((COALESCE(metadata->'return_counts'->>$2, '0')::int + 1)), true)
+       WHERE id=$1 RETURNING metadata`, [issue.id, key]);
+    const metadata = result.rows?.[0]?.metadata;
+    const count = Number(metadata?.return_counts?.[key]);
+    if (Number.isFinite(count) && count > 0) {
+      const firstEscalation = count >= 3 && !metadata?.return_escalations?.[key];
+      if (firstEscalation) await pool.query(
+        `update issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), ARRAY['return_escalations', $2], 'true'::jsonb, true) WHERE id=$1`, [issue.id, key]);
+      return { count, firstEscalation };
+    }
+  } catch (_) { /* tests and degraded DBs retain the in-process guard below */ }
+  issue.__returnCounts = issue.__returnCounts || {};
+  issue.__returnCounts[key] = (issue.__returnCounts[key] || 0) + 1;
+  const count = issue.__returnCounts[key];
+  issue.__returnEscalations = issue.__returnEscalations || {};
+  const firstEscalation = count >= 3 && !issue.__returnEscalations[key];
+  if (firstEscalation) issue.__returnEscalations[key] = true;
+  return { count, firstEscalation };
 }
 
 // The reconciled build task carries no return reason (context is only
@@ -279,7 +622,7 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
     runs.workflow_runs = (runs.workflow_runs || []).filter(r => !String(r.name || '').startsWith('.github/') && r.conclusion !== 'cancelled');
     const done = (runs.workflow_runs || []).filter(r => r.status === 'completed');
     // Only cancelled or invalid runs: CI was attempted, treat as not yet checked.
-    if (rawCount && !(runs.workflow_runs || []).length) return 'no_checks';
+    if (rawCount && !(runs.workflow_runs || []).length) return 'cancelled_only';
     if (!(runs.workflow_runs || []).length) {
       const ageMinutes = (now - Date.parse(createdAt || '')) / 60000;
       return Number.isFinite(ageMinutes) && ageMinutes >= CI_ABSENT_MINUTES ? 'absent' : 'no_checks';
@@ -289,17 +632,27 @@ function ciState(repo, sha, createdAt, now = Date.now()) {
     if (done.every(r => r.conclusion === 'success')) return 'green';
     if (done.some(r => r.conclusion === 'failure')) return 'red';
     return 'mixed';
-  } catch (e) { return 'unknown'; }
+  } catch (e) {
+    const errorClass = e?.name || e?.constructor?.name || 'Error';
+    const errorMessage = String(e?.message || e).split('\n')[0].slice(0, 160);
+    log(`CI-UNKNOWN ${repo}@${sha}: ${errorClass}: ${errorMessage}`);
+    return 'unknown';
+  }
 }
 
 
 async function sweep() {
+  const prCache = new Map();
   const { rows } = await pool.query(
     `SELECT id, number, title, workspace_id, metadata FROM issue WHERE status='CI/CD & Deploy' ORDER BY number`);
   if (!rows.length) { log('[poll] CI/CD & Deploy is empty'); return; }
   log(`[poll] ${rows.length} ticket(s) in CI/CD & Deploy`);
-  for (const issue of rows) {
+  for (let issueIndex = 0; issueIndex < rows.length; issueIndex++) {
+    const issue = rows[issueIndex];
+    const task = await pool.query(`SELECT id FROM agent_task_queue WHERE issue_id=$1::uuid AND context->>'to_stage'=$2::text ORDER BY created_at DESC LIMIT 1`, [issue.id, 'CI/CD & Deploy']);
+    issue.cicd_task_id = task.rows[0]?.id || null;
     try {
+      watchdog.observe(issue.id);
       // Read the thread, not just its last line. The pull request is announced by
       // whichever comment the builder wrote, and a later note pushes it out of a
       // one-row lookup. Reading one comment closed flights whose pull request was
@@ -324,14 +677,20 @@ async function sweep() {
       }
       if (!prs.length) {
         await returnIssueToBuild(issue, hasBarePR ? 'ambiguous PR reference, no repository' : 'no PR referenced');
+        watchdog.clear(issue.id);
         continue;
       }
 
       // Resolve every referenced PR first, then decide once.
       const states = [];
       for (const cand of prs) {
-        states.push({ pr: cand,
-          info: JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit'])) });
+        const key = `${cand.repo}#${cand.num}`;
+        let info = prCache.get(key);
+        if (!info) {
+          info = JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit']));
+          prCache.set(key, info);
+        }
+        states.push({ pr: cand, info });
       }
       // A closed, unmerged pull request is a dead end only when nothing
       // replaced it. gsp#1577 cited sk-cli#986 (closed) and its replacement
@@ -358,9 +717,12 @@ async function sweep() {
           continue;
         }
         const last = merged[0];
-        await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
-          repo: last.pr.repo, headSha: last.info.headRefOid, createdAt: last.info.createdAt
+        const result = await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
+          repo: last.pr.repo, num: last.pr.num, headSha: last.info.headRefOid, createdAt: last.info.createdAt,
+          mergedAt: last.info.mergedAt
         });
+        if (result?.status === 'pending') await closureWatchdog(issue, result, last.info.mergeCommit.oid);
+        else if (result?.status === 'done' || result?.status === 'returned') watchdog.clear(issue.id);
         continue;
       }
       if (openStates.length > 1) {
@@ -385,7 +747,7 @@ async function sweep() {
       const failures = countCiFailure(issue, pr, info.headRefOid, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
-        const retro = (ci === 'pending' || ci === 'no_checks') && info.mergeable !== 'CONFLICTING' ? retroactiveEligible(pr.repo, pr.num) : null;
+        const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && info.mergeable !== 'CONFLICTING' ? retroactiveEligible(pr.repo, pr.num) : null;
         if (!retro || !retro.ok) {
           const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
           log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}${retro ? ` retro=${retro.why}` : ''}`);
@@ -419,14 +781,30 @@ async function sweep() {
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
       }
     } catch (e) {
-      log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
+      if (e.rateLimited || ghBackoffUntil > Date.now()) {
+        log(`RATE-LIMIT sweep skipped=${rows.length - issueIndex} reset=${new Date(ghBackoffUntil).toISOString()}`);
+        return;
+      }
+      // GSP-1973 / upstream multica#465: watchdogFailure escalates via
+      // humanReview -> relay('Human Review'), which the relay refuses with
+      // 409 actor_denied because this worker holds RELAY_AGENT_SECRET while
+      // that transition is operator-only. Thrown from inside this catch, it
+      // escaped the loop and aborted the whole sweep, so every ticket ordered
+      // after the first escalating one was skipped.
+      let failure = { stalled: false };
+      try {
+        failure = await watchdogFailure(issue, e.message);
+      } catch (escalationError) {
+        log(`ESCALATE-FAIL #${issue.number}: ${String(escalationError.message).split('\n')[0].slice(0, 160)}`);
+      }
+      log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}${failure.stalled ? ' (Human Review)' : ''}`);
     }
   }
 }
 
 async function main() {
   initializeRuntime();
-  log(`[cicd-worker] started; poll=${POLL_MS}ms merge=${MERGE_ENABLED}`);
+  log(`[cicd-worker] started; poll=${POLL_MS}ms merge=${MERGE_ENABLED} sentinel_ms=${SENTINEL_MS} retry_limit=${RETRY_LIMIT}`);
   for (;;) {
     await sweep().catch(e => log('[sweep] error:', e.message));
     await new Promise(r => setTimeout(r, POLL_MS));
@@ -441,7 +819,11 @@ function setTestDependencies(dependencies) {
   if (dependencies.relay) relay = dependencies.relay;
   if (dependencies.gh) gh = dependencies.gh;
   if (dependencies.readReceipt) readReceipt = dependencies.readReceipt;
+  if (dependencies.log) log = dependencies.log;
+  if (dependencies.watchdog) watchdog = dependencies.watchdog;
 }
 
-module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview,
-  routeFinishedPR, receiptFor, mergeDeployEvidence, setTestDependencies, sweep };
+module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview, retryEscalation,
+  routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
+  terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, parseRelayResponse,
+  setTestDependencies, sweep, watchdogFailure, closureWatchdog };

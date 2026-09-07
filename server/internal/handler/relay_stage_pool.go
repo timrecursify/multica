@@ -144,6 +144,16 @@ func (h *Handler) ReplaceRelayStagePool(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusInternalServerError, "failed to save relay pool member")
 			return
 		}
+		// Pool membership grants workspace invocation access. Keep the legacy
+		// visibility field aligned with the permission model for older clients.
+		if _, err = tx.Exec(r.Context(), `UPDATE agent SET permission_mode='public_to', visibility='workspace' WHERE id=$1::uuid AND workspace_id=$2::uuid AND (permission_mode <> 'public_to' OR visibility <> 'workspace')`, id, workspaceID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to grant relay pool invocation access")
+			return
+		}
+		if _, err = tx.Exec(r.Context(), `INSERT INTO agent_invocation_target (agent_id,target_type,target_id,created_by) VALUES ($1::uuid,'workspace',$2::uuid,NULL) ON CONFLICT (agent_id,target_type,target_id) DO NOTHING`, id, workspaceID); err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to grant relay pool invocation target")
+			return
+		}
 	}
 	if err = tx.Commit(r.Context()); err != nil {
 		writeError(w, http.StatusInternalServerError, "failed to commit relay pool update")

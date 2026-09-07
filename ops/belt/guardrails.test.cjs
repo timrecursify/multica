@@ -2,12 +2,36 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 const fs = require('node:fs');
 const {
-  isBundledChild, instructionCompatibility, hasActiveTaskForIssueStage,
+  isBundledChild, instructionCompatibility, agentRegistryDefects, hasActiveTaskForIssueStage,
   crossStageExecutionAdmission,
   retryAdmission, spendPreflight, beltRoutingAdmission, budgetCountPredicate, stageCycleAdmission, lifetimeTaskAdmission,
   isExecutionStage, routableOwnerDefects, assertRoutableStageOwners,
   quotaCircuitAdmission, QUOTA_PAUSE_MAX_AGE_MS, quotaPauseClearance, quotaPauseFlipLogLine
+  , resolveBuilderRoute
 } = require('./guardrails.cjs');
+
+test('agent registry rejects duplicates, blanks, and pooled zero-stage members', () => {
+  const bad = [{ id: 'a', name: 'dup', instructions: 'RUNBOOK_SPEC_WORKER.md' },
+    { id: 'b', name: 'dup', instructions: 'RUNBOOK_SPEC_WORKER.md' },
+    { id: 'c', name: 'blank', instructions: '' }];
+  assert.deepEqual(agentRegistryDefects(bad, [{ agent_id: 'c', stage_name: 'Spec', enabled: true }]), [
+    'c:blank:Spec:zero_permitted_stages',
+    'c:blank:blank_instructions',
+    'dup:duplicate_name:a,b'
+  ]);
+  assert.deepEqual(agentRegistryDefects([{ id: 'ok', name: 'spec', instructions: 'RUNBOOK_SPEC_WORKER.md' }],
+    [{ agent_id: 'ok', stage_name: 'Spec', enabled: true }]), []);
+});
+
+test('builder route resolver rejects contradictory configuration and admits immutable route', () => {
+  const agent = { name: 'gsp-build-deepseek-low', model: 'deepseek/deepseek-v4-flash-0731',
+    runtime_config: { model: 'deepseek/deepseek-v4-flash-0731' } };
+  assert.deepEqual(resolveBuilderRoute(agent, { provider: 'openrouter' }).route,
+    { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash-0731', resolver_version: 'builder-route-v1' });
+  assert.equal(resolveBuilderRoute({ ...agent, runtime_config: { model: 'gpt-5.6-terra' } }, { provider: 'openrouter' }).reason,
+    'builder_route_mismatch');
+  assert.equal(resolveBuilderRoute({ name: 'gsp-build' }, {}).reason, 'builder_route_unavailable');
+});
 
 test('any bundled child is withheld, regardless of parent state', () => {
   assert.equal(isBundledChild({ parent_issue_id: 'p', title: 'child' }), true);
@@ -28,11 +52,18 @@ test('dispatch requires the target stage to be named by agent instructions', () 
 test('belt routing allows DeepSeek/Terra builders and QC-lane QC/spec only', () => {
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-deepseek', model: 'deepseek/v4', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-terra', model: 'gpt-5.6-terra', thinking_level: 'low' }).ok, true);
-  assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'low' }).reason, 'builder_requires_deepseek_or_terra');
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'low' }).ok, true);
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-terra', model: 'gpt-5.6-terra', thinking_level: 'low' }).ok, true);
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-opus', model: 'claude-opus-4-6', thinking_level: 'low' }).reason, 'builder_requires_build_lane');
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'medium' }).reason, 'belt_low_reasoning_effort_required');
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-luna', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
   assert.equal(beltRoutingAdmission({ name: 'ppp-spec', model: 'gpt-5.6-terra', thinking_level: 'low' }).reason, 'qc_spec_requires_qc_lane');
+  // Scoping runs on opus by doctrine; QC must not.
+  assert.equal(beltRoutingAdmission({ name: 'gsp-spec-sol-low-public', model: 'claude-opus-4-6', thinking_level: 'low' }).ok, true);
+  assert.equal(beltRoutingAdmission({ name: 'gsp-qc-sol-low-1', model: 'claude-opus-4-6', thinking_level: 'low' }).reason, 'qc_spec_requires_qc_lane');
+  assert.equal(beltRoutingAdmission({ name: 'gsp-spec-opus', model: 'claude-opus-4-6', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
   const configOnly = beltRoutingAdmission({ id: 'agent-1', name: 'gsp-build', model: 'gpt-5.6-luna', thinking_level: '', runtime_config: { model: 'gpt-5.6-terra', reasoning_effort: 'low' } });
   assert.equal(configOnly.reason, 'belt_low_reasoning_effort_required');
   assert.deepEqual({ agent_name: configOnly.agent_name, agent_id: configOnly.agent_id, model: configOnly.model, effort: configOnly.effort }, { agent_name: 'gsp-build', agent_id: 'agent-1', model: 'gpt-5.6-luna', effort: '' });
@@ -128,13 +159,26 @@ test('quota pauses self-clear after fifteen minutes without an exhausted workspa
     'quota_paused flip agent="DeepSeek Builder" timestamp=2026-09-01T12:00:00.000Z value=true');
 });
 
-test('stage cycle breaker rejects repeated task creation at its exact ceiling', () => {
+test('stage cycle breaker escalates rather than ending the ticket at its ceiling', () => {
   assert.deepEqual(stageCycleAdmission(0), { ok: true, ceiling: 2 });
   assert.deepEqual(stageCycleAdmission(1), { ok: true, ceiling: 2 });
+  // Spec, not Rejected: the ceiling stops another paid run at this stage, it
+  // does not terminate the work. A terminal disposition here killed 11 live
+  // tickets whose cycles accrued while the belt itself was broken.
   assert.deepEqual(stageCycleAdmission(2), {
     ok: false, reason: 'stage_cycle_limit', ceiling: 2,
-    disposition: 'Rejected'
+    disposition: 'Spec'
   });
+});
+
+test('the cycle ceiling never disposes a ticket to a terminal stage', () => {
+  const terminal = new Set(['Rejected', 'Cancelled']);
+  for (const count of [2, 3, 9]) {
+    const admission = stageCycleAdmission(count);
+    assert.equal(admission.ok, false);
+    assert.ok(!terminal.has(admission.disposition),
+      `cycle ceiling disposed to terminal stage ${admission.disposition}`);
+  }
 });
 
 test('budget predicate counts a completed In Review task with a post-completion verdict', () => {
@@ -159,10 +203,23 @@ test('bridge and daemon use the same budget predicate', () => {
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
   assert.deepEqual(lifetimeTaskAdmission(5), { ok: true, ceiling: 6 });
+  // Spec, not Rejected: the ceiling stops another paid run on this ticket, it
+  // does not terminate the work. Same defect class as the stage-cycle ceiling,
+  // which stopped disposing to a terminal stage in #580.
   assert.deepEqual(lifetimeTaskAdmission(6), {
     ok: false, reason: 'lifetime_task_limit', ceiling: 6,
-    disposition: 'Rejected'
+    disposition: 'Spec'
   });
+});
+
+test('the lifetime ceiling never disposes a ticket to a terminal stage', () => {
+  const terminal = new Set(['Rejected', 'Cancelled']);
+  for (const count of [6, 7, 20]) {
+    const admission = lifetimeTaskAdmission(count);
+    assert.equal(admission.ok, false);
+    assert.ok(!terminal.has(admission.disposition),
+      `lifetime ceiling disposed to terminal stage ${admission.disposition}`);
+  }
 });
 
 test('human and disposition stages never execute tasks', () => {

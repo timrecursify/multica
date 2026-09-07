@@ -1027,6 +1027,8 @@ func (h *Handler) DaemonHeartbeat(w http.ResponseWriter, r *http.Request) {
 	probeImportTimedOut = m.ProbeImportTimedOut
 	if err != nil {
 		outcome = "error_update"
+		h.Metrics.RecordOrchestratorHeartbeatWriteFailure()
+		slog.Error("orchestrator heartbeat processing failed", "runtime_id", runtimeID, "error", err)
 		writeError(w, http.StatusInternalServerError, "heartbeat failed")
 		return
 	}
@@ -1088,6 +1090,10 @@ func (h *Handler) HandleDaemonWSHeartbeat(ctx context.Context, identity daemonws
 		return nil, fmt.Errorf("runtime not in connection workspace")
 	}
 	ack, _, err := h.processHeartbeat(ctx, rt, supportsBatchImport)
+	if err != nil {
+		h.Metrics.RecordOrchestratorHeartbeatWriteFailure()
+		slog.Error("orchestrator heartbeat processing failed", "runtime_id", runtimeID, "error", err)
+	}
 	return ack, err
 }
 
@@ -1300,6 +1306,9 @@ func (h *Handler) processHeartbeat(ctx context.Context, rt db.AgentRuntime, supp
 		}
 	}
 
+	// Advance the process-level liveness gauge only after the heartbeat has
+	// completed successfully and an acknowledgement can be returned.
+	h.Metrics.RecordOrchestratorHeartbeat()
 	return ack, m, nil
 }
 

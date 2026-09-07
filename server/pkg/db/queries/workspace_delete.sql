@@ -203,6 +203,13 @@ deleted_issue_vcs_links AS (
     WHERE issue_id IN (SELECT id FROM ws_issues)
        OR pull_request_id IN (SELECT id FROM ws_vcs_prs)
 ),
+deleted_relay_run_log AS (
+    DELETE FROM relay_run_log
+    WHERE issue_id IN (SELECT id FROM ws_issues)
+),
+deleted_workspace_relay_configs AS (
+    DELETE FROM relay_stage_config WHERE workspace_id = $1
+),
 deleted_agent_invocation_targets AS (
     DELETE FROM agent_invocation_target
     WHERE agent_id IN (SELECT id FROM ws_agents)
@@ -349,6 +356,9 @@ deleted_issue_views AS (
 deleted_issue_view_preferences AS (
     DELETE FROM issue_view_preference
     WHERE issue_view_preference.workspace_id = $1
+),
+deleted_issue_funnel_transitions AS (
+    DELETE FROM issue_funnel_transition WHERE workspace_id = $1
 )
 DELETE FROM quick_action WHERE quick_action.workspace_id = $1;
 

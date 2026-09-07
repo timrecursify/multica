@@ -55,9 +55,27 @@ migration-provenance table lets you verify the import is the running bridge.
 | `GSP_BELT_SECRETS_DIR` | `/home/newadmin/.secrets` | daemon/fleet wrappers source `deepseek.env`, `openrouter.env` |
 | `GSP_BELT_SECRETS_ENV_FILE` | `/home/newadmin/.secrets/multica-remote/remote-bridge.env` | cicd worker |
 | `GSP_BELT_PG_MODULE` | `/home/newadmin/node_modules/pg` | cicd worker `pg` module path |
+| `GSP_BELT_CODEX_BIN` | `/home/newadmin/tools/codex-openrouter` | fleet daemon codex executable |
+| `CICD_RATE_LIMIT_BASE_MS` | `30000` | cicd worker initial rate-limit backoff |
+| `CICD_RATE_LIMIT_MAX_MS` | `900000` | cicd worker maximum rate-limit cooldown |
+| `GITHUB_APP_ID` | (required unless token is supplied) | GitHub App id used to mint the belt installation token |
+| `GITHUB_APP_INSTALLATION_ID` | (required unless token is supplied) | GitHub App installation id |
+| `GITHUB_APP_PRIVATE_KEY` / `GITHUB_APP_PRIVATE_KEY_FILE` | (secret) | App signing key, supplied only by the runtime secret manager |
+| `GITHUB_APP_INSTALLATION_TOKEN` | (optional) | Pre-minted installation token for runtimes that mint outside the worker |
+| `GITHUB_RATE_LIMIT_STATE_FILE` | `/tmp/multica-github-rate-limit.json` | Shared cross-process cooldown state |
+| `CICD_ATTEMPT_TIMEOUT_MS` | `2700000` | watchdog threshold for stale CI/CD attempts (45 minutes) |
 | `GSP_BELT_CODEX_BIN` | `/home/newadmin/tools/codex-native` | daemon wrapper codex binary |
 | `MULTICA_DAEMON_DIR` | `/home/newadmin/multica-daemon` | daemon/fleet server binary + workdir |
 | `GSP_WORKSPACES_ROOT` | `/home/newadmin/multica-workspaces-gsp` | daemon `--workspaces-root` |
+
+For the service-user install, set these variables from the systemd
+`EnvironmentFile` (for example `/etc/gsp/multica/workers.env`) to values such as
+`GSP_BELT_SECRETS_DIR=/etc/gsp/multica`,
+`GSP_BELT_SECRETS_ENV_FILE=/etc/gsp/multica/remote-bridge.env`,
+`GSP_BELT_PG_MODULE=/opt/gsp/multica-workers/node_modules/pg`,
+`MULTICA_DAEMON_DIR=/opt/gsp/multica-workers`, and
+`GSP_WORKSPACES_ROOT=/opt/gsp/multica-workspaces`. Leaving them unset retains
+the noc2 defaults above.
 
 ## Review
 
@@ -114,9 +132,45 @@ bash <release-dir>/ops/gsp-belt/scripts/belt-status.sh --release <release-dir>
 It exits non-zero if an app is offline or resolves outside that immutable
 release.
 
+To compare restart counters after a cutover (the bridge form remains supported):
+
+```bash
+bash <release-dir>/ops/gsp-belt/scripts/belt-status.sh --release <release-dir> \
+  --baseline-relay-unstable-restarts <count>
+```
+
+If the relay counter increases, inspect the emitted PM2 error-log path and exit
+code/signal, correct the operator environment or deployment, then rerun status.
+
+The worker restart-burst finding tracks the PM2 `unstable_restarts` counter
+between status runs. By default it reports unhealthy when more than 3 restarts
+are observed within 300 seconds. Configure with
+`--worker-restart-burst-threshold`, `--worker-restart-burst-window-seconds`,
+and `--worker-restart-burst-state` (or the corresponding
+`GSP_WORKER_RESTART_BURST_*` environment variables). A missing or malformed
+worker counter is a diagnostic failure; inspect the emitted `pm2_error_log`
+path and remediate the worker before rerunning the check.
+
 ## Dispatch controls
 
 `RECONCILE_MAX_CREATE_PER_CYCLE` limits tasks created per cycle; set it to `0` to halt task creation. `RECONCILE_DISPATCH_HOLD=1` is the supported way to stop dispatch, holding the reconcile cycle before any database access.
+
+## Fleet health watchdog
+
+`/health` includes `last_tick_completed_at`, `tick_count`, and
+`last_tick_outcome` alongside the existing heartbeat fields. `scripts/fleet-health.sh`
+uses independent defaults of 90 seconds for `MULTICA_HEARTBEAT_MAX_AGE_SECONDS`
+and 120 seconds for `MULTICA_TICK_MAX_AGE_SECONDS`. `--repair` restarts PM2 only
+when a selected predicate fails and verifies recovery. Exit 0 is healthy, exit 1
+identifies unavailable/stale/wedged conditions, and exit 2 means invalid arguments.
+Missing or malformed telemetry is unhealthy.
+
+The daemon and watchdog share the effective port through `MULTICA_DAEMON_PORT`
+and `MULTICA_HEALTH_PORT`; when neither is set the GSP fleet default is `20464`.
+Setting both is supported only when they agree, so a stale `20463` probe fails
+with an actionable mismatch before any restart is attempted. Verify a live
+deployment with `bash <release-dir>/ops/gsp-belt/scripts/fleet-health.sh`; use
+`--repair` only after correcting configuration, then rerun the probe.
 
 ## Tests
 
@@ -124,6 +178,7 @@ release.
 bash ops/gsp-belt/test/deploy-tool.test.sh   # dry-run, preflight, missing-input, rollback
 bash ops/gsp-belt/test/guard-check.test.sh   # secret + unmanaged-script guards
 bash ops/gsp-belt/test/relay-advance.integration.test.cjs  # unchanged relay coverage
+bash ops/gsp-belt/test/relay-launcher-status.test.cjs      # launcher + restart baseline coverage
 ```
 
 From a clean checkout the acceptance criterion is that these pass without any
