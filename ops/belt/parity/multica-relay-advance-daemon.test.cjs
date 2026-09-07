@@ -1640,3 +1640,26 @@ test('a transient relay denial keeps its three-strike allowance', async () => {
     logger: { log() {} }, typedOutcomes: true });
   assert.equal(calls.some(({ sql }) => sql.includes("SET blocked_on = 'human'")), false);
 });
+
+test('risk-path PR already In Review advances to the configured next stage, not itself', async () => {
+  const pr = { state: 'OPEN', files: [{ path: 'server/auth/session.go' }],
+    headRefOid: 'f'.repeat(40), mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ conclusion: 'SUCCESS' }] };
+  const route = await buildCompletionRoute(linkedPrClient(pr), {
+    issue_id: 'issue-1', to_stage: 'In Review', next_stage: 'CI/CD & Deploy'
+  }, { githubCommand: () => JSON.stringify(pr) });
+  assert.equal(route.kind, 'risk_reviewed');
+  assert.equal(route.toStage, 'CI/CD & Deploy');
+  assert.notEqual(route.toStage, 'In Review');
+});
+
+test('risk-path PR completing In Progress still enters In Review once', async () => {
+  const pr = { state: 'OPEN', files: [{ path: 'server/auth/session.go' }],
+    headRefOid: 'f'.repeat(40), mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ conclusion: 'SUCCESS' }] };
+  const route = await buildCompletionRoute(linkedPrClient(pr), {
+    issue_id: 'issue-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: () => JSON.stringify(pr) });
+  assert.equal(route.kind, 'risk');
+  assert.equal(route.toStage, 'In Review');
+});
