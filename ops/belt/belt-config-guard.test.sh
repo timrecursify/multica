@@ -52,6 +52,7 @@ if ! env MULTICA_OPERATOR_RELEASE_FILE="$release_fixture/release" MULTICA_SUPERV
   echo 'worker release gate behavior unexpected'; exit 1
 fi
 rm -rf "$release_fixture"
+
 for expected in "${RELAY_CAP_EXPECTATIONS[@]}"; do
   IFS='|' read -r app expected_stage expected_lifetime <<<"$expected"
   if ! relay_caps_match "$expected_stage" "$expected_lifetime" "$expected_stage" "$expected_lifetime"; then
