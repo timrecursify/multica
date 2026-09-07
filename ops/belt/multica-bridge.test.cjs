@@ -74,8 +74,18 @@ const {
   operatorRespec,
   relayDiagnosisRerun,
   isTerminalStage,
-  isNoDispatchArrivalStage
+  isNoDispatchArrivalStage,
+  normalizeRelayStage
 } = require('./multica-bridge.cjs');
+
+test('PPP relay aliases normalize to configured canonical stages', () => {
+  const ppp = 'da3c5c5c-a123-4567-b999-c3ed1820da00';
+  assert.equal(normalizeRelayStage(ppp, 'backlog'), 'Queue');
+  assert.equal(normalizeRelayStage(ppp, 'in_progress'), 'In Progress');
+  assert.equal(normalizeRelayStage(ppp, 'in_review'), 'In Review');
+  assert.equal(normalizeRelayStage(ppp, 'cancelled'), 'Cancelled');
+  assert.equal(normalizeRelayStage('f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f', 'backlog'), 'backlog');
+});
 
 test('relay error response does not write headers after a response has ended', () => {
   const writes = [];
