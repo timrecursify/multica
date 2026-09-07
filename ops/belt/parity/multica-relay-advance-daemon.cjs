@@ -355,7 +355,9 @@ function greenChecks(checks) {
 }
 
 async function buildCompletionRoute(client, row, { githubCommand = github } = {}) {
-  if (row.to_stage !== 'In Progress' || row.next_stage !== 'In Review') return null;
+  const buildHandoff = row.to_stage === 'In Progress' && row.next_stage === 'In Review';
+  const qcHandoff = row.to_stage === 'In Review' && row.next_stage === 'CI/CD & Deploy';
+  if (!buildHandoff && !qcHandoff) return null;
   const linked = await client.query(
     `SELECT p.html_url, p.repo_owner, p.repo_name
        FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
@@ -387,9 +389,8 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   }
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
       greenChecks(pr.statusCheckRollup)) {
-    githubCommand(['pr', 'merge', prUrl, '--squash', '--admin']);
-    return { ...route, toStage: 'Done', kind: 'merge_only_admin_merged', repo,
-      pr_url: prUrl, pr_state: 'MERGED', boundSha: pr.headRefOid };
+    return { ...route, toStage: qcHandoff ? 'CI/CD & Deploy' : 'In Review',
+      kind: 'merge_only_ready', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
   }
   return { ...route, repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
 }
@@ -1167,7 +1168,10 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
 
         const route = await buildCompletionRoute(client, row);
         if (route && !route.toStage) {
-          logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=${route.reason}`);
+          const escalation = await requestRetryEscalation(row, route.reason);
+          logger.log(`${LOG_PREFIX} [route] RESPEC: issue=${row.issue_id}, ` +
+            `stage='${row.to_stage}', reason=${route.reason}, relay=${escalation.status}`);
+          if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
           continue;
         }
         const targetStage = route?.toStage || row.next_stage;
