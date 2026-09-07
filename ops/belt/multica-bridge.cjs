@@ -830,7 +830,7 @@ async function retireParkedWork(client, issue, reason) {
       RETURNING id`, [issue.id, reason]);
   const relays = await client.query(
     `UPDATE relay_run_log
-        SET status = 'noop',
+        SET status = 'rejected',
             parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
               jsonb_build_object('parked_retired', true, 'parked_retired_reason', $2::text)
       WHERE issue_id = $1 AND status = 'pending'
