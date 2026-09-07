@@ -27,13 +27,13 @@ health() {
   snapshot="$($pm2_bin jlist)" || { echo 'health: pm2 jlist failed' >&2; return 1; }
   RELEASE="$release" INCLUDE_WORKER="$include_worker" SKIP_CICD="$skip_cicd_worker" PM2_SNAPSHOT="$snapshot" node -e '
     const apps=JSON.parse(process.env.PM2_SNAPSHOT), release=process.env.RELEASE;
-    const required=["gsp-multica-bridge","multica-relay-advance","multica-archiver"];
-    if(process.env.INCLUDE_WORKER==="1") required.push("gsp-multica-worker");
-    if(process.env.SKIP_CICD!=="1") required.push("multica-cicd-worker");
-    const expected=`${release}/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh`, byName=new Map(apps.map(a=>[a.name,a])); let ok=true;
-    for(const name of required){const app=byName.get(name),e=app?.pm2_env||{}, pathOk=name!=="multica-relay-advance"||e.pm_exec_path===expected;
-      if(!app||e.status!=="online"||e.pm_cwd!==release||!pathOk){console.error(`health: app=${name} status=${e.status||"missing"} pid=${app?.pid??"unknown"} exit_code=${e.exit_code??"unknown"} exit_signal=${e.exit_signal||"unknown"} restarts=${e.unstable_restarts??"unknown"} error_log=${e.pm_err_log_path||"unknown"} expected_script=${name==="multica-relay-advance"?expected:"release cwd"}`);ok=false;}}
-    process.exit(ok?0:1);'
+    const required=["gsp-multica-worker","multica-relay-advance","multica-cicd-worker","multica-archiver"];
+    const expected={"gsp-multica-worker":`${release}/ops/belt/multica-daemon-wrapper.sh`,"multica-relay-advance":`${release}/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh`,"multica-cicd-worker":`${release}/ops/belt/multica-cicd-worker.cjs`,"multica-archiver":`${release}/ops/belt/multica-archiver.cjs`};
+    const byName=new Map(apps.map(a=>[a.name,a])), diagnostics=[];
+    for(const name of required){const app=byName.get(name),e=app?.pm2_env||{};
+      if(!app||e.status!=="online"||e.pm_cwd!==release||e.pm_exec_path!==expected[name]) diagnostics.push(`health: app=${name} status=${e.status||"missing"} pid=${app?.pid??"unknown"} exit_code=${e.exit_code??"unknown"} exit_signal=${e.exit_signal||"unknown"} restarts=${e.unstable_restarts??"unknown"} error_log=${e.pm_err_log_path||"unknown"} expected_script=${expected[name]} observed_script=${e.pm_exec_path||"missing"}`);}
+    if(diagnostics.length){ console.error(diagnostics.join("\n")); process.exit(1); }
+    process.exit(0);'
 }
 require_graph() { local tree="$1" src dep rel; for src in "${manifest[@]}"; do [[ "$src" == *.cjs ]] || continue; while IFS= read -r dep; do [[ "$dep" == ./* || "$dep" == ../* ]] || continue; rel="$(realpath -m --relative-to="$tree" "$tree/$(dirname "$src")/$dep")"; [[ -f "$tree/$rel" ]] || rel+='.cjs'; [[ -f "$tree/$rel" ]] || { echo "Missing manifest runtime dependency: $src requires $rel" >&2; return 65; }; done < <(grep -oE "require\\([[:space:]]*[\"'][^\"']+[\"'][[:space:]]*\\)" "$tree/$src" | sed -E "s/^require\\([[:space:]]*[\"']([^\"']+)[\"'][[:space:]]*\\)$/\\1/"); done; }
 manifest_checksum() { local tree="$1"; (cd "$tree" && sha256sum "${manifest[@]}" | sha256sum | awk '{print $1}'); }
@@ -42,6 +42,7 @@ if [[ "$mode" == --rollback ]]; then
   [[ -f "$ecosystem" ]] || { echo "release missing: $release" >&2; exit 66; }
   MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env
   health || { echo 'rollback health failed' >&2; exit 67; }
+  "$pm2_bin" save || { echo 'rollback pm2 save failed' >&2; exit 67; }
   exit 0
 fi
 preflight "$checkout"
@@ -61,5 +62,6 @@ if ! MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_ci
   fi
   echo 'apply health failed; prior release reload attempted' >&2; exit 67
 fi
+"$pm2_bin" save || { echo 'apply pm2 save failed' >&2; exit 67; }
 printf '{"source_sha":"%s","release":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"],"health":"ok"}\n' "$requested_sha" "$release" "$manifest_sha256" > "$receipt_root/belt-$requested_sha.json"
 echo "$receipt_root/belt-$requested_sha.json"
