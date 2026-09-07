@@ -400,6 +400,17 @@ func gitCloneBare(url, dest string) error {
 // would keep basing new worktrees on the original default branch forever
 // after the remote flipped.
 func gitFetch(barePath string) error {
+	// A shallow bare cache cannot safely serve isolated clones: `git clone
+	// --local` may ignore the local optimization and transfer only stale
+	// heads, leaving commits referenced by the cache unavailable to the
+	// checkout. Refuse the fetch explicitly so callers can repair the cache
+	// (for example with `git fetch --unshallow`) instead of failing later with
+	// the opaque "reference is not a tree" error.
+	if _, err := os.Stat(filepath.Join(barePath, "shallow")); err == nil {
+		return fmt.Errorf("shallow repository cache: %s", barePath)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("check shallow repository state: %w", err)
+	}
 	if err := ensureRemoteTrackingLayout(barePath); err != nil {
 		return fmt.Errorf("ensure refspec: %w", err)
 	}
@@ -835,14 +846,14 @@ func createIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef
 			return "", err
 		}
 	}
+	if err := syncIsolatedCheckoutRefs(barePath, checkoutPath, baseRef); err != nil {
+		return "", err
+	}
 
 	if out, err := runGitCombinedOutput("-C", checkoutPath, "checkout", "--detach", baseCommit); err != nil {
 		return "", fmt.Errorf("git checkout --detach: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	if err := deleteAllLocalBranches(checkoutPath); err != nil {
-		return "", err
-	}
-	if err := syncIsolatedCheckoutRefs(barePath, checkoutPath, baseRef); err != nil {
 		return "", err
 	}
 	if out, err := runGitCombinedOutput("-C", checkoutPath, "config", isolatedCheckoutConfigKey, isolatedCheckoutConfigValue); err != nil {
