@@ -28,3 +28,13 @@ grep -q 'restart_burst app=gsp-multica-worker count=2' "$fixture/out"
 grep -q 'status=healthy pm2_error_log=/var/log/gsp-multica-worker.err' "$fixture/out"
 grep -q 'status: all five apps resolve to release commit' "$fixture/out"
 printf '%s\n' 'belt status reporting regression passed'
+
+# Missing worker restart diagnostics must fail closed and identify the PM2 log.
+sed -i "s/'restart_time': 1,/'restart_time': ('' if os.environ.get('STATUS_DIAGNOSTIC_FAILURE') else 1),/" "$fixture/bin/pm2"
+if STATUS_RELEASE="$release" STATUS_DIAGNOSTIC_FAILURE=1 PATH="$fixture/bin:$PATH" bash "$root_dir/belt-status.sh" --release "$release" --worker-restart-burst-state "$fixture/diag.json" >"$fixture/diag.out" 2>"$fixture/diag.err"; then
+  echo 'diagnostic failure unexpectedly passed' >&2
+  exit 1
+fi
+grep -q 'status=diagnostic_failure' "$fixture/diag.err"
+grep -q 'pm2_error_log=/var/log/gsp-multica-worker.err' "$fixture/diag.err"
+printf '%s\n' 'belt status diagnostic fail-closed regression passed'
