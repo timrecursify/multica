@@ -313,10 +313,15 @@ jobs:
         run: node --test ops/belt/backfill-parked-diagnosis.test.cjs
 
       - name: Verify bridge integration uses the service database
-        run: test "$DATABASE_URL" != "postgres://test"
+        run: |
+          test -n "$DATABASE_URL"
+          test "$DATABASE_URL" != "postgres://test"
 
       - name: Test Multica bridge integration
         run: node --test ops/belt/multica-bridge.test.cjs
+
+      - name: Test belt status reporting contract
+        run: bash ops/gsp-belt/scripts/belt-status.test.sh
 
   unattended-lifecycle:
     # Release acceptance binds the production manifest, relay policy, CI/CD
