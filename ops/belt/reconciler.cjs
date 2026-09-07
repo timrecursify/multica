@@ -163,7 +163,8 @@ const HUMAN_REVIEW_FROM = new Set(["Spec", "Queue", "In Progress", "In Review", 
 const LINK_TABLE = { ci: "issue_pull_request", sha: "issue_pull_request", dependency: "issue_dependency" };
 
 // A recorded BLOCKED outcome is terminal when no machine-observable input remains
-// that could ever change the stage input hash and re-open the stage:
+// that could ever change the stage input hash and re-open the stage. FAILED/human
+// is also terminal because only a person can resolve it:
 //   human      - definitionally a person's call, never a hash event.
 //   ci / sha   - need a linked PR to supply a head sha or a checks rollup.
 //   dependency - needs a linked issue_dependency row to supply a state.
@@ -269,7 +270,7 @@ async function mergedPullRequestNoop(client, issue, options = {}) {
 }
 
 async function terminalBlocker(client, issue, prior, options = {}) {
-  if (!prior || prior.outcome !== "BLOCKED") return null;
+  if (!prior || (prior.outcome !== "BLOCKED" && !(prior.outcome === "FAILED" && prior.blocked_on === "human"))) return null;
   const why = prior.blocked_on;
   if (why === "human") return "blocked_human";
   const table = LINK_TABLE[why];
