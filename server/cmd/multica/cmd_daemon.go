@@ -1717,8 +1717,8 @@ func printAggregateDiskUsage(w io.Writer, agg daemon.AggregateDiskUsageReport, b
 		formatBytes(agg.TotalSizeBytes), agg.TotalTaskCount, len(agg.Roots),
 		formatBytes(agg.TotalArtifactSizeBytes), agg.TotalArtifactRatio*100)
 	if agg.TotalRepoCacheCount > 0 || agg.TotalRepoCacheSizeBytes > 0 {
-		fmt.Fprintf(w, "Repo cache (.repos): %s across %d repo(s) in all roots, not included above.\n",
-			formatBytes(agg.TotalRepoCacheSizeBytes), agg.TotalRepoCacheCount)
+		fmt.Fprintf(w, "Repo cache (%s): %s across %d repo(s) in all roots, not included above.\n",
+			aggregateRepoCacheLabel(agg), formatBytes(agg.TotalRepoCacheSizeBytes), agg.TotalRepoCacheCount)
 	}
 }
 
@@ -1762,6 +1762,41 @@ func printDiskUsageTaskTable(w io.Writer, report daemon.DiskUsageReport) {
 	printRepoCacheLine(w, report)
 }
 
+// repoCacheLabel names the directory the cache numbers were measured from.
+// MULTICA_REPO_MIRRORS_ROOT can move the mirrors off the workspaces root, and
+// a hardcoded ".repos" then points at a directory that no longer holds them.
+func repoCacheLabel(report daemon.DiskUsageReport) string {
+	if report.RepoCacheRoot == "" {
+		return ".repos"
+	}
+	return report.RepoCacheRoot
+}
+
+// aggregateRepoCacheLabel names the mirror root behind the combined total, or
+// reports the count when profiles disagree about where their mirrors live.
+func aggregateRepoCacheLabel(agg daemon.AggregateDiskUsageReport) string {
+	seen := map[string]bool{}
+	first := ""
+	for _, r := range agg.Roots {
+		root := r.Report.RepoCacheRoot
+		if root == "" || seen[root] {
+			continue
+		}
+		seen[root] = true
+		if first == "" {
+			first = root
+		}
+	}
+	switch len(seen) {
+	case 0:
+		return ".repos"
+	case 1:
+		return first
+	default:
+		return fmt.Sprintf("%d mirror roots", len(seen))
+	}
+}
+
 // printRepoCacheLine reports the bare-repo cache on its own line. Every task
 // directory in a workspace checks out from this shared cache, so folding it
 // into the task totals would attribute it to directories that do not contain
@@ -1771,8 +1806,8 @@ func printRepoCacheLine(w io.Writer, report daemon.DiskUsageReport) {
 	if report.RepoCacheCount == 0 && report.RepoCacheSizeBytes == 0 {
 		return
 	}
-	fmt.Fprintf(w, "Repo cache (.repos): %s across %d repo(s), not included above. Evicted once a repo is unused for MULTICA_GC_REPO_TTL and no longer attached to a workspace.\n",
-		formatBytes(report.RepoCacheSizeBytes), report.RepoCacheCount)
+	fmt.Fprintf(w, "Repo cache (%s): %s across %d repo(s), not included above. Evicted once a repo is unused for MULTICA_GC_REPO_TTL and no longer attached to a workspace.\n",
+		repoCacheLabel(report), formatBytes(report.RepoCacheSizeBytes), report.RepoCacheCount)
 }
 
 func printDiskUsageWorkspaceTable(w io.Writer, report daemon.DiskUsageReport) {

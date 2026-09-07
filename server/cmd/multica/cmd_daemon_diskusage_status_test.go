@@ -317,13 +317,14 @@ func TestRunDaemonDiskUsageAllProfilesUsesPerProfileToken(t *testing.T) {
 func TestPrintRepoCacheLineAppearsInEveryView(t *testing.T) {
 	t.Parallel()
 
-	const wantLine = "Repo cache (.repos): 4.0 KiB across 2 repo(s)"
+	const wantLine = "Repo cache (/mirrors): 4.0 KiB across 2 repo(s)"
 	report := daemon.DiskUsageReport{
 		WorkspacesRoot:     "/root",
 		Tasks:              []daemon.TaskDiskUsage{{WorkspaceShort: "ws0", TaskShort: "t0", SizeBytes: 100}},
 		Workspaces:         []daemon.WorkspaceDiskUsage{{WorkspaceShort: "ws0", TaskCount: 1, SizeBytes: 100}},
 		RepoCacheSizeBytes: 4096,
 		RepoCacheCount:     2,
+		RepoCacheRoot:      "/mirrors",
 	}
 
 	cases := []struct {

@@ -152,8 +152,16 @@ func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesR
 		"TEMP":                 tempDir,
 		// Dependency caches are daemon-owned and shared across task sandboxes.
 		// node_modules remain task-local; only the pnpm content-addressed store is shared.
+		//
+		// The store location must be published as npm_config_store_dir. pnpm
+		// reads store-dir through its npm-config layer, so PNPM_STORE_DIR is
+		// not consulted by pnpm 9 or 10 and the setting was silently inert:
+		// tasks fell back to $HOME/.local/share/pnpm/store instead. Both forms
+		// are set, and to the same path, so any pnpm that honours either one
+		// lands in the daemon-owned store rather than a per-user fallback.
 		"MULTICA_CODE_REVIEW_GRAPH_VENV": filepath.Join(sharedCache, "code-review-graph", "2.3.8"),
 		"PNPM_HOME":                       filepath.Join(sharedCache, "pnpm"),
+		"npm_config_store_dir":            filepath.Join(sharedCache, "pnpm", "store"),
 		"PNPM_STORE_DIR":                  filepath.Join(sharedCache, "pnpm", "store"),
 		"npm_config_cache":                filepath.Join(sharedCache, "npm"),
 	}
