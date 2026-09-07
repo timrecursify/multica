@@ -418,11 +418,28 @@ func processUsesPath(root string) bool {
 }
 
 func gitWorktreeIsClean(workDir string) bool {
-	status, err := runGitGCCommand(workDir, "status", "--porcelain")
+	if isGitWorktree(workDir) {
+		return gitCheckoutIsPublished(workDir)
+	}
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && isGitWorktree(filepath.Join(workDir, entry.Name())) &&
+			!gitCheckoutIsPublished(filepath.Join(workDir, entry.Name())) {
+			return false
+		}
+	}
+	return true
+}
+
+func gitCheckoutIsPublished(checkout string) bool {
+	status, err := runGitGCCommand(checkout, "status", "--porcelain")
 	if err != nil || status != "" {
 		return false
 	}
-	_, err = verifyGitPublication(workDir)
+	_, err = verifyGitPublication(checkout)
 	return err == nil
 }
 

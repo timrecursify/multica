@@ -1,6 +1,10 @@
 package daemon
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestTaskWorkdirReclaimable(t *testing.T) {
 	workDir := "/workspaces/ws/12345678/workdir"
@@ -23,5 +27,15 @@ func TestTaskWorkdirReclaimable(t *testing.T) {
 				t.Fatalf("taskWorkdirReclaimable() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestGitWorktreeIsCleanAllowsManagedRootWithoutCheckout(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("managed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !gitWorktreeIsClean(root) {
+		t.Fatal("managed workdir without a checkout should be reclaimable")
 	}
 }
