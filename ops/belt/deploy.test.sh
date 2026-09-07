@@ -240,6 +240,7 @@ grep -q 'Wrapper preflight: source/runtime parity mismatch (wrapper not selected
 
 # A restart command that exits zero can still leave the service failed. The
 # deploy must reject that state and include journal evidence.
+cp -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
 printf '\nstale-runtime\n' >> "$tmp_dir/multica-archiver/multica-archiver.cjs"
 : > "$fake_state/multica-archiver.fail"
 if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-archiver > "$tmp_dir/restart-fail.log" 2>&1; then
