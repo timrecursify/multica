@@ -517,35 +517,13 @@ function operatorRescopeIssueId(explicitIssueId, reason) {
   return match?.[1] || null;
 }
 
-async function issueImplementationArtifact(client, issueId) {
-  const canonical = await client.query(
-    `SELECT false AS has_qc_verdict, false AS has_builder_artifact, false AS has_review_artifact
-       FROM qc_verdict WHERE issue_id = $1`, [issueId]);
-  if (canonical.rows.length) {
-    const row = canonical.rows[0];
-    return Boolean(row.has_qc_verdict || row.has_builder_artifact || row.has_comment_artifact);
-  }
-  // Canonical evidence is recorded by qc_verdict; prose tables are deliberately ignored.
+async function issueImplementationArtifact(client, issue) {
+  const issueId = typeof issue === "object" ? issue.id : issue;
+  // Only the canonical verdict table can establish immutable implementation
+  // evidence. Task results and comments are untrusted prose.
   const result = await client.query(
-    `SELECT
-       EXISTS (SELECT 1 FROM qc_verdict WHERE issue_id = $1) AS has_qc_verdict,
-       EXISTS (
-         SELECT 1 FROM agent_task_queue
-          WHERE issue_id = $1 AND status = 'completed'
-            AND context->>'to_stage' = 'Queue'
-            AND (
-              NULLIF(BTRIM(COALESCE(result->>'work_product', '')), '') IS NOT NULL
-              OR result::text ~* 'https?://github\\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/pull/[0-9]+'
-              OR result::text ~* '"(implementation_sha|bound_sha|observed_sha)"[^0-9a-f]{0,32}[0-9a-f]{40}'
-            )
-       ) AS has_builder_artifact,
-       EXISTS (
-         SELECT 1 FROM comment
-          WHERE issue_id = $1 AND (
-            content ~* 'https?://github\\.com/[[:alnum:]_.-]+/[[:alnum:]_.-]+/pull/[0-9]+'
-            OR content ~* '(^|[\r\n])[[:space:]*-]*(implementation[_ ]sha|bound[_ ]sha|observed[_ ]sha)[[:space:]]*[:=][[:space:]]*[0-9a-f]{40}'
-          )
-       ) AS has_comment_artifact`, [issueId]);
+    `SELECT true AS has_qc_verdict
+       FROM qc_verdict WHERE issue_id = $1 LIMIT 1`, [issueId]);
   const row = result.rows[0] || {};
   return Boolean(row.has_qc_verdict || row.has_builder_artifact || row.has_comment_artifact);
 }
@@ -556,7 +534,8 @@ function relayRedirect(requestedStage, status, cause) {
     reason: cause?.reason === 'lifetime_task_limit' ? 'retry_escalation' : 'relay_stage_policy' };
 }
 function passVerdictRescopeForbidden(redirect, verdict) {
-  return Boolean(redirect?.reason === 'retry_escalation' && verdict === 'PASS');
+  const value = typeof verdict === "object" ? verdict?.verdict : verdict;
+  return Boolean(redirect?.reason === 'retry_escalation' && value === 'PASS');
 }
 // Admission invariants: !noArtifactRescope && !allowedStages.includes(to_stage)
 // Cap bypass requires !cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope
@@ -841,6 +820,9 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
   return changed.rowCount > 0;
 }
 
+// The spec agent's output is recognised by its required headings, not by author:
+// re-running the spec lane under a different agent must keep working.
+
 // Compatibility helper used by operator cap admission: only the current PASS
 // work-product hash authorizes a release (case-insensitive comparison).
 async function hasCurrentPassWorkProduct(client, issueId, workProductMd5) {
@@ -875,8 +857,6 @@ async function retireParkedWork(client, issue, reason) {
     relay_count: relays.rowCount, relay_ids: relays.rows.map(r => r.id) };
 }
 
-// The spec agent's output is recognised by its required headings, not by author:
-// re-running the spec lane under a different agent must keep working.
 async function latestSpecComment(client, issueId) {
   const r = await client.query(
     `SELECT content
@@ -1577,7 +1557,8 @@ async function relayAdvance(req, res, body) {
   let client;
   try {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
-      operator_rescope_issue_id, operator_terminal_exit, operator_release } = body;
+      operator_rescope_issue_id, operator_terminal_exit, operator_release,
+      operator_cap_release } = body;
     
     // The archiver is a narrowly-scoped service authority. It authenticates
     // with its dedicated header and a signed receipt; it must not inherit the
@@ -1823,7 +1804,15 @@ async function relayAdvance(req, res, body) {
       !OPERATOR_SECRET_DISABLED &&
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
-    const operatorCapBypass = explicitTerminalExit || explicitOperatorRelease;
+    const explicitOperatorCapReleaseRequested = issue.status === "In Review" &&
+      to_stage === "CI/CD & Deploy" && operator_cap_release === true &&
+      typeof reason === "string" && reason.trim() !== "";
+    const explicitOperatorCapRelease = explicitOperatorCapReleaseRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const operatorCapBypass = explicitTerminalExit || explicitOperatorRelease ||
+      explicitOperatorCapRelease;
 
     // Check the durable gate before the same-stage/idempotency fast path. A
     // replay of a Done request must not turn a newly recorded QC FAIL into a
@@ -1869,7 +1858,25 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
-    if (isTerminalStage(issue.status) && !configuredTerminalExit && !explicitTerminalExit) {
+    if (explicitOperatorCapReleaseRequested && !explicitOperatorCapRelease) {
+      await client.query("ROLLBACK");
+      res.writeHead(403, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "operator_cap_release_secret_required" }));
+      return;
+    }
+    if (explicitOperatorCapRelease &&
+        !await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5)) {
+      await client.query("ROLLBACK");
+      res.writeHead(409, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "operator_cap_release_pass_required" }));
+      return;
+    }
+    const rejectedPassTerminalExit = issue.status === "Rejected" &&
+      to_stage === "In Review" && explicitTerminalExit &&
+      await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
+    if (isTerminalStage(issue.status) && !configuredTerminalExit &&
+        !rejectedPassTerminalExit &&
+        !explicitTerminalExit) {
       await client.query("ROLLBACK");
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1994,6 +2001,14 @@ async function relayAdvance(req, res, body) {
         }));
       }
     }
+    if (!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&
+        !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) &&
+        !evidenceTransition && !rejectedPassTerminalExit && !explicitTerminalExit &&
+        !dispositionStages.has(to_stage)) {
+      await client.query("ROLLBACK");
+      rejectInvalidRelayTransition(res, issue.status, to_stage);
+      return;
+    }
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
@@ -2070,27 +2085,11 @@ async function relayAdvance(req, res, body) {
             client, issue, body.relay_source_task_id
           );
           if (!sourceTaskId) {
-            // A capped QC return must be terminally bounded even when the
-            // original task has already been consumed. Requiring a source task
-            // here caused the daemon to retry the same 409 forever.
-            retryEscalation = null;
-            to_stage = "Human Review";
-            parkedAudit = {
-              ...(parkedAudit || {}),
-              reason: "qc_bounce_ceiling",
-              bounce_count: n,
-              ceiling,
-              disposition: "Human Review",
-              issue_id: issue.id
-            };
-            console.warn(JSON.stringify({
-              event: "qc_bounce_ceiling",
-              issue_id,
-              bounces: n,
-              ceiling,
-              redirected_to: "Human Review",
-              source_task_id: null
-            }));
+            await client.query("ROLLBACK");
+            res.writeHead(409, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+              reason: "qc_bounce_ceiling" }));
+            return;
           } else {
             retryEscalation = {
               reason: "qc_bounce_ceiling", trigger_stage: issue.status,
@@ -2330,46 +2329,28 @@ async function relayAdvance(req, res, body) {
       const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
         client, issue, to_stage, reason, parkedEvidenceQcRelease
       );
-      if (!cycle.ok && !operatorCapBypass && retryEscalationLoop(issue, issue.status)) {
-        escalationLoop = true;
-        parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
-          attempts: 2, taskCount: 2 };
-        to_stage = "Parked";
-      }
-      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !escalationLoop &&
+      const passVerdictProtected = issue.status === "In Review" &&
+        (await latestQcVerdict(client, issue.id))?.verdict === "PASS";
+      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
           !noArtifactRescope && !retryEscalation) {
-        const sourceTaskId = await retryEscalationSourceTask(
-          client, issue, body.relay_source_task_id
-        );
-        if (!sourceTaskId) {
+        if (passVerdictProtected) {
           await client.query("ROLLBACK");
           res.writeHead(409, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
-            reason: cycle.reason }));
+          res.end(JSON.stringify({ error: "operator_cap_release_required",
+            message: "a PASS-verdict ticket requires an authenticated operator cap release" }));
           return;
         }
-        retryEscalation = {
-          reason: cycle.reason, trigger_stage: issue.status,
-          attempts: history.rows[0]?.n || 0, ceiling: cycle.ceiling,
-          source_task_id: sourceTaskId, deadline: escalationDeadline(),
-          target_stage: cycle.disposition
-        };
-        to_stage = cycle.disposition;
-        stage = await selectRetryEscalationOwner(client, issue);
-        retryEscalation.owner = stage.agent_name;
-        retryEscalation.model = stage.model;
-        retryEscalation.effort = stage.thinking_level;
-        console.warn(JSON.stringify({
-          event: "relay_retry_escalated",
-          reason: cycle.reason,
-          issue_id: issue.id,
-          target_stage: to_stage,
-          historical_tasks: history.rows[0]?.n || 0,
-          ceiling: cycle.ceiling,
-          disposition: cycle.disposition,
-          escalation_owner: stage.agent_name,
-          deadline: retryEscalation.deadline
-        }));
+        const taskCount = history.rows[0]?.n || 0;
+        const applied = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
+          ceiling: cycle.ceiling, task_count: taskCount, target_stage: to_stage,
+          trigger_stage: issue.status
+        });
+        await client.query("COMMIT");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: cycle.disposition },
+          disposition: cycle.disposition, disposition_applied: applied, reason: cycle.reason,
+          ceiling: cycle.ceiling, task_count: taskCount }));
+        return;
       }
       const lifetimeHistory = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
@@ -2381,46 +2362,26 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !operatorCapBypass && retryEscalationLoop(issue, issue.status)) {
-        escalationLoop = true;
-        parkedAudit = { trigger: "escalation_loop", reason: "escalation_loop", intendedStage: "Spec",
-          attempts: 2, taskCount: 2 };
-        to_stage = "Parked";
-      }
-      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope && !escalationLoop && !retryEscalation) {
-        const sourceTaskId = await retryEscalationSourceTask(
-          client, issue, body.relay_source_task_id
-        );
-        if (!sourceTaskId) {
+      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope &&
+          !retryEscalation) {
+        if (passVerdictProtected) {
           await client.query("ROLLBACK");
           res.writeHead(409, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
-            reason: lifetime.reason }));
+          res.end(JSON.stringify({ error: "operator_cap_release_required",
+            message: "a PASS-verdict ticket requires an authenticated operator cap release" }));
           return;
         }
-        retryEscalation = {
-          reason: lifetime.reason, trigger_stage: issue.status,
-          attempts: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling,
-          source_task_id: sourceTaskId, deadline: escalationDeadline()
-        };
-        // Lifetime ceiling is an auditable terminal rejection, not a re-spec escalation.
-        // passVerdictProtected requires operator_cap_release_required before applyDisposition.
-        to_stage = lifetime.disposition;
-        stage = await selectRetryEscalationOwner(client, issue);
-        retryEscalation.owner = stage.agent_name;
-        retryEscalation.model = stage.model;
-        retryEscalation.effort = stage.thinking_level;
-        console.warn(JSON.stringify({
-          event: "relay_retry_escalated",
-          reason: lifetime.reason,
-          issue_id: issue.id,
-          target_stage: to_stage,
-          historical_tasks: lifetimeHistory.rows[0]?.n || 0,
-          ceiling: lifetime.ceiling,
-          disposition: lifetime.disposition,
-          escalation_owner: stage.agent_name,
-          deadline: retryEscalation.deadline
-        }));
+        const taskCount = lifetimeHistory.rows[0]?.n || 0;
+        const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
+          ceiling: lifetime.ceiling, task_count: taskCount, target_stage: to_stage,
+          trigger_stage: issue.status
+        });
+        await client.query("COMMIT");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: lifetime.disposition },
+          disposition: lifetime.disposition, disposition_applied: applied, reason: lifetime.reason,
+          ceiling: lifetime.ceiling, task_count: taskCount }));
+        return;
       }
     }
 
@@ -2619,6 +2580,9 @@ async function relayAdvance(req, res, body) {
         ...(explicitTerminalExit ? {
           terminal_exit: { operator_marker: true, reason: reason.trim() }
         } : {}),
+        ...(explicitOperatorCapRelease ? {
+          operator_cap_release: { operator_marker: true, reason: reason.trim() }
+        } : {}),
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
@@ -2642,6 +2606,9 @@ async function relayAdvance(req, res, body) {
           } : {}),
           ...(explicitTerminalExit ? {
             terminal_exit: { operator_marker: true, reason: reason.trim() }
+          } : {}),
+          ...(explicitOperatorCapRelease ? {
+            operator_cap_release: { operator_marker: true, reason: reason.trim() }
           } : {}),
           operator_cap_bypass: true,
           reason: reason.trim()
