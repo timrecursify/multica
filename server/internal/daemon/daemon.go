@@ -136,7 +136,6 @@ func taskScopedAuthToken(task Task) (string, error) {
 
 func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesRoot, serverURL string, healthPort, slot int, tempDir string) map[string]string {
 	sharedCache := filepath.Join(filepath.Dir(workspacesRoot), "cache")
-	taskCache := filepath.Join(configRoot, "shared-cache")
 	return map[string]string{
 		"MULTICA_TOKEN":        token,
 		cli.TaskConfigRootEnv:  configRoot,
@@ -153,7 +152,7 @@ func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesR
 		"TEMP":                 tempDir,
 		// Dependency caches are daemon-owned and shared across task sandboxes.
 		// node_modules remain task-local; only the pnpm content-addressed store is shared.
-		"MULTICA_CODE_REVIEW_GRAPH_VENV": filepath.Join(taskCache, "code-review-graph", "2.3.8"),
+		"MULTICA_CODE_REVIEW_GRAPH_VENV": filepath.Join(sharedCache, "code-review-graph", "2.3.8"),
 		"PNPM_HOME":                       filepath.Join(sharedCache, "pnpm"),
 		"PNPM_STORE_DIR":                  filepath.Join(sharedCache, "pnpm", "store"),
 		"npm_config_cache":                filepath.Join(sharedCache, "npm"),
@@ -4982,7 +4981,7 @@ func retainTaskWorkspace() bool {
 }
 
 func removeTerminalTaskArtifacts(envRoot string, logger *slog.Logger) {
-	for _, name := range []string{"workdir", "codex-home"} {
+	for _, name := range []string{"workdir", "codex-home", "multica-config"} {
 		path := filepath.Join(envRoot, name)
 		bytes := dirSize(path)
 		if _, err := os.Stat(path); os.IsNotExist(err) {
@@ -6253,7 +6252,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Provision the daemon-owned graph environment before launching the task.
 	// This is shared and version-pinned; failed/partial installs are removed by
 	// the provisioner so the next task can retry safely.
-	sharedCacheRoot := filepath.Join(env.MulticaConfigRoot, "shared-cache")
+	sharedCacheRoot := filepath.Join(filepath.Dir(d.cfg.WorkspacesRoot), "cache")
 	graphVenv, err := ensureCodeReviewGraphCache(sharedCacheRoot)
 	if err != nil {
 		taskLog.Error("code-review-graph cache provisioning failed", "error", err)

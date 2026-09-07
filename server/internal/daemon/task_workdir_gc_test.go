@@ -52,7 +52,7 @@ func TestRetainTaskWorkspace(t *testing.T) {
 
 func TestRemoveTerminalTaskArtifactsKeepsLogsAndMetadata(t *testing.T) {
 	root := t.TempDir()
-	for _, rel := range []string{"workdir/repo/file", "codex-home/session", "logs/task.log", ".gc_meta.json"} {
+	for _, rel := range []string{"workdir/repo/file", "codex-home/session", "multica-config/config", "logs/task.log", ".gc_meta.json"} {
 		path := filepath.Join(root, rel)
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
@@ -63,7 +63,7 @@ func TestRemoveTerminalTaskArtifactsKeepsLogsAndMetadata(t *testing.T) {
 	}
 	var output bytes.Buffer
 	removeTerminalTaskArtifacts(root, slog.New(slog.NewTextHandler(&output, nil)))
-	for _, rel := range []string{"workdir", "codex-home"} {
+	for _, rel := range []string{"workdir", "codex-home", "multica-config"} {
 		if _, err := os.Stat(filepath.Join(root, rel)); !os.IsNotExist(err) {
 			t.Fatalf("%s still exists after cleanup", rel)
 		}
@@ -73,8 +73,8 @@ func TestRemoveTerminalTaskArtifactsKeepsLogsAndMetadata(t *testing.T) {
 			t.Fatalf("preserved artifact %s: %v", rel, err)
 		}
 	}
-	if got := strings.Count(output.String(), "terminal task artifact deleted"); got != 2 {
-		t.Fatalf("deletion log count = %d, want 2; output=%q", got, output.String())
+	if got := strings.Count(output.String(), "terminal task artifact deleted"); got != 3 {
+		t.Fatalf("deletion log count = %d, want 3; output=%q", got, output.String())
 	}
 	if !strings.Contains(output.String(), "bytes=4") {
 		t.Fatalf("deletion log missing byte count: %q", output.String())
