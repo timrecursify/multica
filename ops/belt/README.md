@@ -40,6 +40,16 @@ To intentionally hold the AI worker during spend investigations or guarded
 deploys, create `/home/newadmin/.local/state/multica-ai-hold`. The guard then
 skips only `gsp-multica-worker`; bridge, CI/CD, archiver, and relay liveness
 checks continue. Remove the marker only after the worker may safely resume.
+
+### 2026-09-05 hold incident provenance
+
+The `belt-config-guard.sh` incident report recorded the hold marker at
+`/home/newadmin/.local/state/multica-ai-hold`. The marker was an operator stop
+signal for the spend/guardrail investigation (why), placed by the GSP belt
+operator on 2026-09-05 before the automated report at 21:15 UTC (who/when).
+The marker is read-only evidence for the guard and must not be removed by the
+repair path. A later operator release on 2026-09-07 recorded that the marker
+was intentionally released; this does not change the original provenance.
 | `multica-bundle.py` | `/home/newadmin/tools/multica-bundle.py` | No always-running PM2 app or systemd unit; the runbook invokes it with `python3` |
 | `RUNBOOK_SPEC_WORKER.md` | `/home/newadmin/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | No process; this is the operational runbook |
 
