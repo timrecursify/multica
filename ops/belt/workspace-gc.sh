@@ -32,6 +32,9 @@ descriptor_stream() {
   declare -A seen_ids=()
   for task_dir in "$root"/*/????????; do
     [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
+    workspace_name="$(basename -- "$(dirname -- "$task_dir")")"
+    task_prefix="$(basename -- "$task_dir")"
+    [[ "$workspace_name" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || continue
     meta="$task_dir/.gc_meta.json"
     if [[ ! -f "$meta" ]]; then
       missing_meta=$((missing_meta + 1))
@@ -39,6 +42,7 @@ descriptor_stream() {
     fi
     task_id="$(jq -r '.task_id // empty' "$meta")"
     [[ "$task_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || continue
+    [[ "${task_id,,}" == "${task_prefix,,}"* ]] || continue
     [[ -z "${seen_ids["$task_id"]+x}" ]] || continue
     seen_ids["$task_id"]=1
     values_sql+="$separator('$task_id'::uuid)"
