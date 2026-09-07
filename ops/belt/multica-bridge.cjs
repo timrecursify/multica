@@ -1782,8 +1782,10 @@ async function relayAdvance(req, res, body) {
       await client.query("ROLLBACK");
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
-        error: "terminal_stage_operator_marker_required",
-        message: "terminal exits require the configured successor or an authenticated operator marker and reason"
+        error: issue.status === "Parked" ? "parked_release_required" : "terminal_stage_operator_marker_required",
+        message: issue.status === "Parked"
+          ? "Parked releases require metadata.parked_release_once=true; a Sol-low diagnosis does not authorize release"
+          : "terminal exits require the configured successor or an authenticated operator marker and reason"
       }));
       return;
     }
