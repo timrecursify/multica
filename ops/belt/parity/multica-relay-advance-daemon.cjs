@@ -1361,6 +1361,7 @@ function requestCapDisposition(row, admission, relay = postToRelay, taskCount = 
     issue_id: row.issue_id,
     to_stage: admission.disposition,
     agent_token: RELAY_AGENT_SECRET,
+    relay_source_task_id: row.task_id || row.dead_task_id,
     cap_refusal: {
       reason: admission.reason,
       ceiling: admission.ceiling,
@@ -2388,7 +2389,7 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestRetryEscalation,
+module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestCapDisposition, requestRetryEscalation,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
