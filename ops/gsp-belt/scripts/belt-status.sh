@@ -31,13 +31,20 @@ metadata="$release_dir/.gsp-belt-release.json"
 commit_sha="$(python3 -c "import json; print(json.load(open('$metadata'))['commit_sha'])")"
 [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "status: invalid release commit SHA" >&2; exit 1; }
 
+fail=0
+capacity_query="SELECT workspace_slug, stage_name, capacity_budget, available_capacity, ready_count, waiting_count, running_count FROM public.relay_stage_capacity_status ORDER BY workspace_slug, stage_name;"
+echo "stage capacity: workspace|stage|budget|available|ready|waiting|running"
+if ! sudo -n /bin/bash -c "docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -c \"$capacity_query\""; then
+  echo "status: stage capacity view unavailable" >&2
+  fail=1
+fi
+
 apps="gsp-multica-bridge,gsp-multica-worker,multica-cicd-worker,multica-archiver,multica-relay-advance"
 snapshot="$(mktemp "${TMPDIR:-/tmp}/gsp-belt-status.XXXXXX")"
 trap 'rm -f "$snapshot"' EXIT
 "$PM2" jlist > "$snapshot"
 
 echo "release commit = $commit_sha"
-fail=0
 IFS=',' read -r -a app_arr <<< "$apps"
 for app in "${app_arr[@]}"; do
   read -r path status unstable restart_time err_path exit_code exit_signal < <(python3 - "$snapshot" "$app" <<'PY'
@@ -106,5 +113,45 @@ PY
   fi
   [[ "$path" == "$release_dir/ops/belt/"* && "$status" == "online" ]] || fail=1
 done
+
+print_unattended_lifecycle_metrics() {
+  local activated_sha="$1" query output
+  read -r -d '' query <<'SQL' || true
+WITH task_stage AS (
+  SELECT COALESCE(rrl.to_stage,t.context->>'to_stage',t.context->>'pool_stage') AS stage,t.*
+  FROM agent_task_queue t LEFT JOIN relay_run_log rrl ON rrl.task_id=t.id
+), entries AS (
+  SELECT to_stage AS stage,max(created_at) AS entry_at FROM relay_run_log WHERE to_stage<>'Registered' GROUP BY to_stage
+  UNION ALL SELECT 'Registered',max(created_at) FROM issue
+)
+SELECT 'lifecycle_stage stage='||quote_literal(e.stage)||' entry_at='||COALESCE(e.entry_at::text,'none')||
+  ' eligible_at='||COALESCE(max(t.created_at)::text,'none')||' wait_at='||COALESCE(max(t.updated_at) FILTER (WHERE t.status LIKE 'waiting%')::text,'none')||
+  ' start_at='||COALESCE(max(t.started_at)::text,'none')||' finish_at='||COALESCE(max(t.completed_at)::text,'none')||
+  ' blocker_owner='||COALESCE(string_agg(DISTINCT o.blocked_on,','),'none')||' queue_age_seconds='||
+  COALESCE(max(extract(epoch FROM (now()-t.created_at))) FILTER (WHERE t.status IN ('queued','dispatched','waiting_local_directory','deferred'))::bigint::text,'0')
+FROM entries e LEFT JOIN task_stage t ON t.stage=e.stage LEFT JOIN issue_stage_outcome o ON o.task_id=t.id
+GROUP BY e.stage,e.entry_at ORDER BY array_position(ARRAY['Registered','Spec','Queue','In Progress','In Review','CI/CD & Deploy','Done','Archived'],e.stage);
+SELECT 'lifecycle_outcome outcome='||outcome||' unique_issues='||count(DISTINCT issue_id) FROM issue_stage_outcome GROUP BY outcome ORDER BY outcome;
+SELECT 'lifecycle_flow pr_inflow='||(SELECT count(DISTINCT issue_id) FROM issue_pull_request)||
+  ' merge_outflow='||(SELECT count(DISTINCT ipr.issue_id) FROM issue_pull_request ipr JOIN github_pull_request pr ON pr.id=ipr.pull_request_id WHERE pr.merged_at IS NOT NULL)||
+  ' shipped='||(SELECT count(DISTINCT a.issue_id) FROM activity_log a JOIN issue i ON i.id=a.issue_id WHERE a.action='relay_transition' AND a.details->>'to_stage'='Done' AND i.status IN ('Done','Archived') AND (a.details->>'from_stage'='CI/CD & Deploy' OR a.details#>>'{evidence,workProductEvidence}' ~* '\mNO-SHA\M'))||
+  ' cancelled='||(SELECT count(*) FROM issue WHERE status='Cancelled')||' approval_waits='||(SELECT count(*) FROM issue WHERE status='Human Review');
+WITH latest_merge AS (
+  SELECT COALESCE(details#>>'{evidence,mergeDeployReceipt,source_sha}',details#>>'{evidence,mergeDeployReceipt,sha}') AS merged_sha,created_at
+  FROM activity_log WHERE action='relay_transition' AND details->>'from_stage'='CI/CD & Deploy' AND details->>'to_stage'='Done'
+  ORDER BY created_at DESC LIMIT 1
+)
+SELECT 'activated_vs_merged_sha activated_sha='||current_setting('belt.activated_sha')||' merged_sha='||COALESCE(merged_sha,'none')||
+  ' matches='||COALESCE((merged_sha=current_setting('belt.activated_sha'))::text,'false')||' lag_seconds='||
+  COALESCE((CASE WHEN merged_sha IS NULL THEN NULL WHEN merged_sha=current_setting('belt.activated_sha') THEN 0 ELSE extract(epoch FROM (now()-created_at)) END)::bigint::text,'unknown') FROM latest_merge;
+SQL
+  if ! output="$(sudo -n /bin/bash -c 'docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -v ON_ERROR_STOP=1 -qAt -c "SET belt.activated_sha TO '\''$1'\''; $2"' _ "$activated_sha" "$query" 2>&1)"; then
+    echo "lifecycle_metrics status=unavailable" >&2
+    return 0
+  fi
+  printf '%s\n' "$output"
+}
+
 [[ $fail -eq 0 ]] || { echo "status: one or more apps are not online in the selected immutable release" >&2; exit 1; }
 echo "status: all five apps resolve to release commit $commit_sha"
+print_unattended_lifecycle_metrics "$commit_sha"

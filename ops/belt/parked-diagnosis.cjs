@@ -293,6 +293,10 @@ async function recordParkAndQueueDiagnosis(client, issue, evidence = {}) {
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue
         WHERE issue_id = $2::uuid AND context->>'kind' = $7::text
+          AND created_at >= COALESCE((
+            SELECT max(created_at) FROM relay_run_log
+             WHERE issue_id = $2::uuid AND to_stage = 'Parked'
+          ), '-infinity'::timestamptz)
           AND (
             (COALESCE($9::boolean, FALSE) = FALSE
               AND COALESCE(LOWER(status), '') NOT IN ('failed', 'cancelled'))
