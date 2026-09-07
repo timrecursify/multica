@@ -42,7 +42,7 @@ let readReceipt = (repo, target, sha) =>
 let readChangedPaths = (repo, number) => {
   const files = JSON.parse(gh(['api', `repos/${repo}/pulls/${number}/files?per_page=100`]));
   if (!Array.isArray(files) || files.length >= 100) throw new Error('changed path manifest unavailable or truncated');
-  return files.map(file => file.filename);
+  return files.flatMap(file => [file.filename, file.previous_filename]).filter(Boolean);
 };
 
 function initializeRuntime() {
@@ -181,6 +181,7 @@ function receiptProblem(receipt, repo, target, owner, sha) {
     || receipt.activation?.process_sha !== sha
     || typeof receipt.activation?.release !== 'string' || !receipt.activation.release) return 'activation';
   if (receipt.health?.status !== 'ok' || !validTimestamp(receipt.health?.checked_at)
+    || Date.parse(receipt.health.checked_at) < Date.parse(receipt.activation.activated_at)
     || typeof receipt.health?.probe !== 'string' || !receipt.health.probe) return 'health';
   return null;
 }
@@ -462,6 +463,9 @@ function terminalFailedDeployRuns(repo, sha) {
 }
 
 function mergeDeployEvidence(repo, sha, pr = {}) {
+  if (!/^[0-9a-f]{40}$/.test(sha)) return { outcome: 'failed', blocker: {
+    type: 'source_sha_invalid', retry_eligible: false
+  } };
   const manifest = changedPathManifest(repo, pr);
   if (manifest.blocker) return { outcome: 'discovery_unavailable', blocker: manifest.blocker };
   if (docsOnly(manifest.paths)) return { outcome: 'verified_not_applicable', evidence: {
