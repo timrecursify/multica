@@ -95,6 +95,69 @@ test("restart is idempotent when the current-stage task is live", async () => {
   assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
+test("completed build work product is handed off once without another task", async () => {
+  const completed = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  let relayArmed = false;
+  let handoff;
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) {
+      return { rows: [{ ...issue, status: "In Progress" }] };
+    }
+    if (sql.includes("SELECT task.id, task.completed_at")) {
+      return { rows: [{ id: completed, completed_at: "2026-09-06T00:00:00Z" }] };
+    }
+    if (sql.includes("FROM qc_effective_verdict")) return { rows: [] };
+    if (sql.includes("INSERT INTO relay_run_log") && sql.includes("ON CONFLICT (task_id)")) {
+      handoff = { sql, values };
+      if (relayArmed) return { rows: [] };
+      relayArmed = true;
+      return { rows: [{ task_id: completed }] };
+    }
+    return original(sql, values);
+  };
+
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }),
+    { action: "handoff", taskId: completed });
+  assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
+  assert.match(handoff.sql, /UPDATE relay_run_log SET task_id = NULL/);
+  assert.match(handoff.sql, /status = 'completed'/);
+  assert.match(handoff.sql, /to_stage IS DISTINCT FROM \$2::text/);
+
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "reused", taskId: completed, reason: "completed_build_work_product"
+  });
+  assert.equal(db.calls.filter((call) => call.sql.includes("INSERT INTO agent_task_queue")).length, 0);
+});
+
+test("completed build without a work product remains admitted", async () => {
+  const db = harness();
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }),
+    { action: "created", taskId: "task-1" });
+  assert.equal(db.calls.some((call) => call.sql.includes("ON CONFLICT (task_id)")), false);
+});
+
+test("existing implementation retry remains reused without a relay handoff", async () => {
+  const prior = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const retry = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.includes("SELECT task.id, task.completed_at")) {
+      return { rows: [{ id: prior, completed_at: "2026-09-06T00:00:00Z" }] };
+    }
+    if (sql.includes("FROM qc_effective_verdict")) return { rows: [{ id: "qc-1" }] };
+    if (sql.includes("retry_of_task_id=$2::uuid")) return { rows: [{ id: retry }] };
+    return original(sql, values);
+  };
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "reused", taskId: retry, reason: "implementation_retry_exists"
+  });
+  assert.equal(db.calls.some((call) => call.sql.includes("ON CONFLICT (task_id)")), false);
+  assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
+});
+
 test("rollups with open children and running old-stage tasks are skipped", async () => {
   const rollup = harness({ isLeaf: false });
   assert.deepEqual(await reconcileIssue(rollup, issue.id, { evaluate: ok }),
