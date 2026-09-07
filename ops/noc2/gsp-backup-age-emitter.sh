@@ -46,6 +46,7 @@ failure_reason() {
     10) echo missing_repo ;;
     11) echo authentication ;;
     91|92|93|94) echo configuration ;;
+    90) echo unknown ;;
     *) echo transport ;;
   esac
 }
