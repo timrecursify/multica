@@ -1870,9 +1870,10 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       ($1, 'Queue', $2, true, NULL), ($1, 'In Progress', $2, true, NULL),
       ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage, alt_next_stages) VALUES
-      ($1, 'Human Review', 'In Progress'), ($1, 'Done', 'CI/CD & Deploy'),
-      ($1, 'CI/CD & Deploy', 'Done'), ($1, 'In Progress', 'In Review'),
-      ($1, 'Parked', 'Queue', ARRAY['In Review']), ($1, 'Queue', 'In Progress')`, [workspaceId]);
+      ($1, 'Human Review', 'In Progress', NULL), ($1, 'Done', 'CI/CD & Deploy', NULL),
+      ($1, 'CI/CD & Deploy', 'Done', NULL), ($1, 'In Progress', 'In Review', NULL),
+      ($1, 'Parked', 'Queue', ARRAY['In Review']), ($1, 'Queue', 'In Progress', NULL),
+      ($1, 'In Review', 'CI/CD & Deploy', NULL)`, [workspaceId]);
 
     await t.test('releases at the cycle limit, enqueues work, persists metadata, and logs', async () => {
       const issueId = '44444444-4444-4444-4444-444444444444';
