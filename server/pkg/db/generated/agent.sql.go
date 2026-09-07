@@ -1596,6 +1596,8 @@ type CountActiveAgentTasksByWorkDirParams struct {
 	ID      pgtype.UUID `json:"id"`
 }
 
+// A terminal task directory is reclaimable only when no in-flight task still
+// owns the same checkout (resume and retry tasks can share work_dir).
 func (q *Queries) CountActiveAgentTasksByWorkDir(ctx context.Context, arg CountActiveAgentTasksByWorkDirParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countActiveAgentTasksByWorkDir, arg.WorkDir, arg.ID)
 	var count int64
