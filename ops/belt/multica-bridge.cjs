@@ -1470,21 +1470,38 @@ async function relayVerdict(req, res, payload) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 404, "issue_not_found");
     }
-    const qcTask = await latestCompletedSolLowQcTask(client, payload.issue_id,
-      issue.rows[0].workspace_id, payload.qc_task_id || null);
-    if (!qcTask) {
-      await client.query("ROLLBACK");
-      return relayVerdictError(res, 409, "assigned_running_sol_low_in_review_qc_task_required");
+    const externalQc = payload.operator_external_qc === true;
+    if (externalQc) {
+      if (req?.headers?.['x-relay-operator-secret'] !== RELAY_OPERATOR_SECRET) {
+        await client.query("ROLLBACK");
+        return relayVerdictError(res, 403, "operator_secret_required");
+      }
+      if (!isQcLane(payload.model, payload.effort)) {
+        await client.query("ROLLBACK");
+        return relayVerdictError(res, 409, "invalid_qc_lane");
+      }
     }
-    const evidenceMismatch = qcTaskEvidenceMismatch(qcTask, payload);
+    let qcTask = externalQc ? null : await latestCompletedSolLowQcTask(client, payload.issue_id,
+      issue.rows[0].workspace_id, payload.qc_task_id || null);
+    if (!externalQc && !qcTask) qcTask = await latestRunningSolLowQcTask(client, payload.issue_id,
+      issue.rows[0].workspace_id, payload.checker, payload.qc_task_id || null);
+    if (!qcTask && !externalQc) {
+      await client.query("ROLLBACK");
+      return relayVerdictError(res, 409, payload.checker === 'different-checker'
+        ? "assigned_running_sol_low_in_review_qc_task_required" : "completed_sol_low_qc_required");
+    }
+    const evidenceMismatch = externalQc || qcTask.status === 'running' ? null : qcTaskEvidenceMismatch(qcTask, payload);
     if (evidenceMismatch) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, evidenceMismatch);
     }
+    const checkerId = externalQc ? '00000000-0000-0000-0000-000000000000' : qcTask.agent_id;
+    const checkerName = externalQc ? payload.checker : qcTask.agent_name;
     const notes = [
-      `relay_task_id=${qcTask.id}`,
-      `relay_agent_id=${qcTask.agent_id}`,
-      `relay_agent_name=${qcTask.agent_name}`,
+      qcTask ? `relay_task_id=${qcTask.id}` : null,
+      qcTask ? `relay_agent_id=${qcTask.agent_id}` : null,
+      qcTask ? `relay_agent_name=${qcTask.agent_name}` : null,
+      externalQc ? `operator_external_qc=${payload.reason || 'external QC'}` : null,
       typeof payload.notes === "string" && payload.notes.length <= 2000 ? payload.notes : null,
     ].filter(Boolean).join("\n");
     const current = await client.query(
@@ -1492,11 +1509,11 @@ async function relayVerdict(req, res, payload) {
          FROM qc_verdict WHERE issue_id = $1 FOR UPDATE`, [payload.issue_id]
     );
     const currentVerdict = current.rows[0];
-    const currentFromBoundTask = currentVerdict &&
+    const currentFromBoundTask = currentVerdict && qcTask &&
       currentVerdict.checker_id === qcTask.agent_id &&
       String(currentVerdict.notes || "").includes(`relay_task_id=${qcTask.id}`);
-    if (replay && !liveQcTask && currentVerdict && !currentFromBoundTask &&
-        new Date(currentVerdict.created_at) > new Date(qcTask.completed_at)) {
+    if (replay && currentVerdict && !currentFromBoundTask &&
+        qcTask && new Date(currentVerdict.created_at) > new Date(qcTask.completed_at || 0)) {
       await client.query("ROLLBACK");
       return relayVerdictError(res, 409, "qc_verdict_newer_than_bound_qc_task");
     }
@@ -1506,7 +1523,7 @@ async function relayVerdict(req, res, payload) {
            (issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head,
             failure_class, qualifying, model, effort, idem_key, notes)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-        [payload.issue_id, qcTask.agent_name, payload.verdict, payload.work_product_md5,
+        [payload.issue_id, checkerName, payload.verdict, payload.work_product_md5,
           payload.bound_sha, payload.observed_sha, payload.failure_class, payload.qualifying,
           payload.model, payload.effort, payload.idem_key, notes]
       );
@@ -1517,7 +1534,7 @@ async function relayVerdict(req, res, payload) {
           `UPDATE qc_verdict SET checker_id = $2, checker_name = $3, verdict = $4,
                   work_product_md5 = $5, notes = $6, created_at = NOW()
             WHERE issue_id = $1`,
-          [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
+          [payload.issue_id, checkerId, checkerName, payload.verdict,
             payload.work_product_md5, notes]
         );
       } else {
@@ -1525,7 +1542,7 @@ async function relayVerdict(req, res, payload) {
           `INSERT INTO qc_verdict
              (issue_id, checker_id, checker_name, verdict, work_product_md5, notes)
            VALUES ($1, $2, $3, $4, $5, $6)`,
-          [payload.issue_id, qcTask.agent_id, qcTask.agent_name, payload.verdict,
+          [payload.issue_id, checkerId, checkerName, payload.verdict,
             payload.work_product_md5, notes]
         );
       }
@@ -1533,7 +1550,8 @@ async function relayVerdict(req, res, payload) {
     await client.query("COMMIT");
     res.writeHead(replay ? 200 : 201, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, replay, issue_id: payload.issue_id,
-      checker_id: qcTask.agent_id, work_product_md5: payload.work_product_md5 }));
+      checker_id: checkerId,
+      work_product_md5: payload.work_product_md5 }));
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});
     console.error("[relay/verdict] ERROR:", err.message);
