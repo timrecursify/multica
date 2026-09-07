@@ -6,7 +6,7 @@ const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
-  readvanceRecordedOutcomes, buildCompletionRoute } = require('./multica-relay-advance-daemon.cjs');
+  readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
@@ -1084,6 +1084,16 @@ test('retry ceilings use the relay-owned terminal disposition receipt', () => {
   assert.match(requeue,
     /row\.metadata\?\.parked_release_at \|\|\s+row\.metadata\?\.retry_escalation_at \|\| null/);
   assert.doesNotMatch(requeue, /UPDATE issue SET status/);
+});
+
+test('retry ceiling disposition binds the completed source task for Spec routing', async () => {
+  let payload;
+  await requestCapDisposition({ issue_id: 'issue-1', task_id: 'task-1', stage: 'Spec' },
+    { disposition: 'Spec', reason: 'stage_cycle_limit', ceiling: 2 },
+    async (body) => { payload = body; return { ok: true }; }, 3);
+  assert.equal(payload.relay_source_task_id, 'task-1');
+  assert.equal(payload.to_stage, 'Spec');
+  assert.equal(payload.cap_refusal.trigger_stage, 'Spec');
 });
 
 test('stranded-task recovery rotates a marker only when it still references the terminal predecessor', () => {
