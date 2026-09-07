@@ -40,7 +40,7 @@ To intentionally hold the AI worker during spend investigations or guarded
 deploys, create `/var/lib/gsp/.local/state/multica-ai-hold`. The guard then
 skips only `gsp-multica-worker`; bridge, CI/CD, archiver, and relay liveness
 checks continue. Remove the marker only after the worker may safely resume.
-| `multica-bundle.py` | `/var/lib/gsp/tools/multica-bundle.py` | No always-running PM2 app or systemd unit; the runbook invokes it with `python3` |
+| `multica-bundle.py` | `ops/belt/multica-bundle.py` | Run from the checkout; no persistent service |
 | `RUNBOOK_SPEC_WORKER.md` | `/var/lib/gsp/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | No process; this is the operational runbook |
 
 ## Guard parity repair
@@ -78,7 +78,7 @@ belt-config-guard.timer belt-config-guard.service
 
 `multica-relay-advance` is a PM2 wrapper process; its launcher invokes the
 runtime daemon path shown above. The runbook currently names the bundle command
-as `python3 /var/lib/gsp/tools/multica-bundle.py`.
+as `python3 ops/belt/multica-bundle.py` from the Multica checkout.
 
 ## Deploy and verify
 

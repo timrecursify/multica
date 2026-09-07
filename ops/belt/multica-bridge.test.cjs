@@ -2024,6 +2024,13 @@ test('operator Human Review releases record actor, target, and reason in the aud
   assert.match(source, /operator_release:\s*\{[\s\S]*?reason:\s*reason\.trim\(\)/);
 });
 
+test('operator recovery admits an authenticated same-stage redispatch', () => {
+  const fs = require('node:fs');
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /!explicitOperatorRecovery &&\n\s*!dispositionStages\.has\(to_stage\)/);
+  assert.match(source, /rejectedPassTerminalExit \|\| explicitOperatorRelease \|\| explicitOperatorRecovery \|\|/);
+});
+
 test('operator cap release requires the current PASS work-product hash', async () => {
   const client = { query: async () => ({ rows: [{ verdict: 'PASS',
     work_product_md5: 'e41d8cd98f00b204e9800998ecf8427e' }] }) };

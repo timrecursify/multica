@@ -2096,6 +2096,7 @@ async function relayAdvance(req, res, body) {
     if (!retryEscalation && !parkedRelease && !parkedEvidenceQcRelease &&
         !parkedDiagnosisDone && !noArtifactRescope && !allowedStages.includes(to_stage) &&
         !evidenceTransition && !rejectedPassTerminalExit && !explicitTerminalExit &&
+        !explicitOperatorRecovery &&
         !dispositionStages.has(to_stage)) {
       await client.query("ROLLBACK");
       rejectInvalidRelayTransition(res, issue.status, to_stage);
@@ -2111,7 +2112,8 @@ async function relayAdvance(req, res, body) {
       altStages,
       exceptional: retryEscalation || parkedRelease || parkedEvidenceQcRelease ||
         parkedDiagnosisDone || noArtifactRescope || evidenceTransition ||
-        rejectedPassTerminalExit || explicitOperatorRelease || dispositionStages.has(to_stage)
+        rejectedPassTerminalExit || explicitOperatorRelease || explicitOperatorRecovery ||
+        dispositionStages.has(to_stage)
     });
     if (!transitionAdmission.ok) {
       await client.query("ROLLBACK");
