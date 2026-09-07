@@ -309,6 +309,9 @@ jobs:
       - name: Test parked diagnosis backfill
         run: node --test ops/belt/backfill-parked-diagnosis.test.cjs
 
+      - name: Test MEGA bundling preserves the source pull-request trail
+        run: python3 ops/belt/multica-bundle.test.py
+
       - name: Verify bridge integration uses the service database
         run: test "$DATABASE_URL" != "postgres://test"
 
