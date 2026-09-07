@@ -2708,13 +2708,19 @@ async function relayAdvance(req, res, body) {
       }
     }
     console.error("Relay error:", err);
-    res.writeHead(500, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: err.message }));
+    writeJsonResponse(res, 500, { error: err.message });
   } finally {
     if (client) {
       await client.end().catch(() => {});
     }
   }
+}
+
+function writeJsonResponse(res, status, payload) {
+  if (res.headersSent || res.writableEnded) return false;
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(payload));
+  return true;
 }
 
 async function relayOperatorRespec(req, res, body) {
@@ -2793,7 +2799,10 @@ const server = http.createServer(async (req, res) => {
         req.on("end", () => {
           try {
             const data = JSON.parse(body);
-            relayAdvance(req, res, data);
+            relayAdvance(req, res, data).catch((err) => {
+              console.error("Unhandled relay request rejection:", err);
+              writeJsonResponse(res, 500, { error: "internal_error" });
+            });
           } catch (err) {
             res.writeHead(400);
             res.end("Invalid JSON");
@@ -2867,6 +2876,9 @@ async function start() {
 }
 
 if (require.main === module) {
+  process.on("unhandledRejection", (reason) => {
+    console.error("Unhandled bridge rejection (process remains online):", reason);
+  });
   start().catch((err) => {
     console.error(`Relay bridge startup refused: ${err.message}`);
     process.exitCode = 1;
@@ -2896,6 +2908,7 @@ module.exports = {
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
+  writeJsonResponse,
   admitConfiguredTransition,
   relayOperatorRespec,
   operatorRespec,
