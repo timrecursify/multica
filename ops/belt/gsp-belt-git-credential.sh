@@ -6,7 +6,7 @@
 # the narrowing is the whole point: an unscoped token would hand the belt write
 # access to every repository the app can see. Only the repositories the belt
 # actually works are allowed, and each token carries contents+pull_requests
-# write, metadata read, and the two read-only commit-check permissions the QC
+# write, metadata read, workflow write, and the two read-only commit-check permissions the QC
 # gate needs, nothing else.
 #
 # checks:read and statuses:read are here because the QC gate reads
@@ -85,7 +85,7 @@ sig=$(printf "%s" "$header.$payload" | openssl dgst -sha256 -sign "$GH_APP_PEM" 
 token=$(curl -sS -X POST \
   -H "Authorization: Bearer $header.$payload.$sig" \
   -H "Accept: application/vnd.github+json" \
-  -d "{\"repositories\":[\"$repo\"],\"permissions\":{\"contents\":\"write\",\"pull_requests\":\"write\",\"metadata\":\"read\",\"checks\":\"read\",\"statuses\":\"read\"}}" \
+  -d "{\"repositories\":[\"$repo\"],\"permissions\":{\"contents\":\"write\",\"pull_requests\":\"write\",\"workflows\":\"write\",\"metadata\":\"read\",\"checks\":\"read\",\"statuses\":\"read\"}}" \
   "https://api.github.com/app/installations/$GH_APP_INSTALLATION_ID/access_tokens" \
   | python3 -c "import sys,json; print(json.load(sys.stdin).get(\"token\",\"\"))")
 
