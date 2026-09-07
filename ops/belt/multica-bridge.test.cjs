@@ -5,12 +5,54 @@ const { qcCompletionAdvance } = require('./parity/multica-relay-advance-daemon.c
 const { classifyStageRoute } = require('./stage-routing.cjs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
-process.env.DATABASE_URL = process.env.DATABASE_URL || 'postgres://test';
+// Capture the operator-supplied database before the placeholder default below.
+// The placeholder only exists so the modules under test can be loaded; it is
+// never a database, so it must never satisfy an integration test.
+const PLACEHOLDER_DATABASE_URL = 'postgres://test';
+const suppliedDatabaseUrl = process.env.DATABASE_URL
+  && process.env.DATABASE_URL !== PLACEHOLDER_DATABASE_URL
+  ? process.env.DATABASE_URL : null;
+process.env.DATABASE_URL = process.env.DATABASE_URL || PLACEHOLDER_DATABASE_URL;
 // This handler test sends fixed fixture credentials. Do not inherit a live
 // relay credential, which would make the expected 201 path return 403.
 process.env.RELAY_AGENT_SECRET = 'test-relay-secret';
 process.env.RELAY_OPERATOR_SECRET = 'test-operator-secret';
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
+
+// A suite that silently degrades to skipping when its database is absent
+// certifies anything: PR #761 reported "111 passed, 4 skipped" as a pass while
+// every integration test -- including the one that PR was written to add -- had
+// skipped, hiding a 42601 error in its own fixture. Absence of DATABASE_URL is
+// therefore a hard failure. A context that genuinely cannot supply a database
+// must opt out on purpose with BRIDGE_INTEGRATION_SKIP=1, which is reported in
+// the banner below so the run cannot be read as a clean pass.
+const integrationOptOut = process.env.BRIDGE_INTEGRATION_SKIP === '1';
+const skippedIntegrationTests = [];
+
+function integrationDatabase(t) {
+  if (suppliedDatabaseUrl) return suppliedDatabaseUrl;
+  if (!integrationOptOut) {
+    assert.fail('DATABASE_URL is absent or is the "postgres://test" placeholder, so this '
+      + 'integration test cannot exercise the database and must not report success. Point '
+      + 'DATABASE_URL at a real Multica test database, or set BRIDGE_INTEGRATION_SKIP=1 to '
+      + 'opt out of integration coverage deliberately.');
+  }
+  skippedIntegrationTests.push(t.name || 'unnamed integration test');
+  t.skip('BRIDGE_INTEGRATION_SKIP=1: no database supplied, integration coverage not run');
+  return null;
+}
+
+test.after(() => {
+  if (!skippedIntegrationTests.length) return;
+  const rule = '='.repeat(78);
+  const names = skippedIntegrationTests.map((name) => `  - ${name}`).join('\n');
+  process.stderr.write(`\n${rule}\nINTEGRATION COVERAGE NOT RUN: `
+    + `${skippedIntegrationTests.length} test(s) skipped because BRIDGE_INTEGRATION_SKIP=1 `
+    + `and no DATABASE_URL was supplied.\n${names}\n`
+    + 'This run proves nothing about bridge database behaviour. Do not read its "pass" '
+    + 'summary as\na verified suite, and do not cite it as evidence on a pull request.\n'
+    + `${rule}\n`);
+});
 
 test('stage routing applies only the required QC and deploy lanes', () => {
   assert.deepEqual(classifyStageRoute({ repo: 'timrecursify/multica', state: 'OPEN',
@@ -235,10 +277,8 @@ test('relay receipts identify a changed destination and preserve its cause', () 
 });
 
 test('comment-reply tasks do not consume lifetime or stage-cycle cap history', async (t) => {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl || databaseUrl === 'postgres://test') {
-    return t.skip('integration test requires the Multica test DATABASE_URL');
-  }
+  const databaseUrl = integrationDatabase(t);
+  if (!databaseUrl) return;
   const { Client } = require('pg');
   const admin = new Client({ connectionString: databaseUrl });
   const schema = `relay_comment_caps_${Date.now()}`;
@@ -1463,10 +1503,8 @@ test('nine one-slot builders fill fairly and a tenth waits until capacity frees'
 });
 
 test('twenty concurrent stage retries create one active successor task', async (t) => {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl || databaseUrl === 'postgres://test') {
-    return t.skip('integration test requires a real DATABASE_URL');
-  }
+  const databaseUrl = integrationDatabase(t);
+  if (!databaseUrl) return;
   const { Client } = require('pg');
   const admin = new Client({ connectionString: databaseUrl });
   await admin.connect();
@@ -1518,10 +1556,8 @@ test('twenty concurrent stage retries create one active successor task', async (
 });
 
 test('twenty concurrent Queue entries through both routes rotate across equal-load pool agents', async (t) => {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl || databaseUrl === 'postgres://test') {
-    return t.skip('integration test requires a real DATABASE_URL');
-  }
+  const databaseUrl = integrationDatabase(t);
+  if (!databaseUrl) return;
   const { Client } = require('pg');
   const admin = new Client({ connectionString: databaseUrl });
   await admin.connect();
@@ -1888,8 +1924,8 @@ test('release admission is explicit, one-use, and resets task history by time', 
 });
 
 test('operator Human Review release is authenticated, bounded, and auditable', async (t) => {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl || databaseUrl === 'postgres://test') return t.skip('integration test requires a real DATABASE_URL');
+  const databaseUrl = integrationDatabase(t);
+  if (!databaseUrl) return;
   const { Client } = require('pg');
   const admin = new Client({ connectionString: databaseUrl });
   let countClient;
