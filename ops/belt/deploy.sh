@@ -319,7 +319,6 @@ done
 
 for index in "${!sources[@]}"; do
   selected "$index" || continue
-  [[ -n "${changed_index_set[$index]-}" ]] || continue
   source_file="${sources[$index]}"
   target_file="${targets[$index]}"
   if [[ "$mode" == dry-run ]]; then
