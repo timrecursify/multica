@@ -2508,17 +2508,15 @@ async function relayAdvance(req, res, body) {
       const parkedQcRecovery = !cycle.ok && await consumeParkedQcRecovery(
         client, issue, to_stage, reason, parkedEvidenceQcRelease
       );
-      const passVerdictProtected = issue.status === "In Review" &&
-        (await latestQcVerdict(client, issue.id))?.verdict === "PASS";
+      // A current work-product-bound PASS is the normal authority for the
+      // configured In Review -> CI/CD handoff. Retry ceilings prevent another
+      // paid task; they must not turn a completed QC gate into a human-only
+      // release and strand verified work before the deploy worker can see it.
+      const verifiedPassAdvance = issue.status === "In Review" &&
+        to_stage === "CI/CD & Deploy" &&
+        await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
       if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
-          !noArtifactRescope && !retryEscalation) {
-        if (passVerdictProtected) {
-          await client.query("ROLLBACK");
-          res.writeHead(409, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "operator_cap_release_required",
-            message: "a PASS-verdict ticket requires an authenticated operator cap release" }));
-          return;
-        }
+          !verifiedPassAdvance && !noArtifactRescope && !retryEscalation) {
         if (escalationLoop) {
           const taskCount = history.rows[0]?.n || 0;
           const applied = await applyDisposition(client, issue, "Parked", "escalation_loop", {
@@ -2561,15 +2559,8 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope &&
-          !retryEscalation) {
-        if (passVerdictProtected) {
-          await client.query("ROLLBACK");
-          res.writeHead(409, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "operator_cap_release_required",
-            message: "a PASS-verdict ticket requires an authenticated operator cap release" }));
-          return;
-        }
+      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
+          !noArtifactRescope && !retryEscalation) {
         const taskCount = lifetimeHistory.rows[0]?.n || 0;
         const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
           ceiling: lifetime.ceiling, task_count: taskCount, target_stage: to_stage,
