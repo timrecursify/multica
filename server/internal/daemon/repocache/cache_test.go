@@ -249,6 +249,35 @@ func createTestRepoAt(t *testing.T, dir string) string {
 	return dir
 }
 
+func TestEnsureIsolatedCheckoutCommitFetchesMissingObject(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	defaultBranch, err := runGitOutput("-C", sourceRepo, "branch", "--show-current")
+	if err != nil {
+		t.Fatalf("resolve default branch: %v", err)
+	}
+	runGitAuthored(t, sourceRepo, "switch", "--orphan", "missing-base")
+	runGitAuthored(t, sourceRepo, "commit", "--allow-empty", "-m", "missing base")
+	missingCommit := gitHead(t, sourceRepo)
+	runGitAuthored(t, sourceRepo, "switch", strings.TrimSpace(string(defaultBranch)))
+
+	checkoutPath := filepath.Join(t.TempDir(), "checkout")
+	if out, err := runGitCombinedOutput(
+		"clone", "--depth=1", "file://"+sourceRepo, checkoutPath,
+	); err != nil {
+		t.Fatalf("create shallow checkout: %s: %v", out, err)
+	}
+	if err := runGit("-C", checkoutPath, "cat-file", "-e", missingCommit+"^{commit}"); err == nil {
+		t.Fatal("test checkout unexpectedly contains recovery commit")
+	}
+	if err := ensureIsolatedCheckoutCommit(checkoutPath, missingCommit); err != nil {
+		t.Fatalf("ensure missing commit: %v", err)
+	}
+	if err := runGit("-C", checkoutPath, "cat-file", "-e", missingCommit+"^{commit}"); err != nil {
+		t.Fatalf("recovery commit remains missing: %v", err)
+	}
+}
+
 func TestSyncAndLookup(t *testing.T) {
 	t.Parallel()
 	sourceRepo := createTestRepo(t)

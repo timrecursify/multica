@@ -861,6 +861,9 @@ func createIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef
 	if err := syncIsolatedCheckoutRefs(barePath, checkoutPath, baseRef); err != nil {
 		return "", err
 	}
+	if err := ensureIsolatedCheckoutCommit(checkoutPath, baseCommit); err != nil {
+		return "", err
+	}
 
 	if out, err := runGitCombinedOutput("-C", checkoutPath, "checkout", "--detach", baseCommit); err != nil {
 		return "", fmt.Errorf("git checkout --detach: %s: %w", strings.TrimSpace(string(out)), err)
@@ -881,6 +884,25 @@ func createIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef
 	}
 	cleanup = false
 	return actualBranch, nil
+}
+
+// ensureIsolatedCheckoutCommit repairs the object gap left when Git ignores
+// --local for a shallow cache and clones only the cache's advertised branch.
+func ensureIsolatedCheckoutCommit(checkoutPath, commit string) error {
+	if err := runGit("-C", checkoutPath, "cat-file", "-e", commit+"^{commit}"); err == nil {
+		return nil
+	}
+	out, err := runGitCombinedOutput(
+		"-C", checkoutPath, "fetch", "--force", "--no-tags", "origin", commit,
+	)
+	if err != nil {
+		return fmt.Errorf("fetch missing checkout commit %s: %s: %w",
+			commit, strings.TrimSpace(string(out)), err)
+	}
+	if err := runGit("-C", checkoutPath, "cat-file", "-e", commit+"^{commit}"); err != nil {
+		return fmt.Errorf("verify fetched checkout commit %s: %w", commit, err)
+	}
+	return nil
 }
 
 func resolveCommit(repoPath, ref string) (string, error) {
