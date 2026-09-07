@@ -1754,7 +1754,13 @@ async function relayAdvance(req, res, body) {
       !OPERATOR_SECRET_DISABLED &&
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
-    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease;
+    const explicitOperatorReleaseRequested = operator_release === true &&
+      typeof reason === "string" && reason.trim() !== "";
+    const explicitOperatorRelease = explicitOperatorReleaseRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const operatorCapBypass = explicitTerminalExit || explicitOperatorRelease;
 
     // Check the durable gate before the same-stage/idempotency fast path. A
     // replay of a Done request must not turn a newly recorded QC FAIL into a
@@ -1791,7 +1797,7 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
-    if (explicitHumanReviewReleaseRequested && !explicitHumanReviewRelease) {
+    if (explicitOperatorReleaseRequested && !explicitOperatorRelease) {
       await client.query("ROLLBACK");
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
