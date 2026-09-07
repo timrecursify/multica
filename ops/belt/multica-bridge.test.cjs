@@ -118,6 +118,15 @@ test('Spec completion advances a written spec and bounds repeated blockers', asy
   assert.deepEqual(await specCompletionDisposition(client, issueId, taskId),
     { toStage: 'Queue', reason: 'completed_spec_work_product' });
 
+  for (const output of [
+    'Verified existing delivery.\nOUTCOME: NO_OP',
+    'No new source change was needed; the implementation is already merged.'
+  ]) {
+    client.rows = [{ id: taskId, result: { output } }];
+    assert.deepEqual(await specCompletionDisposition(client, issueId, taskId),
+      { toStage: 'Parked', reason: 'completed_spec_noop' });
+  }
+
   client.rows = [
     { id: taskId, result: { output: 'OUTCOME: BLOCKED blocked_on=dependency' } },
     { id: priorId, result: { output: 'OUTCOME: BLOCKED   blocked_on=dependency' } }

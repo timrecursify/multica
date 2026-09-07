@@ -530,6 +530,12 @@ function specBlockedFingerprint(result) {
     : null;
 }
 
+function isCompletedSpecNoop(result) {
+  const text = taskResultText(result);
+  return /^\s*OUTCOME\s*:\s*NO_OP\b/im.test(text) ||
+    /\b(?:already (?:implemented|merged|deployed|delivered|present)|no (?:new )?(?:implementation|code|source) change (?:is |was )?(?:needed|required))\b/i.test(text);
+}
+
 async function specCompletionDisposition(client, issueId, requestedTaskId) {
   if (!UUID_RE.test(String(requestedTaskId || ""))) return null;
   const completed = await client.query(
@@ -545,6 +551,9 @@ async function specCompletionDisposition(client, issueId, requestedTaskId) {
     [issueId, requestedTaskId]
   );
   if (String(completed.rows[0]?.id || "") !== String(requestedTaskId)) return null;
+  if (isCompletedSpecNoop(completed.rows[0].result)) {
+    return { toStage: "Parked", reason: "completed_spec_noop" };
+  }
   const blocked = specBlockedFingerprint(completed.rows[0].result);
   if (blocked) {
     const repeated = blocked === specBlockedFingerprint(completed.rows[1]?.result);
