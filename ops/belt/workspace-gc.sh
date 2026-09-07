@@ -15,11 +15,36 @@ descriptor_stream() {
     head -n "$limit" -- "$WORKSPACE_GC_DESCRIPTOR_FILE"
     return
   fi
-  docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -F $'\t' -v batch_limit="$limit" -c "
+  local ids=() dir meta id prefix workspace
+  shopt -s nullglob
+  for workspace_dir in "$root"/*; do
+    [[ -d "$workspace_dir" && ! -L "$workspace_dir" ]] || continue
+    workspace="${workspace_dir##*/}"
+    for dir in "$workspace_dir"/*; do
+      [[ -d "$dir" && ! -L "$dir" ]] || continue
+      prefix="${dir##*/}"
+      [[ "$prefix" =~ ^[0-9a-fA-F]{8}$ ]] || continue
+      meta="$dir/.gc_meta.json"
+      [[ -f "$meta" && ! -L "$meta" ]] || continue
+      id="$(jq -r '.task_id // empty' "$meta" 2>/dev/null || :)"
+      [[ "$id" =~ ^[0-9a-fA-F-]{36}$ && "${id:0:8}" == "$prefix" ]] || continue
+      ids+=("$id")
+    done
+  done
+  shopt -u nullglob
+  ((${#ids[@]})) || return 0
+  mapfile -t ids < <(printf '%s\n' "${ids[@]}" | sort -u)
+  local in_list=""
+  for id in "${ids[@]}"; do
+    if [[ -n "$in_list" ]]; then in_list+=","; fi
+    in_list+="'$id'::uuid"
+  done
+  local query="
     SELECT t.id, t.status, t.completed_at, t.issue_id,
            COALESCE(t.work_dir, '$root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir')
     FROM agent_task_queue t
-    WHERE t.status IN ('completed','failed','cancelled')
+    WHERE t.id IN ($in_list)
+      AND t.status IN ('completed','failed','cancelled')
       AND t.completed_at < now() - interval '1 hour'
       AND (t.status <> 'completed' OR COALESCE(t.result->>'pr_url','') <> ''
            OR COALESCE(t.result->>'branch_name','') = '')
@@ -29,7 +54,12 @@ descriptor_stream() {
           AND live.status NOT IN ('completed','failed','cancelled')
           AND live.issue_id = t.issue_id
           AND live.work_dir = COALESCE(t.work_dir, '$root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir'))
-      ORDER BY t.completed_at LIMIT :batch_limit"
+      ORDER BY t.completed_at"
+  if [[ -n "${WORKSPACE_GC_PSQL_COMMAND:-}" ]]; then
+    eval "$WORKSPACE_GC_PSQL_COMMAND" <<<"$query"
+  else
+    docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -F $'\t' -c "$query"
+  fi
 }
 
 declare -A busy_task_dirs=()
@@ -54,6 +84,7 @@ done
 
 total=0; count=0
 while IFS=$'\t' read -r task_id status completed_at issue_id work_dir; do
+  ((count < limit)) || break
   [[ "$task_id" =~ ^[0-9a-fA-F-]{36}$ ]] || continue
   prefix="${task_id:0:8}"
   [[ "$work_dir" == "$root"/*/"$prefix"/workdir ]] || continue
