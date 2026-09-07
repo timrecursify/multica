@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -406,7 +407,10 @@ func runRepoCheckout(cmd *cobra.Command, args []string) error {
 	}
 	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read checkout response: %w", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("checkout failed: %s", string(body))
@@ -418,6 +422,19 @@ func runRepoCheckout(cmd *cobra.Command, args []string) error {
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("parse response: %w", err)
+	}
+	result.Path = strings.TrimSpace(result.Path)
+	if result.Path == "" {
+		return fmt.Errorf("invalid checkout response: missing path")
+	}
+	if info, err := os.Stat(result.Path); err != nil || !info.IsDir() {
+		if err != nil {
+			return fmt.Errorf("checkout response unusable: path %q: %w", result.Path, err)
+		}
+		return fmt.Errorf("checkout response unusable: path %q is not a directory", result.Path)
+	}
+	if out, err := exec.Command("git", "-C", result.Path, "rev-parse", "--is-inside-work-tree").Output(); err != nil || strings.TrimSpace(string(out)) != "true" {
+		return fmt.Errorf("checkout response unusable: path %q is not a Git worktree", result.Path)
 	}
 
 	fmt.Fprintf(os.Stdout, "%s\n", result.Path)

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -236,6 +237,10 @@ func TestRunRepoRemoveRejectsMissingRepoWithoutPatch(t *testing.T) {
 }
 
 func TestRunRepoCheckoutForwardsManagedCheckoutMode(t *testing.T) {
+	checkoutPath := t.TempDir()
+	if err := exec.Command("git", "init", checkoutPath).Run(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	var body map[string]string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/repo/checkout" {
@@ -246,7 +251,7 @@ func TestRunRepoCheckoutForwardsManagedCheckoutMode(t *testing.T) {
 			t.Fatalf("decode checkout body: %v", err)
 		}
 		json.NewEncoder(w).Encode(map[string]string{
-			"path":        "/work/repo",
+			"path":        checkoutPath,
 			"branch_name": "agent/test/task",
 		})
 	}))
@@ -270,5 +275,24 @@ func TestRunRepoCheckoutForwardsManagedCheckoutMode(t *testing.T) {
 	}
 	if got := body["ref"]; got != "release/v2" {
 		t.Fatalf("ref = %q, want release/v2", got)
+	}
+}
+
+func TestRunRepoCheckoutRejectsInvalidResponses(t *testing.T) {
+	checkoutCases := []struct {
+		name, body, want string
+	}{
+		{"empty JSON", `{}`, "missing path"},
+		{"blank path", `{"path":"  "}`, "missing path"},
+		{"missing directory", `{"path":"/does/not/exist"}`, "unusable"},
+	}
+	for _, tc := range checkoutCases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, tc.body) }))
+			defer srv.Close()
+			t.Setenv("MULTICA_DAEMON_PORT", strings.TrimPrefix(srv.URL, "http://127.0.0.1:"))
+			err := runRepoCheckout(&cobra.Command{}, []string{"https://github.com/org/repo.git"})
+			if err == nil || !strings.Contains(err.Error(), tc.want) { t.Fatalf("error = %v, want %q", err, tc.want) }
+		})
 	}
 }
