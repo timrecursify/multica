@@ -23,6 +23,7 @@ declare -A REQUIRED=(
   ['pulls/<n>']=pull_requests
   ['pulls/<n>/files']=pull_requests
   ['contents/<path>']=contents
+  ['actions/workflows/<file>']=workflows
 )
 
 # --- hermetic mint: stub curl, sign with a throwaway key -------------------
@@ -68,6 +69,9 @@ for perm in checks statuses; do
   level="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["permissions"][sys.argv[2]])' "$MINT_BODY" "$perm")"
   [[ "$level" == read ]] || fail "$perm must stay read-only, found $level"
 done
+
+workflow_level="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["permissions"]["workflows"])' "$MINT_BODY")"
+[[ "$workflow_level" == write ]] || fail "workflows must be write, found $workflow_level"
 
 # --- the source of truth for REQUIRED: no belt call may write a check run or
 # --- a commit status, or the read-only grant above would be wrong.
