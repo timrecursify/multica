@@ -514,6 +514,18 @@ guard_wrapper() {
   fi
 }
 
+# Guardrails are a required runtime input for both the worker and relay.  Keep
+# this check separate from PM2 liveness: an online process with a missing
+# guardrails module is still an unsafe deployment.  The guard deliberately
+# fails closed and names the exact runtime path so an operator can restore it
+# from the next immutable release.
+guard_runtime_guardrails() {
+  local guardrails="$RUNTIME_ROOT/gsp-multica/guardrails.cjs"
+  if [[ ! -r "$guardrails" ]]; then
+    unfixable+=("gsp-multica-worker guardrails missing: $guardrails (restore from immutable release)")
+  fi
+}
+
 # 1b. The running Tower must match the wrapper. A patched file is not a patched
 # process: a restart that happened while the file was drifted leaves a correct
 # file and a wrong process, which the file check alone cannot see.
@@ -1562,7 +1574,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 guard_relay_preflight
 repair_source_runtime_parity
 guard_source_runtime_parity
-guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+guard_wrapper; guard_runtime_guardrails; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 # Several guards can observe the same flight in one tick. Emit each exact
 # finding once so the P0 is stable and one-run idempotent.
