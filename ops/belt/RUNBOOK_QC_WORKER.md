@@ -49,8 +49,8 @@ FAILURE_CLASS=none; QUALIFYING=true
 # For an unavailable prerequisite: FAILURE_CLASS=evidence|tool|access;
 # QUALIFYING=false; BLOCKED_REASON='actionable reason'
 IDEM_KEY="qc-${NUMBER}-${BOUND_SHA}-${VERDICT}"
-QC_MODEL="${QC_MODEL:?set to the model from your task context}"
-QC_EFFORT="${QC_EFFORT:?set to the effort from your task context}"
+QC_MODEL="gpt-5.6-sol"
+QC_EFFORT="low"
 VERDICT_NOTES=''
 if [ "$VERDICT" = FAIL ]; then
   VERDICT_NOTES="${REWORK_SUMMARY:?set a concise rework summary}"
@@ -73,7 +73,7 @@ test -z "${BLOCKED_REASON:-}" || printf 'BLOCKED: %s\n' "$BLOCKED_REASON"
 sk multica verdict "$NUMBER" --board "$BOARD" --verdict "$VERDICT" \
   --bound-sha "$BOUND_SHA" --observed-sha "$OBSERVED_SHA" \
   --work-product-md5 "$WORK_PRODUCT_MD5" --failure-class "$FAILURE_CLASS" \
-  --qualifying "$QUALIFYING" --model "$QC_MODEL" --effort "$QC_EFFORT" --idem-key "$IDEM_KEY" \
+  --qualifying "$QUALIFYING" --model gpt-5.6-sol --effort low --idem-key "$IDEM_KEY" \
   --notes "$VERDICT_NOTES"
 ```
 

@@ -66,6 +66,7 @@ const {
   retryEscalationSourceTask,
   capEscalationVerified,
   retryEscalationLoop,
+  consumesRetryEscalation,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
   diagnosisRerunErrorStatus,
@@ -321,6 +322,13 @@ test('a second retry escalation for one stage is parked', () => {
     trigger_stage: 'Spec' } } }, 'Spec'), true);
   assert.equal(retryEscalationLoop({ metadata: { retry_escalation: {
     trigger_stage: 'Queue' } } }, 'Spec'), false);
+});
+
+test('successful departure consumes active retry escalation metadata', () => {
+  const issue = { status: 'Queue', metadata: { retry_escalation: { trigger_stage: 'Queue' } } };
+  assert.equal(consumesRetryEscalation(issue, 'In Progress'), true);
+  assert.equal(consumesRetryEscalation(issue, 'Queue'), false);
+  assert.equal(consumesRetryEscalation({ status: 'Queue', metadata: {} }, 'In Progress'), false);
 });
 
 test('completion escalation is bound to one exact completed failed task', async () => {
@@ -1753,7 +1761,10 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
       author_type text, author_id uuid, content text, type text, created_at timestamptz DEFAULT now());
       CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, checker_id uuid, verdict text,
-      work_product_md5 text, created_at timestamptz DEFAULT now());`);
+      work_product_md5 text, created_at timestamptz DEFAULT now());
+      CREATE TABLE "${schema}".activity_log (id bigserial PRIMARY KEY, workspace_id uuid NOT NULL,
+      issue_id uuid NOT NULL, actor_type text NOT NULL, actor_id uuid, action text NOT NULL,
+      details jsonb, created_at timestamptz DEFAULT now());`);
     await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
     await admin.query(`INSERT INTO "${schema}".agent (id, workspace_id, name, runtime_id, status, instructions, model, thinking_level, max_concurrent_tasks)
       VALUES ($1, $2, 'builder', $3, 'idle', 'Queue\nIn Progress\nCI/CD & Deploy', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
