@@ -15,6 +15,10 @@ git -C "$fixture/$workspace/${task:0:8}/workdir" push -qu origin HEAD:main
 git -C "$fixture/$workspace/${task:0:8}/workdir" fetch -q origin
 printf '{"task_id":"%s","issue_id":"%s"}\n' "$task" "$issue" > "$fixture/$workspace/${task:0:8}/.gc_meta.json"
 printf '%s\tcompleted\t2026-01-01T00:00:00Z\t%s\t%s\n' "$task" "$issue" "$fixture/$workspace/${task:0:8}/workdir" > "$fixture/descriptors"
+sleep 30 < "$fixture/$workspace/${task:0:8}/workdir/tracked" & busy_pid=$!
+busy_out="$(BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" WORKSPACE_GC_DESCRIPTOR_FILE="$fixture/descriptors" "$dir/workspace-gc.sh")"
+! grep -q "$task" <<<"$busy_out"
+kill "$busy_pid"; wait "$busy_pid" 2>/dev/null || :
 out="$(BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" WORKSPACE_GC_DESCRIPTOR_FILE="$fixture/descriptors" "$dir/workspace-gc.sh")"
 grep -q "$task" <<<"$out"
 BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" WORKSPACE_GC_DESCRIPTOR_FILE="$fixture/descriptors" "$dir/workspace-gc.sh" --apply >/dev/null

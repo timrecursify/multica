@@ -32,6 +32,26 @@ descriptor_stream() {
       ORDER BY t.completed_at LIMIT :batch_limit"
 }
 
+declare -A busy_task_dirs=()
+record_busy_path() {
+  local link="$1" path relative workspace remainder task
+  path="$(readlink -e -- "$link" 2>/dev/null)" || return 0
+  [[ "$path" == "$root"/* ]] || return 0
+  relative="${path#"$root"/}"
+  [[ "$relative" == */* ]] || return 0
+  workspace="${relative%%/*}"
+  remainder="${relative#*/}"
+  task="${remainder%%/*}"
+  [[ -n "$workspace" && -n "$task" ]] || return 0
+  busy_task_dirs["$root/$workspace/$task"]=1
+}
+
+for proc in /proc/[0-9]*; do
+  [[ -d "$proc" ]] || continue
+  record_busy_path "$proc/cwd"
+  for fd in "$proc"/fd/*; do record_busy_path "$fd"; done
+done
+
 total=0; count=0
 while IFS=$'\t' read -r task_id status completed_at issue_id work_dir; do
   [[ "$task_id" =~ ^[0-9a-fA-F-]{36}$ ]] || continue
@@ -39,6 +59,7 @@ while IFS=$'\t' read -r task_id status completed_at issue_id work_dir; do
   [[ "$work_dir" == "$root"/*/"$prefix"/workdir ]] || continue
   task_dir="${work_dir%/workdir}"
   [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
+  [[ -z "${busy_task_dirs["$task_dir"]+x}" ]] || continue
   meta="$task_dir/.gc_meta.json"
   [[ -f "$meta" && "$(jq -r '.task_id // empty' "$meta")" == "$task_id" && "$(jq -r '.issue_id // empty' "$meta")" == "$issue_id" ]] || continue
   safe=1
