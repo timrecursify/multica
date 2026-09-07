@@ -44,6 +44,7 @@ const {
   qcTaskEvidenceMismatch,
   relayVerdict,
   relayAdvance,
+  writeJsonResponse,
   admitConfiguredTransition,
   setTestClientFactory,
   isCicdReturn,
@@ -75,6 +76,23 @@ const {
   isTerminalStage,
   isNoDispatchArrivalStage
 } = require('./multica-bridge.cjs');
+
+test('relay error response does not write headers after a response has ended', () => {
+  const writes = [];
+  const res = {
+    headersSent: false,
+    writableEnded: false,
+    writeHead(status) { this.headersSent = true; writes.push(['head', status]); },
+    end(body) { this.writableEnded = true; writes.push(['body', body]); }
+  };
+
+  assert.equal(writeJsonResponse(res, 409, { error: 'lifetime_task_limit' }), true);
+  assert.equal(writeJsonResponse(res, 500, { error: 'internal_error' }), false);
+  assert.deepEqual(writes, [
+    ['head', 409],
+    ['body', JSON.stringify({ error: 'lifetime_task_limit' })]
+  ]);
+});
 
 test('relay transition admission is a single pre-mutation decision', () => {
   const admitted = admitConfiguredTransition({ fromStage: 'Human Review', toStage: 'Queue',
