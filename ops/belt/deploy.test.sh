@@ -42,6 +42,10 @@ for parity_file in "$root_dir"/parity/*.cjs; do
   case "$parity_file" in *.test.cjs) continue ;; esac
   while read -r required; do
     [[ -n "$required" ]] || continue
+    # multica-bridge.cjs is hosted only by the canonical bridge runtime; the
+    # relay dead-row helper is loaded on demand and is not a relay daemon boot
+    # dependency.
+    [[ "$required" == "multica-bridge.cjs" ]] && continue
     printf '%s\n' "${targets[@]}" | grep -q "/app/$required\$" || {
       echo "parity/$(basename "$parity_file") requires ../$required, which the manifest does not deploy to app/" >&2
       exit 1
@@ -73,9 +77,23 @@ dry_log="$tmp_dir/dry-run.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run >"$dry_log"
 grep -q "Would copy .*/parked-diagnosis.cjs to $bridge_dir/parked-diagnosis.cjs" "$dry_log"
 grep -q "Would copy .*/parked-diagnosis.cjs to $relay_dir/parked-diagnosis.cjs" "$dry_log"
+if grep -q 'multica-relay-advance/app/multica-bridge.cjs' "$dry_log"; then
+  echo 'bridge dry-run selected nonexistent relay target' >&2
+  exit 1
+fi
 grep -q "Would copy .*/parity/relay-dead-rows.cjs to .*/parity/relay-dead-rows.cjs" "$dry_log"
 # transition-policy.cjs ships to three service directories from one source row.
 [[ "$(grep -c 'Would copy .*/transition-policy.cjs' "$dry_log")" -eq 3 ]]
+
+# Bridge-only rollout must touch exactly the canonical runtime target.
+bridge_only_log="$tmp_dir/bridge-only.log"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$bridge_only_log"
+cmp -s -- "$root_dir/multica-bridge.cjs" "$bridge_dir/multica-bridge.cjs"
+[[ "$(grep -c '^Copied ' "$bridge_only_log")" -eq 1 ]]
+if grep -q 'multica-relay-advance/app/multica-bridge.cjs' "$bridge_only_log"; then
+  echo 'bridge-only rollout touched nonexistent relay target' >&2
+  exit 1
+fi
 
 # An unscoped apply rewrites every managed target, so it must be requested by name.
 if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$tmp_dir/unscoped.log" 2>&1; then
@@ -126,6 +144,7 @@ apply_log="$tmp_dir/apply.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --all >"$apply_log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" "$(git -C "$root_dir/../.." rev-parse HEAD)" >"$tmp_dir/verify.log"
 grep -q "Match: $cicd_dir/multica-cicd-worker.cjs" "$tmp_dir/verify.log"
+grep -q "Match: $bridge_dir/multica-bridge.cjs" "$tmp_dir/verify.log"
 receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$apply_log")"
 [[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" >/dev/null
