@@ -142,6 +142,19 @@ test('typed re-advance moves recorded work through relay without an agent dispat
   assert.equal(calls.some((sql) => sql.includes('INSERT INTO agent_task_queue')), false);
 });
 
+test('typed Spec NO_OP re-enters Spec disposition instead of creating a Queue task', async () => {
+  const client = { release() {}, query: async (sql) => sql.includes('FROM issue_stage_outcome')
+    ? { rows: [{ issue_id: 'issue-1', to_stage: 'Spec', outcome: 'NO_OP', task_id: 'task-1',
+      task_result: { output: 'already implemented\n\nOUTCOME: NO_OP' }, issue_title: 'work',
+      next_stage: 'Queue' }] } : { rows: [] } };
+  const payloads = [];
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async (payload) => { payloads.push(payload); return { ok: true }; },
+    logger: { log() {} }, typedOutcomes: true });
+  assert.equal(payloads[0].to_stage, 'Spec');
+  assert.equal(payloads[0].relay_source_task_id, 'task-1');
+});
+
 function typedReadvanceQcRow(overrides = {}) {
   return {
     issue_id: 'issue-1', to_stage: 'In Review', outcome: 'ADVANCED', task_id: 'task-1',
