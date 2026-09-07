@@ -509,9 +509,9 @@ async function reconcileIssue(client, issueId, options = {}) {
 async function armCompletedBuildWorkProduct(client, issueId, stage, taskId) {
   await client.query(
     `UPDATE relay_run_log SET task_id = NULL
-      WHERE task_id = $3::uuid AND status = 'completed'
+      WHERE task_id = $1::uuid AND status = 'completed'
         AND to_stage IS DISTINCT FROM $2::text`,
-    [issueId, stage, taskId]
+    [taskId, stage]
   );
   return client.query(
     `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
