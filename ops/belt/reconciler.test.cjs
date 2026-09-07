@@ -3,7 +3,8 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
-  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql } = require("./reconciler.cjs");
+  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql, classifyRollupChildren,
+  nextRollupDependency, reconcileRollupDependency } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
 const ok = () => ({ ok: true });
@@ -27,6 +28,7 @@ function harness({ live = [], isLeaf = true, owner = {
 test("query builders hold the live status invariant", () => {
   assert.match(issueCandidatesSql(), /status = ANY/);
   assert.match(issueCandidatesSql(), /NOT EXISTS \(SELECT 1 FROM issue c/);
+  assert.doesNotMatch(issueCandidatesSql(), /c\.status NOT IN/);
   assert.doesNotMatch(issueCandidatesSql(), /parent_issue_id IS NULL/);
   assert.match(isLeafSql(), /AS is_leaf/);
   assert.match(liveTasksSql(), /FOR UPDATE/);
@@ -40,6 +42,76 @@ test("query builders hold the live status invariant", () => {
   assert.match(ownerSql(), /ORDER BY pool.last_selected_at NULLS FIRST, pool.agent_id LIMIT 1/);
   assert.match(stageAttemptsSql(), /\$3::int/);
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
+});
+
+test("mixed child dispositions have one explicit rollup outcome", () => {
+  const doneMixed = classifyRollupChildren([
+    { id: "a", status: "Done" },
+    { id: "b", status: "Cancelled" },
+    { id: "c", status: "Archived" }
+  ]);
+  assert.equal(doneMixed.state, "ready");
+  assert.equal(doneMixed.outcome, "Done");
+  assert.equal(classifyRollupChildren([
+    { id: "a", status: "Cancelled" }, { id: "b", status: "Archived" }
+  ]).outcome, "Cancelled");
+
+  const failed = classifyRollupChildren([
+    { id: "a", status: "Done" },
+    { id: "b", status: "Rejected", latest_task_status: "failed" }
+  ]);
+  assert.equal(failed.state, "blocked");
+  assert.deepEqual(failed.failed.map((child) => child.id), ["b"]);
+  assert.equal(failed.outcome, undefined);
+});
+
+test("dependency versions change only with child state and cycles stay blocked", () => {
+  const blocked = nextRollupDependency({}, classifyRollupChildren([
+    { id: "child", status: "Queue", latest_task_status: "failed" }
+  ]));
+  assert.equal(blocked.version, 1);
+  assert.equal(blocked.wakeup_owner, "reconciler");
+  assert.deepEqual(blocked.blocked_on_child_ids, ["child"]);
+  assert.deepEqual(blocked.failed_child_ids, ["child"]);
+  assert.equal(nextRollupDependency(blocked, classifyRollupChildren([
+    { id: "child", status: "Queue", latest_task_status: "failed" }
+  ])).version, 1);
+  const ready = nextRollupDependency(blocked, classifyRollupChildren([
+    { id: "child", status: "Done", latest_task_status: "completed" }
+  ]));
+  assert.equal(ready.version, 2);
+  assert.equal(ready.outcome, "Done");
+  const cyclic = classifyRollupChildren([{ id: "child", status: "Queue" }], ["parent", "child", "parent"]);
+  assert.equal(cyclic.state, "cycle");
+});
+
+test("last terminal child wakes exactly one durable aggregation", async () => {
+  const parent = { id: issue.id, workspace_id: issue.workspace_id, status: "Queue", metadata: {
+    rollup_dependency: { version: 1, state: "blocked", child_states: [{ id: "child", status: "Queue", task_status: null }] }
+  } };
+  const calls = [];
+  const client = { query: async (sql, values = []) => {
+    calls.push({ sql, values });
+    if (sql.includes("SELECT id, workspace_id, status, metadata FROM issue")) return { rows: [parent] };
+    if (sql.includes("FROM issue child WHERE child.parent_issue_id") && sql.includes("FOR SHARE")) {
+      return { rows: [{ id: "child", status: "Done", latest_task_status: "completed" }] };
+    }
+    if (sql.includes("WITH RECURSIVE descendants")) return { rows: [] };
+    if (sql.startsWith("UPDATE issue SET status")) {
+      if (["Done", "Cancelled", "Archived"].includes(parent.status)) return { rows: [] };
+      parent.status = values[1];
+      parent.metadata.rollup_dependency = JSON.parse(values[2]);
+      return { rows: [{ id: parent.id }] };
+    }
+    return { rows: [] };
+  } };
+  assert.deepEqual(await reconcileRollupDependency(client, parent.id), {
+    action: "aggregated", outcome: "Done", version: 2
+  });
+  assert.deepEqual(await reconcileRollupDependency(client, parent.id), { action: "unchanged" });
+  assert.equal(calls.filter(({ sql }) => sql.includes("'rollup_aggregated'")).length, 1);
+  assert.equal(calls.filter(({ sql }) => sql.startsWith("UPDATE relay_run_log")).length, 1);
+  assert.equal(calls.filter(({ sql }) => sql.startsWith("INSERT INTO relay_run_log")).length, 1);
 });
 
 test("zero-task issue creates exactly one reconcile task and pending log", async () => {
@@ -79,7 +151,7 @@ test("restart is idempotent when the current-stage task is live", async () => {
 test("rollups with open children and running old-stage tasks are skipped", async () => {
   const rollup = harness({ isLeaf: false });
   assert.deepEqual(await reconcileIssue(rollup, issue.id, { evaluate: ok }),
-    { action: "skipped", reason: "rollup_has_open_children" });
+    { action: "skipped", reason: "rollup_dependency_owned" });
   assert.equal(rollup.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
   const leafChild = harness();
   const childOriginal = leafChild.query;

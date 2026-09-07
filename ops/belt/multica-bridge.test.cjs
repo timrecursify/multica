@@ -123,24 +123,46 @@ const {
   normalizeRelayStage
 } = require('./multica-bridge.cjs');
 
-test('rollup admission with an open child is skipped before a task insert attempt', async () => {
+test('rollup admission persists a versioned dependency before any task insert', async () => {
   const calls = [];
   const client = { query: async (sql, values) => {
     calls.push({ sql, values });
-    if (/parent_issue_id/.test(sql)) return { rows: [{ number: 23886 }, { number: 23887 }] };
-    if (/SELECT 1 FROM activity_log/.test(sql)) return { rows: [] };
-    if (/INSERT INTO activity_log/.test(sql)) return { rows: [] };
+    if (/parent_issue_id/.test(sql)) return { rows: [
+      { id: 'child-1', status: 'Queue', number: 23886, latest_task_status: 'failed' },
+      { id: 'child-2', status: 'Spec', number: 23887, latest_task_status: null }
+    ] };
+    if (/UPDATE issue SET metadata/.test(sql) || /INSERT INTO activity_log/.test(sql)) return { rows: [] };
     assert.fail(`unexpected query: ${sql}`);
   } };
 
   const admission = await openChildAdmission(client, {
     id: '123e4567-e89b-42d3-a456-426614174000',
-    workspace_id: '223e4567-e89b-42d3-a456-426614174000'
+    workspace_id: '223e4567-e89b-42d3-a456-426614174000', metadata: {}
   });
 
-  assert.deepEqual(admission, { ok: false, childNumbers: [23886, 23887], auditWritten: true });
+  assert.equal(admission.ok, false);
+  assert.deepEqual(admission.childNumbers, [23886, 23887]);
+  assert.equal(admission.dependency.version, 1);
+  assert.equal(admission.dependency.wakeup_owner, 'reconciler');
+  assert.deepEqual(admission.dependency.blocked_on_child_ids, ['child-1', 'child-2']);
+  assert.deepEqual(admission.dependency.failed_child_ids, ['child-1']);
   assert.equal(calls.some(({ sql }) => /INSERT INTO agent_task_queue/.test(sql)), false);
-  assert.match(calls.at(-1).values[2], /"child_numbers":\[23886,23887\]/);
+  assert.match(calls.at(-1).values[2], /"reason":"rollup_dependency_wait"/);
+  assert.doesNotMatch(calls.at(-1).values[2], /rollup_has_open_children/);
+});
+
+test('a rollup with terminal children waits for reconciler aggregation', async () => {
+  const client = { query: async (sql) => /parent_issue_id/.test(sql)
+    ? { rows: [{ id: 'child-1', status: 'Done', number: 1, latest_task_status: 'completed' }] }
+    : { rows: [] } };
+  const admission = await openChildAdmission(client, {
+    id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '223e4567-e89b-42d3-a456-426614174000', metadata: {}
+  });
+  assert.equal(admission.ok, false);
+  assert.equal(admission.dependency.state, 'ready');
+  assert.equal(admission.dependency.outcome, 'Done');
+  assert.ok(admission.dependency.next_eligible_at);
 });
 
 test('Spec completion advances a written spec and bounds repeated blockers', async () => {

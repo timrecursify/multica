@@ -732,6 +732,17 @@ async function markRelayLogFailed(client, issueId) {
   }
 }
 
+async function markRelayLogRejected(client, issueId) {
+  try {
+    await client.query(
+      `UPDATE relay_run_log SET status = $1 WHERE issue_id = $2 AND status = $3`,
+      ['rejected', issueId, 'pending']
+    );
+  } catch (err) {
+    console.error(`${LOG_PREFIX} Failed to reject relay_run_log: ${err.message}`);
+  }
+}
+
 // Row-scoped variants. The issue-scoped functions above close EVERY pending
 // row for an issue, which loses the correlation between a task and the relay
 // log it belongs to. Use these wherever the specific row id is known.
@@ -755,6 +766,26 @@ async function markRelayLogFailedById(client, logId) {
   } catch (err) {
     console.error(`${LOG_PREFIX} Failed to update relay_run_log ${logId}: ${err.message}`);
   }
+}
+
+async function markRelayLogRejectedById(client, logId) {
+  try {
+    await client.query(
+      `UPDATE relay_run_log SET status = 'rejected' WHERE id = $1 AND status = 'pending'`,
+      [logId]
+    );
+  } catch (err) {
+    console.error(`${LOG_PREFIX} Failed to reject relay_run_log ${logId}: ${err.message}`);
+  }
+}
+
+async function holdRelayLogDeferred(client, logId, response) {
+  const receipt = { classification: response.classification, reason: response.error || null,
+    retry_condition: response.retryCondition || null, next_eligible_at: response.nextEligibleAt || null };
+  await client.query(`UPDATE relay_run_log
+    SET parked_audit = jsonb_set(COALESCE(parked_audit, '{}'::jsonb),
+      '{relay_deferred}', $2::jsonb, true)
+    WHERE id = $1 AND status = 'pending'`, [logId, JSON.stringify(receipt)]);
 }
 
 async function failMissingQcVerdict(client, logId) {
@@ -850,6 +881,7 @@ async function enqueuePassWithoutRelayRows({ dbPool = pool, logger = console } =
           ) evidence_task ON true
           WHERE i.status = 'In Review'
             AND rsc.next_stage = 'CI/CD & Deploy'
+            AND NOT EXISTS (SELECT 1 FROM issue child WHERE child.parent_issue_id = i.id)
             AND qc."verdict" = 'PASS'
             AND qc."created_at" > COALESCE((
               SELECT MAX(created_at) FROM relay_run_log WHERE issue_id = i.id
@@ -1099,6 +1131,13 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       WHERE atq.status = 'completed'
         AND i.status = rrl.to_stage
         AND rsc.next_stage IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM issue child WHERE child.parent_issue_id = i.id)
+        AND (
+          NOT (COALESCE(rrl.parked_audit, '{}'::jsonb) ? 'relay_deferred')
+          OR NULLIF(rrl.parked_audit->'relay_deferred'->>'next_eligible_at', '')::timestamptz <= NOW()
+          OR COALESCE((i.metadata->'rollup_dependency'->>'version')::bigint, 0) >
+             COALESCE((rrl.parked_audit->'relay_deferred'->'retry_condition'->>'after_version')::bigint, 0)
+        )
       ORDER BY rrl.created_at ASC
       LIMIT 100`;
 
@@ -1218,16 +1257,15 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
           logger.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${targetStage}' route=${route?.kind || 'configured'} (task-correlated log ${row.log_id})${proof}`);
           await markRelayLogCompletedById(client, row.log_id);
         } else if (response.deferred) {
-          // Preserve the task-correlated pending log. The same advance becomes
-          // eligible once the predecessor is terminal; recording failure here
-          // would strand it permanently.
-          logger.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
-        } else {
-          // The relay's own error text was parsed and then discarded, so 76 of every
-          // 400 log lines were a bare `status 409` with no cause. Print the reason.
-          logger.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
+          await holdRelayLogDeferred(client, row.log_id, response);
+          logger.log(`${LOG_PREFIX} ACCEPTED-DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
+        } else if (response.refused) {
+          logger.log(`${LOG_PREFIX} REFUSED: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
           if (response.status === 409) relayRefusalMemo.set(row.issue_id, refusalFingerprint);
-          else await markRelayLogFailedById(client, row.log_id);
+          else await markRelayLogRejectedById(client, row.log_id);
+        } else {
+          logger.log(`${LOG_PREFIX} FAILED: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
+          await markRelayLogFailedById(client, row.log_id);
         }
       } catch (err) {
         logger.error(`${LOG_PREFIX} Error: ${err.message}`);
@@ -1262,6 +1300,7 @@ async function recoveryAdvanceTasks() {
       WHERE atq.status IN ('completed', 'failed')
         AND i.status = ANY($1)
         AND rsc.next_stage IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM issue child WHERE child.parent_issue_id = i.id)
         AND (rrl.id IS NULL OR rrl.status IN ('pending', 'completed'))
       LIMIT 30`;
 
@@ -1302,9 +1341,12 @@ async function recoveryAdvanceTasks() {
           console.log(`${LOG_PREFIX} [recovery] Advanced Registered ticket ${row.issue_id} '${row.to_stage}' → '${row.next_stage}'`);
           await markRelayLogCompleted(client, row.issue_id);
         } else if (response.deferred) {
-          console.log(`${LOG_PREFIX} [recovery] DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
+          console.log(`${LOG_PREFIX} [recovery] ACCEPTED-DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
+        } else if (response.refused) {
+          console.log(`${LOG_PREFIX} [recovery] REFUSED: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
+          await markRelayLogRejected(client, row.issue_id);
         } else {
-          console.log(`${LOG_PREFIX} [recovery] Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
+          console.log(`${LOG_PREFIX} [recovery] FAILED: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
           await markRelayLogFailed(client, row.issue_id);
         }
       } catch (err) {
@@ -1317,6 +1359,20 @@ async function recoveryAdvanceTasks() {
   } finally {
     client.release();
   }
+}
+
+function classifyRelayResponse(status, headers = {}, parsed = {}, body = '', now = Date.now) {
+  const retryAfter = Number(parsed.retry_after_seconds ?? headers['retry-after']);
+  const nextEligibleAt = parsed.next_eligible_at ||
+    (Number.isFinite(retryAfter) && retryAfter > 0 ? new Date(now() + retryAfter * 1000).toISOString() : null);
+  const classification = status === 202 ? 'accepted-deferred'
+    : status >= 200 && status < 300 ? 'accepted'
+    : status >= 400 && status < 500 ? 'refused' : 'failed';
+  const retryCondition = parsed.retry_condition || (nextEligibleAt
+    ? { type: 'after_seconds', seconds: retryAfter } : null);
+  return { ok: classification === 'accepted', deferred: classification === 'accepted-deferred',
+    refused: classification === 'refused', failed: classification === 'failed', classification,
+    status, error: parsed.error, retryCondition, nextEligibleAt, body };
 }
 
 function postToRelay(payload) {
@@ -1332,10 +1388,8 @@ function postToRelay(payload) {
       res.on('end', () => {
         try {
           const parsed = JSON.parse(data);
-          resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
-            status: res.statusCode, error: parsed.error, body: data });
-        } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
-          status: res.statusCode, body: data }); }
+          resolve(classifyRelayResponse(res.statusCode, res.headers, parsed, data));
+        } catch { resolve(classifyRelayResponse(res.statusCode, res.headers, {}, data)); }
       });
     });
 
@@ -1358,10 +1412,8 @@ function postToPath(path, payload) {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
-        try { const parsed = JSON.parse(data); resolve({ ok: res.statusCode === 200 || res.statusCode === 201,
-          deferred: res.statusCode === 202, status: res.statusCode, error: parsed.error, body: data });
-        } catch { resolve({ ok: res.statusCode === 200 || res.statusCode === 201,
-          deferred: res.statusCode === 202, status: res.statusCode, body: data }); }
+        try { resolve(classifyRelayResponse(res.statusCode, res.headers, JSON.parse(data), data)); }
+        catch { resolve(classifyRelayResponse(res.statusCode, res.headers, {}, data)); }
       });
     });
     req.on('error', reject); req.on('timeout', () => req.destroy(new Error('relay timeout'))); req.write(body); req.end();
@@ -1412,6 +1464,7 @@ async function findAndAdvanceRegistered() {
     const query = `SELECT i.id, i.number
       FROM issue i
       WHERE i.status = $1
+        AND NOT EXISTS (SELECT 1 FROM issue child WHERE child.parent_issue_id = i.id)
         AND EXISTS (SELECT 1 FROM relay_stage_config rsc
                     WHERE rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status)
         AND (
@@ -1451,8 +1504,12 @@ async function findAndAdvanceRegistered() {
 
         if (response.ok) {
           console.log(`${LOG_PREFIX} Advanced Registered ticket ${row.id} (#${row.number}) → Spec`);
+        } else if (response.deferred) {
+          console.log(`${LOG_PREFIX} ACCEPTED-DEFERRED: ${row.id} reason=${response.error || 'retry_condition'}`);
+        } else if (response.refused) {
+          console.log(`${LOG_PREFIX} REFUSED: ${row.id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
         } else {
-          console.log(`${LOG_PREFIX} Failed: ${row.id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
+          console.log(`${LOG_PREFIX} FAILED: ${row.id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
         }
       } catch (err) {
         console.error(`${LOG_PREFIX} Error advancing Registered: ${err.message}`);
@@ -2428,4 +2485,5 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
+  classifyRelayResponse, holdRelayLogDeferred,
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup };
