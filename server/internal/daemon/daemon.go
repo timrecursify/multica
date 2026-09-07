@@ -6167,7 +6167,17 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		taskLog.Error("task auth token invalid; refusing to start agent", "error", err)
 		return TaskResult{}, err
 	}
+	// Provision the daemon-owned graph environment before launching the task.
+	// This is shared and version-pinned; failed/partial installs are removed by
+	// the provisioner so the next task can retry safely.
+	sharedCacheRoot := filepath.Join(env.MulticaConfigRoot, "shared-cache")
+	graphVenv, err := ensureCodeReviewGraphCache(sharedCacheRoot)
+	if err != nil {
+		taskLog.Error("code-review-graph cache provisioning failed", "error", err)
+		return TaskResult{}, err
+	}
 	agentEnv := taskMulticaEnvironment(task, agentName, agentToken, env.MulticaConfigRoot, d.cfg.WorkspacesRoot, d.cfg.ServerBaseURL, d.cfg.HealthPort, slot, taskTempDir)
+	agentEnv["MULTICA_CODE_REVIEW_GRAPH_VENV"] = graphVenv
 	if checkoutMode := repoCheckoutModeFor(provider, runtime.GOOS); checkoutMode != "" {
 		agentEnv[repoCheckoutModeEnv] = checkoutMode
 	}
