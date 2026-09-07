@@ -110,6 +110,10 @@ readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver 
 # deploying guardrails.  This marker suppresses only worker self-healing; all
 # pipeline services remain under the normal liveness guard.
 readonly AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-$RUNTIME_ROOT/.local/state/multica-ai-hold}"
+# Worker remediation is fail-closed unless an operator explicitly releases the
+# hold and approves the supervisor/concurrency settings for this run.
+readonly OPERATOR_RELEASE_FILE="${MULTICA_OPERATOR_RELEASE_FILE:-$RUNTIME_ROOT/.local/state/multica-operator-release}"
+readonly SUPERVISOR_APPROVAL_FILE="${MULTICA_SUPERVISOR_APPROVAL_FILE:-$RUNTIME_ROOT/.local/state/multica-supervisor-approval}"
 readonly PSQL=(docker exec -i gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At)
 
 fixed=(); unfixable=()
@@ -436,6 +440,10 @@ ai_hold_active() {
   [[ -f "$AI_HOLD_FILE" ]]
 }
 
+worker_remediation_released() {
+  ! ai_hold_active && [[ -f "$OPERATOR_RELEASE_FILE" ]] && [[ -f "$SUPERVISOR_APPROVAL_FILE" ]]
+}
+
 file_p0() {
   local title="$1" body="$2" out rc
   out=$("$SK" multica create --board gsp --title "P0: $title" --desc "$body" 2>&1); rc=$?
@@ -531,8 +539,12 @@ tower_concurrency_state() {
 
 guard_tower_process() {
   local live concurrency_state
-  if ai_hold_active; then
-    unfixable+=("gsp-multica-worker held by ${AI_HOLD_FILE}")
+  if ! worker_remediation_released; then
+    if ai_hold_active; then
+      unfixable+=("gsp-multica-worker held by ${AI_HOLD_FILE}")
+    else
+      unfixable+=("gsp-multica-worker remediation requires operator release ${OPERATOR_RELEASE_FILE} and supervisor approval ${SUPERVISOR_APPROVAL_FILE}")
+    fi
     return 0
   fi
   live=$(ps -eo args | grep "[m]ultica-daemon/server daemon start" | head -1)
@@ -563,8 +575,8 @@ sys.exit(0 if a and a[0]['pm2_env'].get('max_restarts') else 1)
   done
   (( ${#missing[@]} == 0 )) && return 0
   for app in "${missing[@]}"; do
-    if [[ "$app" == gsp-multica-worker ]] && ai_hold_active; then
-      unfixable+=("$app guardrails missing; held by ${AI_HOLD_FILE}")
+    if [[ "$app" == gsp-multica-worker ]] && ! worker_remediation_released; then
+      unfixable+=("$app guardrails missing; remediation release/approval required")
       continue
     fi
     # Restarting the Tower kills in-flight flights; only do it when idle.
@@ -687,8 +699,8 @@ guard_build_capacity() {
 guard_pm2_liveness() {
   local app status
   for app in "${LIVENESS_APPS[@]}"; do
-    if [[ "$app" == gsp-multica-worker ]] && ai_hold_active; then
-      unfixable+=("$app held by ${AI_HOLD_FILE}")
+    if [[ "$app" == gsp-multica-worker ]] && ! worker_remediation_released; then
+      unfixable+=("$app held or unreleased; remediation release/approval required")
       continue
     fi
     status=$("$PM2" jlist 2>/dev/null | python3 -c "
