@@ -756,9 +756,9 @@ test('technical QC block cannot route to Human Review and exact re-scope bypasse
   assert.match(source, /technical_human_review_forbidden/);
   assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
   assert.match(source,
-    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope/);
+    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&\n\s*!verifiedPassAdvance && !noArtifactRescope/);
   assert.match(source,
-    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope/);
+    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&\n\s*!noArtifactRescope/);
   assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
   assert.match(source, /operator_rescope_issue_id: issue\.id/);
   assert.match(source, /if \(noArtifactRescope && to_stage === "In Progress"\) \{\s+to_stage = "Spec";/);
@@ -2104,21 +2104,19 @@ test('operator cap release requires the current PASS work-product hash', async (
     'd41d8cd98f00b204e9800998ecf8427e'), false);
 });
 
-test('PASS verdict cap escalation is held for an authenticated operator release, never rejected', () => {
+test('a current work-product-bound PASS bypasses paid-task caps into CI/CD', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /operator_cap_release === true/);
   assert.match(source, /operator_cap_release_secret_required/);
   assert.match(source, /operator_cap_release_pass_required/);
-  assert.match(source, /operator_cap_release_required/);
   assert.match(source, /operator_cap_release: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
   const cycleCap = source.slice(source.indexOf('const cycle = stageCycleAdmission'),
     source.indexOf('const lifetimeHistory'));
-  assert.match(cycleCap, /if \(passVerdictProtected\) \{[\s\S]*?operator_cap_release_required[\s\S]*?return;/);
-  assert.ok(cycleCap.indexOf('operator_cap_release_required') < cycleCap.indexOf('applyDisposition'));
+  assert.match(cycleCap, /const verifiedPassAdvance = issue\.status === "In Review"[\s\S]*?hasCurrentPassWorkProduct/);
+  assert.match(cycleCap, /!parkedQcRecovery &&\n\s*!verifiedPassAdvance/);
   const lifetimeCap = source.slice(source.indexOf('const lifetime = lifetimeTaskAdmission'),
     source.indexOf('// Never advance an issue into another execution lane'));
-  assert.match(lifetimeCap, /if \(passVerdictProtected\) \{[\s\S]*?operator_cap_release_required[\s\S]*?return;/);
-  assert.ok(lifetimeCap.indexOf('operator_cap_release_required') < lifetimeCap.indexOf('applyDisposition'));
+  assert.match(lifetimeCap, /!cicdReturn && !verifiedPassAdvance/);
 });
 
 test('parking records a reason and hands off one Sol-low diagnosis', () => {
