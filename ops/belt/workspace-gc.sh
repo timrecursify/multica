@@ -15,10 +15,30 @@ descriptor_stream() {
     head -n "$limit" -- "$WORKSPACE_GC_DESCRIPTOR_FILE"
     return
   fi
-  docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -F $'\t' -v batch_limit="$limit" -c "
+  local task_dir meta task_id values_sql='' separator='' missing_meta=0 sql_root
+  declare -A seen_ids=()
+  for task_dir in "$root"/*/????????; do
+    [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
+    meta="$task_dir/.gc_meta.json"
+    if [[ ! -f "$meta" ]]; then
+      missing_meta=$((missing_meta + 1))
+      continue
+    fi
+    task_id="$(jq -r '.task_id // empty' "$meta")"
+    [[ "$task_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || continue
+    [[ -z "${seen_ids["$task_id"]+x}" ]] || continue
+    seen_ids["$task_id"]=1
+    values_sql+="$separator('$task_id'::uuid)"
+    separator=','
+  done
+  printf 'workspace-gc: skipped_missing_meta=%s\n' "$missing_meta" >&2
+  [[ -n "$values_sql" ]] || return
+  sql_root="${root//\'/\'\'}"
+  docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -F $'\t' -c "
+    WITH disk_task(id) AS (VALUES $values_sql)
     SELECT t.id, t.status, t.completed_at, t.issue_id,
-           COALESCE(t.work_dir, '$root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir')
-    FROM agent_task_queue t
+           COALESCE(t.work_dir, '$sql_root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir')
+    FROM agent_task_queue t JOIN disk_task d ON d.id = t.id
     WHERE t.status IN ('completed','failed','cancelled')
       AND t.completed_at < now() - interval '1 hour'
       AND (t.status <> 'completed' OR COALESCE(t.result->>'pr_url','') <> ''
@@ -28,8 +48,9 @@ descriptor_stream() {
         WHERE live.id <> t.id
           AND live.status NOT IN ('completed','failed','cancelled')
           AND live.issue_id = t.issue_id
-          AND live.work_dir = COALESCE(t.work_dir, '$root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir'))
-      ORDER BY t.completed_at LIMIT :batch_limit"
+          AND live.work_dir = COALESCE(t.work_dir, '$sql_root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir'))
+      )
+      ORDER BY t.completed_at" | awk -v limit="$limit" 'NR <= limit'
 }
 
 declare -A busy_task_dirs=()
