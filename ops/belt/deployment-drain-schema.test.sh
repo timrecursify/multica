@@ -38,6 +38,23 @@ for relation in "${relations[@]}"; do
   assertions=$(( assertions + 1 ))
 done
 
+# The callbacks term must stay correlated to a live task. Counting every pending
+# row reintroduces a drain that never returns: measured live on 2026-09-07 that
+# was 1588 rows, of which 2 were task-live. The authority for correlation rather
+# than age is multica-relay-advance-daemon.cjs:858.
+callbacks_term="$(sed -n "/'callbacks=' ||/,/))$/p" <<<"$snapshot_sql")"
+[[ -n "$callbacks_term" ]] || { echo 'could not isolate the callbacks term' >&2; exit 1; }
+if ! grep -qiE 'JOIN[[:space:]]+agent_task_queue' <<<"$callbacks_term"; then
+  echo 'callbacks term lost its agent_task_queue join.' >&2
+  echo 'It would count pending rows the advancer never consumes, and the drain would never return.' >&2
+  exit 1
+fi
+if ! grep -qiE "status[[:space:]]+IN[[:space:]]*\([[:space:]]*'dispatched'[[:space:]]*,[[:space:]]*'running'[[:space:]]*\)" <<<"$callbacks_term"; then
+  echo "callbacks term no longer restricts the joined task to ('dispatched','running')." >&2
+  exit 1
+fi
+assertions=$(( assertions + 2 ))
+
 # A term that always reports zero is worse than an absent one: it would claim a
 # clean drain while that work was live. Keep the count honest instead.
 if grep -qiE 'coalesce\([^)]*to_regclass|to_regclass' <<<"$snapshot_sql"; then

@@ -74,7 +74,26 @@ deployment_drain_snapshot() {
 SELECT concat_ws(' ',
   'leases=' || count(*) FILTER (WHERE status IN ('dispatched','running') OR prepare_lease_expires_at IS NOT NULL),
   'children=' || count(*) FILTER (WHERE parent_task_id IS NOT NULL AND status IN ('dispatched','running')),
-  'callbacks=' || (SELECT count(*) FROM relay_run_log WHERE status = 'pending'))
+  -- callbacks counts only pending rows the advancer can still consume.
+  --
+  -- The authority is the daemon's own consumption model, stated above
+  -- enqueuePassWithoutRelayRows in ops/belt/parity/multica-relay-advance-daemon.cjs:858:
+  -- "findAndAdvanceTasks deliberately consumes only pending, task-correlated
+  -- rows". A pending row whose task is finished, or which carries no task_id at
+  -- all, will never be consumed, so a restart cannot interrupt it. It is not
+  -- in-flight work and must not hold a drain open.
+  --
+  -- Age is deliberately NOT the axis. cleanupStalePendingRows (same file, :826)
+  -- closes a pending row only when the issue has advanced past that row's
+  -- to_stage; it defines no age constant, and there is none to cite elsewhere,
+  -- so any hour threshold here would be invented. Do not "fix" this back to
+  -- counting every pending row: measured live on 2026-09-07, that was 1588 rows
+  -- of which 2 were task-live, 935 pointed at terminal tasks and 650 had no
+  -- task_id, so the drain could never return and no deploy could proceed.
+  'callbacks=' || (SELECT count(*) FROM relay_run_log rrl
+     JOIN agent_task_queue callback_task ON callback_task.id = rrl.task_id
+    WHERE rrl.status = 'pending'
+      AND callback_task.status IN ('dispatched','running')))
 FROM agent_task_queue;
 SQL
 }
