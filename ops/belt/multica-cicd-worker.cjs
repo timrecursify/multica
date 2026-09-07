@@ -13,7 +13,7 @@ const { evaluate } = require('./transition-policy.cjs');
 const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
 const { mintGithubToken, repoFromGhArgs } = require('./github-token.cjs');
 const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multica-runtime/receipts';
-const SK_COMMAND = process.env.SK_COMMAND || '/home/newadmin/.local/bin/sk';
+const SK_COMMAND = process.env.SK_COMMAND || '/opt/gsp/.sk/bin/sk';
 let pool;
 let relayToken;
 let readReceipt = (sha) => JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/belt-${sha}.json`, 'utf8'));
