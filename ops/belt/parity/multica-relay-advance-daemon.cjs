@@ -2210,7 +2210,11 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       // buildCompletionRoute decide; it returns the no_pr -> Done route itself
       // when no PR exists.
       const route = await buildCompletionRoute(client, row);
-      const targetStage = route?.toStage || row.next_stage;
+      // Preserve Spec as the requested stage for typed NO_OP completions so
+      // the bridge applies specCompletionDisposition instead of bypassing it
+      // with the configured Spec -> Queue target.
+      const targetStage = row.to_stage === 'Spec' && row.outcome === 'NO_OP'
+        ? 'Spec' : route?.toStage || row.next_stage;
       if (!targetStage) continue;
       const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
       if (row.to_stage === 'In Review' && !qcAdvance.ok) {
