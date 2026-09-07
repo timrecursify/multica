@@ -1433,6 +1433,32 @@ func TestGitFetchRefreshesOriginHeadAfterDefaultChange(t *testing.T) {
 	}
 }
 
+func TestGitFetchUnshallowsBareCache(t *testing.T) {
+	t.Parallel()
+	source := createTestRepo(t)
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws", []RepoInfo{{URL: source}}); err != nil { t.Fatal(err) }
+	bare := cache.Lookup("ws", source)
+	commit := gitRefCommit(t, bare, getRemoteDefaultBranch(bare))
+	if err := os.WriteFile(filepath.Join(bare, "shallow"), []byte(commit+"\n"), 0o644); err != nil { t.Fatal(err) }
+	if err := gitFetch(bare); err != nil { t.Fatalf("gitFetch: %v", err) }
+	if out, _ := runGitOutput("-C", bare, "rev-parse", "--is-shallow-repository"); strings.TrimSpace(out) == "true" { t.Fatal("cache remains shallow") }
+}
+
+func TestCreateIsolatedCheckoutSyncsBeforeDetachForRemoteOnlyCommit(t *testing.T) {
+	t.Parallel()
+	source := createTestRepo(t)
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws", []RepoInfo{{URL: source}}); err != nil { t.Fatal(err) }
+	bare := cache.Lookup("ws", source)
+	baseRef := getRemoteDefaultBranch(bare)
+	baseCommit := gitRefCommit(t, bare, baseRef)
+	if err := runGit("-C", bare, "update-ref", "refs/heads/temp", baseCommit); err != nil { t.Fatal(err) }
+	if err := runGit("-C", bare, "update-ref", baseRef, ""); err != nil { t.Fatal(err) }
+	checkout := filepath.Join(t.TempDir(), "checkout")
+	if _, err := createIsolatedCheckout(bare, source, checkout, "agent/test", baseRef, baseCommit); err != nil { t.Fatalf("checkout failed: %v", err) }
+}
+
 // TestGetRemoteDefaultBranchUsesBareHeadHintForCustomDefault verifies step 3
 // of the resolver: when the cache has a non-standard default branch name
 // (trunk, develop, …) and `git remote set-head origin --auto` didn't
