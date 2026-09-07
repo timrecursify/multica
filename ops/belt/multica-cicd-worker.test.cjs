@@ -718,3 +718,37 @@ test('sweep holds an all-cancelled open PR in a non-retroactive repo', async () 
   assert.match(hold, /retro=repo not retroactive/);
   worker.setTestDependencies({ log: defaultLog });
 });
+
+test('an unauthenticated gh failure escalates on the first attempt, not after the retry budget', async () => {
+  const issue = { id: 'issue-gh-auth', number: 4242 };
+  const sha = 'd'.repeat(40);
+  const calls = [];
+  const lines = [];
+  // An earlier test leaves a stubbed watchdog in place, so bind a real one:
+  // this asserts the attempt count the fail-fast path reports.
+  worker.setTestDependencies({
+    watchdog: require('./cicd-watchdog.cjs').createWatchdog({
+      file: require('path').join(require('os').tmpdir(), `cicd-watchdog-ghauth-${process.pid}.json`)
+    }),
+    relay: async (...args) => { calls.push(args); return '{}'; },
+    log: (...args) => lines.push(args.join(' ')),
+  });
+
+  const error = new Error('Command failed: gh api -i repos/timrecursify/sk-cli/pulls/1582\n'
+    + 'To get started with GitHub CLI, please run: gh auth login');
+  const result = await worker.watchdogFailure(issue, error, sha);
+
+  assert.equal(result.stalled, true);
+  assert.equal(result.audit.attempts, 1);
+  assert.equal(result.audit.outcome, 'deploy_unauthenticated');
+  assert.equal(calls.length, 1);
+  const [issueId, toStage, workProductMd5, reason] = calls[0];
+  assert.equal(issueId, issue.id);
+  assert.equal(toStage, 'Spec');
+  assert.equal(workProductMd5, null);
+  assert.ok(reason.startsWith(`deploy_unauthenticated issue=${issue.id}`), reason);
+  assert.match(reason, /attempts=1 /);
+  assert.ok(lines.some(line => line.includes('TERMINAL #4242') && line.includes('credential unavailable')),
+    lines.join(' | '));
+  worker.setTestDependencies({ log: defaultLog });
+});
