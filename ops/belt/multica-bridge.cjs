@@ -1772,7 +1772,9 @@ async function relayAdvance(req, res, body) {
       "SELECT stage_name FROM relay_stage_config WHERE workspace_id = $1 AND stage_name = $2",
       [issue.workspace_id, to_stage]
     );
-    if (targetStageResult.rows.length === 0 && !dispositionStages.has(to_stage)) {
+    const rejectedPassCandidate = issue.status === "Rejected" && to_stage === "In Review";
+    if (targetStageResult.rows.length === 0 && !dispositionStages.has(to_stage) &&
+        !rejectedPassCandidate) {
       await client.query("ROLLBACK");
       rejectInvalidRelayStage(res, to_stage);
       return;
@@ -1871,9 +1873,11 @@ async function relayAdvance(req, res, body) {
       res.end(JSON.stringify({ error: "operator_cap_release_pass_required" }));
       return;
     }
-    const rejectedPassTerminalExit = issue.status === "Rejected" &&
-      to_stage === "In Review" && explicitTerminalExit &&
+    const rejectedPassCliReopen = rejectedPassCandidate &&
       await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
+    const rejectedPassOperatorReopen = rejectedPassCandidate && explicitTerminalExit &&
+      (await latestQcVerdict(client, issue.id))?.verdict === "PASS";
+    const rejectedPassTerminalExit = rejectedPassCliReopen || rejectedPassOperatorReopen;
     if (isTerminalStage(issue.status) && !configuredTerminalExit &&
         !rejectedPassTerminalExit &&
         !explicitTerminalExit) {
@@ -2193,9 +2197,11 @@ async function relayAdvance(req, res, body) {
 
     const ownerStage = retryEscalation ? "Registered" :
       ownerStageForTransition(issue.status, to_stage);
-    const preferModels = (isNoDispatchArrivalStage(to_stage) || evidenceTransition || retryEscalation)
+    const preferModels = (isNoDispatchArrivalStage(to_stage) || evidenceTransition ||
+      retryEscalation || rejectedPassTerminalExit)
       ? [] : await qcEscalationPreference(client, issue, to_stage);
-    let stage = (isNoDispatchArrivalStage(to_stage) || evidenceTransition) ? {} : (retryEscalation
+    let stage = (isNoDispatchArrivalStage(to_stage) || evidenceTransition ||
+      rejectedPassTerminalExit) ? {} : (retryEscalation
       ? await selectRetryEscalationOwner(client, issue)
       : await selectStageOwner(client, issue.workspace_id, ownerStage, to_stage, { preferModels }));
     if (retryEscalation) {
@@ -2340,17 +2346,37 @@ async function relayAdvance(req, res, body) {
             message: "a PASS-verdict ticket requires an authenticated operator cap release" }));
           return;
         }
-        const taskCount = history.rows[0]?.n || 0;
-        const applied = await applyDisposition(client, issue, cycle.disposition, cycle.reason, {
-          ceiling: cycle.ceiling, task_count: taskCount, target_stage: to_stage,
-          trigger_stage: issue.status
-        });
-        await client.query("COMMIT");
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: cycle.disposition },
-          disposition: cycle.disposition, disposition_applied: applied, reason: cycle.reason,
-          ceiling: cycle.ceiling, task_count: taskCount }));
-        return;
+        if (escalationLoop) {
+          const taskCount = history.rows[0]?.n || 0;
+          const applied = await applyDisposition(client, issue, "Parked", "escalation_loop", {
+            ceiling: cycle.ceiling, task_count: taskCount, target_stage: to_stage
+          });
+          await client.query("COMMIT");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: "Parked" },
+            disposition: "Parked", disposition_applied: applied, reason: "escalation_loop" }));
+          return;
+        }
+        const sourceTaskId = await retryEscalationSourceTask(
+          client, issue, body.relay_source_task_id
+        );
+        if (!sourceTaskId) {
+          await client.query("ROLLBACK");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "retry_escalation_source_task_required",
+            reason: cycle.reason }));
+          return;
+        }
+        retryEscalation = {
+          reason: cycle.reason,
+          trigger_stage: issue.status,
+          attempts: history.rows[0]?.n || 0,
+          ceiling: cycle.ceiling,
+          source_task_id: sourceTaskId,
+          deadline: escalationDeadline(),
+          target_stage: cycle.disposition
+        };
+        to_stage = cycle.disposition;
       }
       const lifetimeHistory = await client.query(
         `SELECT count(*)::int AS n FROM agent_task_queue
@@ -2502,12 +2528,22 @@ async function relayAdvance(req, res, body) {
       return;
     }
 
-    if (isNoDispatchArrivalStage(to_stage)) {
+    let noDispatchArrival = false;
+    if (isNoDispatchArrivalStage(to_stage)) noDispatchArrival = true;
+    if (noDispatchArrival || rejectedPassTerminalExit) {
       // Parked has already written its completed, dedicated audit row above.
       // Other no-dispatch arrivals need a regular completed relay log.
       relayLogId = relayLogId || await ensureCompletedRelayLog(
         client, issue_id, issue.status, to_stage
       );
+      if (explicitTerminalExit) {
+        await client.query(`UPDATE relay_run_log SET parked_audit=$2::jsonb WHERE id=$1`,
+          [relayLogId, JSON.stringify({
+            terminal_exit: { operator_marker: true, reason: reason.trim() },
+            operator_cap_bypass: true,
+            reason: reason.trim()
+          })]);
+      }
       await recordTransitionAudit(client, issue, {
         fromStage: issue.status, toStage: to_stage, reason,
         evidence: {
@@ -2603,6 +2639,9 @@ async function relayAdvance(req, res, body) {
               target_stage: to_stage,
               reason: reason.trim()
             }
+          } : {}),
+          ...(explicitOperatorRelease && issue.status === "Parked" ? {
+            parked_release: { operator_marker: true, reason: reason.trim() }
           } : {}),
           ...(explicitTerminalExit ? {
             terminal_exit: { operator_marker: true, reason: reason.trim() }
