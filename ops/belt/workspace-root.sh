@@ -21,7 +21,7 @@ workspace_root_resolve() {
   printf '%s\n' "$configured"
 }
 workspace_root_validate_children() {
-  local root="$1" child name allowed bad=0
+  local root="$1" child name allowed bad=0 quarantine_dir quarantine_target
   while IFS= read -r -d '' child; do
     name="${child##*/}"
     # The canonical root also holds belt infrastructure beside the workspace
@@ -31,11 +31,35 @@ workspace_root_validate_children() {
     [[ "$name" == .* ]] && continue
     allowed=0
     for uuid in "${BELT_WORKSPACE_UUIDS[@]}"; do [[ "$name" == "$uuid" ]] && allowed=1; done
-    if (( ! allowed )) || [[ ! -d "$child" || -L "$child" ]]; then
+    if (( ! allowed )) && [[ -d "$child" && ! -L "$child" ]]; then
+      # Empty unknown directories are harmless drift: move them atomically to
+      # a hidden quarantine beneath the same root so startup can proceed.
+      if [[ -z "$(find "$child" -mindepth 1 -print -quit 2>/dev/null)" ]]; then
+        quarantine_dir="$root/.quarantine"
+        mkdir -p -- "$quarantine_dir"
+        quarantine_target="$quarantine_dir/$name"
+        if [[ -e "$quarantine_target" || -L "$quarantine_target" ]]; then
+          quarantine_target="$quarantine_dir/${name}-$(date +%s%N)"
+        fi
+        if mv -- "$child" "$quarantine_target"; then
+          echo "warning: quarantined unknown empty workspace directory: $child -> $quarantine_target" >&2
+          continue
+        fi
+      fi
+      echo "workspace drift: malformed or unknown workspace directory: $name" >&2; bad=1
+    elif (( ! allowed )) || [[ ! -d "$child" || -L "$child" ]]; then
       echo "workspace drift: malformed or unknown workspace directory: $name" >&2; bad=1
     fi
   done < <(find "$root" -mindepth 1 -maxdepth 1 -print0)
   return "$bad"
+}
+workspace_root_create_workspace_dir() {
+  local root="$1" workspace_id="$2" uuid
+  for uuid in "${BELT_WORKSPACE_UUIDS[@]}"; do
+    [[ "$workspace_id" == "$uuid" ]] && { mkdir -p -- "$root/$workspace_id"; return; }
+  done
+  echo "invalid workspace UUID: $workspace_id" >&2
+  return 64
 }
 workspace_root_validate() {
   local root
