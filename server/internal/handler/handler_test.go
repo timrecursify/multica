@@ -455,6 +455,49 @@ func TestIssueCRUD(t *testing.T) {
 	}
 }
 
+func TestGetIssueAndChildrenIncludeAcceptanceCriteria(t *testing.T) {
+	parentID := createTestIssue(t, "Acceptance criteria parent", "todo", "medium")
+	child := createChildIssue(t, "Acceptance criteria child", "todo", parentID)
+	want := `[{"text":"Bundle every child criterion","checked":false}]`
+	if _, err := testPool.Exec(context.Background(), `UPDATE issue SET acceptance_criteria = $2::jsonb WHERE id = $1`, child.ID, want); err != nil {
+		t.Fatalf("set acceptance criteria: %v", err)
+	}
+
+	assertCriteria := func(t *testing.T, got json.RawMessage) {
+		t.Helper()
+		assertJSONEqual(t, got, want)
+	}
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("GET", "/api/issues/"+child.ID, nil), "id", child.ID)
+	testHandler.GetIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("GetIssue: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var detail IssueResponse
+	if err := json.NewDecoder(w.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	assertCriteria(t, detail.AcceptanceCriteria)
+
+	w = httptest.NewRecorder()
+	req = withURLParam(newRequest("GET", "/api/issues/"+parentID+"/children", nil), "id", parentID)
+	testHandler.ListChildIssues(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ListChildIssues: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var children struct {
+		Issues []IssueResponse `json:"issues"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&children); err != nil {
+		t.Fatalf("decode children: %v", err)
+	}
+	if len(children.Issues) != 1 {
+		t.Fatalf("expected 1 child, got %d", len(children.Issues))
+	}
+	assertCriteria(t, children.Issues[0].AcceptanceCriteria)
+}
+
 // TestDeleteIssueByIdentifier guards against #1661 — DELETE /api/issues/{id}
 // must actually delete the row when the path segment is a human-readable
 // identifier ("HAN-42") rather than a UUID. Before the PR #1680 + MUL-1410

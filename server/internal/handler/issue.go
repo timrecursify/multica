@@ -32,21 +32,22 @@ import (
 
 // IssueResponse is the JSON response for an issue.
 type IssueResponse struct {
-	ID            string  `json:"id"`
-	WorkspaceID   string  `json:"workspace_id"`
-	Number        int32   `json:"number"`
-	Identifier    string  `json:"identifier"`
-	Title         string  `json:"title"`
-	Description   *string `json:"description"`
-	Status        string  `json:"status"`
-	Priority      string  `json:"priority"`
-	AssigneeType  *string `json:"assignee_type"`
-	AssigneeID    *string `json:"assignee_id"`
-	CreatorType   string  `json:"creator_type"`
-	CreatorID     string  `json:"creator_id"`
-	ParentIssueID *string `json:"parent_issue_id"`
-	ProjectID     *string `json:"project_id"`
-	Position      float64 `json:"position"`
+	ID                 string          `json:"id"`
+	WorkspaceID        string          `json:"workspace_id"`
+	Number             int32           `json:"number"`
+	Identifier         string          `json:"identifier"`
+	Title              string          `json:"title"`
+	Description        *string         `json:"description"`
+	Status             string          `json:"status"`
+	Priority           string          `json:"priority"`
+	AssigneeType       *string         `json:"assignee_type"`
+	AssigneeID         *string         `json:"assignee_id"`
+	CreatorType        string          `json:"creator_type"`
+	CreatorID          string          `json:"creator_id"`
+	ParentIssueID      *string         `json:"parent_issue_id"`
+	AcceptanceCriteria json.RawMessage `json:"acceptance_criteria"`
+	ProjectID          *string         `json:"project_id"`
+	Position           float64         `json:"position"`
 	// Stage groups sub-issues under the same parent into ordered barrier
 	// groups (null = unstaged). See issue_child_done.go for how a closed
 	// stage gates the child-done -> parent wake.
@@ -119,7 +120,8 @@ func issueToResponse(i db.Issue, issuePrefix string, contract *IssueStatusContra
 		AssigneeID:    uuidToPtr(i.AssigneeID),
 		CreatorType:   i.CreatorType.String,
 		CreatorID:     uuidToString(i.CreatorID),
-		ParentIssueID: uuidToPtr(i.ParentIssueID),
+		ParentIssueID:      uuidToPtr(i.ParentIssueID),
+		AcceptanceCriteria: json.RawMessage(i.AcceptanceCriteria),
 		ProjectID:     uuidToPtr(i.ProjectID),
 		Position:      i.Position,
 		Stage:         int4ToPtr(i.Stage),
@@ -149,7 +151,8 @@ func issueListRowToResponse(i db.ListIssuesRow, issuePrefix string, contract *Is
 		AssigneeID:    uuidToPtr(i.AssigneeID),
 		CreatorType:   i.CreatorType.String,
 		CreatorID:     uuidToString(i.CreatorID),
-		ParentIssueID: uuidToPtr(i.ParentIssueID),
+		ParentIssueID:      uuidToPtr(i.ParentIssueID),
+		AcceptanceCriteria: json.RawMessage(i.AcceptanceCriteria),
 		ProjectID:     uuidToPtr(i.ProjectID),
 		Position:      i.Position,
 		Stage:         int4ToPtr(i.Stage),
@@ -211,7 +214,8 @@ func openIssueRowToResponse(i db.ListOpenIssuesRow, issuePrefix string, contract
 		AssigneeID:    uuidToPtr(i.AssigneeID),
 		CreatorType:   i.CreatorType.String,
 		CreatorID:     uuidToString(i.CreatorID),
-		ParentIssueID: uuidToPtr(i.ParentIssueID),
+		ParentIssueID:      uuidToPtr(i.ParentIssueID),
+		AcceptanceCriteria: json.RawMessage(i.AcceptanceCriteria),
 		ProjectID:     uuidToPtr(i.ProjectID),
 		Position:      i.Position,
 		Stage:         int4ToPtr(i.Stage),
