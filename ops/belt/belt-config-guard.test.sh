@@ -44,6 +44,14 @@ fi
 assert_eq missing "$(tower_concurrency_state 'multica-daemon/server daemon start')" 'missing Tower concurrency flag'
 assert_eq correct "$(tower_concurrency_state "multica-daemon/server daemon start --max-concurrent-tasks=${expected_cap}")" 'configured Tower concurrency flag'
 assert_eq mismatched "$(tower_concurrency_state "multica-daemon/server daemon start --max-concurrent-tasks=$((expected_cap + 1))")" 'mismatched Tower concurrency flag'
+
+# Worker remediation stays fail-closed until both independent operator
+# controls are present, and an active AI hold always wins.
+release_fixture="$(mktemp -d)"
+if ! env MULTICA_OPERATOR_RELEASE_FILE="$release_fixture/release" MULTICA_SUPERVISOR_APPROVAL_FILE="$release_fixture/approval" MULTICA_AI_HOLD_FILE="$release_fixture/hold" bash -c 'source "$1"; ! worker_remediation_released; touch "$MULTICA_OPERATOR_RELEASE_FILE" "$MULTICA_SUPERVISOR_APPROVAL_FILE"; worker_remediation_released; touch "$MULTICA_AI_HOLD_FILE"; ! worker_remediation_released' _ "$root_dir/belt-config-guard.sh"; then
+  echo 'worker release gate behavior unexpected'; exit 1
+fi
+rm -rf "$release_fixture"
 for expected in "${RELAY_CAP_EXPECTATIONS[@]}"; do
   IFS='|' read -r app expected_stage expected_lifetime <<<"$expected"
   if ! relay_caps_match "$expected_stage" "$expected_lifetime" "$expected_stage" "$expected_lifetime"; then
