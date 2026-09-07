@@ -275,11 +275,11 @@ test('rollup waits for open children, then closes after every child is terminal'
   emittedMetrics.push(report(harness, 'rollup-with-children'));
 });
 
-test('red CI and stale SHA remain blocked before deploy', () => {
+test('red CI and stale SHA remain blocked before deploy', async () => {
   cicd.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [
     { status: 'completed', conclusion: 'failure', name: 'ci' }
   ] }), log() {} });
-  assert.equal(cicd.ciState('timrecursify/multica', SHA, new Date(BASE_TIME).toISOString()), 'red');
+  assert.equal(await cicd.ciState('timrecursify/multica', SHA, new Date(BASE_TIME).toISOString()), 'red');
   assert.deepEqual(relay.qcCompletionAdvance(staleQcRow()), {
     ok: false, reason: 'qc_attempt_binding_required'
   });
@@ -320,9 +320,9 @@ function runCodeClosureFromImplementation(harness) {
   work(harness, { waitMs: 0, runMs: 0, outcome: 'ARCHIVED' });
 }
 
-test('GitHub API outage and non-shipping terminal states stay out of shipped metrics', () => {
+test('GitHub API outage and non-shipping terminal states stay out of shipped metrics', async () => {
   cicd.setTestDependencies({ gh: () => { throw new Error('GitHub unavailable'); }, log() {} });
-  assert.equal(cicd.ciState('timrecursify/multica', SHA, new Date(BASE_TIME).toISOString()), 'unknown');
+  assert.equal(await cicd.ciState('timrecursify/multica', SHA, new Date(BASE_TIME).toISOString()), 'unknown');
   const outage = createHarness('github-api-outage');
   runToImplementation(outage);
   arriveAtDeploy(outage);
@@ -349,7 +349,7 @@ test('archiver uses its real endpoint adapter only after the fake 24-hour clock'
     /^archiver:archive-candidate:Done->Archived:[0-9a-f]{64}$/);
 });
 
-test('known defects execute as packet-owned expected-red contracts', () => {
+test('known defects execute as packet-owned expected-red contracts', async () => {
   const deploySource = fs.readFileSync(path.join(beltRoot, 'deploy.sh'), 'utf8');
   const activation = expectedRed('ALPHA-000356 deploy-restart', () => {
     assert.match(deploySource, /\bsystemctl\b[^\n]*(?:restart|reload)|\bpm2\b[^\n]*(?:restart|reload)/);
@@ -357,7 +357,7 @@ test('known defects execute as packet-owned expected-red contracts', () => {
   });
   cicd.setTestDependencies({ readReceipt: () => { throw new Error('receipt unavailable'); },
     gh: () => { throw new Error('GitHub unavailable'); }, log() {} });
-  const evidenceResult = cicd.mergeDeployEvidence(
+  const evidenceResult = await cicd.mergeDeployEvidence(
     'timrecursify/multica', SHA, '2026-09-01T00:00:00Z');
   assert.equal(evidenceResult.outcome, 'discovery_unavailable');
   assert.equal(evidenceResult.evidence, undefined,

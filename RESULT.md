@@ -26,7 +26,7 @@ Production snapshot: 2026-09-07 15:13:59 UTC. Counts marked `lower bound` are th
 - The advance batch uses fair ordering, bounded workers and exact per-pass metrics (`ops/belt/parity/multica-relay-advance-daemon.cjs:1250-1299`).
 - A single atomic statement claims both the issue/SHA and its relay row, with no transaction held over GitHub/git calls; the claim and retry eligibility survive process loss and expire using the existing QC pending-recheck interval (`ops/belt/parity/multica-relay-advance-daemon.cjs:1104-1155`).
 - Transient external failures persist retry eligibility instead of failing the relay row (`ops/belt/parity/multica-relay-advance-daemon.cjs:1240-1246`).
-- CICD merges stay serialized per repository while unrelated repositories remain independent (`ops/belt/multica-cicd-worker.cjs:194-200,899-901`).
+- CICD merges stay serialized per repository while unrelated repositories remain independent (`ops/belt/multica-cicd-worker.cjs:194-200,919-921`).
 - Rebase onto `origin/main` preserved the activation-receipt contract from upstream and converted only its changed-path GitHub read to async; workflow success still cannot substitute for activation evidence (`ops/belt/multica-cicd-worker.cjs:44-49,541-579`).
 
 # Measurement and proof
@@ -40,13 +40,14 @@ Production snapshot: 2026-09-07 15:13:59 UTC. Counts marked `lower bound` are th
 
 Verification:
 
-- 78/78 targeted adapter, QC gate, CICD worker/sweep, and reconciler tests passed after rebasing.
+- 79/79 targeted adapter, QC gate, CICD worker/sweep, and reconciler tests passed after rebasing.
+- 9/9 unattended-lifecycle checks passed after updating the harness to await the asynchronous CI/CD API.
 - Relay concurrency/claim assertions passed 8/8 with an injected `pg` boundary. The full relay suite could not load because this checkout has no `pg` module; dependency installation was not duplicated because ALPHA-000372 owns it.
-- Slow-worker/heartbeat isolation is covered at `ops/belt/parity/multica-relay-advance-daemon.test.cjs:1575-1587`; atomic claims at `:1590-1600`; TTL/in-flight collapse at `ops/belt/github-api-adapter.test.cjs:75-97`; async QC fan-out at `ops/belt/qc-gate.test.cjs:8-47`; merge serialization at `ops/belt/multica-cicd-worker.test.cjs:715-730`.
+- Slow-worker/heartbeat isolation is covered at `ops/belt/parity/multica-relay-advance-daemon.test.cjs:1575-1587`; atomic claims at `:1590-1600`; TTL/in-flight collapse at `ops/belt/github-api-adapter.test.cjs:75-97`; async QC fan-out at `ops/belt/qc-gate.test.cjs:8-47`; merge serialization at `ops/belt/multica-cicd-worker.test.cjs:764-779`.
 - `iostat -x 1 2` verified the bottleneck during this lane: the live one-second sample had 19.98% CPU idle, 54.53% iowait, `sda` 83.40% utilized, and 13.01 ms write await.
 - Production DB was read only. At the snapshot it showed 168 task creations, 163 starts, 146 completions, 33 QC-gate comments across 23 issues, and 42 tickets across Spec/Queue/In Progress/In Review.
 - No deploy, restart, credential rotation, PPP-23686 access, or Multica ticket occurred.
 
-Implementation commit: `160da98ebfdede6d8b8fd3c93d174693108a4c31`
+Implementation commit: `14b603d34e6db06152f3de4cc5d5ed0b43fe3da0`
 
 PR: https://github.com/timrecursify/multica/pull/785
