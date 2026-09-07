@@ -1501,7 +1501,8 @@ async function relayAdvance(req, res, body) {
   let client;
   try {
     let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
-      operator_rescope_issue_id, operator_terminal_exit, operator_release } = body;
+      operator_rescope_issue_id, operator_terminal_exit, operator_release,
+      operator_recovery } = body;
     
     // The archiver is a narrowly-scoped service authority. It authenticates
     // with its dedicated header and a signed receipt; it must not inherit the
@@ -1732,7 +1733,18 @@ async function relayAdvance(req, res, body) {
       !OPERATOR_SECRET_DISABLED &&
       typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
-    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease;
+    // An authenticated operator may deliberately re-dispatch a stalled task
+    // at its current execution stage. This is distinct from a replay: the
+    // explicit recovery marker opts out of same-stage idempotency and the
+    // retry ceilings, while still requiring a non-empty reason and operator
+    // credentials.
+    const explicitOperatorRecoveryRequested = operator_recovery === true &&
+      issue.status === to_stage && typeof reason === "string" && reason.trim() !== "";
+    const explicitOperatorRecovery = explicitOperatorRecoveryRequested &&
+      !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
+    const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease || explicitOperatorRecovery;
 
     // Check the durable gate before the same-stage/idempotency fast path. A
     // replay of a Done request must not turn a newly recorded QC FAIL into a
@@ -1816,7 +1828,7 @@ async function relayAdvance(req, res, body) {
     const humanReleaseAt = issue.metadata?.human_review_release_at ||
       issue.metadata?.parked_release_at || null;
     const releaseAt = humanReleaseAt || issue.metadata?.retry_escalation_at || null;
-    if (issue.status === to_stage && !retryEscalation) {
+    if (issue.status === to_stage && !retryEscalation && !explicitOperatorRecovery) {
       const taskId = await existingStageTask(client, issue.id, to_stage);
       const relayLogId = isTerminalStage(to_stage)
         ? await completedTerminalRelayLog(client, issue.id, to_stage) : null;
@@ -2511,6 +2523,9 @@ async function relayAdvance(req, res, body) {
         ...(explicitTerminalExit ? {
           terminal_exit: { operator_marker: true, reason: reason.trim() }
         } : {}),
+        ...(explicitOperatorRecovery ? {
+          operator_recovery: { actor: "operator", target_stage: to_stage, reason: reason.trim() }
+        } : {}),
         // Present only on a build dispatch, and duplicated in the issue
         // description: a builder cannot claim it never received the spec.
         ...(bindingSpec ? { spec: bindingSpec } : {})
@@ -2534,6 +2549,9 @@ async function relayAdvance(req, res, body) {
           } : {}),
           ...(explicitTerminalExit ? {
             terminal_exit: { operator_marker: true, reason: reason.trim() }
+          } : {}),
+          ...(explicitOperatorRecovery ? {
+            operator_recovery: { actor: "operator", target_stage: to_stage, reason: reason.trim() }
           } : {}),
           operator_cap_bypass: true,
           reason: reason.trim()
