@@ -2023,7 +2023,7 @@ async function relayAdvance(req, res, body) {
       altStages,
       exceptional: retryEscalation || parkedRelease || parkedEvidenceQcRelease ||
         parkedDiagnosisDone || noArtifactRescope || evidenceTransition ||
-        dispositionStages.has(to_stage)
+        rejectedPassTerminalExit || dispositionStages.has(to_stage)
     });
     if (!transitionAdmission.ok) {
       await client.query("ROLLBACK");
