@@ -2263,6 +2263,23 @@ async function relayAdvance(req, res, body) {
     // Parked and Rejected are terminal non-execution dispositions, not normal
     // workflow successors. Operators and bounded workers must be able to stop
     // a broken lane without adding an escape hatch to every stage row.
+    //
+    // explicitTerminalExit belongs here too. The guard above already admits
+    // it, but this one used to drop it, so an authenticated operator exit was
+    // accepted and then refused as `invalid_transition`. Every other terminal
+    // stage hid the omission: Done and Rejected have a configured successor,
+    // or reach this through rejectedPassTerminalExit. Cancelled has no
+    // configured successor on either board, so it was the one terminal stage
+    // with no way out at all -- tickets whose PR merged and whose only verdict
+    // was a PASS ended there permanently. Automatic advancement stays exactly
+    // as narrow as before, because explicitTerminalExit already requires a
+    // terminal source stage, the operator marker, a non-empty reason, and the
+    // operator secret.
+    //
+    // Rejected -> In Review keeps its own admission (rejectedPassTerminalExit),
+    // which additionally requires the newest verdict to be a PASS. Excluding
+    // that candidate here keeps the operator marker from bypassing it.
+    const operatorTerminalExitAdmission = explicitTerminalExit && !rejectedPassCandidate;
     const transitionAdmission = admitConfiguredTransition({
       fromStage: issue.status,
       toStage: to_stage,
@@ -2270,7 +2287,8 @@ async function relayAdvance(req, res, body) {
       altStages,
       exceptional: retryEscalation || parkedRelease || parkedEvidenceQcRelease ||
         parkedDiagnosisDone || noArtifactRescope || evidenceTransition ||
-        rejectedPassTerminalExit || explicitOperatorRelease || explicitOperatorRecovery ||
+        rejectedPassTerminalExit || operatorTerminalExitAdmission ||
+        explicitOperatorRelease || explicitOperatorRecovery ||
         dispositionStages.has(to_stage)
     });
     if (!transitionAdmission.ok) {
