@@ -84,6 +84,7 @@ const PORT = Number(process.env.PORT || 5005);
 //      merely told to fetch.
 // Scoped to the GSP workspace: PPP runs its own relay and its own stage contract.
 const SPEC_ENFORCED_WORKSPACE = "f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f";
+const PPP_WORKSPACE = "da3c5c5c-a123-4567-b999-c3ed1820da00";
 const SPEC_BEGIN = "<!-- RELAY-SPEC:BEGIN -->";
 const SPEC_END = "<!-- RELAY-SPEC:END -->";
 const STAGE_CYCLE_LIMIT = Number.parseInt(process.env.RELAY_STAGE_CYCLE_LIMIT || "2", 10);
@@ -100,6 +101,25 @@ function isTerminalStage(stage) {
 
 function isNoDispatchArrivalStage(stage) {
   return isTerminalStage(stage) || NO_DISPATCH_ARRIVAL_STAGES.has(stage);
+}
+
+// The prod board API still exposes legacy status tokens, and sk preserves
+// those tokens on the wire for compatibility. The shared relay configuration
+// stores canonical display names, so normalize only PPP requests before the
+// configured-stage lookup. Other workspaces keep their strict vocabulary.
+function normalizeRelayStage(workspaceId, stage) {
+  if (workspaceId !== PPP_WORKSPACE || typeof stage !== "string") return stage;
+  return ({
+    todo: "Spec",
+    backlog: "Queue",
+    in_progress: "In Progress",
+    in_review: "In Review",
+    blocked: "Human Review",
+    done: "Done",
+    archived: "Archived",
+    cancelled: "Cancelled",
+    parked: "Parked"
+  })[stage] || stage;
 }
 
 function validArchiveReceipt(issueId, receipt) {
@@ -1647,6 +1667,7 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    to_stage = normalizeRelayStage(issue.workspace_id, to_stage);
     if (archiverRequest && (issue.status !== "Done" || !validArchiveReceipt(issue.id, archiveEvidence))) {
       await client.query("ROLLBACK");
       res.writeHead(403, { "Content-Type": "application/json" });
@@ -2992,6 +3013,7 @@ module.exports = {
   latestQcGateComment,
   isTerminalStage,
   isNoDispatchArrivalStage,
+  normalizeRelayStage,
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
