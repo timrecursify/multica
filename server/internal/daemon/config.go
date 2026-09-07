@@ -97,6 +97,7 @@ type Config struct {
 	Profile                        string                // profile name (empty = default)
 	Agents                         map[string]AgentEntry // keyed by provider: claude, codebuddy, codex, copilot, opencode, openclaw, hermes, pi, cursor, kimi, reasonix, kiro, antigravity, qoder, qoderclicn, traecli, grok, qwen, qwenpaw (plus built-in runtime identities from agent.BuiltinRuntimes, e.g. omp)
 	WorkspacesRoot                 string                // base path for execution envs (default: ~/multica_workspaces)
+	RepoMirrorsRoot                string                // shared bare-repo mirrors (empty = <WorkspacesRoot>/.repos)
 	KeepEnvAfterTask               bool                  // preserve env after task for debugging
 	HealthPort                     int                   // local HTTP port for health checks (default: 19514)
 	MaxConcurrentTasks             int                   // max tasks running in parallel (default: 20)
@@ -143,6 +144,7 @@ type Config struct {
 type Overrides struct {
 	ServerURL         string
 	WorkspacesRoot    string
+	RepoMirrorsRoot   string
 	PollInterval      time.Duration
 	HeartbeatInterval time.Duration
 	// AgentTimeout is a pointer so an explicit `--agent-timeout 0` (no cap) is
@@ -392,6 +394,14 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	// Repo mirrors default to empty so the daemon keeps its historic
+	// <WorkspacesRoot>/.repos location. A deployment that wants the mirrors on
+	// a separate path (a workspaces root on tmpfs, a second filesystem) sets
+	// the env var or the override; there is no portable absolute default here.
+	repoMirrorsRoot := strings.TrimSpace(os.Getenv("MULTICA_REPO_MIRRORS_ROOT"))
+	if overrides.RepoMirrorsRoot != "" {
+		repoMirrorsRoot = overrides.RepoMirrorsRoot
+	}
 
 	// Health port: override > default
 	healthPort := DefaultHealthPort
@@ -490,6 +500,7 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		Profile:                        profile,
 		Agents:                         agents,
 		WorkspacesRoot:                 workspacesRoot,
+		RepoMirrorsRoot:                repoMirrorsRoot,
 		KeepEnvAfterTask:               keepEnv,
 		GCEnabled:                      gcEnabled,
 		GCInterval:                     gcInterval,

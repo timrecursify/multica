@@ -925,10 +925,21 @@ const (
 	gitMaintenanceTimeout = 10 * time.Minute
 )
 
+// reposRoot returns the directory holding the bare-repo mirrors. It follows the
+// daemon's configured mirror root so the GC evicts the same trees the repo
+// cache creates; a daemon built without one (tests, degraded startup) keeps the
+// historic sibling-of-the-workspaces-root location.
+func (d *Daemon) reposRoot(workspacesRoot string) string {
+	if root := strings.TrimSpace(d.repoCacheRoot); root != "" {
+		return root
+	}
+	return filepath.Join(workspacesRoot, reposDirName)
+}
+
 // pruneRepoWorktrees runs `git worktree prune` on all bare repos in the cache,
 // then evicts the ones nothing needs anymore.
 func (d *Daemon) pruneRepoWorktrees(workspacesRoot string, stats *gcStats) {
-	reposRoot := filepath.Join(workspacesRoot, reposDirName)
+	reposRoot := d.reposRoot(workspacesRoot)
 	wsEntries, err := os.ReadDir(reposRoot)
 	if err != nil {
 		return
