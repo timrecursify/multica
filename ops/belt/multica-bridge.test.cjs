@@ -2053,6 +2053,13 @@ test('operator Human Review releases record actor, target, and reason in the aud
   assert.match(source, /operator_release:\s*\{[\s\S]*?reason:\s*reason\.trim\(\)/);
 });
 
+test('operator Human Review release consumes the stale destination verdict', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /if \(explicitHumanReviewRelease\)[\s\S]*?DELETE FROM issue_stage_outcome/);
+  assert.match(source, /issue_id = \$1::uuid AND stage = \$2::text[\s\S]*?outcome_at < \$3::timestamptz/);
+  assert.match(source, /\[issue\.id, to_stage, issue\.metadata\.human_review_release_at\]/);
+});
+
 test('operator recovery admits an authenticated same-stage redispatch', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');

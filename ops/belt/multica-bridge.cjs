@@ -2619,6 +2619,16 @@ async function relayAdvance(req, res, body) {
         explicitHumanReviewRelease ? reason.trim() : null,
         consumesRetryEscalation(issue, to_stage)]
     );
+    if (explicitHumanReviewRelease) {
+      // The operator resolved the old Human Review decision. Consume the
+      // destination verdict so only a new task result can escalate it again.
+      await client.query(
+        `DELETE FROM issue_stage_outcome
+          WHERE issue_id = $1::uuid AND stage = $2::text
+            AND outcome_at < $3::timestamptz`,
+        [issue.id, to_stage, issue.metadata.human_review_release_at]
+      );
+    }
     if (parkedRelease || parkedEvidenceQcRelease) {
       console.warn(JSON.stringify({ event: "parked_release_consumed",
         issue_id: issue.id, from_stage: issue.status, to_stage }));
