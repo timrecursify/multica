@@ -1058,10 +1058,11 @@ async function recordTransitionAudit(client, issue, {
 
 async function openChildAdmission(client, issue) {
   const children = await client.query(
-    `SELECT number FROM "issue"
-      WHERE parent_issue_id = $1
-        AND status NOT IN ('Done', 'Cancelled', 'Archived')
-      ORDER BY number`,
+    `SELECT (to_jsonb(child)->>'number')::int AS number
+       FROM "issue" child
+      WHERE child.parent_issue_id = $1
+        AND child.status NOT IN ('Done', 'Cancelled', 'Archived')
+      ORDER BY (to_jsonb(child)->>'number')::int NULLS LAST`,
     [issue.id]
   );
   const childNumbers = children.rows.map((row) => Number(row.number));
