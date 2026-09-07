@@ -1140,7 +1140,7 @@ relay_cancel_child() {
   agent=$(sed -n 's/^RELAY_AGENT_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
   operator=$(sed -n 's/^RELAY_OPERATOR_SECRET=//p' "$RELAY_ENV_FILE" | tail -1)
   [[ -z "$agent" || -z "$operator" ]] && return 1
-  body=$(printf '{"issue_id":"%s","to_stage":"Cancelled","agent_token":"%s","reason":"Folded into mega flight gsp#%s (Done), which carried the specification and the change for this report.","evidence":{"boardOwnerAuthority":"belt-config-guard bundled-child rule","reason":"child of completed mega gsp#%s"}}' \
+  body=$(printf '{"issue_id":"%s","to_stage":"Cancelled","actor":"operator","agent_token":"%s","reason":"Folded into mega flight gsp#%s (Done), which carried the specification and the change for this report.","evidence":{"boardOwnerAuthority":"belt-config-guard bundled-child rule","reason":"child of completed mega gsp#%s"}}' \
     "$child_id" "$agent" "$parent_number" "$parent_number")
   receipt=$(curl -sS -X POST http://127.0.0.1:5005/relay/advance -H 'content-type: application/json' \
     -H "x-relay-operator-secret: $operator" -d "$body" 2>&1) || return 1

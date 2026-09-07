@@ -90,6 +90,9 @@ function evaluate({ from, to, actor, evidence = {}, ...request } = {}) {
   const transition = TRANSITIONS.find((row) => row.from === from && row.to === to);
   if (!transition) return { ok: false, code: 'transition_denied' };
   if (!transition.actors.includes(actor)) return { ok: false, code: 'actor_denied' };
+  if (to === 'Cancelled' && (typeof evidence.reason !== 'string' || !evidence.reason.trim())) {
+    return { ok: false, code: 'evidence_missing' };
+  }
   if (from === 'In Progress' && to === 'Done') {
     // The no-deploy route is valid only for an independently verified clean
     // checkout.  Keep the offending paths in the result so the relay audit

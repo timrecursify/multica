@@ -89,6 +89,7 @@ const {
   relayAdvance,
   writeJsonResponse,
   admitConfiguredTransition,
+  transitionPolicyActor,
   openChildAdmission,
   setTestClientFactory,
   isCicdReturn,
@@ -208,13 +209,37 @@ test('relay error response does not write headers after a response has ended', (
 
 test('relay transition admission is a single pre-mutation decision', () => {
   const admitted = admitConfiguredTransition({ fromStage: 'Human Review', toStage: 'Queue',
-    expectedStage: 'Queue' });
+    expectedStage: 'Queue', actor: 'operator',
+    evidence: { recordedDecision: true, destinationEvidence: true } });
   assert.equal(admitted.ok, true);
   // A later read of the committed issue sees Queue; it must not be used to
   // overwrite the original authorization result.
   assert.deepEqual(admitted, { fromStage: 'Human Review', toStage: 'Queue', ok: true });
   assert.equal(admitConfiguredTransition({ fromStage: 'Queue', toStage: 'Archived',
-    expectedStage: 'In Progress' }).ok, false);
+    expectedStage: 'In Progress', actor: 'system' }).ok, false);
+});
+
+test('bridge cancellation admission requires the canonical operator evidence', () => {
+  const configured = { fromStage: 'Spec', toStage: 'Cancelled',
+    expectedStage: 'Queue', altStages: ['Cancelled'], exceptional: true };
+  assert.deepEqual(admitConfiguredTransition(configured), {
+    fromStage: 'Spec', toStage: 'Cancelled', ok: false, code: 'actor_denied'
+  });
+  assert.equal(admitConfiguredTransition({ ...configured, actor: 'worker',
+    evidence: { boardOwnerAuthority: true, reason: 'already satisfied' } }).code, 'actor_denied');
+  assert.equal(admitConfiguredTransition({ ...configured, actor: 'operator',
+    evidence: { boardOwnerAuthority: true, reason: '   ' } }).code, 'evidence_missing');
+  assert.deepEqual(admitConfiguredTransition({ ...configured, actor: 'operator',
+    evidence: { boardOwnerAuthority: true, reason: 'withdrawn by board owner' } }), {
+    fromStage: 'Spec', toStage: 'Cancelled', ok: true
+  });
+});
+
+test('bridge binds a claimed cancellation operator to operator credentials', () => {
+  const request = { requestedActor: 'operator', fromStage: 'Spec', toStage: 'Cancelled' };
+  assert.equal(transitionPolicyActor(request), null);
+  assert.equal(transitionPolicyActor({ ...request, authenticatedOperator: true }), 'operator');
+  assert.equal(transitionPolicyActor({ ...request, requestedActor: 'worker' }), 'worker');
 });
 
 test('operator respec validates requests and replays the same receipt', async () => {
