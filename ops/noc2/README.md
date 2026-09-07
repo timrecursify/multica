@@ -48,3 +48,26 @@ confirm the resulting metrics:
 sudo systemctl start gsp-backup-age-emitter.service
 curl -s http://127.0.0.1:9100/metrics | grep -E 'backup_lane_query_(ok|failure)'
 ```
+
+## Quarterly Fedkit restore drill
+
+Run this procedure once per quarter on a disposable Mint test PC (never the
+production Huawei host). Boot the Ventoy/Mint media, unlock the stick's LUKS
+volume, and set `REPO` and `RESTIC_PASSWORD_FILE` to the mounted vault. Before
+any replay, create the explicit replacement-host checkpoint and capture the
+dry-run boundary evidence:
+
+```sh
+sudo install -D /dev/null /var/lib/fedkit/old-host-fenced
+CHECKPOINT=/var/lib/fedkit/old-host-fenced DRY_RUN=1 \
+  ./fedkit-restore.sh | tee /tmp/fedkit-restore-drill.log
+grep -F 'no writes' /tmp/fedkit-restore-drill.log
+```
+
+The dry run must print `manifest validated; no writes performed`. Only after
+reviewing that line may the operator run `DRY_RUN=0 ./fedkit-restore.sh` and
+verify the allow-listed services, database dump, Redis data, Docker volumes,
+Mumble data, and tunnel/unit configuration. Record the date, Mint ISO version,
+repository snapshot ID, checkpoint path, and the successful verification output
+in the operations log. If the checkpoint is absent or the repository/passphrase
+is invalid, the launcher must stop before writing and the drill is a failure.
