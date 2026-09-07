@@ -403,6 +403,9 @@ func gitFetch(barePath string) error {
 	if err := ensureRemoteTrackingLayout(barePath); err != nil {
 		return fmt.Errorf("ensure refspec: %w", err)
 	}
+	if out, err := runGitOutput("-C", barePath, "rev-parse", "--is-shallow-repository"); err == nil && strings.TrimSpace(string(out)) == "true" {
+		return fmt.Errorf("shallow repository cache: %s", barePath)
+	}
 	if err := runGitFetch(barePath); err != nil {
 		return err
 	}
@@ -835,14 +838,14 @@ func createIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef
 			return "", err
 		}
 	}
+	if err := syncIsolatedCheckoutRefs(barePath, checkoutPath, baseRef); err != nil {
+		return "", err
+	}
 
 	if out, err := runGitCombinedOutput("-C", checkoutPath, "checkout", "--detach", baseCommit); err != nil {
 		return "", fmt.Errorf("git checkout --detach: %s: %w", strings.TrimSpace(string(out)), err)
 	}
 	if err := deleteAllLocalBranches(checkoutPath); err != nil {
-		return "", err
-	}
-	if err := syncIsolatedCheckoutRefs(barePath, checkoutPath, baseRef); err != nil {
 		return "", err
 	}
 	if out, err := runGitCombinedOutput("-C", checkoutPath, "config", isolatedCheckoutConfigKey, isolatedCheckoutConfigValue); err != nil {
