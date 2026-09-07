@@ -15,11 +15,14 @@
 // every required target; only exact receipts for all targets can prove deploy.
 const fs = require('fs');
 const http = require('http');
-const { execFileSync } = require('child_process');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const { evaluate } = require('./transition-policy.cjs');
 const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
-const { mintGithubToken, repoFromGhArgs } = require('./github-token.cjs');
+const { repoFromGhArgs } = require('./github-token.cjs');
 const { globRegex } = require('./stage-routing.cjs');
+const { createRateLimitState, createTtlCache } = require('./github-api-adapter.cjs');
+const execFileAsync = promisify(execFile);
 const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multica-runtime/receipts';
 const DOCS_ONLY_PATHS = ['*.md', '**/*.md', 'docs/**', 'apps/docs/**'];
 const DEPLOY_TARGET_RULES = {
@@ -39,8 +42,9 @@ let pool;
 let relayToken;
 let readReceipt = (repo, target, sha) =>
   JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/${repo}/${target}/${sha}.json`, 'utf8'));
-let readChangedPaths = (repo, number) => {
-  const files = JSON.parse(gh(['api', `repos/${repo}/pulls/${number}/files?per_page=100`]));
+let readChangedPaths = async (repo, number, sha) => {
+  const files = JSON.parse(await gh(['api', `repos/${repo}/pulls/${number}/files?per_page=100`],
+    { cacheKey: sha ? `${repo}@${sha}:pr-files` : `${repo}:pr:${number}:files` }));
   if (!Array.isArray(files) || files.length >= 100) throw new Error('changed path manifest unavailable or truncated');
   return files.flatMap(file => [file.filename, file.previous_filename]).filter(Boolean);
 };
@@ -57,16 +61,22 @@ const CI_FAILURE_POLLS = parseInt(process.env.CICD_FAILURE_POLLS || '3', 10);
 const CI_ABSENT_MINUTES = parseInt(process.env.CICD_ABSENT_MINUTES || '20', 10);
 const DEPLOY_CANCEL_RETRY_LIMIT = parseInt(process.env.CICD_DEPLOY_CANCEL_RETRY_LIMIT || '3', 10);
 const deployCancelRetries = new Map();
+const githubReadCache = createTtlCache({ ttlMs: POLL_MS });
+const githubTokenCache = createTtlCache({ ttlMs: POLL_MS });
+const githubRateLimits = new Map();
+const githubStats = { externalCalls: 0, cacheHits: 0 };
+const repoMergeLocks = new Map();
 // Retroactive CI (Tim 2026-09-02 16:16Z: admin merge + admin deploy with
 // retroactive CI/CD for speed; risk paths still wait). Repos listed here merge
 // a mergeable PR while its CI is still pending unless the diff touches a risk
 // path; main CI validates after the merge.
 const RETRO_REPOS = new Set((process.env.CICD_RETROACTIVE_REPOS || '').split(',').map(s => s.trim()).filter(Boolean));
 const RISK_PATH = /(^|\/)(migrations?|drizzle)\/|\.env|secret|credential|auth|billing\/.*flag|feature-flag|\.github\/workflows\//i;
-function retroactiveEligible(repo, num) {
+async function retroactiveEligible(repo, num, sha) {
   if (!RETRO_REPOS.has(repo)) return { ok: false, why: 'repo not retroactive' };
   try {
-    const files = JSON.parse(gh(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]));
+    const files = JSON.parse(await gh(['api', `repos/${repo}/pulls/${num}/files?per_page=100`],
+      { cacheKey: sha ? `${repo}@${sha}:pr-files` : `${repo}:pr:${num}:files` }));
     const risky = files.map(f => f.filename).filter(f => RISK_PATH.test(f));
     if (risky.length) return { ok: false, why: `risk path ${risky[0]}` };
     return { ok: true, why: `${files.length} files, no risk path` };
@@ -80,13 +90,56 @@ let watchdog = createWatchdog({ file: process.env.CICD_WATCHDOG_STATE || `${RECE
 
 let log = (...a) => console.log(new Date().toISOString(), ...a);
 
-let gh = function github(args) {
-  if (ghBackoffUntil > Date.now()) { const e = new Error('GitHub API rate limit backoff'); e.rateLimited = true; throw e; }
+function githubRepo(args) {
+  const joined = args.join(' ');
+  return joined.match(/repos\/([\w.-]+\/[\w.-]+)/)?.[1] ||
+    (args.includes('-R') ? args[args.indexOf('-R') + 1] : null) ||
+    (args.includes('--repo') ? args[args.indexOf('--repo') + 1] : null) ||
+    repoFromGhArgs(args);
+}
+function githubState(args) {
+  const repo = githubRepo(args) || 'default';
+  if (!githubRateLimits.has(repo)) {
+    githubRateLimits.set(repo, createRateLimitState({ scope: 'credential-helper' }));
+  }
+  return githubRateLimits.get(repo);
+}
+function githubCooldownUntil() {
+  return Math.max(0, ...[...githubRateLimits.values()].map(state => state.cooldown()));
+}
+async function githubOptions(args) {
+  const repo = githubRepo(args);
+  const token = await githubTokenCache.get(repo || 'default', async () => {
+    const helper = process.env.GSP_BELT_GIT_CREDENTIAL || '/usr/local/bin/gsp-belt-git-credential';
+    try {
+      const result = await execFileAsync(helper, ['token', repo], { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
+      return String(result.stdout).trim().split(/\r?\n/)[0] || '';
+    } catch (error) {
+      log(`[github-token] helper failed for ${repo || 'default'}: ${String(error.message).slice(0, 160)}`);
+      return '';
+    }
+  });
+  return { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6,
+    ...(token ? { env: { ...process.env, GH_TOKEN: token } } : {}) };
+}
+function githubReadKey(args) {
+  if (args.includes('-X') || (args[0] === 'pr' && args[1] === 'merge')) return null;
+  const joined = args.join(' ');
+  const repo = githubRepo(args);
+  if (!repo) return null;
+  const sha = joined.match(/(?:commits\/|head_sha=|[?&]ref=|--commit\s+)([0-9a-f]{40})/i)?.[1];
+  const pull = joined.match(/pulls\/(\d+)/)?.[1] || (args[0] === 'pr' ? args[2] : null);
+  return sha ? `${repo}@${sha}:${joined}` : pull ? `${repo}:pr:${pull}:${joined}` : `${repo}:${joined}`;
+}
+async function executeGithub(args) {
+  const state = githubState(args);
+  if (state.cooldown() > Date.now()) { const e = new Error('GitHub API rate limit backoff'); e.rateLimited = true; throw e; }
   // GraphQL (gh pr view/merge) shares one per-user quota with every operator
   // session and was exhausted at 02:19Z on 2026-09-03; route both through REST.
   if (args[0] === 'pr' && args[1] === 'view' && args[3] === '-R') {
-    const raw = execFileSync('gh', ['api', '-i', `repos/${args[4]}/pulls/${args[2]}`], ghOptions(args));
-    const pr = JSON.parse(rateLimitBody(raw));
+    githubStats.externalCalls += 1;
+    const result = await execFileAsync('gh', ['api', '-i', `repos/${args[4]}/pulls/${args[2]}`], await githubOptions(args));
+    const pr = JSON.parse(rateLimitBody(result.stdout, state));
     return JSON.stringify({
       state: pr.merged ? 'MERGED' : String(pr.state || '').toUpperCase(),
       mergeable: pr.mergeable === true ? 'MERGEABLE' : pr.mergeable === false ? 'CONFLICTING' : 'UNKNOWN',
@@ -96,35 +149,54 @@ let gh = function github(args) {
   }
   if (args[0] === 'pr' && args[1] === 'merge' && args[3] === '-R') {
     try {
-      const raw = execFileSync('gh', ['api', '-i', '-X', 'PUT', `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'], ghOptions(args));
-      return rateLimitBody(raw).trim();
+      githubStats.externalCalls += 1;
+      const result = await execFileAsync('gh', ['api', '-i', '-X', 'PUT',
+        `repos/${args[4]}/pulls/${args[2]}/merge`, '-f', 'merge_method=squash'], await githubOptions(args));
+      return rateLimitBody(result.stdout, state).trim();
     } catch (e) {
       const text = `${e.stdout || ''}\n${e.stderr || ''}`;
-      if (/API rate limit exceeded/i.test(text) || /x-ratelimit-remaining:\s*0/i.test(text)) { ghBackoffUntil = rateLimitReset(text); e.rateLimited = true; }
+      if (/API rate limit exceeded/i.test(text) || /x-ratelimit-remaining:\s*0/i.test(text)) {
+        state.hold(rateLimitReset(text), 0, rateLimitReset(text)); e.rateLimited = true;
+      }
       throw e;
     }
   }
   try {
     const command = args[0] === 'api' && !args.includes('-i') ? ['api', '-i', ...args.slice(1)] : args;
-    const raw = execFileSync('gh', command, ghOptions(args));
-    return args[0] === 'api' ? rateLimitBody(raw).trim() : raw.trim();
+    githubStats.externalCalls += 1;
+    const result = await execFileAsync('gh', command, await githubOptions(args));
+    return args[0] === 'api' ? rateLimitBody(result.stdout, state).trim() : result.stdout.trim();
   } catch (e) {
     const text = `${e.stdout || ''}\n${e.stderr || ''}`;
     if (/API rate limit exceeded/i.test(text) || /x-ratelimit-remaining:\s*0/i.test(text)) {
-      ghBackoffUntil = rateLimitReset(text); e.rateLimited = true;
+      state.hold(rateLimitReset(text), 0, rateLimitReset(text)); e.rateLimited = true;
     }
     throw e;
   }
+}
+let gh = async function github(args, { cacheKey } = {}) {
+  const key = cacheKey || githubReadKey(args);
+  if (!key) return executeGithub(args);
+  const hits = githubReadCache.stats.hits + githubReadCache.stats.inFlightHits;
+  const value = await githubReadCache.get(key, () => executeGithub(args));
+  githubStats.cacheHits += githubReadCache.stats.hits + githubReadCache.stats.inFlightHits - hits;
+  return value;
 };
-function ghOptions(args) { const token = mintGithubToken(repoFromGhArgs(args)); return { encoding: 'utf8', timeout: 90000, maxBuffer: 8e6, ...(token ? { env: { ...process.env, GH_TOKEN: token } } : {}) }; }
-let ghBackoffUntil = 0;
 function rateLimitReset(raw) {
   const m = raw.match(/x-ratelimit-reset:\s*(\d+)/i); return m ? Number(m[1]) * 1000 : Date.now() + 3600000;
 }
-function rateLimitBody(raw) {
+function rateLimitBody(raw, state) {
   const split = raw.split(/\r?\n\r?\n/); const headers = split.slice(0, -1).join('\n');
-  if (/x-ratelimit-remaining:\s*0/i.test(headers)) ghBackoffUntil = rateLimitReset(headers);
+  if (/x-ratelimit-remaining:\s*0/i.test(headers)) state.hold(rateLimitReset(headers), 0, rateLimitReset(headers));
   return split[split.length - 1];
+}
+
+async function withRepoMergeLock(repo, operation) {
+  const prior = repoMergeLocks.get(repo) || Promise.resolve();
+  const next = prior.catch(() => {}).then(operation);
+  repoMergeLocks.set(repo, next);
+  try { return await next; }
+  finally { if (repoMergeLocks.get(repo) === next) repoMergeLocks.delete(repo); }
 }
 
 let relay = function relayRequest(issueId, toStage, currentWorkProductMd5, reason, parkedAudit, evidence, relaySourceTaskId) {
@@ -279,9 +351,10 @@ function receiptSummary(receipt) {
   };
 }
 
-function changedPathManifest(repo, pr) {
+async function changedPathManifest(repo, pr) {
   try {
-    const paths = Array.isArray(pr?.changedPaths) ? pr.changedPaths : readChangedPaths(repo, pr?.num);
+    const paths = Array.isArray(pr?.changedPaths) ? pr.changedPaths
+      : await readChangedPaths(repo, pr?.num, pr?.headSha || pr?.headRefOid);
     if (!paths.length || paths.some(path => typeof path !== 'string' || !path)) {
       throw new Error('changed path manifest is empty or invalid');
     }
@@ -311,24 +384,28 @@ function deploymentRequirements(repo, paths) {
   return [...requirements.values()].sort((a, b) => a.target.localeCompare(b.target));
 }
 
-function deployWorkflowNames(repo, sha) {
+async function deployWorkflowNames(repo, sha) {
   try {
-    return JSON.parse(gh(['api', `repos/${repo}/contents/.github/workflows?ref=${sha}`]))
+    return JSON.parse(await gh(['api', `repos/${repo}/contents/.github/workflows?ref=${sha}`]))
       .map(entry => entry.name).filter(name => /^deploy-.*\.ya?ml$/i.test(name));
   } catch (_) { return []; }
 }
 
-function noWorkflowCi(repo, sha) {
+async function noWorkflowCi(repo, sha) {
   try {
-    const workflows = JSON.parse(gh(['api', `repos/${repo}/contents/.github/workflows`]));
-    const suites = JSON.parse(gh(['api', `repos/${repo}/commits/${sha}/check-suites`]));
+    const [workflowsRaw, suitesRaw] = await Promise.all([
+      gh(['api', `repos/${repo}/contents/.github/workflows`]),
+      gh(['api', `repos/${repo}/commits/${sha}/check-suites`])
+    ]);
+    const workflows = JSON.parse(workflowsRaw);
+    const suites = JSON.parse(suitesRaw);
     return workflows.length === 0 && (suites.check_suites || []).length === 0;
   } catch (_) { return false; }
 }
 
-function successfulDeployRun(repo, sha, workflow) {
+async function successfulDeployRun(repo, sha, workflow) {
   try {
-    const runs = JSON.parse(gh(['run', 'list', '--repo', repo, '--commit', sha, '--workflow', workflow,
+    const runs = JSON.parse(await gh(['run', 'list', '--repo', repo, '--commit', sha, '--workflow', workflow,
       '--status', 'success', '--json', 'databaseId,conclusion,name,event,path']));
     const run = runs.find(candidate => candidate.conclusion === 'success'
       && (candidate.event === undefined || candidate.event === 'workflow_dispatch'));
@@ -348,11 +425,11 @@ function successfulDeployRun(repo, sha, workflow) {
 // Upstream: timrecursify/multica PR #422.
 const DEPLOY_TRIGGER_GRACE_MINUTES = parseInt(process.env.CICD_DEPLOY_TRIGGER_GRACE_MINUTES || '10', 10);
 
-function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
+async function noDeployRunTriggered(repo, sha, mergedAt, now = Date.now()) {
   const ageMinutes = (now - Date.parse(mergedAt || '')) / 60000;
   if (!Number.isFinite(ageMinutes) || ageMinutes < DEPLOY_TRIGGER_GRACE_MINUTES) return false;
   try {
-    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]));
+    const runs = JSON.parse(await gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]));
     return !(runs.workflow_runs || []).some(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || '')
       && (r.event === undefined || r.event === 'workflow_dispatch'));
   } catch (_) { return false; }
@@ -370,25 +447,25 @@ const TERMINAL_DEPLOY_CONCLUSIONS = new Set([
   'failure', 'timed_out', 'startup_failure', 'stale', 'action_required',
 ]);
 
-function laterSuccessfulDeploy(repo, cancelled, sourceSha) {
+async function laterSuccessfulDeploy(repo, cancelled, sourceSha) {
   try {
-    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?status=success&per_page=100`]))
+    const runs = JSON.parse(await gh(['api', `repos/${repo}/actions/runs?status=success&per_page=100`]))
       .workflow_runs || [];
     const later = runs.filter(run => run.path === cancelled.path && run.conclusion === 'success'
       && String(run.created_at || '') > String(cancelled.created_at || '')
       && /^[0-9a-f]{40}$/i.test(run.head_sha || ''))
       .sort((a, b) => String(a.created_at).localeCompare(String(b.created_at)));
     for (const run of later) {
-      const comparison = JSON.parse(gh(['api', `repos/${repo}/compare/${sourceSha}...${run.head_sha}`]));
+      const comparison = JSON.parse(await gh(['api', `repos/${repo}/compare/${sourceSha}...${run.head_sha}`]));
       if (comparison.status === 'ahead' || comparison.status === 'identical') return run;
     }
   } catch (_) { /* REST errors conservatively leave the cancellation unresolved. */ }
   return null;
 }
 
-function terminalDeployEvaluation(repo, sha) {
+async function terminalDeployEvaluation(repo, sha) {
   try {
-    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]))
+    const runs = JSON.parse(await gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=100`]))
       .workflow_runs || [];
     const deployRuns = runs.filter(r => /(^|\/)deploy-[^/]*\.ya?ml$/i.test(r.path || '')
       && (r.event === undefined || r.event === 'workflow_dispatch'));
@@ -399,7 +476,7 @@ function terminalDeployEvaluation(repo, sha) {
       let jobs = null;
       try {
         if (run.id || run.database_id) {
-          const payload = JSON.parse(gh(['api', `repos/${repo}/actions/runs/${run.id || run.database_id}/jobs?per_page=100`]));
+          const payload = JSON.parse(await gh(['api', `repos/${repo}/actions/runs/${run.id || run.database_id}/jobs?per_page=100`]));
           jobs = payload.jobs || [];
         }
       } catch (_) { jobs = null; }
@@ -419,8 +496,10 @@ function terminalDeployEvaluation(repo, sha) {
         `blocked_on=ci failing_gate=${name}`).join(', ') };
     }
     if (!attempted.length) return { noAttempt: true };
-    const superseded = attempted.filter(run => run.conclusion === 'cancelled'
-      && laterSuccessfulDeploy(repo, run, sha));
+    const superseded = [];
+    for (const run of attempted) {
+      if (run.conclusion === 'cancelled' && await laterSuccessfulDeploy(repo, run, sha)) superseded.push(run);
+    }
     const unresolved = attempted.filter(run => !superseded.includes(run));
     if (unresolved.some(run => run.conclusion !== 'cancelled' && !TERMINAL_DEPLOY_CONCLUSIONS.has(run.conclusion))) return null;
     if (unresolved.length) {
@@ -463,7 +542,7 @@ async function retriggerCancelledDeploys(issue, repo, sha, cancelledRuns) {
       if (!runId) throw new Error('cancelled deploy run has no id');
       // Rerun the cancelled run itself. workflow_dispatch --ref accepts only a
       // branch or tag, not the merge commit SHA, and would therefore fail.
-      gh(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
+      await gh(['api', '-X', 'POST', `repos/${repo}/actions/runs/${runId}/rerun`]);
       deployCancelRetries.set(key, attempts + 1);
       dispatched += 1;
       try { await pool?.query("update issue SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('deploy_cancel_retries', COALESCE(metadata->'deploy_cancel_retries', '{}'::jsonb) || jsonb_build_object($2, $3::int)) WHERE id=$1", [issue.id, key, attempts + 1]); } catch (_) { /* degraded/test DB */ }
@@ -478,15 +557,15 @@ async function retriggerCancelledDeploys(issue, repo, sha, cancelledRuns) {
   return { dispatched, capped: workflows.filter(path => (deployCancelRetries.get(`${issue.id}:${sha}:${path.replace(/^.*\//, '')}`) || 0) >= DEPLOY_CANCEL_RETRY_LIMIT).length };
 }
 
-function terminalFailedDeployRuns(repo, sha) {
-  return terminalDeployEvaluation(repo, sha)?.failed || null;
+async function terminalFailedDeployRuns(repo, sha) {
+  return (await terminalDeployEvaluation(repo, sha))?.failed || null;
 }
 
-function mergeDeployEvidence(repo, sha, pr = {}) {
+async function mergeDeployEvidence(repo, sha, pr = {}) {
   if (!/^[0-9a-f]{40}$/.test(sha)) return { outcome: 'failed', blocker: {
     type: 'source_sha_invalid', retry_eligible: false
   } };
-  const manifest = changedPathManifest(repo, pr);
+  const manifest = await changedPathManifest(repo, pr);
   if (manifest.blocker) return { outcome: 'discovery_unavailable', blocker: manifest.blocker };
   if (docsOnly(manifest.paths)) return { outcome: 'verified_not_applicable', evidence: {
     kind: 'changed_path_manifest', repository: repo, source_sha: sha,
@@ -519,8 +598,8 @@ function mergeDeployEvidence(repo, sha, pr = {}) {
 
 async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   const latest = await latestVerdict(issue.id);
-  let ci = ciState(pr.repo, pr.headSha || mergedSha, pr.createdAt);
-  if (ci === 'absent' && noWorkflowCi(pr.repo, pr.headSha || mergedSha)) {
+  let ci = await ciState(pr.repo, pr.headSha || mergedSha, pr.createdAt);
+  if (ci === 'absent' && await noWorkflowCi(pr.repo, pr.headSha || mergedSha)) {
     ci = 'green';
     log(`CI N/A #${issue.number} ${pr.repo} has no workflows or check suites`);
   }
@@ -528,7 +607,7 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   // Re-check that authorization here, then continue to the deploy-evidence
   // gate; CI queue state alone must not strand an already deployed ticket.
   const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && pr.num != null
-    ? retroactiveEligible(pr.repo, pr.num) : null;
+    ? await retroactiveEligible(pr.repo, pr.num, pr.headSha || mergedSha) : null;
   // A merged PR with no checks or only cancelled checks is already terminal:
   // retroactive eligibility authorizes a merge, but cannot veto one that
   // happened. Keep the risk-path veto for pending, pre-merge authorization.
@@ -550,7 +629,7 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     await returnIssueToBuild(issue, `${note}; latest QC PASS evidence is absent`);
     return { status: 'returned' };
   }
-  const deploy = mergeDeployEvidence(pr.repo, mergedSha, pr);
+  const deploy = await mergeDeployEvidence(pr.repo, mergedSha, pr);
   if (deploy.outcome === 'failed') {
     await returnIssueToBuild(issue, `${note}; deployment evidence failed for ${mergedSha} (${deploy.blocker.type})`);
     return { status: 'returned' };
@@ -617,7 +696,7 @@ async function returnIssueToBuild(issue, reason) {
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'In Progress', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected In Progress: ${verdict.code}`);
   await relay(issue.id, 'In Progress', null, `RETURN:In Progress — ${reason}`, null, evidence);
-  noteReturn(issue, reason);
+  await noteReturn(issue, reason);
   log(`RETURN #${issue.number} ${reason}`);
 }
 
@@ -662,7 +741,7 @@ async function recordReturn(issue, reason) {
 // 70 of 97 rework tasks finished in <3 min with the PR still dirty). The
 // reason has to live on the ticket, where the brief is assembled from.
 const PPP_WORKSPACE = 'da3c5c5c-a123-4567-b999-c3ed1820da00';
-function noteReturn(issue, reason) {
+async function noteReturn(issue, reason) {
   const board = issue.workspace_id === PPP_WORKSPACE ? 'prod' : 'gsp';
   const body = [`/note CI/CD RETURN: ${reason}.`,
     'Required before this ticket can advance again:',
@@ -670,8 +749,8 @@ function noteReturn(issue, reason) {
     '2. Push the rebased branch; confirm GitHub reports the PR mergeable and CI runs on the new head.',
     '3. Report the new head SHA. Reporting ADVANCED with the PR still conflicting or without a fresh CI run returns it here again.'].join('\n');
   try {
-    execFileSync(SK_COMMAND, ['multica', 'comment', '--board', board, '--number', String(issue.number), '--body', body],
-      { encoding: 'utf8', timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] });
+    await execFileAsync(SK_COMMAND, ['multica', 'comment', '--board', board, '--number', String(issue.number), '--body', body],
+      { encoding: 'utf8', timeout: 60000 });
   } catch (e) {
     log(`NOTE-FAIL #${issue.number} ${String(e.message).split('\n')[0].slice(0, 160)}`);
   }
@@ -698,9 +777,9 @@ function countCiFailure(issue, pr, sha, ci) {
 // Green means every completed run on THIS head SHA succeeded. A run list
 // filtered by status alone can return a success from an older SHA of the same
 // branch, which is how a red PR reads as green.
-function ciState(repo, sha, createdAt, now = Date.now()) {
+async function ciState(repo, sha, createdAt, now = Date.now()) {
   try {
-    const runs = JSON.parse(gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=30`]));
+    const runs = JSON.parse(await gh(['api', `repos/${repo}/actions/runs?head_sha=${sha}&per_page=30`]));
     // A run whose name is its file path is GitHub's 'invalid workflow file'
     // marker: it has no jobs and says nothing about this SHA.
     // Cancelled runs (superseded by a newer push, or operator queue trims)
@@ -808,7 +887,7 @@ async function sweep() {
         continue;
       }
 
-      const ci = ciState(pr.repo, product.head_sha, info.createdAt);
+      const ci = await ciState(pr.repo, product.head_sha, info.createdAt);
       if (ci === 'absent') {
         await returnToBuild(issue, pr, `no CI runs after ${CI_ABSENT_MINUTES} minutes`);
         continue;
@@ -816,7 +895,8 @@ async function sweep() {
       const failures = countCiFailure(issue, pr, product.head_sha, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
-        const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && info.mergeable !== 'CONFLICTING' ? retroactiveEligible(pr.repo, pr.num) : null;
+        const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && info.mergeable !== 'CONFLICTING'
+          ? await retroactiveEligible(pr.repo, pr.num, info.headRefOid) : null;
         if (!retro || !retro.ok) {
           const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
           log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}${retro ? ` retro=${retro.why}` : ''}`);
@@ -836,7 +916,8 @@ async function sweep() {
         continue;
       }
       try {
-        gh(['pr', 'merge', String(pr.num), '-R', pr.repo, '--squash', '--admin', '--delete-branch']);
+        await withRepoMergeLock(pr.repo, () =>
+          gh(['pr', 'merge', String(pr.num), '-R', pr.repo, '--squash', '--admin', '--delete-branch']));
         log(`MERGED #${issue.number} ${pr.repo}#${pr.num} squash by belt operator`);
       } catch (e) {
         // GitHub reports mergeable=null for every open PR right after a base
@@ -851,8 +932,9 @@ async function sweep() {
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);
       }
     } catch (e) {
-      if (e.rateLimited || ghBackoffUntil > Date.now()) {
-        log(`RATE-LIMIT sweep skipped=${rows.length - issueIndex} reset=${new Date(ghBackoffUntil).toISOString()}`);
+      const cooldownUntil = githubCooldownUntil();
+      if (e.rateLimited || cooldownUntil > Date.now()) {
+        log(`RATE-LIMIT sweep skipped=${rows.length - issueIndex} reset=${new Date(cooldownUntil).toISOString()}`);
         return;
       }
       // GSP-1973 / upstream multica#465: watchdogFailure escalates via
@@ -898,4 +980,5 @@ module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanRevi
   routeFinishedPR, receiptFor, mergeDeployEvidence, changedPathManifest, deploymentRequirements,
   noDeployRunTriggered, terminalFailedDeployRuns,
   terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, parseRelayResponse,
-  setTestDependencies, sweep, watchdogFailure, closureWatchdog, resolveSkCommand };
+  setTestDependencies, sweep, watchdogFailure, closureWatchdog, resolveSkCommand,
+  githubReadKey, withRepoMergeLock };

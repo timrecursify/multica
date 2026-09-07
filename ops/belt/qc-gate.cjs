@@ -1,7 +1,9 @@
 'use strict';
 
-const { execFileSync } = require('child_process');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const { readTaskEvidence } = require('./qc-verdict-policy.cjs');
+const execFileAsync = promisify(execFile);
 
 const SHA_RE = /^[0-9a-f]{40}$/i;
 const SK_SECRET_RE = /\bsk-(?:ant|proj)-[A-Za-z0-9_-]{20,}|\bsk-[A-Za-z0-9_]{20,}\b/;
@@ -19,14 +21,18 @@ const PR_URL_RE = /github\.com\/([\w.-]+\/[\w.-]+)\/pull\/(\d+)/i;
 const CI_EXCLUDED_CONTEXTS = new Set(['verdict-gate', 'reviewer-gate']);
 
 function check(name, ok, detail) { return { name, ok: Boolean(ok), detail: String(detail || '') }; }
-function ghJson(gh, args) { return JSON.parse(gh(args)); }
+async function ghJson(gh, args, cacheKey) { return JSON.parse(await gh(args, { cacheKey })); }
 function repoFrom(issue, pr) {
   return issue.repo || issue.repository || (pr.html_url || '').match(/github\.com\/([\w.-]+\/[\w.-]+)\/pull/)?.[1];
 }
 function pathTokens(scope) {
   return String(scope || '').split(/\s+/).map(s => s.replace(/[(),;:]$/g, '')).filter(s => s.includes('/') || /\.[A-Za-z0-9]+$/.test(s));
 }
-function md5ForSha(sha, workspace, repo) {
+async function runGit(args, options) {
+  const result = await execFileAsync('git', args, options);
+  return result.stdout;
+}
+async function md5ForSha(sha, workspace, repo, git = runGit) {
   const [owner, name] = String(repo || '').split('/');
   // Resolve the mirror root the way the daemon does. MULTICA_REPO_MIRRORS_ROOT
   // can move the bare mirrors off the workspaces root, and this path is the
@@ -38,17 +44,19 @@ function md5ForSha(sha, workspace, repo) {
     || process.env.MULTICA_REPO_MIRRORS_ROOT
     || '/var/lib/gsp/multica/workspaces/.repos';
   const dir = `${root}/${workspace?.id}/github.com+${owner}+${name}.git`;
+  let tree;
   try {
-    execFileSync('git', ['-C', dir, 'ls-tree', '-r', '--full-tree', sha], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    tree = await git(['-C', dir, 'ls-tree', '-r', '--full-tree', sha], { encoding: 'utf8' });
   } catch (err) {
     if (!require('fs').existsSync(dir)) return `unavailable: no bare cache for ${owner}/${name}`;
-    try { execFileSync('git', ['-C', dir, 'fetch', '--quiet', 'origin', sha], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }); }
+    try {
+      await git(['-C', dir, 'fetch', '--quiet', 'origin', sha], { encoding: 'utf8' });
+      tree = await git(['-C', dir, 'ls-tree', '-r', '--full-tree', sha], { encoding: 'utf8' });
+    }
     catch (fetchErr) { return `unavailable: ${fetchErr.message}`; }
   }
-  try {
-    const tree = execFileSync('git', ['-C', dir, 'ls-tree', '-r', '--full-tree', sha], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-    return require('crypto').createHash('md5').update(tree.split('\n').filter(Boolean).sort().join('\n') + (tree.trim() ? '\n' : '')).digest('hex');
-  } catch (err) { return `unavailable: ${err.message}`; }
+  return require('crypto').createHash('md5').update(tree.split('\n').filter(Boolean).sort().join('\n') +
+    (tree.trim() ? '\n' : '')).digest('hex');
 }
 async function findPr({ issue, db }) {
   const metadata = issue.metadata || {};
@@ -64,16 +72,20 @@ async function findPr({ issue, db }) {
   for (const row of tasks.rows) { const parsed = readTaskEvidence({ result: row.result }); const text = JSON.stringify(row.result || {}); const m = text.match(PR_URL_RE); if (m) return { html_url: m[0], repo: m[1], pr_number: Number(m[2]), result: parsed }; }
   return null;
 }
-async function runQcGate({ issue = {}, workspace = {}, evidence = {}, gh, db }) {
+async function runQcGate({ issue = {}, workspace = {}, evidence = {}, gh, db, workProduct = md5ForSha }) {
   const checks = [];
   const pr = await findPr({ issue, db });
   if (!pr) { checks.push(check('pr_linked', false, 'no_pr')); return { verdict: evidence.bound_sha ? 'FAIL' : 'BLOCKED', failure_class: evidence.bound_sha ? 'evidence' : 'evidence', checks, bound_sha: null, pr_number: null }; }
   checks.push(check('pr_linked', true, pr.html_url || `#${pr.pr_number}`));
   const repo = repoFrom(issue, pr); const number = pr.pr_number || pr.number;
-  const detail = ghJson(gh, ['api', `repos/${repo}/pulls/${number}`]);
+  const detail = await ghJson(gh, ['api', `repos/${repo}/pulls/${number}`], `${repo}:pr:${number}`);
   const sha = detail.head?.sha; checks.push(check('sha_reachable', SHA_RE.test(String(sha)), SHA_RE.test(String(sha)) ? sha : 'invalid_sha'));
   if (!SHA_RE.test(String(sha))) return { verdict: 'FAIL', failure_class: 'evidence', checks, bound_sha: null, pr_number: number };
-  const runs = ghJson(gh, ['api', `repos/${repo}/commits/${sha}/check-runs`]).check_runs || [];
+  const [runPayload, files] = await Promise.all([
+    ghJson(gh, ['api', `repos/${repo}/commits/${sha}/check-runs`], `${repo}@${sha}:check-runs`),
+    ghJson(gh, ['api', `repos/${repo}/pulls/${number}/files?per_page=100`], `${repo}@${sha}:pr-files`)
+  ]);
+  const runs = runPayload.check_runs || [];
   const pending = runs.some(r => !['completed'].includes(String(r.status).toLowerCase()));
   const ciRuns = runs.filter(r => !CI_EXCLUDED_CONTEXTS.has(String(r.name || '').toLowerCase()));
   const failing = ciRuns.find(r => ['failure', 'timed_out', 'startup_failure', 'action_required'].includes(String(r.conclusion).toLowerCase()));
@@ -82,7 +94,6 @@ async function runQcGate({ issue = {}, workspace = {}, evidence = {}, gh, db }) 
   const ciPending = ciRuns.some(r => !['completed'].includes(String(r.status).toLowerCase()));
   const ciGreen = !failing && !ciPending && ciRuns.every(r => ['success', 'skipped', 'neutral'].includes(String(r.conclusion).toLowerCase()));
   checks.push(check('ci_green', ciGreen, ciGreen ? 'all_green' : (ciPending ? 'ci_pending' : 'not_green')));
-  const files = ghJson(gh, ['api', `repos/${repo}/pulls/${number}/files?per_page=100`]);
   const tokens = pathTokens(evidence.bindingScope || issue.bindingScope); const scopeOk = !tokens.length || files.every(f => tokens.some(t => f.filename === t || f.filename.startsWith(t.endsWith('/') ? t : `${t}/`)));
   checks.push(check('scope', scopeOk, tokens.length ? (scopeOk ? 'in_scope' : 'out_of_scope') : 'no path tokens'));
   const patch = files.map(f => f.patch || '').join('\n');
@@ -90,7 +101,8 @@ async function runQcGate({ issue = {}, workspace = {}, evidence = {}, gh, db }) 
   checks.push(check('no_secrets', !secretPattern, secretPattern ? `secret_pattern:${secretPattern}` : 'clean'));
   let sizeOk = true; let sizeDetail = 'under_limit';
   if (files.length > 40) sizeDetail = 'skipped >40 files'; else for (const f of files) if (f.additions > 0 && SOURCE_RE.test(f.filename) && !TEST_RE.test(f.filename)) {
-    const body = ghJson(gh, ['api', `repos/${repo}/contents/${f.filename}?ref=${sha}`]);
+    const body = await ghJson(gh, ['api', `repos/${repo}/contents/${f.filename}?ref=${sha}`],
+      `${repo}@${sha}:content:${f.filename}`);
     const lines = Buffer.from(body.content || '', 'base64').toString().split('\n').length;
     const added = String(f.status || '').toLowerCase() === 'added';
     if (lines > 500 && (added || lines - Number(f.additions || 0) + Number(f.deletions || 0) <= 500)) {
@@ -102,7 +114,7 @@ async function runQcGate({ issue = {}, workspace = {}, evidence = {}, gh, db }) 
   checks.push(check('tests_touched', !files.some(f => SOURCE_RE.test(f.filename)) || files.some(f => TEST_RE.test(f.filename)), 'soft'));
   checks.push(check('pr_mergeable', true, detail.mergeable_state || 'unknown'));
   const failed = checks.filter(c => getHardChecks().includes(c.name) && !c.ok);
-  const workProductMd5 = md5ForSha(sha, workspace, repo);
+  const workProductMd5 = await workProduct(sha, workspace, repo);
   if (String(workProductMd5 || '').startsWith('unavailable:')) checks.push(check('work_product_md5', true, workProductMd5));
   return { verdict: failed.length ? 'FAIL' : 'PASS', failure_class: failed.length ? 'evidence' : 'none', checks, bound_sha: sha, pr_number: Number(number), work_product_md5: workProductMd5 };
 }

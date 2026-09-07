@@ -191,7 +191,7 @@ async function linkObservedPullRequest(client, issue, options = {}) {
   if (!pointer) return false;
   let pr;
   try {
-    pr = JSON.parse(githubCommand(["pr", "view", pointer.url, "--json",
+    pr = JSON.parse(await githubCommand(["pr", "view", pointer.url, "--json",
       "number,title,state,url,headRefOid,createdAt,updatedAt,mergedAt,closedAt," +
       "author,headRefName,additions,deletions,changedFiles,mergeable,mergeStateStatus,statusCheckRollup"]));
   } catch (error) {
