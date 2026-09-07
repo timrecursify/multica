@@ -14,6 +14,7 @@ set -uo pipefail
 
 readonly RUNTIME_ROOT="${BELT_RUNTIME_ROOT:-/var/lib/gsp}"
 readonly PM2="${BELT_PM2:-$RUNTIME_ROOT/.npm-global/bin/pm2}"
+readonly SYSTEMCTL="${BELT_SYSTEMCTL:-systemctl}"
 readonly SK="${BELT_SK:-$RUNTIME_ROOT/bin/sk}"
 readonly GSP_WS='f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 readonly RELAY_ENV_FILE="${BELT_RELAY_ENV_FILE:-$RUNTIME_ROOT/gsp-multica/.env}"
@@ -107,6 +108,7 @@ readonly RELAY_CAP_EXPECTATIONS=(
 # multica-relay-advance is here but NOT in GUARDED_APPS: it is not defined in
 # ECOSYSTEM, so it is restarted by name and cannot be started via --only.
 readonly LIVENESS_APPS=(gsp-multica-bridge multica-cicd-worker multica-archiver gsp-multica-worker multica-relay-advance)
+readonly BELT_SYSTEMD_UNITS=(gsp-multica-bridge.service multica-relay-advance.service multica-archiver.service multica-cicd-worker.service gsp-multica-worker.service gsp-multica-worker-ppp.service)
 # Operators may intentionally hold the AI worker while investigating spend or
 # deploying guardrails.  This marker suppresses only worker self-healing; all
 # pipeline services remain under the normal liveness guard.
@@ -728,6 +730,23 @@ print(a[0]['pm2_env'].get('status','missing') if a else 'missing')
       fixed+=("pm2 app $app restarted (was ${status:-unknown})")
     else
       unfixable+=("pm2 could not restart $app (status ${status:-unknown})")
+    fi
+  done
+}
+
+# Restore only units that are explicitly enabled but currently inactive.
+# Missing, masked, disabled, and already-active units are left untouched.
+guard_systemd_liveness() {
+  local unit enabled active
+  for unit in "${BELT_SYSTEMD_UNITS[@]}"; do
+    enabled=$($SYSTEMCTL is-enabled "$unit" 2>/dev/null || true)
+    active=$($SYSTEMCTL is-active "$unit" 2>/dev/null || true)
+    [[ "$enabled" == enabled ]] || continue
+    [[ "$active" == inactive ]] || continue
+    if $SYSTEMCTL start "$unit" >/dev/null 2>&1 && [[ "$($SYSTEMCTL is-active "$unit" 2>/dev/null || true)" == active ]]; then
+      fixed+=("systemd unit $unit started (enabled/inactive)")
+    else
+      unfixable+=("systemd unit $unit failed to start or remained inactive (enabled=$enabled active=$active)")
     fi
   done
 }
@@ -1587,7 +1606,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 guard_relay_preflight
 repair_source_runtime_parity
 guard_source_runtime_parity
-guard_wrapper; guard_runtime_guardrails; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+guard_wrapper; guard_runtime_guardrails; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_systemd_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 # Several guards can observe the same flight in one tick. Emit each exact
 # finding once so the P0 is stable and one-run idempotent.
