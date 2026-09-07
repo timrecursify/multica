@@ -9,20 +9,20 @@ BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" \
 mkdir "$fixture/ f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f"
 touch "$fixture/ f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f/state"
 if BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" \
-  bash -c 'source "$1/workspace-root.sh"; workspace_root_validate' _ "$root_dir" 2>"$fixture/error"; then
+  bash -c 'source "$1/workspace-root.sh"; workspace_root_validate' _ "$root_dir" 2>"$fixture/.error"; then
   echo 'malformed child unexpectedly accepted' >&2; exit 1
 fi
-grep -q 'malformed or unknown workspace directory:  f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f' "$fixture/error"
+grep -q 'malformed or unknown workspace directory:  f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f' "$fixture/.error"
 rm -rf -- "$fixture/ f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f"
 mkdir "$fixture/unknown-empty"
 if ! BELT_TEST_MODE=1 BELT_WRAPPER_TEST=0 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" \
-  bash -c 'source "$1/workspace-root.sh"; workspace_root_validate' _ "$root_dir" 2>"$fixture/quarantine-error"; then
+  bash -c 'source "$1/workspace-root.sh"; workspace_root_validate' _ "$root_dir" 2>"$fixture/.quarantine-error"; then
   echo 'empty unknown child unexpectedly rejected' >&2; exit 1
 fi
 [[ ! -e "$fixture/unknown-empty" ]]
 quarantined=("$fixture"/.quarantine/unknown-empty)
 [[ -d "${quarantined[0]}" ]]
-grep -q 'quarantined unknown empty workspace directory' "$fixture/quarantine-error"
+grep -q 'quarantined unknown empty workspace directory' "$fixture/.quarantine-error"
 mkdir "$fixture/unknown-nonempty"
 touch "$fixture/unknown-nonempty/state"
 if BELT_TEST_MODE=1 BELT_WRAPPER_TEST=0 BELT_WORKSPACES_ROOT_OVERRIDE="$fixture" \
