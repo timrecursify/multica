@@ -258,10 +258,10 @@ const GATE_PR_FIELDS = ['state', 'files', 'headRefOid', 'mergeStateStatus', 'sta
 // mergeable as a boolean where GraphQL answers MERGEABLE/CONFLICTING/UNKNOWN.
 // Both are restored to the GraphQL spelling the callers already consume.
 // files(first: 100) in GraphQL is per_page=100 here.
-async function restPrViewFields(repo, num, fields, run = ghExec) {
+async function restPrViewFields(repo, num, fields, run = ghExec, { fresh = false } = {}) {
   const want = new Set(fields);
   const pr = JSON.parse(await run(['api', `repos/${repo}/pulls/${num}`],
-    { cacheKey: `${repo}:pr:${num}` }));
+    fresh ? {} : { cacheKey: `${repo}:pr:${num}` }));
   const sha = pr.head && pr.head.sha;
   const out = {};
   if (want.has('number')) out.number = pr.number;
@@ -296,7 +296,8 @@ async function restPrViewFields(repo, num, fields, run = ghExec) {
 // logged and left pr_url empty, and mergedPullRequestNoop swallowed the error
 // whole, which is why a merged PR never completed its ticket. Hand the
 // reconciler this authenticated REST reader instead.
-async function reconcileGithubCommand(args, run = ghExec) {
+async function reconcileGithubCommand(args, options = {}, run = ghExec) {
+  if (typeof options === 'function') { run = options; options = {}; }
   if (args[0] !== 'pr' || args[1] !== 'view') {
     throw new Error(`unsupported GitHub command: ${args.join(' ')}`);
   }
@@ -305,7 +306,7 @@ async function reconcileGithubCommand(args, run = ghExec) {
   const index = args.indexOf('--json');
   const fields = index === -1 ? []
     : String(args[index + 1] || '').split(',').map((f) => f.trim()).filter(Boolean);
-  return restPrViewFields(`${match[1]}/${match[2]}`, Number(match[3]), fields, run);
+  return restPrViewFields(`${match[1]}/${match[2]}`, Number(match[3]), fields, run, options);
 }
 
 async function github(args, run = ghExec) {

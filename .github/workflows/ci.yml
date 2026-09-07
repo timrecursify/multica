@@ -326,7 +326,7 @@ jobs:
       - name: Test reconciler against PostgreSQL (asserts 0 skipped)
         run: |
           set +e
-          output="$(node --test ops/belt/reconciler.test.cjs 2>&1)"
+          output="$(node --test ops/belt/reconciler.test.cjs ops/belt/stage-outcome.test.cjs ops/belt/work-product-contract.test.cjs 2>&1)"
           status=$?
           set -e
           printf '%s\n' "$output"
