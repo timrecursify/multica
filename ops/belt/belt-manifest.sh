@@ -63,6 +63,7 @@ declare -a sources=(
   "$root_dir/scoping-claude-driver.sh"
   "$root_dir/belt-concurrency.sh"
   "$root_dir/workspace-root.sh"
+  "$root_dir/workspace-gc.sh"
 )
 
 declare -a targets=(
@@ -105,4 +106,5 @@ declare -a targets=(
   "$runtime_root/gsp-multica-worker/scoping-claude-driver.sh"
   "$runtime_root/gsp-multica-worker/belt-concurrency.sh"
   "$runtime_root/gsp-multica-worker/workspace-root.sh"
+  "$runtime_root/gsp-multica-worker/workspace-gc.sh"
 )
