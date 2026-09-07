@@ -9,6 +9,7 @@ process.env.CICD_RETROACTIVE_REPOS = 'timrecursify/multica';
 // retro test's merge assertion into a 'green but merging disabled' hold.
 process.env.CICD_MERGE_ENABLED = '1';
 process.env.CICD_DEPLOY_CANCEL_RETRY_LIMIT = '3';
+process.env.SK_COMMAND = '/usr/bin/false';
 process.env.CICD_WATCHDOG_STATE = require('path')
   .join(require('os').tmpdir(), `cicd-watchdog-test-${process.pid}.json`);
 const worker = require('./multica-cicd-worker.cjs');
@@ -26,12 +27,30 @@ function greenGh(args) {
   throw new Error(`unexpected gh ${args.join(' ')}`);
 }
 
+function activationReceipt(target = 'gsp-belt', sourceSha = sha) {
+  const owners = {
+    'gsp-belt': 'ops/belt/deploy.sh',
+    'gsp-multica': 'multica-application-deployer'
+  };
+  return {
+    schema_version: 1, repository: 'timrecursify/multica', target,
+    deployment_owner: owners[target], source_sha: sourceSha,
+    activation: { status: 'activated', activated_at: '2026-09-07T14:00:00Z',
+      process_sha: sourceSha, release: `/releases/${sourceSha}` },
+    health: { status: 'ok', checked_at: '2026-09-07T14:00:05Z', probe: 'service-health' }
+  };
+}
+
 function dependencies({ receipt, verdict = pass, gh = greenGh }) {
   const calls = [];
   worker.setTestDependencies({
     pool: { query: async () => ({ rows: verdict ? [verdict] : [] }) },
     relay: async (...args) => calls.push(args), gh,
-    readReceipt: () => { if (!receipt) throw new Error('missing'); return receipt; }
+    readChangedPaths: () => ['ops/belt/multica-cicd-worker.cjs'],
+    readReceipt: (_repo, target) => {
+      if (!receipt) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; }
+      return activationReceipt(target, receipt.source_sha);
+    }
   });
   return calls;
 }
@@ -50,7 +69,8 @@ test('Done relay carries the locally evaluated shipped evidence', async () => {
   await worker.routeFinishedPR(issue, 'merged', sha, pr);
   assert.equal(calls[0][1], 'Done');
   assert.equal(calls[0][5].ciSuccess, true);
-  assert.deepStrictEqual(calls[0][5].mergeDeployReceipt, receipt);
+  assert.equal(calls[0][5].mergeDeployReceipt.kind, 'activation_receipts');
+  assert.deepStrictEqual(calls[0][5].mergeDeployReceipt.targets, ['gsp-belt']);
   assert.equal(calls[0][5].reviewedSha, sha);
 });
 
@@ -133,10 +153,11 @@ test('no verdict accepts merged green work with no-verdict evidence', async () =
   await worker.routeFinishedPR(issue, 'merged', sha, pr);
   assert.equal(calls[0][1], 'Done');
   assert.equal(calls[0][2], null);
-  assert.deepStrictEqual(calls[0][5], {
-    ciSuccess: true, mergeDeployReceipt: receipt, reviewedSha: sha,
-    qualifyingPass: false, noVerdict: true
-  });
+  assert.equal(calls[0][5].ciSuccess, true);
+  assert.equal(calls[0][5].mergeDeployReceipt.kind, 'activation_receipts');
+  assert.equal(calls[0][5].reviewedSha, sha);
+  assert.equal(calls[0][5].qualifyingPass, false);
+  assert.equal(calls[0][5].noVerdict, true);
 });
 
 test('merged CI absent is accepted only when the repo has no workflows or suites', async () => {
@@ -161,17 +182,11 @@ test('return relay carries return evidence', async () => {
   assert.match(calls[0][5].mergeConflictEvidence, /CI is red/);
 });
 
-test('receipt mismatch parks with system retry-escalation evidence', async () => {
+test('mismatched SHA receipt refuses Done and returns to build', async () => {
   const calls = dependencies({ receipt: { source_sha: 'c'.repeat(40), release: '/bad', health: 'ok' } });
   await worker.routeFinishedPR(issue, 'merged', sha, pr);
-  assert.equal(calls[0][1], 'Parked');
-  assert.equal(calls[0][5].retry_escalation, true);
-  assert.equal(calls[0][5].anomaly, 'release_receipt_mismatch');
-  assert.equal(calls[0][5].merged_sha, sha);
-  assert.deepStrictEqual(calls[0][5].receipt, {
-    present: true, source_sha: 'c'.repeat(40), release: '/bad', health: 'ok'
-  });
-  assert.match(calls[0][3], /^retry_escalation:release_receipt_mismatch/);
+  assert.equal(calls[0][1], 'In Progress');
+  assert.match(calls[0][3], /deployment evidence failed.*activation_receipt_invalid/);
 });
 
 test('closure stall returns to Spec with system retry-escalation evidence', async () => {
@@ -197,6 +212,30 @@ test('closure stall returns to Spec with system retry-escalation evidence', asyn
   }), relay: async (...args) => calls.push(args) });
 });
 
+test('retryable deploy blocker stays in CI/CD and bypasses closure escalation', async () => {
+  const calls = [];
+  const observations = [];
+  worker.setTestDependencies({
+    watchdog: {
+      observe: (...args) => observations.push(args),
+      stalled: () => { throw new Error('retryable hold must not enter the stall path'); }
+    },
+    relay: async (...args) => calls.push(args)
+  });
+  const alerted = await worker.closureWatchdog(issue, {
+    status: 'pending', outcome: 'discovery_unavailable', retryEligible: true,
+    blocker: { type: 'changed_path_discovery_unavailable' }
+  }, sha);
+  assert.equal(alerted, false);
+  assert.equal(calls.length, 0);
+  assert.deepStrictEqual(observations[0][1], {
+    sha, outcome: 'discovery_unavailable', error: 'changed_path_discovery_unavailable'
+  });
+  worker.setTestDependencies({ watchdog: require('./cicd-watchdog.cjs').createWatchdog({
+    file: require('path').join(require('os').tmpdir(), `cicd-watchdog-test-${process.pid}.json`)
+  }) });
+});
+
 test('worker retains no self-deploy or direct database writes', () => {
   const source = require('fs').readFileSync(require.resolve('./multica-cicd-worker.cjs'), 'utf8');
   // Merge is belt-owned since 2026-09-03 (CI/CD & Deploy owned end to end);
@@ -205,8 +244,13 @@ test('worker retains no self-deploy or direct database writes', () => {
   assert.match(source, /info\.mergeable === 'CONFLICTING'/);
   assert.doesNotMatch(source, /UPDATE |INSERT INTO /);
   assert.match(source, /transition-policy\.cjs/);
-  assert.match(source, /process\.env\.SK_COMMAND \|\| '\/home\/newadmin\/\.local\/bin\/sk'/);
+  assert.match(source, /DEFAULT_SK_COMMAND = '\/opt\/gsp\/.sk\/bin\/sk'/);
   assert.match(source, /execFileSync\(SK_COMMAND, \['multica', 'comment'/);
+});
+
+test('SK_COMMAND defaults safely and honors an explicit override', () => {
+  assert.equal(worker.resolveSkCommand({}), '/opt/gsp/.sk/bin/sk');
+  assert.equal(worker.resolveSkCommand({ SK_COMMAND: '/custom/bin/sk' }), '/custom/bin/sk');
 });
 
 test('watchdog escalation forwards producing CI/CD task id', async () => {
@@ -219,7 +263,7 @@ test('watchdog escalation forwards producing CI/CD task id', async () => {
   assert.equal(calls[0][6], '223e4567-e89b-42d3-a456-426614174000');
 });
 
-test('a merge that triggered no deploy workflow ships as merge_is_deploy', async () => {
+test('missing receipt refuses Done even when no deploy workflow ran', async () => {
   const noDeployRunGh = (args) => {
     const path = args[1] || '';
     if (path.includes('/actions/runs')) {
@@ -232,10 +276,12 @@ test('a merge that triggered no deploy workflow ships as merge_is_deploy', async
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   const calls = dependencies({ receipt: null, gh: noDeployRunGh });
-  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2020-01-01T00:00:00Z' });
-  assert.equal(calls[0][1], 'Done');
-  assert.deepStrictEqual(calls[0][5].mergeDeployReceipt,
-    { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha,
+    { ...pr, mergedAt: '2020-01-01T00:00:00Z' });
+  assert.equal(calls.length, 0);
+  assert.equal(result.outcome, 'pending');
+  assert.equal(result.blocker.type, 'activation_receipt_missing');
+  assert.equal(result.retryEligible, true);
 });
 
 test('a deploy run on the merge sha keeps the ticket pending until it succeeds', async () => {
@@ -257,13 +303,14 @@ test('a deploy run on the merge sha keeps the ticket pending until it succeeds',
   assert.equal(calls.length, 0);
 });
 
-test('merged PR whose runs are all cancelled continues through deploy evidence', async () => {
+test('cancelled workflows cannot substitute for activation evidence', async () => {
   const calls = dependencies({ receipt: null, gh: () => JSON.stringify({ workflow_runs: [
     { status: 'completed', conclusion: 'cancelled', name: 'CI', path: '.github/workflows/ci.yml' },
   ] }) });
   const result = await worker.routeFinishedPR(issue, 'merged', sha, pr);
-  assert.equal(result.status, 'done');
-  assert.equal(calls[0][1], 'Done');
+  assert.equal(result.status, 'pending');
+  assert.equal(result.outcome, 'pending');
+  assert.equal(calls.length, 0);
 });
 
 test('merged PR whose CI lookup throws is held without returning to build', async () => {
@@ -271,14 +318,17 @@ test('merged PR whose CI lookup throws is held without returning to build', asyn
   const calls = dependencies({ receipt: null, gh: () => { throw new Error('rate limited'); } });
   worker.setTestDependencies({ log: (...a) => lines.push(a.join(' ')) });
   const result = await worker.routeFinishedPR(issue, 'merged', sha, pr);
-  assert.equal(result.status, 'returned');
+  assert.equal(result.status, 'pending');
+  assert.equal(result.outcome, 'discovery_unavailable');
+  assert.equal(result.blocker.type, 'ci_discovery_unavailable');
+  assert.equal(result.retryEligible, true);
   assert.equal(calls.length, 0);
   assert.ok(lines.some(line => line.includes('HOLD #1 merged') && line.includes('ci=unknown')));
   assert.ok(lines.some(line => line.includes('CI-UNKNOWN') && line.includes('rate limited')));
   worker.setTestDependencies({ log: defaultLog });
 });
 
-test('cancelled deploy superseded by a later success containing the merge reaches Done', async () => {
+test('a superseding successful workflow cannot substitute for activation evidence', async () => {
   const laterSha = 'b'.repeat(40);
   const cancelled = { path: '.github/workflows/deploy-billing-server.yml', conclusion: 'cancelled',
     created_at: '2026-09-04T01:00:00Z', id: 7 };
@@ -302,9 +352,10 @@ test('cancelled deploy superseded by a later success containing the merge reache
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   const calls = dependencies({ receipt: null, gh });
-  await worker.routeFinishedPR(issue, 'merged', sha, { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
-  assert.equal(calls[0][1], 'Done');
-  assert.equal(calls[0][5].mergeDeployReceipt.kind, 'github_deploy_run_superseded');
+  const result = await worker.routeFinishedPR(issue, 'merged', sha,
+    { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
+  assert.equal(result.outcome, 'pending');
+  assert.equal(calls.length, 0);
   assert.equal(reruns.length, 0);
 });
 
@@ -332,12 +383,7 @@ test('cancelled deploy without qualifying later success is held as undeployed', 
   assert.equal(calls.length, 0);
 });
 
-// Regression: mergeDeployEvidence used to return only { cancelled }, dropping
-// terminalDeployEvaluation's cancelledRuns. retriggerCancelledDeploys then saw an
-// empty run list, dispatched nothing, and routeFinishedPR logged DEPLOY-CANCELLED
-// forever. The direct retriggerCancelledDeploys tests below could not catch that,
-// because they hand the run list in themselves. This one drives the real path.
-test('routeFinishedPR reruns a cancelled deploy through mergeDeployEvidence', async () => {
+test('routeFinishedPR does not rerun workflows as activation evidence', async () => {
   let deployLookup = 0;
   const reruns = [];
   const gh = (args) => {
@@ -360,8 +406,7 @@ test('routeFinishedPR reruns a cancelled deploy through mergeDeployEvidence', as
     { ...pr, mergedAt: '2026-09-04T00:00:00Z' });
   assert.equal(result.status, 'pending');
   assert.equal(calls.length, 0);
-  assert.equal(reruns.length, 1, 'cancelled deploy run must be re-run through the real path');
-  assert.deepStrictEqual(reruns[0], ['api', '-X', 'POST', 'repos/timrecursify/multica/actions/runs/555/rerun']);
+  assert.equal(reruns.length, 0);
 });
 
 test('cancelled deploy reruns by run id and caps repeated rerun failures', async () => {
@@ -476,22 +521,23 @@ test('a just-merged sha stays pending inside the deploy trigger grace window', (
   assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, undefined), false);
 });
 
-test('push-triggered deploy workflow runs are ignored for deploy verdicts', () => {
+test('wrongly named successful workflow refuses Done without a receipt', () => {
   const gh = (args) => {
     const path = args[1] || '';
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
     if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{
-      id: 41, path: '.github/workflows/deploy-billing-server.yml', event: 'push', conclusion: 'cancelled'
+      id: 41, path: '.github/workflows/release-production.yml', event: 'workflow_dispatch', conclusion: 'success'
     }] });
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, '2020-01-01T00:00:00Z');
-  assert.deepEqual(result.evidence, { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true });
+  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  assert.equal(result.outcome, 'pending');
+  assert.equal(result.blocker.type, 'activation_receipt_missing');
   worker.setTestDependencies({ log: defaultLog });
 });
 
-test('dispatch deploy run with zero jobs is treated as no deployment attempt', () => {
+test('workflow with zero jobs refuses Done without a receipt', () => {
   const gh = (args) => {
     const path = args[1] || '';
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
@@ -502,11 +548,11 @@ test('dispatch deploy run with zero jobs is treated as no deployment attempt', (
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, '2020-01-01T00:00:00Z');
-  assert.deepEqual(result.evidence, { kind: 'github_deploy_run_no_attempt', sha });
+  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  assert.equal(result.outcome, 'pending');
 });
 
-test('skipped dispatch deploy reports the failing gate as a CI blocker', () => {
+test('skipped dispatch deploy still refuses Done without a receipt', () => {
   const gh = (args) => {
     const path = args[1] || '';
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
@@ -520,8 +566,65 @@ test('skipped dispatch deploy reports the failing gate as a CI blocker', () => {
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, '2020-01-01T00:00:00Z');
-  assert.match(result.failed, /blocked_on=ci failing_gate=test \/ billing-server \(deploy gate\)/);
+  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  assert.equal(result.outcome, 'pending');
+  assert.equal(result.blocker.type, 'activation_receipt_missing');
+});
+
+test('GitHub changed-path outage is retryable and refuses Done', () => {
+  worker.setTestDependencies({ readChangedPaths: () => { throw new Error('GitHub unavailable'); } });
+  const result = worker.mergeDeployEvidence('timrecursify/multica', sha, { num: 17 });
+  assert.equal(result.outcome, 'discovery_unavailable');
+  assert.equal(result.blocker.type, 'changed_path_discovery_unavailable');
+  assert.equal(result.blocker.retry_eligible, true);
+});
+
+test('one receipt for several applicable deploy targets refuses Done', () => {
+  worker.setTestDependencies({ readReceipt: (_repo, target) => {
+    if (target === 'gsp-belt') return activationReceipt(target);
+    const error = new Error('missing'); error.code = 'ENOENT'; throw error;
+  } });
+  const result = worker.mergeDeployEvidence('timrecursify/multica', sha,
+    { changedPaths: ['ops/belt/worker.cjs', 'server/main.go'] });
+  assert.equal(result.outcome, 'pending');
+  assert.deepStrictEqual(result.blocker.missing_targets, ['gsp-multica']);
+});
+
+test('non-exact source SHA refuses Done before receipt lookup', () => {
+  worker.setTestDependencies({ readReceipt: () => { throw new Error('receipt lookup must not run'); } });
+  const result = worker.mergeDeployEvidence('timrecursify/multica', 'A'.repeat(40),
+    { changedPaths: ['ops/belt/worker.cjs'] });
+  assert.equal(result.outcome, 'failed');
+  assert.equal(result.blocker.type, 'source_sha_invalid');
+});
+
+test('health recorded before activation invalidates the receipt', () => {
+  const receipt = activationReceipt();
+  receipt.health.checked_at = '2026-09-07T13:59:59Z';
+  worker.setTestDependencies({ readReceipt: () => receipt });
+  const result = worker.mergeDeployEvidence('timrecursify/multica', sha,
+    { changedPaths: ['ops/belt/worker.cjs'] });
+  assert.equal(result.outcome, 'failed');
+  assert.equal(result.blocker.field, 'health');
+});
+
+test('docs-only manifest completes Done as verified not applicable', async () => {
+  const calls = dependencies({ receipt: null });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha,
+    { ...pr, changedPaths: ['README.md', 'docs/runbook.md'] });
+  assert.equal(result.status, 'done');
+  assert.equal(calls[0][1], 'Done');
+  assert.equal(calls[0][5].mergeDeployReceipt.classification, 'docs_only');
+});
+
+test('valid receipt for every applicable target permits Done', async () => {
+  const calls = dependencies({ receipt: { source_sha: sha } });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha,
+    { ...pr, changedPaths: ['ops/belt/worker.cjs', 'server/main.go'] });
+  assert.equal(result.status, 'done');
+  assert.equal(calls[0][1], 'Done');
+  assert.deepStrictEqual(calls[0][5].mergeDeployReceipt.targets, ['gsp-belt', 'gsp-multica']);
+  assert.equal(calls[0][5].mergeDeployReceipt.receipts.length, 2);
 });
 
 // Fix A renamed the all-cancelled CI state to 'cancelled_only'. The retroactive

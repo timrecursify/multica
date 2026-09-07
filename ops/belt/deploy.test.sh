@@ -15,6 +15,50 @@ bash -n "$guard_source"
 tmp_dir="$(mktemp -d)"
 trap 'rm -rf -- "$tmp_dir"' EXIT
 
+# Exercise restart behavior without touching the host systemd instance. The
+# fake sudo preserves the production command shape while running the fake
+# systemctl from this fixture's PATH.
+fake_bin="$tmp_dir/bin"
+fake_state="$tmp_dir/systemd"
+mkdir -p -- "$fake_bin" "$fake_state"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -Eeuo pipefail' \
+  '[[ "${1:-}" == -n ]] || exit 2' \
+  'shift' \
+  'exec "$@"' > "$fake_bin/sudo"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -Eeuo pipefail' \
+  'command_name="${1:?}"; shift' \
+  'unit="${!#}"; unit="${unit%.service}"' \
+  'state_file="$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.state"' \
+  'IFS="|" read -r pid active substate entered < "$state_file"' \
+  'case "$command_name" in' \
+  '  show)' \
+  '    if [[ " $* " == *" --value "* ]]; then printf "%s\\n" "$pid"' \
+  '    else printf "MainPID=%s\\nSubState=%s\\nActiveEnterTimestamp=%s\\n" "$pid" "$substate" "$entered"; fi ;;' \
+  '  is-active) [[ "$active" == active ]] ;;' \
+  '  restart)' \
+  '    if [[ -e "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.fail" ]]; then' \
+  '      printf "0|failed|failed|n/a\\n" > "$state_file"; exit 0' \
+  '    fi' \
+  '    new_pid=$((pid + 100))' \
+  '    printf "%s|active|running|Mon 2026-09-07 14:00:00 UTC\\n" "$new_pid" > "$state_file"' \
+  '    printf "%s|%s|%s\\n" "$unit" "$pid" "$new_pid" >> "$BELT_DEPLOY_SYSTEMCTL_STATE/restarts.log" ;;' \
+  '  *) exit 2 ;;' \
+  'esac' > "$fake_bin/systemctl"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "fake journal: unit=%s crashed after restart\\n" "${2:-unknown}"' > "$fake_bin/journalctl"
+chmod +x -- "$fake_bin/sudo" "$fake_bin/systemctl" "$fake_bin/journalctl"
+export PATH="$fake_bin:$PATH"
+export BELT_DEPLOY_SYSTEMCTL_STATE="$fake_state"
+for unit in multica-relay-advance gsp-multica-worker gsp-multica-worker-ppp \
+  multica-cicd-worker multica-archiver gsp-multica-bridge; do
+  printf '1000|active|running|Mon 2026-09-07 13:30:00 UTC\n' > "$fake_state/$unit.state"
+done
+
 # Expectations come from the canonical manifest, never a second copy of it.
 runtime_root="$tmp_dir"
 . "$root_dir/belt-manifest.sh"
@@ -68,14 +112,20 @@ bridge_dir="$tmp_dir/gsp-multica-bridge"
 relay_dir="$tmp_dir/multica-relay-advance/app"
 worker_dir="$tmp_dir/gsp-multica-worker"
 cicd_dir="$tmp_dir/multica-cicd-worker"
+doctrine_dir="$tmp_dir/multica-doctrine"
 
 dry_log="$tmp_dir/dry-run.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run >"$dry_log"
 grep -q "Would copy .*/parked-diagnosis.cjs to $bridge_dir/parked-diagnosis.cjs" "$dry_log"
 grep -q "Would copy .*/parked-diagnosis.cjs to $relay_dir/parked-diagnosis.cjs" "$dry_log"
 grep -q "Would copy .*/parity/relay-dead-rows.cjs to .*/parity/relay-dead-rows.cjs" "$dry_log"
+grep -q "Would copy .*/multica-bundle.py to $doctrine_dir/multica-bundle.py" "$dry_log"
+grep -q "Would copy .*/RUNBOOK_SPEC_WORKER.md to $doctrine_dir/RUNBOOK_SPEC_WORKER.md" "$dry_log"
 # transition-policy.cjs ships to three service directories from one source row.
 [[ "$(grep -c 'Would copy .*/transition-policy.cjs' "$dry_log")" -eq 3 ]]
+grep -q '^Would restart gsp-multica-bridge$' "$dry_log"
+grep -q '^Would restart multica-relay-advance$' "$dry_log"
+[[ "$(grep -c '^Would restart ' "$dry_log")" -eq 2 ]]
 
 # An unscoped apply rewrites every managed target, so it must be requested by name.
 if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$tmp_dir/unscoped.log" 2>&1; then
@@ -90,6 +140,8 @@ rm -f -- "$worker_dir/multica-daemon-wrapper.sh"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-daemon-wrapper.sh >"$tmp_dir/missing-wrapper.log"
 cmp -s -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
 grep -q "Copied .*/multica-daemon-wrapper.sh to $worker_dir/multica-daemon-wrapper.sh" "$tmp_dir/missing-wrapper.log"
+grep -q '^Restarted gsp-multica-worker: 1000 -> 1100 ' "$tmp_dir/missing-wrapper.log"
+grep -q '^Restarted gsp-multica-worker-ppp: 1000 -> 1100 ' "$tmp_dir/missing-wrapper.log"
 
 # Remove a dependency from a disposable manifest copy. Validation must fail
 # before copy, proving the deploy cannot restart with an incomplete runtime.
@@ -126,6 +178,8 @@ apply_log="$tmp_dir/apply.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --all >"$apply_log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" "$(git -C "$root_dir/../.." rev-parse HEAD)" >"$tmp_dir/verify.log"
 grep -q "Match: $cicd_dir/multica-cicd-worker.cjs" "$tmp_dir/verify.log"
+[[ "$(stat -c '%a:%g' "$doctrine_dir/multica-bundle.py")" == "750:$(stat -c '%g' "$doctrine_dir")" ]]
+[[ "$(stat -c '%a:%g' "$doctrine_dir/RUNBOOK_SPEC_WORKER.md")" == "640:$(stat -c '%g' "$doctrine_dir")" ]]
 receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$apply_log")"
 [[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" >/dev/null
@@ -149,7 +203,30 @@ fi
 [[ "$(grep -c '^Backed up ' "$tmp_dir/selective.log")" -eq 1 ]]
 selective_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-cicd-worker$/\1/p' "$tmp_dir/selective.log")"
 [[ "$selective_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
+node -e 'const r=require(process.argv[1]);if(r.restarted_units.length!==1||r.restarted_units[0].unit!=="multica-cicd-worker"||r.restarted_units[0].pid<=0)process.exit(1)' \
+  "$tmp_dir/gsp-multica/deploy-receipts/belt-$selective_receipt.json"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$selective_receipt" --only multica-cicd-worker >/dev/null
+
+# A no-op apply and an explicit copy-only apply must restart nothing.
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-bridge.cjs > "$tmp_dir/noop.log"
+grep -q '^No processes were restarted.$' "$tmp_dir/noop.log"
+noop_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-bridge.cjs$/\1/p' "$tmp_dir/noop.log")"
+node -e 'const r=require(process.argv[1]);if(r.restarted_units.length!==0)process.exit(1)' \
+  "$tmp_dir/gsp-multica/deploy-receipts/belt-$noop_receipt.json"
+restart_count="$(wc -l < "$fake_state/restarts.log")"
+printf '\nstale-runtime\n' >> "$tmp_dir/multica-archiver/multica-archiver.cjs"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --no-restart --only multica-archiver > "$tmp_dir/no-restart.log"
+[[ "$restart_count" -eq "$(wc -l < "$fake_state/restarts.log")" ]]
+grep -q '^Restarts disabled (--no-restart).$' "$tmp_dir/no-restart.log"
+
+# A missing nested directory below an existing canonical service root is
+# created by selective deployment.
+rm -rf -- "$relay_dir/parity"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-relay-advance-daemon >"$tmp_dir/parity-create.log"
+cmp -s -- "$root_dir/parity/multica-relay-advance-daemon.cjs" "$relay_dir/parity/multica-relay-advance-daemon.cjs"
+grep -q "Created target directory $relay_dir/parity" "$tmp_dir/parity-create.log"
+grep -q 'Backed up absence of new target' "$tmp_dir/parity-create.log"
+grep -q '^Restarted multica-relay-advance: ' "$tmp_dir/parity-create.log"
 
 # A selected wrapper is repaired even when runtime drifted; omitting it keeps
 # the fail-closed parity guard.
@@ -165,4 +242,30 @@ if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only mult
   exit 1
 fi
 grep -q 'Wrapper preflight: source/runtime parity mismatch (wrapper not selected)' "$tmp_dir/wrapper-selective.log"
+
+# A restart command that exits zero can still leave the service failed. The
+# deploy must reject that state and include journal evidence.
+cp -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
+printf '\nstale-runtime\n' >> "$tmp_dir/multica-archiver/multica-archiver.cjs"
+: > "$fake_state/multica-archiver.fail"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-archiver > "$tmp_dir/restart-fail.log" 2>&1; then
+  echo 'expected failed service restart to fail deployment' >&2
+  exit 1
+fi
+grep -q '^Restart verification failed: multica-archiver ' "$tmp_dir/restart-fail.log"
+grep -q 'fake journal: unit=multica-archiver crashed after restart' "$tmp_dir/restart-fail.log"
+if grep -q '^Receipt:' "$tmp_dir/restart-fail.log"; then
+  echo 'failed restart wrote a success receipt' >&2
+  exit 1
+fi
+
+# Keep the absent-service-root check last because it deliberately removes the
+# relay fixture that later full-manifest tests require.
+cp -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
+rm -rf -- "$tmp_dir/multica-relay-advance"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-relay-advance-daemon >"$tmp_dir/missing-service.log" 2>&1; then
+  echo 'expected missing canonical service root rejection' >&2
+  exit 1
+fi
+grep -q 'Missing runtime file:' "$tmp_dir/missing-service.log"
 echo 'deploy rollback test passed'

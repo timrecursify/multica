@@ -33,7 +33,8 @@ function liveTasksSql() {
 function ownerSql() {
   return `SELECT pool.agent_id, a.name AS agent_name, a.model, a.runtime_config,
                    COALESCE(own_runtime.provider, online_runtime.provider) AS selected_runtime_provider,
-                   COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id
+                   COALESCE(own_runtime.id, online_runtime.id) AS selected_runtime_id,
+                   a.max_concurrent_tasks - COALESCE(running.task_count, 0) AS available_capacity
             FROM relay_stage_agent_pool pool
             JOIN relay_stage_pool policy ON policy.workspace_id = pool.workspace_id
              AND policy.stage_name = pool.stage_name AND policy.enabled = true
@@ -47,10 +48,15 @@ function ownerSql() {
                  AND ar.provider = CASE WHEN a.model LIKE 'claude%' THEN 'claude' ELSE 'codex' END
                ORDER BY ar.updated_at DESC LIMIT 1
             ) online_runtime ON true
+            LEFT JOIN LATERAL (
+              SELECT count(*)::int AS task_count FROM agent_task_queue task
+               WHERE task.agent_id = pool.agent_id AND task.status = 'running'
+            ) running ON true
            WHERE pool.workspace_id = $1::uuid AND pool.stage_name = $2
              AND pool.enabled = true
              AND a.archived_at IS NULL AND a.status IN ('idle', 'working')
              AND COALESCE(own_runtime.id, online_runtime.id) IS NOT NULL
+             AND COALESCE(running.task_count, 0) < a.max_concurrent_tasks
            ORDER BY pool.last_selected_at NULLS FIRST, pool.agent_id LIMIT 1`;
 }
 
@@ -380,7 +386,8 @@ async function reconcileIssue(client, issueId, options = {}) {
       const eligibility = await stageEligibility(client, issue.id, issue.status, {
         failedTtlMinutes: options.failedTtlMinutes,
         attempt,
-        maxAttempts
+        maxAttempts,
+        releaseAt: issue.metadata?.human_review_release_at
       });
       if (eligibility.eligible && eligibility.reason === "advanced_stall") {
         console.log(`[reconcile] advanced_stall: issue=${issue.id} stage=${issue.status}`);

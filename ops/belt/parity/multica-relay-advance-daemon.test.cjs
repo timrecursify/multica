@@ -6,8 +6,8 @@ const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
-  readvanceRecordedOutcomes, buildCompletionRoute } = require('./multica-relay-advance-daemon.cjs');
-const { createGuardedRunner } = require('./multica-relay-advance-daemon.cjs');
+  readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition } = require('./multica-relay-advance-daemon.cjs');
+const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
@@ -43,6 +43,14 @@ test('guarded runner contains startup rejection and allows the next pass', async
   await runner();
   assert.equal(calls, 2);
   assert.match(errors[0], /startup-test.*injected startup rejection/);
+});
+
+test('relay pool covers all independent passes without reserving worker task slots', () => {
+  assert.equal(resolveRelayPoolMax(), 12);
+  assert.equal(resolveRelayPoolMax('10'), 10);
+  assert.equal(resolveRelayPoolMax('64'), 16);
+  assert.equal(resolveRelayPoolMax('0'), 12);
+  assert.equal(resolveRelayPoolMax('invalid'), 12);
 });
 
 test('provider quota aliases remain retryable infrastructure failures', () => {
@@ -142,6 +150,19 @@ test('typed re-advance moves recorded work through relay without an agent dispat
   assert.equal(calls.some((sql) => sql.includes('INSERT INTO agent_task_queue')), false);
 });
 
+test('typed Spec NO_OP re-enters Spec disposition instead of creating a Queue task', async () => {
+  const client = { release() {}, query: async (sql) => sql.includes('FROM issue_stage_outcome')
+    ? { rows: [{ issue_id: 'issue-1', to_stage: 'Spec', outcome: 'NO_OP', task_id: 'task-1',
+      task_result: { output: 'already implemented\n\nOUTCOME: NO_OP' }, issue_title: 'work',
+      next_stage: 'Queue' }] } : { rows: [] } };
+  const payloads = [];
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async (payload) => { payloads.push(payload); return { ok: true }; },
+    logger: { log() {} }, typedOutcomes: true });
+  assert.equal(payloads[0].to_stage, 'Spec');
+  assert.equal(payloads[0].relay_source_task_id, 'task-1');
+});
+
 function typedReadvanceQcRow(overrides = {}) {
   return {
     issue_id: 'issue-1', to_stage: 'In Review', outcome: 'ADVANCED', task_id: 'task-1',
@@ -194,6 +215,7 @@ test('no linked PR completion routes directly to Done and never In Review', () =
   assert.match(route, /FROM issue_pull_request/);
   assert.match(route, /FROM comment/);
   assert.match(route, /kind: 'no_pr', toStage: 'Done'/);
+  assert.match(route, /kind: 'no_pr_noop', toStage: 'Parked', reason: 'completed_spec_noop'/);
   assert.doesNotMatch(route.slice(0, route.indexOf("kind: 'no_pr'")), /toStage: 'In Review'/);
 });
 
@@ -252,6 +274,51 @@ test('merged non-runtime PR completing In Progress reviews before Done', async (
   assert.equal(route.kind, 'merge_only');
   assert.equal(route.toStage, 'In Review');
   assert.equal(route.boundSha, 'c'.repeat(40));
+});
+
+test('green open non-runtime PR advances from review to CI/CD without daemon merge', async () => {
+  const pr = { state: 'OPEN', files: [{ path: 'web/app.ts' }], headRefOid: 'd'.repeat(40),
+    mergeStateStatus: 'CLEAN', statusCheckRollup: [{ conclusion: 'SUCCESS' }] };
+  const calls = [];
+  const route = await buildCompletionRoute(linkedPrClient(pr), {
+    issue_id: 'issue-1', to_stage: 'In Review', next_stage: 'CI/CD & Deploy'
+  }, { githubCommand: (args) => { calls.push(args); return JSON.stringify(pr); } });
+  assert.equal(route.kind, 'merge_only_ready');
+  assert.equal(route.toStage, 'CI/CD & Deploy');
+  assert.equal(route.pr_state, 'OPEN');
+  assert.equal(route.boundSha, 'd'.repeat(40));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], 'pr');
+  assert.equal(calls[0][1], 'view');
+});
+
+test('red open non-runtime PR completing In Progress still enters review', async () => {
+  const route = await inProgressRoute({ state: 'OPEN', files: [{ path: 'web/app.ts' }],
+    headRefOid: 'e'.repeat(40), mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ conclusion: 'FAILURE' }] });
+  assert.equal(route.toStage, 'In Review');
+  assert.equal(route.kind, 'merge_only');
+  assert.equal(route.boundSha, 'e'.repeat(40));
+});
+
+test('red open non-runtime PR routes to Human Review with evidence', async () => {
+  const route = await buildCompletionRoute(linkedPrClient(), {
+    issue_id: 'issue-1', to_stage: 'In Review', next_stage: 'CI/CD & Deploy'
+  }, { githubCommand: () => JSON.stringify({ state: 'OPEN', files: [{ path: 'web/app.ts' }],
+    headRefOid: 'e'.repeat(40), mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ conclusion: 'FAILURE' }] }) });
+  assert.equal(route.toStage, 'Human Review');
+  assert.equal(route.kind, 'ci_blocked');
+  assert.match(route.evidence, /ci=red_or_absent/);
+  assert.equal(route.reason, 'non_runtime_pr_not_merged');
+});
+
+test('409 relay refusals are memoized by issue state and PR head', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  assert.match(source, /const relayRefusalMemo = new Map\(\)/);
+  assert.match(source, /row\.issue_updated_at.*route\?\.boundSha/s);
+  assert.match(source, /relayRefusalMemo\.get\(row\.issue_id\) === refusalFingerprint/);
+  assert.match(source, /response\.status === 409.*relayRefusalMemo\.set/s);
 });
 
 async function noPrDoneEvidence(noShaComment) {
@@ -1084,6 +1151,16 @@ test('retry ceilings use the relay-owned terminal disposition receipt', () => {
   assert.match(requeue,
     /row\.metadata\?\.parked_release_at \|\|\s+row\.metadata\?\.retry_escalation_at \|\| null/);
   assert.doesNotMatch(requeue, /UPDATE issue SET status/);
+});
+
+test('retry ceiling disposition binds the completed source task for Spec routing', async () => {
+  let payload;
+  await requestCapDisposition({ issue_id: 'issue-1', task_id: 'task-1', stage: 'Spec' },
+    { disposition: 'Spec', reason: 'stage_cycle_limit', ceiling: 2 },
+    async (body) => { payload = body; return { ok: true }; }, 3);
+  assert.equal(payload.relay_source_task_id, 'task-1');
+  assert.equal(payload.to_stage, 'Spec');
+  assert.equal(payload.cap_refusal.trigger_stage, 'Spec');
 });
 
 test('stranded-task recovery rotates a marker only when it still references the terminal predecessor', () => {

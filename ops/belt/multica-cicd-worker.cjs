@@ -6,17 +6,44 @@
 // the loop: it reads each ticket's work product, finds its PR, and finishes the
 // ticket when the PR is merged, merges it when CI is green, or returns it to
 // build with the exact blocking reason when deploy cannot finish.
+//
+// Deployment receipt contract (full schema: ops/belt/RECEIPT_CONTRACT.md):
+//   <root>/<owner>/<repository>/<target>/<source-sha>.json
+// The JSON binds schema_version=1, repository, target, deployment_owner and
+// source_sha to activation.status=activated and health.status=ok evidence.
+// Workflow discovery is never deployment evidence. Changed PR paths select
+// every required target; only exact receipts for all targets can prove deploy.
 const fs = require('fs');
 const http = require('http');
 const { execFileSync } = require('child_process');
 const { evaluate } = require('./transition-policy.cjs');
 const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
 const { mintGithubToken, repoFromGhArgs } = require('./github-token.cjs');
+const { globRegex } = require('./stage-routing.cjs');
 const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multica-runtime/receipts';
-const SK_COMMAND = process.env.SK_COMMAND || '/home/newadmin/.local/bin/sk';
+const DOCS_ONLY_PATHS = ['*.md', '**/*.md', 'docs/**', 'apps/docs/**'];
+const DEPLOY_TARGET_RULES = {
+  'timrecursify/multica': {
+    default: { target: 'gsp-multica', owner: 'multica-application-deployer' },
+    rules: [{ target: 'gsp-belt', owner: 'ops/belt/deploy.sh', paths: ['ops/belt/**', 'ops/gsp-belt/**'] }]
+  },
+  'timrecursify/sk-cli': { default: { target: 'fleet-sk-cli', owner: 'sk-cli-release' }, rules: [] },
+  'timrecursify/ppp': { default: { target: 'ppp-production', owner: 'ppp-release' }, rules: [] }
+};
+const DEFAULT_SK_COMMAND = '/opt/gsp/.sk/bin/sk';
+function resolveSkCommand(env = process.env) {
+  return env.SK_COMMAND || DEFAULT_SK_COMMAND;
+}
+const SK_COMMAND = resolveSkCommand();
 let pool;
 let relayToken;
-let readReceipt = (sha) => JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/belt-${sha}.json`, 'utf8'));
+let readReceipt = (repo, target, sha) =>
+  JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/${repo}/${target}/${sha}.json`, 'utf8'));
+let readChangedPaths = (repo, number) => {
+  const files = JSON.parse(gh(['api', `repos/${repo}/pulls/${number}/files?per_page=100`]));
+  if (!Array.isArray(files) || files.length >= 100) throw new Error('changed path manifest unavailable or truncated');
+  return files.flatMap(file => [file.filename, file.previous_filename]).filter(Boolean);
+};
 
 function initializeRuntime() {
   const { Pool } = require('pg');
@@ -140,11 +167,29 @@ async function latestVerdict(issueId) {
   return result.rows[0] || null;
 }
 
-function receiptFor(sha) {
+function validTimestamp(value) {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value));
+}
+
+function receiptProblem(receipt, repo, target, owner, sha) {
+  if (!receipt || receipt.schema_version !== 1) return 'schema_version';
+  if (receipt.repository !== repo) return 'repository';
+  if (receipt.target !== target) return 'target';
+  if (receipt.deployment_owner !== owner) return 'deployment_owner';
+  if (receipt.source_sha !== sha) return 'source_sha';
+  if (receipt.activation?.status !== 'activated' || !validTimestamp(receipt.activation?.activated_at)
+    || receipt.activation?.process_sha !== sha
+    || typeof receipt.activation?.release !== 'string' || !receipt.activation.release) return 'activation';
+  if (receipt.health?.status !== 'ok' || !validTimestamp(receipt.health?.checked_at)
+    || Date.parse(receipt.health.checked_at) < Date.parse(receipt.activation.activated_at)
+    || typeof receipt.health?.probe !== 'string' || !receipt.health.probe) return 'health';
+  return null;
+}
+
+function receiptFor(repo, target, sha, owner) {
   try {
-    const receipt = readReceipt(sha);
-    return receipt?.source_sha === sha && receipt.health === 'ok' && typeof receipt.release === 'string'
-      ? receipt : null;
+    const receipt = readReceipt(repo, target, sha);
+    return receiptProblem(receipt, repo, target, owner, sha) ? null : receipt;
   } catch (_) { return null; }
 }
 
@@ -191,24 +236,59 @@ async function watchdogFailure(issue, error, sha = '') {
   return { stalled: false, audit: row };
 }
 
-function receiptEvidence(sha) {
+function inspectReceipt(repo, requirement, sha) {
   try {
-    const receipt = readReceipt(sha);
-    if (receipt?.source_sha === sha && receipt.health === 'ok' && typeof receipt.release === 'string') {
-      return { receipt, mismatch: false };
-    }
-    return { receipt, mismatch: true };
-  } catch (_) { return { receipt: null, mismatch: false }; }
+    const receipt = readReceipt(repo, requirement.target, sha);
+    const problem = receiptProblem(receipt, repo, requirement.target, requirement.owner, sha);
+    return problem ? { kind: 'invalid', receipt, problem } : { kind: 'valid', receipt };
+  } catch (error) {
+    if (error?.code === 'ENOENT' || /missing|enoent/i.test(String(error?.message))) return { kind: 'missing' };
+    return { kind: 'unavailable', error: String(error?.message || error).slice(0, 160) };
+  }
 }
 
 function receiptSummary(receipt) {
   if (!receipt || typeof receipt !== 'object') return { present: false };
   return {
     present: true,
+    repository: typeof receipt.repository === 'string' ? receipt.repository : null,
+    target: typeof receipt.target === 'string' ? receipt.target : null,
     source_sha: typeof receipt.source_sha === 'string' ? receipt.source_sha : null,
-    release: typeof receipt.release === 'string' ? receipt.release : null,
-    health: typeof receipt.health === 'string' ? receipt.health : null
+    activation: receipt.activation?.status || null,
+    health: receipt.health?.status || null
   };
+}
+
+function changedPathManifest(repo, pr) {
+  try {
+    const paths = Array.isArray(pr?.changedPaths) ? pr.changedPaths : readChangedPaths(repo, pr?.num);
+    if (!paths.length || paths.some(path => typeof path !== 'string' || !path)) {
+      throw new Error('changed path manifest is empty or invalid');
+    }
+    return { paths: [...new Set(paths)].sort() };
+  } catch (error) {
+    return { blocker: { type: 'changed_path_discovery_unavailable', retry_eligible: true,
+      detail: String(error?.message || error).slice(0, 160) } };
+  }
+}
+
+function docsOnly(paths) {
+  return paths.every(path => DOCS_ONLY_PATHS.some(pattern => globRegex(pattern).test(path)));
+}
+
+function deploymentRequirements(repo, paths) {
+  const config = DEPLOY_TARGET_RULES[repo];
+  if (!config) return null;
+  const requirements = new Map();
+  const matchedPaths = new Set();
+  for (const rule of config.rules) {
+    if (!paths.some(path => rule.paths.some(pattern => globRegex(pattern).test(path)))) continue;
+    requirements.set(rule.target, { target: rule.target, owner: rule.owner });
+    paths.filter(path => rule.paths.some(pattern => globRegex(pattern).test(path)))
+      .forEach(path => matchedPaths.add(path));
+  }
+  if (paths.some(path => !matchedPaths.has(path))) requirements.set(config.default.target, config.default);
+  return [...requirements.values()].sort((a, b) => a.target.localeCompare(b.target));
 }
 
 function deployWorkflowNames(repo, sha) {
@@ -382,30 +462,39 @@ function terminalFailedDeployRuns(repo, sha) {
   return terminalDeployEvaluation(repo, sha)?.failed || null;
 }
 
-function mergeDeployEvidence(repo, sha, mergedAt) {
-  const receipt = receiptEvidence(sha);
-  if (receipt.mismatch) return { mismatch: true, receipt: receipt.receipt };
-  if (receipt.receipt) return { evidence: receipt.receipt };
-  const workflows = deployWorkflowNames(repo, sha);
-  if (!workflows.length) return { evidence: { kind: 'merge_is_deploy', sha } };
-  for (const workflow of workflows) {
-    const run = successfulDeployRun(repo, sha, workflow);
-    if (run) return { evidence: run };
+function mergeDeployEvidence(repo, sha, pr = {}) {
+  if (!/^[0-9a-f]{40}$/.test(sha)) return { outcome: 'failed', blocker: {
+    type: 'source_sha_invalid', retry_eligible: false
+  } };
+  const manifest = changedPathManifest(repo, pr);
+  if (manifest.blocker) return { outcome: 'discovery_unavailable', blocker: manifest.blocker };
+  if (docsOnly(manifest.paths)) return { outcome: 'verified_not_applicable', evidence: {
+    kind: 'changed_path_manifest', repository: repo, source_sha: sha,
+    classification: 'docs_only', changed_paths: manifest.paths
+  } };
+  const requirements = deploymentRequirements(repo, manifest.paths);
+  if (!requirements?.length) return { outcome: 'failed', blocker: {
+    type: 'deployment_target_unclassified', retry_eligible: false, repository: repo
+  } };
+  const receipts = [];
+  const missing = [];
+  for (const requirement of requirements) {
+    const result = inspectReceipt(repo, requirement, sha);
+    if (result.kind === 'missing') { missing.push(requirement.target); continue; }
+    if (result.kind === 'unavailable') return { outcome: 'discovery_unavailable', blocker: {
+      type: 'receipt_discovery_unavailable', retry_eligible: true, target: requirement.target, detail: result.error
+    } };
+    if (result.kind === 'invalid') return { outcome: 'failed', blocker: {
+      type: 'activation_receipt_invalid', retry_eligible: false, target: requirement.target,
+      field: result.problem, receipt: receiptSummary(result.receipt)
+    } };
+    receipts.push(result.receipt);
   }
-  if (noDeployRunTriggered(repo, sha, mergedAt)) {
-    return { evidence: { kind: 'merge_is_deploy', sha, noDeployWorkflowTriggered: true } };
-  }
-  const terminal = terminalDeployEvaluation(repo, sha);
-  if (terminal?.noAttempt) {
-    return { evidence: { kind: 'github_deploy_run_no_attempt', sha } };
-  }
-  if (terminal?.failed) return { failed: terminal.failed };
-  if (terminal?.cancelled) return { cancelled: terminal.cancelled, cancelledRuns: terminal.cancelledRuns };
-  if (terminal?.superseded?.length) {
-    return { evidence: { kind: 'github_deploy_run_superseded', sha,
-      superseded: terminal.superseded.map(run => ({ workflow: run.path, run: run.id || run.database_id })) } };
-  }
-  return { pending: true };
+  if (missing.length) return { outcome: 'pending', blocker: {
+    type: 'activation_receipt_missing', retry_eligible: true, missing_targets: missing
+  } };
+  return { outcome: 'deployed', evidence: { kind: 'activation_receipts', repository: repo,
+    source_sha: sha, targets: requirements.map(item => item.target), receipts } };
 }
 
 async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
@@ -426,6 +515,12 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   const terminalMergedCi = ci === 'no_checks' || ci === 'cancelled_only';
   const retroactiveMerge = terminalMergedCi || Boolean(retro?.ok);
   if (ci !== 'green' && !retroactiveMerge) {
+    if (ci === 'unknown') {
+      const blocker = { type: 'ci_discovery_unavailable', retry_eligible: true };
+      log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=unknown blocker=${blocker.type}`);
+      return { status: 'pending', outcome: 'discovery_unavailable', blocker,
+        retryEligible: true, sha: mergedSha };
+    }
     if (ci === 'absent' || ['red', 'mixed'].includes(ci)) {
       await returnIssueToBuild(issue, `${note}; merged head CI is ${ci}`);
     } else log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci}${retro?.why ? ` retro=${retro.why}` : ''}`);
@@ -435,29 +530,19 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     await returnIssueToBuild(issue, `${note}; latest QC PASS evidence is absent`);
     return { status: 'returned' };
   }
-  const deploy = mergeDeployEvidence(pr.repo, mergedSha, pr.mergedAt);
-  if (deploy.mismatch) {
-    const reason = `retry_escalation:release_receipt_mismatch issue=${issue.id} merged_sha=${mergedSha}`;
-    await retryEscalation(issue, 'Parked', reason, {
-      anomaly: 'release_receipt_mismatch', merged_sha: mergedSha,
-      receipt: receiptSummary(deploy.receipt)
-    });
+  const deploy = mergeDeployEvidence(pr.repo, mergedSha, pr);
+  if (deploy.outcome === 'failed') {
+    await returnIssueToBuild(issue, `${note}; deployment evidence failed for ${mergedSha} (${deploy.blocker.type})`);
     return { status: 'returned' };
   }
-  if (deploy.failed) {
-    await returnIssueToBuild(issue, `${note}; deploy run failed for ${mergedSha} (${deploy.failed})`);
-    return { status: 'returned' };
+  if (deploy.outcome === 'pending' || deploy.outcome === 'discovery_unavailable') {
+    log(`HOLD #${issue.number} deploy_outcome=${deploy.outcome} blocker=${deploy.blocker.type} sha=${mergedSha}`);
+    return { status: 'pending', outcome: deploy.outcome, blocker: deploy.blocker,
+      retryEligible: deploy.blocker.retry_eligible === true, sha: mergedSha };
   }
-  if (deploy.cancelled) {
-    const retry = await retriggerCancelledDeploys(issue, pr.repo, mergedSha, deploy.cancelledRuns);
-    if (!retry.dispatched && retry.capped) {
-      await returnIssueToBuild(issue, `${note}; deploy cancelled retry cap reached for ${mergedSha} (${deploy.cancelled})`);
-      return { status: 'returned', sha: mergedSha };
-    }
-    log(`DEPLOY-CANCELLED #${issue.number} ${mergedSha} (${deploy.cancelled}); deploy was cancelled and is undeployed`);
-    return { status: 'pending', sha: mergedSha };
+  if (!['deployed', 'verified_not_applicable'].includes(deploy.outcome)) {
+    throw new Error(`unhandled deployment outcome: ${deploy.outcome}`);
   }
-  if (deploy.pending) { log(`HOLD #${issue.number} deploy run pending for ${mergedSha}`); return { status: 'pending', sha: mergedSha }; }
   const noVerdict = !latest;
   const reviewedSha = noVerdict ? mergedSha : latest.bound_sha || mergedSha;
   const evidence = { ciSuccess: retroactiveMerge ? 'retroactive' : true,
@@ -474,6 +559,10 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
 
 async function closureWatchdog(issue, result, sha) {
   if (!result || result.status !== 'pending') return false;
+  if (result.retryEligible && ['pending', 'discovery_unavailable'].includes(result.outcome)) {
+    watchdog.observe(issue.id, { sha, outcome: result.outcome, error: result.blocker?.type });
+    return false;
+  }
   const row = watchdog.observe(issue.id, { sha, outcome: 'closure_pending' });
   if (!watchdog.stalled(row)) return false;
   const alerted = watchdog.markAlerted(row, 'closure_stalled');
@@ -820,11 +909,13 @@ function setTestDependencies(dependencies) {
   if (dependencies.relay) relay = dependencies.relay;
   if (dependencies.gh) gh = dependencies.gh;
   if (dependencies.readReceipt) readReceipt = dependencies.readReceipt;
+  if (dependencies.readChangedPaths) readChangedPaths = dependencies.readChangedPaths;
   if (dependencies.log) log = dependencies.log;
   if (dependencies.watchdog) watchdog = dependencies.watchdog;
 }
 
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview, retryEscalation,
-  routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
+  routeFinishedPR, receiptFor, mergeDeployEvidence, changedPathManifest, deploymentRequirements,
+  noDeployRunTriggered, terminalFailedDeployRuns,
   terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, parseRelayResponse,
-  setTestDependencies, sweep, watchdogFailure, closureWatchdog };
+  setTestDependencies, sweep, watchdogFailure, closureWatchdog, resolveSkCommand };

@@ -191,9 +191,17 @@ async function persistOutcome(client, row, parsed, logger) {
 // Reconciler eligibility: dispatch only when nothing is recorded for this stage or
 // the inputs changed since. BLOCKED/human never re-opens without a hash change.
 // FAILED is retryable after a bounded TTL; callers may pass a clock/config for tests.
-async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Number.parseInt(process.env.MULTICA_FAILED_TTL_MINUTES || "15", 10), now = Date.now(), attempt, maxAttempts } = {}) {
+async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Number.parseInt(process.env.MULTICA_FAILED_TTL_MINUTES || "15", 10), now = Date.now(), attempt, maxAttempts, releaseAt } = {}) {
   const prior = (await client.query(outcomeForStageSql(), [issueId, stage])).rows[0];
   if (!prior) return { eligible: true, reason: "no_outcome" };
+  // An authenticated operator release starts a new decision epoch. Outcomes
+  // recorded before that release cannot immediately replay the same Human
+  // Review escalation; a genuinely new task result records a fresh outcome.
+  const releaseTime = Date.parse(releaseAt || "");
+  const priorTime = Date.parse(prior.outcome_at || "");
+  if (Number.isFinite(releaseTime) && Number.isFinite(priorTime) && priorTime < releaseTime) {
+    return { eligible: true, reason: "operator_release_epoch", prior };
+  }
   const currentRow = (await client.query(stageInputHashSql(), [issueId])).rows[0] || {};
   const current = currentRow.input_hash || null;
   // A recorded outcome belongs only to the stage that recorded it. Once the

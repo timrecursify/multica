@@ -46,6 +46,7 @@ const {
   relayAdvance,
   writeJsonResponse,
   admitConfiguredTransition,
+  openChildAdmission,
   setTestClientFactory,
   isCicdReturn,
   consumeCicdReturnAuthorization,
@@ -65,6 +66,8 @@ const {
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
+  specBlockedFingerprint,
+  specCompletionDisposition,
   capEscalationVerified,
   retryEscalationLoop,
   consumesRetryEscalation,
@@ -77,6 +80,62 @@ const {
   isNoDispatchArrivalStage,
   normalizeRelayStage
 } = require('./multica-bridge.cjs');
+
+test('rollup admission with an open child is skipped before a task insert attempt', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/parent_issue_id/.test(sql)) return { rows: [{ number: 23886 }, { number: 23887 }] };
+    if (/SELECT 1 FROM activity_log/.test(sql)) return { rows: [] };
+    if (/INSERT INTO activity_log/.test(sql)) return { rows: [] };
+    assert.fail(`unexpected query: ${sql}`);
+  } };
+
+  const admission = await openChildAdmission(client, {
+    id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '223e4567-e89b-42d3-a456-426614174000'
+  });
+
+  assert.deepEqual(admission, { ok: false, childNumbers: [23886, 23887], auditWritten: true });
+  assert.equal(calls.some(({ sql }) => /INSERT INTO agent_task_queue/.test(sql)), false);
+  assert.match(calls.at(-1).values[2], /"child_numbers":\[23886,23887\]/);
+});
+
+test('Spec completion advances a written spec and bounds repeated blockers', async () => {
+  const issueId = '00000000-0000-4000-8000-000000000277';
+  const taskId = '00000000-0000-4000-8000-000000000278';
+  const priorId = '00000000-0000-4000-8000-000000000279';
+  const client = {
+    rows: [],
+    async query(sql) {
+      if (/WITH source AS/.test(sql)) return { rows: this.rows };
+      if (/FROM comment/.test(sql)) return { rows: [{ content: '## Spec\nBuild it\n## Evidence\nverified' }] };
+      throw new Error(`unexpected query: ${sql}`);
+    }
+  };
+
+  client.rows = [{ id: taskId, result: { output: 'spec posted\nOUTCOME: ADVANCED' } }];
+  assert.deepEqual(await specCompletionDisposition(client, issueId, taskId),
+    { toStage: 'Queue', reason: 'completed_spec_work_product' });
+
+  for (const output of [
+    'Verified existing delivery.\nOUTCOME: NO_OP',
+    'No new source change was needed; the implementation is already merged.'
+  ]) {
+    client.rows = [{ id: taskId, result: { output } }];
+    assert.deepEqual(await specCompletionDisposition(client, issueId, taskId),
+      { toStage: 'Parked', reason: 'completed_spec_noop' });
+  }
+
+  client.rows = [
+    { id: taskId, result: { output: 'OUTCOME: BLOCKED blocked_on=dependency' } },
+    { id: priorId, result: { output: 'OUTCOME: BLOCKED   blocked_on=dependency' } }
+  ];
+  assert.deepEqual(await specCompletionDisposition(client, issueId, taskId),
+    { toStage: 'Parked', reason: 'repeated_spec_blocked_outcome' });
+  assert.equal(specBlockedFingerprint({ output: 'NEEDS-INFO: choose a repository' }),
+    'needs-info:choose a repository');
+});
 
 test('PPP relay aliases normalize to configured canonical stages', () => {
   const ppp = 'da3c5c5c-a123-4567-b999-c3ed1820da00';
@@ -706,13 +765,13 @@ test('technical QC block cannot route to Human Review and exact re-scope bypasse
   assert.match(source, /technical_human_review_forbidden/);
   assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
   assert.match(source,
-    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope/);
+    /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&\n\s*!verifiedPassAdvance && !noArtifactRescope/);
   assert.match(source,
-    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !noArtifactRescope/);
+    /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&\n\s*!noArtifactRescope/);
   assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
   assert.match(source, /operator_rescope_issue_id: issue\.id/);
   assert.match(source, /if \(noArtifactRescope && to_stage === "In Progress"\) \{\s+to_stage = "Spec";/);
-  assert.match(source, /let retryEscalation = noArtifactRescope \? null/);
+  assert.match(source, /let retryEscalation = \(noArtifactRescope \|\| specCompletion\) \? null/);
   assert.match(source, /to_stage === "Spec" && !noArtifactRescope/);
 });
 
@@ -1793,6 +1852,8 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
+      CREATE TABLE "${schema}".issue_stage_outcome (issue_id uuid NOT NULL, stage text NOT NULL,
+      outcome text NOT NULL, blocked_on text, task_id uuid, input_hash text, outcome_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
       author_type text, author_id uuid, content text, type text, created_at timestamptz DEFAULT now());
       CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, checker_id uuid, verdict text,
@@ -1819,6 +1880,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
         VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'),
                ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
+      await admin.query(`INSERT INTO "${schema}".issue_stage_outcome
+        (issue_id, stage, outcome, blocked_on, outcome_at)
+        VALUES ($1, 'In Progress', 'BLOCKED', 'human', now() - interval '1 hour')`, [issueId]);
       const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved by operator' },
         { 'x-relay-operator-secret': 'test-operator-secret' });
       assert.equal(res.status, 200);
@@ -1830,6 +1894,8 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(issue.rows[0].metadata.human_review_release_reason, 'approved by operator');
       assert.ok(issue.rows[0].metadata.human_review_release_at);
       assert.equal(log.rows.length, 1);
+      assert.equal((await admin.query(`SELECT count(*)::int AS n FROM "${schema}".issue_stage_outcome
+        WHERE issue_id = $1`, [issueId])).rows[0].n, 0);
     });
     await t.test('verdict-less completed In Review tasks do not consume either cap, while verdict-bearing tasks do', async () => {
       const issueId = '55555555-5555-5555-5555-555555555555';
@@ -2024,6 +2090,13 @@ test('operator Human Review releases record actor, target, and reason in the aud
   assert.match(source, /operator_release:\s*\{[\s\S]*?reason:\s*reason\.trim\(\)/);
 });
 
+test('operator Human Review release consumes the stale destination verdict', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /if \(explicitHumanReviewRelease\)[\s\S]*?DELETE FROM issue_stage_outcome/);
+  assert.match(source, /issue_id = \$1::uuid AND stage = \$2::text[\s\S]*?outcome_at < \$3::timestamptz/);
+  assert.match(source, /\[issue\.id, to_stage, issue\.metadata\.human_review_release_at\]/);
+});
+
 test('operator recovery admits an authenticated same-stage redispatch', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
@@ -2040,21 +2113,19 @@ test('operator cap release requires the current PASS work-product hash', async (
     'd41d8cd98f00b204e9800998ecf8427e'), false);
 });
 
-test('PASS verdict cap escalation is held for an authenticated operator release, never rejected', () => {
+test('a current work-product-bound PASS bypasses paid-task caps into CI/CD', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /operator_cap_release === true/);
   assert.match(source, /operator_cap_release_secret_required/);
   assert.match(source, /operator_cap_release_pass_required/);
-  assert.match(source, /operator_cap_release_required/);
   assert.match(source, /operator_cap_release: \{ operator_marker: true, reason: reason\.trim\(\) \}/);
   const cycleCap = source.slice(source.indexOf('const cycle = stageCycleAdmission'),
     source.indexOf('const lifetimeHistory'));
-  assert.match(cycleCap, /if \(passVerdictProtected\) \{[\s\S]*?operator_cap_release_required[\s\S]*?return;/);
-  assert.ok(cycleCap.indexOf('operator_cap_release_required') < cycleCap.indexOf('applyDisposition'));
+  assert.match(cycleCap, /const verifiedPassAdvance = issue\.status === "In Review"[\s\S]*?hasCurrentPassWorkProduct/);
+  assert.match(cycleCap, /!parkedQcRecovery &&\n\s*!verifiedPassAdvance/);
   const lifetimeCap = source.slice(source.indexOf('const lifetime = lifetimeTaskAdmission'),
     source.indexOf('// Never advance an issue into another execution lane'));
-  assert.match(lifetimeCap, /if \(passVerdictProtected\) \{[\s\S]*?operator_cap_release_required[\s\S]*?return;/);
-  assert.ok(lifetimeCap.indexOf('operator_cap_release_required') < lifetimeCap.indexOf('applyDisposition'));
+  assert.match(lifetimeCap, /!cicdReturn && !verifiedPassAdvance/);
 });
 
 test('parking records a reason and hands off one Sol-low diagnosis', () => {

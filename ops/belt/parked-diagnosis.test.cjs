@@ -259,6 +259,8 @@ test('queued diagnosis task is scoped to the issue workspace', async () => {
   const insert = queries.find(({ sql }) => /INSERT INTO agent_task_queue/.test(sql));
   assert.ok(insert, 'diagnosis INSERT was executed');
   assert.match(insert.sql, /agent_id, issue_id, workspace_id, status/);
+  assert.match(insert.sql,
+    /created_at >= COALESCE\(\([\s\S]*FROM relay_run_log[\s\S]*to_stage = 'Parked'/);
   assert.equal(insert.values[2], 'workspace-1');
   assert.match(insert.values[5], /"owner_selection":"dedicated_sol_low"/);
 });

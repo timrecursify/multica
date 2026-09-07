@@ -56,6 +56,7 @@ migration-provenance table lets you verify the import is the running bridge.
 | `GSP_BELT_SECRETS_ENV_FILE` | `/home/newadmin/.secrets/multica-remote/remote-bridge.env` | cicd worker |
 | `GSP_BELT_PG_MODULE` | `/home/newadmin/node_modules/pg` | cicd worker `pg` module path |
 | `GSP_BELT_CODEX_BIN` | `/home/newadmin/tools/codex-openrouter` | fleet daemon codex executable |
+| `SK_COMMAND` | `/opt/gsp/.sk/bin/sk` | cicd worker `sk` executable (override when needed) |
 | `CICD_RATE_LIMIT_BASE_MS` | `30000` | cicd worker initial rate-limit backoff |
 | `CICD_RATE_LIMIT_MAX_MS` | `900000` | cicd worker maximum rate-limit cooldown |
 | `GITHUB_APP_ID` | (required unless token is supplied) | GitHub App id used to mint the belt installation token |
