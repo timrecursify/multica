@@ -247,7 +247,7 @@ async function mergedPullRequestNoop(client, issue, options = {}) {
   const pointer = await commentPullRequestUrl(client, issue);
   if (!pointer) return null;
   try {
-    const view = JSON.parse((options.githubCommand || ghExec)(["pr", "view", pointer.url,
+    const view = JSON.parse(await (options.githubCommand || ghExec)(["pr", "view", pointer.url,
       "--json", "state,mergedAt,headRefOid,url"]));
     if (String(view.state).toUpperCase() !== "MERGED" && !view.mergedAt) return null;
     const verdict = policyFor(options)({ from: issue.status, to: "Done", actor: "operator",

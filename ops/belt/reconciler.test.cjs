@@ -3,10 +3,29 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
-  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql } = require("./reconciler.cjs");
+  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql, mergedPullRequestNoop } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
 const ok = () => ({ ok: true });
+
+test("merged PR check awaits an async GitHub command", async () => {
+  let called = false;
+  const client = { query: async (sql) => {
+    if (sql.startsWith("SELECT content FROM comment")) {
+      return { rows: [{ content: "PR https://github.com/acme/widget/pull/7" }] };
+    }
+    return { rows: [] };
+  }};
+  const result = await mergedPullRequestNoop(client, { id: issue.id, status: "In Progress" }, {
+    githubCommand: async () => {
+      await Promise.resolve();
+      called = true;
+      return JSON.stringify({ state: "MERGED", mergedAt: "2026-09-03T00:00:00Z", url: "https://github.com/acme/widget/pull/7" });
+    }, evaluate: ok
+  });
+  assert.equal(called, true);
+  assert.equal(result.action, "no_op");
+});
 
 function harness({ live = [], isLeaf = true, owner = {
   agent_id: "33333333-3333-4333-8333-333333333333",
