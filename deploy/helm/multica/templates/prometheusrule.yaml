@@ -31,6 +31,8 @@ spec:
           labels:
             severity: critical
             service: multica-orchestrator
+            expected_instance: {{ .Values.monitoring.prometheusRule.heartbeatExpectedInstance | quote }}
+            expected_instance: {{ .Values.monitoring.prometheusRule.heartbeatExpectedInstance | quote }}
           annotations:
             summary: "Multica orchestrator heartbeat is stale"
             description: "The orchestrator heartbeat has not advanced within the expected interval."
