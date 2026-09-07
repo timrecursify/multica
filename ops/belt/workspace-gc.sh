@@ -13,9 +13,19 @@ time_limit="${WORKSPACE_GC_TIME_LIMIT_SECONDS:-45}"
 if [[ "${KEEP_WORKDIR:-}" == 1 ]]; then printf 'total\t0\t0\n'; exit 0; fi
 
 descriptor_stream() {
+  limit_eligible() {
+    local descriptor task_id emitted=0
+    while IFS= read -r descriptor; do
+      task_id="${descriptor%%$'\t'*}"
+      (( ${blocked_until[$task_id]:-0} > now )) && continue
+      printf '%s\n' "$descriptor"
+      emitted=$((emitted + 1))
+      (( emitted >= limit )) && break
+    done
+  }
   if [[ -n "${WORKSPACE_GC_DESCRIPTOR_FILE:-}" ]]; then
     [[ "${BELT_TEST_MODE:-}" == 1 ]] || exit 64
-    head -n "$limit" -- "$WORKSPACE_GC_DESCRIPTOR_FILE"
+    limit_eligible <"$WORKSPACE_GC_DESCRIPTOR_FILE"
     return
   fi
   local task_dir meta task_id values_sql='' separator='' missing_meta=0 sql_root
@@ -52,10 +62,12 @@ descriptor_stream() {
           AND live.status NOT IN ('completed','failed','cancelled')
           AND live.issue_id = t.issue_id
           AND live.work_dir = COALESCE(t.work_dir, '$sql_root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir'))
-      ORDER BY t.completed_at" | awk -v limit="$limit" 'NR <= limit'
+      ORDER BY t.completed_at" | limit_eligible
 }
 
-state_file="$root/.gc-blocked.json"
+state_dir="${WORKSPACE_GC_STATE_DIR:-$(dirname -- "$root")/gc-state}"
+mkdir -p -- "$state_dir" 2>/dev/null || true
+state_file="$state_dir/.gc-blocked.json"
 now="$(date +%s)"
 declare -A blocked_until=() blocked_failures=() blocked_first=()
 if [[ -r "$state_file" ]] && jq -e '.tasks | type == "object" and all(.[]; (.retry_after | type == "number") and (.failures | type == "number") and (.first_blocked_at | type == "number"))' "$state_file" >/dev/null 2>&1; then
@@ -74,7 +86,7 @@ save_blocked() {
   blocked_until["$task_id"]="$retry_after"
   blocked_failures["$task_id"]=$((failures + 1))
   blocked_first["$task_id"]="$first_blocked"
-  tmp="$(mktemp "$root/.gc-blocked.json.XXXXXX" 2>/dev/null)" || return 0
+  tmp="$(mktemp "$state_file.XXXXXX" 2>/dev/null)" || return 0
   if jq -n --argjson tasks "$(for id in "${!blocked_until[@]}"; do printf '%s\t%s\t%s\t%s\n' "$id" "${blocked_until[$id]}" "${blocked_failures[$id]}" "${blocked_first[$id]}"; done | jq -Rn '[inputs | split("\t") | {key: .[0], value: {retry_after: (.[1]|tonumber), failures: (.[2]|tonumber), first_blocked_at: (.[3]|tonumber)}}] | from_entries' 2>/dev/null)" '{tasks:$tasks}' >"$tmp" 2>/dev/null; then
     mv -f -- "$tmp" "$state_file" 2>/dev/null || rm -f -- "$tmp"
   else
