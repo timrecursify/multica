@@ -16,7 +16,7 @@ descriptor_stream() {
     return
   fi
   docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -F $'\t' -v batch_limit="$limit" -c "
-    SELECT t.id, t.status, t.completed_at,
+    SELECT t.id, t.status, t.completed_at, t.issue_id,
            COALESCE(t.work_dir, '$root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir')
     FROM agent_task_queue t
     WHERE t.status IN ('completed','failed','cancelled')
@@ -27,20 +27,28 @@ descriptor_stream() {
         SELECT 1 FROM agent_task_queue live
         WHERE live.id <> t.id
           AND live.status NOT IN ('completed','failed','cancelled')
+          AND live.issue_id = t.issue_id
           AND live.work_dir = COALESCE(t.work_dir, '$root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir'))
       ORDER BY t.completed_at LIMIT :batch_limit"
 }
 
 total=0; count=0
-while IFS=$'\t' read -r task_id status completed_at work_dir; do
+while IFS=$'\t' read -r task_id status completed_at issue_id work_dir; do
   [[ "$task_id" =~ ^[0-9a-fA-F-]{36}$ ]] || continue
   prefix="${task_id:0:8}"
   [[ "$work_dir" == "$root"/*/"$prefix"/workdir ]] || continue
   task_dir="${work_dir%/workdir}"
   [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
-  [[ -z "$(git -C "$work_dir" status --porcelain 2>/dev/null | head -1)" ]] || continue
-  head_sha="$(git -C "$work_dir" rev-parse HEAD 2>/dev/null || :)"
-  [[ -n "$head_sha" && -n "$(git -C "$work_dir" branch -r --contains "$head_sha" 2>/dev/null | head -1)" ]] || continue
+  meta="$task_dir/.gc_meta.json"
+  [[ -f "$meta" && "$(jq -r '.task_id // empty' "$meta")" == "$task_id" && "$(jq -r '.issue_id // empty' "$meta")" == "$issue_id" ]] || continue
+  safe=1
+  for checkout in "$work_dir" "$work_dir"/*; do
+    [[ -d "$checkout/.git" || -f "$checkout/.git" ]] || continue
+    [[ -z "$(git -C "$checkout" status --porcelain 2>/dev/null | head -1)" ]] || { safe=0; break; }
+    head_sha="$(git -C "$checkout" rev-parse HEAD 2>/dev/null || :)"
+    [[ -n "$head_sha" && -n "$(git -C "$checkout" branch -r --contains "$head_sha" 2>/dev/null | head -1)" ]] || { safe=0; break; }
+  done
+  ((safe)) || continue
   size="$(du -sb -- "$task_dir" | awk '{print $1}')"
   printf '%s\t%s\t%s\t%s\t%s\n' "$size" "$task_id" "$status" "$completed_at" "$task_dir"
   total=$((total + size)); count=$((count + 1))
