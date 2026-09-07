@@ -9,9 +9,8 @@ async function buildTaskAdmission(client, { issueId, toStage, locked = false }) 
     `SELECT task.id, task.completed_at FROM agent_task_queue task
       WHERE task.issue_id=$1::uuid AND task.status='completed'
         AND task.context->>'to_stage'=ANY($2::text[])
-        AND (COALESCE(task.result::text, '') ~* '(https?://[^[:space:]]+/pull/[0-9]+|bound[ _-]?sha|[a-f0-9]{40})'
-          OR EXISTS (SELECT 1 FROM issue_pull_request link WHERE link.issue_id=task.issue_id AND NOT link.reference_only)
-          OR EXISTS (SELECT 1 FROM issue_vcs_pull_request link WHERE link.issue_id=task.issue_id AND NOT link.reference_only))
+        AND COALESCE(to_jsonb(task)->>'result', '')
+          ~* '(https?://[^[:space:]]+/pull/[0-9]+|bound[ _-]?sha|[a-f0-9]{40})'
       ORDER BY task.completed_at DESC NULLS LAST, task.created_at DESC, task.id DESC LIMIT 1`,
     [issueId, [...BUILD_STAGES]])).rows[0];
   if (!prior) return { admit: true };

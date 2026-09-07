@@ -463,10 +463,12 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     const context = { ...taskContext(issue.status), ...(route.route ? { builder_route: route.route } : {}),
       ...(admission.qcAttemptId ? { qc_attempt_id: admission.qcAttemptId } : {}) };
+    const retryColumn = admission.retryOfTaskId ? ', retry_of_task_id' : '';
+    const retryValue = admission.retryOfTaskId ? ', $12::uuid' : '';
     const created = await client.query(
       `INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, workspace_id, status, priority, context,
-          trigger_summary, originator_source, attempt, max_attempts, retry_of_task_id)
-       SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'queued', $5, $6::jsonb, $7, 'reconcile', $8, $9, $12::uuid
+          trigger_summary, originator_source, attempt, max_attempts${retryColumn})
+       SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'queued', $5, $6::jsonb, $7, 'reconcile', $8, $9${retryValue}
         WHERE NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
            WHERE active.issue_id = $3::uuid AND active.status = ANY($10::text[])
@@ -475,7 +477,7 @@ async function reconcileIssue(client, issueId, options = {}) {
        ON CONFLICT DO NOTHING RETURNING id`,
       [owner.agent_id, owner.selected_runtime_id, issue.id, issue.workspace_id, issue.priority === "urgent" ? 1 : 0,
         JSON.stringify(context), `reconcile ${issue.status}`, attempt + 1, maxAttempts, LIVE, issue.status,
-        admission.retryOfTaskId || null]
+        ...(admission.retryOfTaskId ? [admission.retryOfTaskId] : [])]
     );
     if (created.rows.length === 0) {
       await client.query("COMMIT");
