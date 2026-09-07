@@ -1,0 +1,6 @@
+[Unit]
+Description=Huawei encrypted Fedkit snapshot
+OnFailure=gsp-unit-alert@%n.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fedkit-backup.sh
