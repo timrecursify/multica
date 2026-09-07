@@ -1052,6 +1052,16 @@ test('strict relay attempt must bind PASS to one observed SHA and artifact MD5',
     qc_attempt_evidence_agent_effort: 'high' }).ok, false);
 });
 
+test('completed-task evidence reads the one effective event and a FAIL blocks advancement', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const reader = source.slice(source.indexOf('function completedTaskEvidenceSql'),
+    source.indexOf('function requeueTriggerSummary'));
+  assert.match(reader, /FROM qc_effective_verdict effective/);
+  assert.doesNotMatch(reader, /FROM qc_attempt|FROM qc_verdict/);
+  assert.equal(qcCompletionAdvance({ ...QC_ROW, qc_verdict: 'FAIL',
+    qc_attempt_verdict: 'FAIL' }).reason, 'completed_sol_low_pass_required');
+});
+
 test('post-completion QC replay fails closed on stale, mismatched, or non-low evidence', () => {
   assert.equal(qcCompletionAdvance({ ...QC_ROW,
     qc_verdict_created_at: '2026-09-01T18:00:00Z' }).ok, false);

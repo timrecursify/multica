@@ -7,7 +7,7 @@ function db({ prior, failure, successor } = {}) {
     this.calls.push({ sql, values });
     if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
     if (sql.includes("SELECT task.id")) return { rows: prior ? [prior] : [] };
-    if (sql.includes("SELECT id FROM qc_attempt")) return { rows: failure ? [failure] : [] };
+    if (sql.includes("SELECT id FROM qc_effective_verdict")) return { rows: failure ? [failure] : [] };
     if (sql.includes("retry_of_task_id")) return { rows: successor ? [successor] : [] };
     throw new Error(`unexpected SQL: ${sql}`);
   }};
@@ -31,6 +31,7 @@ test("GSP-2403 qualifying implementation failure admits exactly one linked retry
   const replay = await buildTaskAdmission(db({ prior, failure: { id: 1772 }, successor: { id: "b4277af2" } }),
     { issueId: "gsp-2403", toStage: "In Progress" });
   assert.deepEqual(replay, { admit: false, reuseTaskId: "b4277af2", reason: "implementation_retry_exists" });
+  assert.equal(replay.admit, false, "the effective failure event admits only one corrective task");
 });
 
 test("non-build stages bypass admission", async () => {

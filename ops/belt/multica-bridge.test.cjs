@@ -795,6 +795,68 @@ const runbookVerdict = ({ verdict = 'PASS', failureClass = 'none', qualifying = 
     : ''
 });
 
+function eventFromInsert(values, id) {
+  return { id, issue_id: values[0], checker_name: values[1], verdict: values[2],
+    work_product_md5: values[3], bound_sha: values[4], observed_head: values[5],
+    failure_class: values[6], qualifying: values[7], model: values[8], effort: values[9],
+    idem_key: values[10], notes: values[11], source_idem_key: values[12],
+    event_kind: values[13], checker_id: values[14], evidence_task_id: values[15],
+    scope_revision: String(values[16]), payload_hash: values[17],
+    created_at: new Date(id * 1000).toISOString() };
+}
+
+function effectiveEvent(events) {
+  return [...events].sort((left, right) => {
+    const leftScope = BigInt(left.scope_revision);
+    const rightScope = BigInt(right.scope_revision);
+    if (leftScope !== rightScope) return leftScope > rightScope ? -1 : 1;
+    if (left.event_kind !== right.event_kind) {
+      return left.event_kind === 'post_gate_disposition' ? -1 : 1;
+    }
+    if (left.verdict !== right.verdict) return left.verdict === 'FAIL' ? -1 : 1;
+    return right.id - left.id;
+  })[0] || null;
+}
+
+function verdictHarness({ getTask = () => null } = {}) {
+  const state = { events: [], verdictWrites: [], calls: [] };
+  state.client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    state.calls.push({ sql, values });
+    if (/FROM qc_attempt\s+WHERE source_idem_key/.test(sql)) {
+      return { rows: state.events.filter((event) =>
+        event.source_idem_key === values[0] && event.issue_id === values[1]) };
+    }
+    if (/SELECT id, workspace_id FROM issue/.test(sql)) {
+      return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
+    }
+    if (/FROM agent_task_queue t/.test(sql)) {
+      const task = getTask();
+      const wanted = sql.includes("t.status = 'running'") ? 'running' : 'completed';
+      const checkerMatches = wanted !== 'running' || values[2] === task?.agent_name;
+      return { rows: task?.status === wanted && checkerMatches ? [task] : [] };
+    }
+    if (/SELECT COALESCE\(\(SELECT scope_revision FROM qc_attempt/.test(sql)) {
+      const sameSha = state.events.find((event) => event.issue_id === values[0] &&
+        event.bound_sha.toLowerCase() === values[1].toLowerCase());
+      const maximum = state.events.reduce((max, event) =>
+        BigInt(event.scope_revision) > max ? BigInt(event.scope_revision) : max, 0n);
+      return { rows: [{ scope_revision: sameSha?.scope_revision || String(maximum + 1n) }] };
+    }
+    if (/INSERT INTO qc_attempt/.test(sql)) {
+      const event = eventFromInsert(values, state.events.length + 1);
+      state.events.push(event);
+      return { rows: [{ id: event.id }] };
+    }
+    if (/FROM qc_effective_verdict/.test(sql)) {
+      const effective = effectiveEvent(state.events.filter((event) => event.issue_id === values[0]));
+      return { rows: effective ? [effective] : [] };
+    }
+    if (/INSERT INTO qc_verdict/.test(sql)) state.verdictWrites.push(values);
+    return { rows: [] };
+  } };
+  return state;
+}
+
 test('verdict validation accepts the sanctioned CLI checker field and rejects forged lane metadata', () => {
   assert.equal(validateRelayVerdict(validVerdict), null);
   assert.equal(validateRelayVerdict({ ...validVerdict, checker: undefined }), 'invalid_checker');
@@ -803,6 +865,9 @@ test('verdict validation accepts the sanctioned CLI checker field and rejects fo
   assert.equal(validateRelayVerdict({ ...validVerdict, model: 'gpt-5.6-terra' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, effort: 'high' }), 'invalid_qc_lane');
   assert.equal(validateRelayVerdict({ ...validVerdict, failure_class: 'invented' }), 'invalid_failure_class');
+  assert.equal(validateRelayVerdict({ ...validVerdict, event_kind: 'replacement' }), 'invalid_event_kind');
+  assert.equal(validateRelayVerdict({ ...validVerdict, scope_revision: '9223372036854775808' }),
+    'invalid_scope_revision');
 });
 
 test('the QC lane admits every configured reviewer model, not Sol alone', async () => {
@@ -848,32 +913,24 @@ test('running Sol-low selector admits exactly one matching assigned task', async
 });
 
 test('assigned running Sol-low task persists live PASS and FAIL without completion evidence', async () => {
-  const writes = [];
   const running = { id: '33333333-3333-4333-8333-333333333333', issue_id: validVerdict.issue_id,
     workspace_id: 'workspace-1', agent_id: 'live-agent', agent_name: validVerdict.checker,
-    status: 'running', context: { to_stage: 'In Review' }, model: 'gpt-5.6-sol', thinking_level: 'low' };
-  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
-    if (/FROM qc_attempt/.test(sql) || /FROM qc_verdict/.test(sql)) return { rows: [] };
-    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
-    if (/FROM agent_task_queue t/.test(sql)) {
-      return { rows: sql.includes("t.status = 'running'") && values[2] === validVerdict.checker ? [running] : [] };
-    }
-    if (/INSERT INTO qc_attempt|INSERT INTO qc_verdict/.test(sql)) writes.push(values);
-    return { rows: [] };
-  } };
+    status: 'running', context: { to_stage: 'In Review' }, model: 'gpt-5.6-sol',
+    thinking_level: 'low', created_at: '2026-09-07T10:00:00Z' };
+  const harness = verdictHarness({ getTask: () => running });
   const post = async (payload) => {
     const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
     await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
     return { ...res, json: JSON.parse(res.body) };
   };
-  setTestClientFactory(() => client);
+  setTestClientFactory(() => harness.client);
   try {
     assert.equal((await post({ ...validVerdict, idem_key: 'live-pass-0001' })).status, 201);
     const fail = { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false, idem_key: 'live-fail-0001' };
     assert.equal((await post(fail)).status, 201);
-    assert.deepEqual(writes.filter((values) => values.length === 12).map((values) => values[1]),
+    assert.deepEqual(harness.events.map((event) => event.checker_name),
       [validVerdict.checker, validVerdict.checker]);
-    assert.deepEqual(writes.filter((values) => values.length === 6).map((values) => values[2]),
+    assert.deepEqual(harness.verdictWrites.map((values) => values[2]),
       [validVerdict.checker, validVerdict.checker]);
     const refused = await post({ ...validVerdict, checker: 'different-checker', idem_key: 'live-wrong-checker-0001' });
     assert.equal(refused.json.error, 'assigned_running_sol_low_in_review_qc_task_required');
@@ -933,33 +990,17 @@ test('verdict route never trusts a caller supplied checker identity', () => {
   assert.match(source, /payload\.checker/);
   assert.match(source, /qcTask\.agent_name/);
   assert.match(source, /qc_task_sha_mismatch/);
-  assert.match(source, /idempotency_conflict/);
+  assert.match(source, /source_idem_key/);
 });
 
 test('verdict handler binds all evidence to the completed QC task and resists forgery', async () => {
-  const attempts = new Map();
-  const writes = [];
-  let taskQueryValues;
-  let task = {
-    id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1',
-    context: {}, result: qcResult()
+  const baseTask = {
+    id: '11111111-1111-4111-8111-111111111110', agent_id: 'agent-1', agent_name: 'qc-sol-low-1',
+    status: 'completed', context: {}, result: qcResult(), created_at: '2026-09-07T10:00:00Z'
   };
-  const client = {
-    async connect() {}, async end() {},
-    async query(sql, values = []) {
-      if (/FROM qc_attempt/.test(sql)) return { rows: attempts.has(values[0]) ? [attempts.get(values[0])] : [] };
-      if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
-      if (/FROM agent_task_queue t/.test(sql)) { taskQueryValues = values; return { rows: task ? [task] : [] }; }
-      if (/FROM qc_verdict/.test(sql)) return { rows: [] };
-      if (/INSERT INTO qc_attempt/.test(sql)) {
-        const [issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head, failure_class, qualifying, model, effort, idem_key] = values;
-        attempts.set(idem_key, { issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head, failure_class, qualifying, model, effort });
-      }
-      if (/INSERT INTO qc_verdict/.test(sql)) writes.push(values);
-      return { rows: [] };
-    }
-  };
-  setTestClientFactory(() => client);
+  let task = baseTask;
+  const harness = verdictHarness({ getTask: () => task });
+  setTestClientFactory(() => harness.client);
   const call = async (payload) => {
     const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
     await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
@@ -968,7 +1009,8 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
   try {
     let result = await call({ ...validVerdict, checker: 'forged-human-name' });
     assert.equal(result.status, 201);
-    assert.equal(writes[0][2], 'qc-sol-low-1', 'checker_name must come from QC agent, not CLI checker');
+    assert.equal(harness.verdictWrites[0][2], 'qc-sol-low-1',
+      'checker_name must come from QC agent, not CLI checker');
     result = await call({ ...validVerdict, idem_key: 'qc-verdict-wrong-md5', work_product_md5: 'a41d8cd98f00b204e9800998ecf8427e' });
     assert.equal(result.json.error, 'qc_task_work_product_mismatch');
     task = { ...task, result: qcResult({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false }) };
@@ -977,44 +1019,37 @@ test('verdict handler binds all evidence to the completed QC task and resists fo
     task = null;
     result = await call({ ...validVerdict, idem_key: 'qc-verdict-cross-workspace' });
     assert.equal(result.json.error, 'completed_sol_low_qc_required');
-    task = { id: 'task-1', agent_id: 'agent-1', agent_name: 'qc-sol-low-1', context: {}, result: qcResult() };
+    task = { ...baseTask, result: qcResult() };
     result = await call({ ...validVerdict, checker: 'replay-forgery' });
     assert.equal(result.status, 200, 'same immutable evidence must replay despite a forged checker string');
     result = await call({ ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false });
-    assert.equal(result.json.error, 'idempotency_conflict');
+    assert.equal(result.json.error, 'qc_task_verdict_mismatch');
     const explicitTaskId = '11111111-1111-4111-8111-111111111111';
     task = { ...task, id: explicitTaskId, result: qcResult() };
     result = await call({ ...validVerdict, idem_key: 'qc-explicit-task-binding', qc_task_id: explicitTaskId });
     assert.equal(result.status, 201);
-    assert.deepEqual(taskQueryValues, [validVerdict.issue_id, 'workspace-1', explicitTaskId,
+    const taskQuery = harness.calls.filter(({ sql }) => /FROM agent_task_queue t/.test(sql)).at(-1);
+    assert.deepEqual(taskQuery.values, [validVerdict.issue_id, 'workspace-1', explicitTaskId,
       ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
-    assert.match(writes.at(-1)[5], new RegExp(`relay_task_id=${explicitTaskId}`));
+    assert.match(harness.verdictWrites.at(-1)[5], new RegExp(`relay_task_id=${explicitTaskId}`));
   } finally {
     setTestClientFactory(null);
   }
 });
 
 test('operator external QC requires its distinct secret and Sol-low evidence lane', async () => {
-  const writes = [];
-  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
-    if (/FROM qc_attempt/.test(sql)) return { rows: [] };
-    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
-    if (/FROM agent_task_queue t/.test(sql)) assert.fail('external QC must not read a task row');
-    if (/FROM qc_verdict/.test(sql)) return { rows: [] };
-    if (/INSERT INTO qc_attempt|INSERT INTO qc_verdict/.test(sql)) writes.push(values);
-    return { rows: [] };
-  } };
+  const harness = verdictHarness();
   const call = async (payload, headers = {}) => {
     const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
     await relayVerdict({ headers }, res, { agent_token: 'test-relay-secret', ...payload });
     return { ...res, json: JSON.parse(res.body) };
   };
-  setTestClientFactory(() => client);
+  setTestClientFactory(() => harness.client);
   try {
     const external = { ...validVerdict, idem_key: 'external-qc-accepted-0001', operator_external_qc: true, reason: 'outside belt PR QC' };
     assert.equal((await call(external, { 'x-relay-operator-secret': 'test-operator-secret' })).status, 201);
-    assert.match(writes[0][11], /operator_external_qc=outside belt PR QC/);
-    assert.deepEqual(writes[1].slice(0, 3), [validVerdict.issue_id,
+    assert.match(harness.events[0].notes, /operator_external_qc=outside belt PR QC/);
+    assert.deepEqual(harness.verdictWrites[0].slice(0, 3), [validVerdict.issue_id,
       '00000000-0000-0000-0000-000000000000', external.checker],
     'external QC verdict insert uses the bridge system actor and operator callsign');
     assert.equal((await call({ ...external, idem_key: 'external-qc-no-secret-0002' })).status, 403);
@@ -1023,66 +1058,110 @@ test('operator external QC requires its distinct secret and Sol-low evidence lan
   } finally { setTestClientFactory(null); }
 });
 
-test('PASS replay writes once, but an older bound task cannot replace a newer FAIL', async () => {
-  const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'pass-agent',
-    agent_name: 'qc-sol-low-pass', context: {}, result: qcResult(), completed_at: '2026-01-01T00:00:00Z' };
-  const prior = { issue_id: validVerdict.issue_id, checker_name: task.agent_name,
-    verdict: 'PASS', work_product_md5: validVerdict.work_product_md5,
-    bound_sha: validVerdict.bound_sha, observed_head: validVerdict.observed_sha,
-    failure_class: validVerdict.failure_class, qualifying: validVerdict.qualifying,
-    model: validVerdict.model, effort: validVerdict.effort };
-  let verdict = null;
-  let writes = 0;
-  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
-    if (/FROM qc_attempt/.test(sql)) return { rows: [prior] };
-    if (/SELECT id, workspace_id FROM issue/.test(sql)) return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1' }] };
-    if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
-    if (/FROM qc_verdict/.test(sql)) return { rows: verdict ? [verdict] : [] };
-    if (/INSERT INTO qc_verdict/.test(sql)) {
-      writes += 1;
-      verdict = { issue_id: values[0], checker_id: values[1], notes: values[5], created_at: '2026-01-01T00:01:00Z' };
-    }
-    if (/UPDATE qc_verdict/.test(sql)) writes += 1;
-    return { rows: [] };
-  } };
-  const post = async () => {
+test('PASS and post-gate FAIL are immutable events; replay and newer SHA keep effective ordering', async () => {
+  let task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'qc-agent',
+    agent_name: 'qc-sol-low', status: 'completed', context: {},
+    created_at: '2026-01-01T00:00:00Z', result: qcResult() };
+  const harness = verdictHarness({ getTask: () => task });
+  const post = async (payload) => {
+    task.result = qcResult(payload);
     const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
-    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...validVerdict, qc_task_id: task.id });
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload, qc_task_id: task.id });
     return { ...res, json: JSON.parse(res.body) };
   };
-  setTestClientFactory(() => client);
+  setTestClientFactory(() => harness.client);
   try {
-    assert.equal((await post()).status, 200);
-    assert.equal((await post()).status, 200);
-    assert.equal(writes, 1, 'a second PASS replay must not duplicate its verdict row');
-    verdict = { issue_id: validVerdict.issue_id, checker_id: 'fail-agent', notes: 'relay_task_id=newer-task',
+    const pass = { ...validVerdict, event_kind: 'reviewer_verdict' };
+    const fail = { ...pass, verdict: 'FAIL', failure_class: 'implementation', qualifying: true,
+      event_kind: 'post_gate_disposition' };
+    const passResult = await post(pass);
+    const failResult = await post(fail);
+    assert.equal(passResult.status, 201);
+    assert.equal(failResult.status, 201);
+    assert.equal(harness.events.length, 2);
+    assert.equal(effectiveEvent(harness.events).verdict, 'FAIL');
+    assert.notEqual(passResult.json.event_id, failResult.json.event_id);
+
+    const replay = await post(fail);
+    assert.equal(replay.status, 200);
+    assert.equal(replay.json.event_id, failResult.json.event_id);
+    assert.equal(harness.events.length, 2, 'an exact replay returns the existing event');
+
+    const changedPayload = await post({ ...pass, notes: 'new evidence detail' });
+    assert.equal(changedPayload.status, 201);
+    assert.equal(harness.events.length, 3,
+      'the same source key with a changed payload must create another immutable event');
+
+    const newerPass = { ...pass, idem_key: 'qc-newer-sha-pass-0001',
+      work_product_md5: 'b'.repeat(32), bound_sha: 'a'.repeat(40), observed_sha: 'a'.repeat(40) };
+    task = { ...task, id: '22222222-2222-4222-8222-222222222222',
       created_at: '2026-01-02T00:00:00Z' };
-    const result = await post();
-    assert.equal(result.status, 409);
-    assert.equal(result.json.error, 'qc_verdict_newer_than_bound_qc_task');
-    assert.equal(writes, 1, 'the older PASS replay must not overwrite the newer FAIL');
+    assert.equal((await post(newerPass)).json.effective_verdict, 'PASS');
+    const newerFail = { ...newerPass, verdict: 'FAIL', failure_class: 'implementation', qualifying: true,
+      event_kind: 'post_gate_disposition' };
+    assert.equal((await post(newerFail)).json.effective_verdict, 'FAIL');
+    assert.equal((await post(pass)).json.effective_verdict, 'FAIL',
+      'a delayed old PASS replay cannot resurrect the stale revision');
   } finally { setTestClientFactory(null); }
 });
 
-test('FAIL replay does not write a qc_verdict row', async () => {
-  const fail = { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: false };
-  const task = { id: '22222222-2222-4222-8222-222222222222', agent_id: 'fail-agent',
-    agent_name: 'qc-sol-low-fail', context: {}, result: qcResult(fail), completed_at: '2026-01-01T00:00:00Z' };
-  const prior = { issue_id: fail.issue_id, checker_name: task.agent_name, verdict: fail.verdict,
-    work_product_md5: fail.work_product_md5, bound_sha: fail.bound_sha, observed_head: fail.observed_sha,
-    failure_class: fail.failure_class, qualifying: fail.qualifying, model: fail.model, effort: fail.effort };
-  let verdictWrites = 0;
-  const client = { async connect() {}, async end() {}, async query(sql) {
-    if (/FROM qc_attempt/.test(sql)) return { rows: [prior] };
-    if (/INSERT INTO qc_verdict|UPDATE qc_verdict/.test(sql)) verdictWrites += 1;
-    return { rows: [] };
-  } };
-  const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
-  setTestClientFactory(() => client);
+test('reverse delivery cannot let reviewer PASS override post-gate FAIL', async () => {
+  const fail = { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation', qualifying: true,
+    event_kind: 'post_gate_disposition', idem_key: 'qc-reverse-order-0001' };
+  const pass = { ...validVerdict, event_kind: 'reviewer_verdict', idem_key: fail.idem_key };
+  let task = { id: '33333333-3333-4333-8333-333333333333', agent_id: 'qc-agent',
+    agent_name: 'qc-sol-low', status: 'completed', context: {},
+    created_at: '2026-01-03T00:00:00Z', result: qcResult(fail) };
+  const harness = verdictHarness({ getTask: () => task });
+  const post = async (payload) => {
+    task = { ...task, result: qcResult(payload) };
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload, qc_task_id: task.id });
+    return JSON.parse(res.body);
+  };
+  setTestClientFactory(() => harness.client);
   try {
-    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...fail, qc_task_id: task.id });
-    assert.equal(res.status, 200);
-    assert.equal(verdictWrites, 0);
+    await post(fail);
+    const result = await post(pass);
+    assert.equal(harness.events.length, 2);
+    assert.equal(result.effective_verdict, 'FAIL');
+  } finally { setTestClientFactory(null); }
+});
+
+test('concurrent changed payloads serialize on the source key and finish at effective FAIL', async () => {
+  const running = { id: '44444444-4444-4444-8444-444444444444', issue_id: validVerdict.issue_id,
+    workspace_id: 'workspace-1', agent_id: 'qc-agent', agent_name: validVerdict.checker,
+    status: 'running', context: {}, created_at: '2026-01-04T00:00:00Z' };
+  const harness = verdictHarness({ getTask: () => running });
+  let lockTail = Promise.resolve();
+  const newClient = () => {
+    let unlock = null;
+    return { async connect() {}, async end() {}, async query(sql, values = []) {
+      if (/pg_advisory_xact_lock/.test(sql)) {
+        const predecessor = lockTail;
+        lockTail = new Promise((resolve) => { unlock = resolve; });
+        await predecessor;
+      }
+      const result = await harness.client.query(sql, values);
+      if ((sql === 'COMMIT' || sql === 'ROLLBACK') && unlock) { unlock(); unlock = null; }
+      return result;
+    } };
+  };
+  const post = async (payload) => {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...payload });
+    return { status: res.status, json: JSON.parse(res.body) };
+  };
+  const pass = { ...validVerdict, event_kind: 'reviewer_verdict', idem_key: 'qc-concurrent-0001' };
+  const fail = { ...pass, verdict: 'FAIL', failure_class: 'implementation', qualifying: true,
+    event_kind: 'post_gate_disposition' };
+  setTestClientFactory(newClient);
+  try {
+    const results = await Promise.all([post(pass), post(fail)]);
+    assert.deepEqual(results.map(({ status }) => status), [201, 201]);
+    assert.equal(harness.events.length, 2);
+    assert.equal(new Set(harness.events.map(({ idem_key }) => idem_key)).size, 2);
+    assert.equal(effectiveEvent(harness.events).verdict, 'FAIL');
   } finally { setTestClientFactory(null); }
 });
 
@@ -1090,20 +1169,28 @@ test('runbook-shaped verdicts advance through the relay handler', async () => {
   const attempts = [];
   const verdicts = [];
   const task = { id: '11111111-1111-4111-8111-111111111111', agent_id: 'qc-agent',
-    agent_name: 'qc-sol-low', context: {}, result: qcResult() };
+    agent_name: 'qc-sol-low', status: 'completed', context: {}, result: qcResult(),
+    created_at: '2026-09-07T10:00:00Z' };
   const client = { async connect() {}, async end() {}, async query(sql, values = []) {
-    if (/FROM qc_attempt/.test(sql)) return { rows: [] };
+    if (/FROM qc_attempt\s+WHERE source_idem_key/.test(sql)) {
+      return { rows: attempts.filter((event) =>
+        event.source_idem_key === values[0] && event.issue_id === values[1]) };
+    }
+    if (/FROM qc_effective_verdict/.test(sql)) {
+      const effective = effectiveEvent(attempts);
+      return { rows: effective ? [effective] : [] };
+    }
     if (/SELECT id, workspace_id FROM issue/.test(sql) || /FROM "issue"\s+WHERE id = \$1\s+FOR UPDATE/.test(sql)) {
       return { rows: [{ id: validVerdict.issue_id, workspace_id: 'workspace-1', status: 'In Review',
         description: '', parent_issue_id: null, title: 'QC fixture', priority: 'none', metadata: {} }] };
     }
     if (/FROM agent_task_queue t/.test(sql)) return { rows: [task] };
-    if (/SELECT verdict, work_product_md5 FROM qc_verdict/.test(sql)) {
-      const latest = verdicts.at(-1);
-      return { rows: latest ? [{ verdict: latest[3], work_product_md5: latest[4] }] : [] };
-    }
     if (/FROM qc_verdict/.test(sql)) return { rows: [] };
-    if (/INSERT INTO qc_attempt/.test(sql)) attempts.push(values);
+    if (/INSERT INTO qc_attempt/.test(sql)) {
+      const event = eventFromInsert(values, attempts.length + 1);
+      attempts.push(event);
+      return { rows: [{ id: event.id }] };
+    }
     if (/INSERT INTO qc_verdict/.test(sql)) verdicts.push(values);
     if (/SELECT stage_name FROM relay_stage_config/.test(sql)) return { rows: [{ stage_name: values[1] }] };
     if (/SELECT next_stage, alt_next_stages/.test(sql)) return { rows: [{ next_stage: 'CI/CD & Deploy', alt_next_stages: ['In Progress'] }] };
@@ -1123,12 +1210,13 @@ test('runbook-shaped verdicts advance through the relay handler', async () => {
     const pass = runbookVerdict({ idemKey: 'qc-runbook-pass-0001' });
     task.result = qcResult(pass);
     assert.equal((await post(pass)).status, 201);
-    const values = attempts[0];
+    const event = attempts[0];
     const row = { task_id: task.id, to_stage: 'In Review', next_stage: 'CI/CD & Deploy', task_status: 'completed',
       task_agent_id: task.agent_id, task_agent_model: 'gpt-5.6-sol', task_agent_effort: 'low',
       qc_verdict_checker_id: task.agent_id, qc_verdict: 'PASS', qc_verdict_work_product_md5: pass.work_product_md5,
-      qc_attempt_verdict: values[2], qc_attempt_work_product_md5: values[3], qc_attempt_bound_sha: values[4],
-      qc_attempt_observed_sha: values[5], qc_attempt_qualifying: values[7], qc_attempt_evidence_task_id: task.id,
+      qc_attempt_verdict: event.verdict, qc_attempt_work_product_md5: event.work_product_md5,
+      qc_attempt_bound_sha: event.bound_sha, qc_attempt_observed_sha: event.observed_head,
+      qc_attempt_qualifying: event.qualifying, qc_attempt_evidence_task_id: task.id,
       qc_attempt_evidence_agent_id: task.agent_id, qc_attempt_evidence_agent_model: 'gpt-5.6-sol', qc_attempt_evidence_agent_effort: 'low' };
     const advance = async (to_stage) => {
       const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
