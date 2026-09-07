@@ -94,7 +94,7 @@ second one:
 ```bash
 sk multica issue-list --board gsp --status Spec --search "MEGA" | head -40
 sk multica issue-update <this-flight> --parent <existing-mega-id> --no-start
-python3 /home/newadmin/tools/multica-bundle.py --mega <existing-mega-number> --apply
+python3 /var/lib/gsp/tools/multica-bundle.py --mega <existing-mega-number> --apply
 ```
 
 A second mega for a root cause that already has one splits the work in two, and
@@ -128,7 +128,7 @@ children are no longer visible.
 4. Fold the children in and hide them:
 
    ```bash
-   python3 /home/newadmin/tools/multica-bundle.py --mega <mega-number> --apply
+   python3 /var/lib/gsp/tools/multica-bundle.py --mega <mega-number> --apply
    ```
 
    This copies each child's title, description and acceptance criteria into a
@@ -159,8 +159,8 @@ the folded content itself:
   with
 
   ```bash
-  python3 /home/newadmin/tools/multica-bundle.py --unbundle <ticket-number> --apply
-  python3 /home/newadmin/tools/multica-bundle.py --mega <new-mega-number> --apply
+  python3 /var/lib/gsp/tools/multica-bundle.py --unbundle <ticket-number> --apply
+  python3 /var/lib/gsp/tools/multica-bundle.py --mega <new-mega-number> --apply
   ```
 
   `--unbundle` returns one folded ticket to `Registered` and detaches it, so
