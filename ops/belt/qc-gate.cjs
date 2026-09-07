@@ -28,7 +28,15 @@ function pathTokens(scope) {
 }
 function md5ForSha(sha, workspace, repo) {
   const [owner, name] = String(repo || '').split('/');
-  const root = workspace?.bareCache || '/var/lib/gsp/multica/workspaces/.repos';
+  // Resolve the mirror root the way the daemon does. MULTICA_REPO_MIRRORS_ROOT
+  // can move the bare mirrors off the workspaces root, and this path is the
+  // only thing that finds them: workspace.bareCache is never populated, so the
+  // literal below is what every lookup actually used. Left hardcoded, a moved
+  // mirror root turns every tree hash into "unavailable: no bare cache" --
+  // evidence degrades silently instead of failing loudly.
+  const root = workspace?.bareCache
+    || process.env.MULTICA_REPO_MIRRORS_ROOT
+    || '/var/lib/gsp/multica/workspaces/.repos';
   const dir = `${root}/${workspace?.id}/github.com+${owner}+${name}.git`;
   try {
     execFileSync('git', ['-C', dir, 'ls-tree', '-r', '--full-tree', sha], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
