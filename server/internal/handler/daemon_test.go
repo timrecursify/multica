@@ -228,7 +228,6 @@ func createDispatchedClaimFixtureTask(t *testing.T, ctx context.Context, agentID
 	t.Helper()
 
 	var taskID string
-	var activeTaskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (
 			agent_id, runtime_id, issue_id, status, priority, dispatched_at, started_at
@@ -636,7 +635,7 @@ func TestClaimTaskByRuntime_SkillBundleRefsAndResolve(t *testing.T) {
 		t.Fatalf("setup: bind skill: %v", err)
 	}
 
-	var taskID string
+	var taskID, activeTaskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, status, priority)
 		VALUES ($1, $2, $3, 'queued', 0)
