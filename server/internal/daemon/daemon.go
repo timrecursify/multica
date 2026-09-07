@@ -6798,13 +6798,20 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 		}, nil
 	case "cancelled":
 		// Server cancelled the task (e.g. issue reassignment, user cancel).
+		// A cancelled daemon root is a lifecycle interruption instead; retain
+		// that provenance in the persisted failure message so retryable recovery
+		// is distinguishable from deliberate cancellation.
 		// handleTask's cancelledByPoll branch already discards this result,
 		// so this case is mainly defensive — and preserves the "cancelled"
 		// status string for the "agent finished" log line so operators can
 		// distinguish "task cancelled by server" from a real timeout.
+		comment := "task cancelled by server"
+		if ctx.Err() != nil {
+			comment = "task interrupted by daemon shutdown/recovery"
+		}
 		return TaskResult{
 			Status:    "cancelled",
-			Comment:   "task cancelled by server",
+			Comment:   comment,
 			SessionID: result.SessionID,
 			WorkDir:   env.WorkDir,
 			EnvRoot:   env.RootDir,
