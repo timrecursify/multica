@@ -1795,7 +1795,7 @@ test('release admission is explicit, one-use, and resets task history by time', 
   assert.match(source, /created_at >= \$3/);
   assert.match(source, /created_at >= \$2/);
   assert.match(source, /'parked_release_once'.*'\{parked_release_at\}'/s);
-  assert.match(source, /\["Queue", "Spec"\]\.includes\(to_stage\)/);
+  assert.match(source, /parkedAllowedStages[\s\S]*?\.includes\(to_stage\)/);
   assert.match(source, /if \(!bindingSpec && parkedRelease\) \{[\s\S]*?to_stage = "Spec"/);
 });
 
@@ -1869,10 +1869,11 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
     await admin.query(`INSERT INTO "${schema}".relay_stage_agent_pool VALUES
       ($1, 'Queue', $2, true, NULL), ($1, 'In Progress', $2, true, NULL),
       ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
-    await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage) VALUES
-      ($1, 'Human Review', 'In Progress'), ($1, 'Done', 'CI/CD & Deploy'),
-      ($1, 'CI/CD & Deploy', 'Done'), ($1, 'In Progress', 'In Review'),
-      ($1, 'Parked', 'Queue'), ($1, 'Queue', 'In Progress')`, [workspaceId]);
+    await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage, alt_next_stages) VALUES
+      ($1, 'Human Review', 'In Progress', NULL), ($1, 'Done', 'CI/CD & Deploy', NULL),
+      ($1, 'CI/CD & Deploy', 'Done', NULL), ($1, 'In Progress', 'In Review', NULL),
+      ($1, 'Parked', 'Queue', ARRAY['In Review']), ($1, 'Queue', 'In Progress', NULL),
+      ($1, 'In Review', 'CI/CD & Deploy', NULL)`, [workspaceId]);
 
     await t.test('releases at the cycle limit, enqueues work, persists metadata, and logs', async () => {
       const issueId = '44444444-4444-4444-4444-444444444444';
@@ -2053,6 +2054,22 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
       assert.deepEqual(audit.rows[0].parked_audit, { parked_release: { operator_marker: true,
         reason: 'approved' }, operator_cap_bypass: true, reason: 'approved' });
+    });
+    await t.test('authenticated one-time Parked release admits configured alternate In Review', async () => {
+      const issueId = '89888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
+      await admin.query(`UPDATE "${schema}".issue SET metadata = '{"parked_release_once": true}'::jsonb WHERE id = $1`, [issueId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_release: true, reason: 'approved alternate' },
+        { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'In Review');
+    });
+    await t.test('authenticated Parked release rejects non-successor target', async () => {
+      const issueId = '89877777-7777-7777-7777-777777777777'; await insertIssue(issueId, 'Parked');
+      await admin.query(`UPDATE "${schema}".issue SET metadata = '{"parked_release_once": true}'::jsonb WHERE id = $1`, [issueId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'Human Review', operator_release: true, reason: 'invalid target' },
+        { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 409); assert.equal(JSON.parse(res.body).error, 'parked_release_required');
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'Parked');
     });
     await t.test('Parked operator release without the secret remains forbidden at an exhausted cap', async () => {
       const issueId = '89898989-8989-8989-8989-898989898989'; await insertIssue(issueId, 'Parked');
