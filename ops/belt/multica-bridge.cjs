@@ -2101,7 +2101,7 @@ async function relayAdvance(req, res, body) {
       await client.query("COMMIT");
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "parked_release_required",
-        message: "parked issues are held until an explicit operator release or diagnosis" }));
+        message: "parked release requires the one-shot parked_release_once authorization marker" }));
       return;
     }
 
