@@ -65,6 +65,9 @@ const QC_EVIDENCE_MISMATCH_LIMIT = 3;
 const PASS_BACKOFF_BASE_MS = 1000;
 const PASS_BACKOFF_MAX_MS = 15000;
 let advanceTickInFlight = false;
+// Process-lifetime suppression for unresolved non-runtime PR routes.  The
+// identity includes the observable PR state so a changed PR is reconsidered.
+const unresolvedRouteHolds = new Map();
 
 // Every daemon pass goes through this runner. A rejected pass is observable,
 // but cannot take down the PM2 process or overlap the next invocation.
@@ -385,14 +388,20 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   // The same applies to a merged non-runtime PR: In Progress -> Done is
   // reserved for NO-SHA work products, so a code-bearing route reviews first.
   if (row.to_stage === 'In Progress' && route.kind !== 'no_pr' && route.toStage && route.toStage !== 'In Review') {
-    return { ...route, toStage: 'In Review', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
+    return { ...route, toStage: 'In Review', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid,
+      merge_state: pr.mergeStateStatus, check_classification: (pr.statusCheckRollup || [])
+        .map((check) => String(check.conclusion || check.state || '').toUpperCase()).sort().join(',') };
   }
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
       greenChecks(pr.statusCheckRollup)) {
     return { ...route, toStage: qcHandoff ? 'CI/CD & Deploy' : 'In Review',
-      kind: 'merge_only_ready', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
+      kind: 'merge_only_ready', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid,
+      merge_state: pr.mergeStateStatus, check_classification: (pr.statusCheckRollup || [])
+        .map((check) => String(check.conclusion || check.state || '').toUpperCase()).sort().join(',') };
   }
-  return { ...route, repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
+  return { ...route, repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid,
+    merge_state: pr.mergeStateStatus, check_classification: (pr.statusCheckRollup || [])
+      .map((check) => String(check.conclusion || check.state || '').toUpperCase()).sort().join(',') };
 }
 
 function uniqueFullSha(value) {
@@ -1168,6 +1177,12 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
 
         const route = await buildCompletionRoute(client, row);
         if (route && !route.toStage) {
+          if (route.reason === 'non_runtime_pr_not_merged') {
+            const holdKey = `${row.issue_id}:${route.pr_url || ''}`;
+            const identity = [route.boundSha || '', route.pr_state || '', route.merge_state || '', route.check_classification || ''].join('|');
+            if (unresolvedRouteHolds.get(holdKey) === identity) continue;
+            unresolvedRouteHolds.set(holdKey, identity);
+          }
           const escalation = await requestRetryEscalation(row, route.reason);
           logger.log(`${LOG_PREFIX} [route] RESPEC: issue=${row.issue_id}, ` +
             `stage='${row.to_stage}', reason=${route.reason}, relay=${escalation.status}`);
