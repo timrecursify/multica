@@ -380,7 +380,8 @@ async function reconcileIssue(client, issueId, options = {}) {
       const eligibility = await stageEligibility(client, issue.id, issue.status, {
         failedTtlMinutes: options.failedTtlMinutes,
         attempt,
-        maxAttempts
+        maxAttempts,
+        releaseAt: issue.metadata?.human_review_release_at
       });
       if (eligibility.eligible && eligibility.reason === "advanced_stall") {
         console.log(`[reconcile] advanced_stall: issue=${issue.id} stage=${issue.status}`);

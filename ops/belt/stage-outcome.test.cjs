@@ -49,6 +49,18 @@ test("stageEligibility: no outcome -> eligible; same hash -> not; changed hash -
   assert.equal((await so.stageEligibility(c, "i1", "Queue")).reason, "input_changed");
 });
 
+test("stageEligibility ignores a stale blocker after an operator release", async () => {
+  const prior = { outcome: "BLOCKED", blocked_on: "human", input_hash: "h1",
+    outcome_at: "2026-09-07T09:00:00Z" };
+  const c = fakeClient([[prior]]);
+  const result = await so.stageEligibility(c, "i1", "Queue", {
+    releaseAt: "2026-09-07T09:13:00Z"
+  });
+  assert.equal(result.eligible, true);
+  assert.equal(result.reason, "operator_release_epoch");
+  assert.equal(c.calls.length, 1);
+});
+
 test("recordStageOutcomes upserts one row per unrecorded completion", async () => {
   const c = fakeClient([[{ id: "t1", issue_id: "i1", stage: "In Review", output: "OUTCOME: ADVANCED" }], [{ input_hash: "h" }], []]);
   const r = await so.recordStageOutcomes(c, { logger: { log() {} } });
