@@ -9,20 +9,169 @@ const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/C
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
 const UNSTARTED = ["queued", "dispatched", "waiting_local_directory", "deferred"];
 const ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1), hashtext('build'))";
+const ROLLUP_TERMINAL = new Set(["Done", "Cancelled", "Archived"]);
 
-// A rollup (an issue that still has a non-terminal child) is dispositioned by
-// its children, not by a builder of its own. A leaf dispatches whether or not it
-// has a parent: bundling children under a MEGA starved them permanently.
-const OPEN_CHILD_SQL = `NOT EXISTS (SELECT 1 FROM issue c
-   WHERE c.parent_issue_id = i.id AND c.status NOT IN ('Done', 'Archived', 'Cancelled'))`;
+// A rollup is always dispositioned by its children, including after the last
+// child becomes terminal. Only an issue that has never had children is a leaf.
+const LEAF_SQL = "NOT EXISTS (SELECT 1 FROM issue c WHERE c.parent_issue_id = i.id)";
 
 function issueCandidatesSql() {
   return `SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata, i.qc_fail_count
-            FROM issue i WHERE i.status = ANY($1::text[]) AND ${OPEN_CHILD_SQL} ORDER BY i.id`;
+            FROM issue i WHERE i.status = ANY($1::text[]) AND ${LEAF_SQL} ORDER BY i.id`;
 }
 
 function isLeafSql() {
-  return `SELECT ${OPEN_CHILD_SQL} AS is_leaf FROM issue i WHERE i.id = $1::uuid`;
+  return `SELECT ${LEAF_SQL} AS is_leaf FROM issue i WHERE i.id = $1::uuid`;
+}
+
+function rollupChildSnapshot(children) {
+  return children.map((child) => ({
+    id: child.id,
+    status: child.status,
+    task_status: child.latest_task_status || null
+  })).sort((a, b) => String(a.id).localeCompare(String(b.id)));
+}
+
+function classifyRollupChildren(children, cyclePath = null) {
+  const childStates = rollupChildSnapshot(children);
+  const open = childStates.filter((child) => !ROLLUP_TERMINAL.has(child.status));
+  const failed = open.filter((child) => child.status === "Rejected" ||
+    ["failed", "cancelled"].includes(child.task_status));
+  const counts = childStates.reduce((all, child) => {
+    all[child.status] = (all[child.status] || 0) + 1;
+    return all;
+  }, {});
+  if (cyclePath) return { state: "cycle", childStates, counts, open, failed, cyclePath };
+  if (open.length) return { state: "blocked", childStates, counts, open, failed };
+  const outcome = childStates.some((child) => child.status === "Done") ? "Done" : "Cancelled";
+  return { state: "ready", childStates, counts, open, failed, outcome };
+}
+
+function nextRollupDependency(previous = {}, classification) {
+  const material = { child_states: classification.childStates, state: classification.state,
+    cycle_path: classification.cyclePath || null };
+  const priorMaterial = { child_states: previous.child_states || [], state: previous.state || null,
+    cycle_path: previous.cycle_path || null };
+  const changed = JSON.stringify(material) !== JSON.stringify(priorMaterial);
+  const priorVersion = Number.isSafeInteger(Number(previous.version)) ? Number(previous.version) : 0;
+  return { ...material, version: changed ? priorVersion + 1 : Math.max(priorVersion, 1),
+    blocked_on_child_ids: classification.open.map((child) => child.id),
+    failed_child_ids: classification.failed.map((child) => child.id),
+    child_outcomes: classification.counts, outcome: classification.outcome || null,
+    outcome_policy: "done_if_any_done_else_cancelled", wakeup_owner: "reconciler",
+    retry_condition: classification.state === "ready" ? null : "child_state_change",
+    next_eligible_at: null };
+}
+
+async function rollupCyclePath(client, issueId) {
+  const result = await client.query(
+    `WITH RECURSIVE descendants(id, path, cycle) AS (
+       SELECT child.id, ARRAY[$1::uuid, child.id], child.id = $1::uuid
+         FROM issue child WHERE child.parent_issue_id = $1::uuid
+       UNION ALL
+       SELECT child.id, descendants.path || child.id, child.id = ANY(descendants.path)
+         FROM descendants JOIN issue child ON child.parent_issue_id = descendants.id
+        WHERE NOT descendants.cycle
+     ) SELECT path FROM descendants WHERE cycle LIMIT 1`, [issueId]);
+  return result.rows[0]?.path || null;
+}
+
+async function loadRollupChildren(client, issueId) {
+  const result = await client.query(
+    `SELECT child.id::text, child.status,
+            (SELECT task.status FROM agent_task_queue task
+              WHERE task.issue_id = child.id ORDER BY task.created_at DESC, task.id DESC LIMIT 1) latest_task_status
+       FROM issue child WHERE child.parent_issue_id = $1::uuid
+       ORDER BY child.id FOR SHARE OF child`, [issueId]);
+  return result.rows;
+}
+
+async function persistRollupBlock(client, issue, dependency) {
+  await client.query(
+    `UPDATE issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),
+        '{rollup_dependency}', $2::jsonb, true), updated_at = NOW()
+      WHERE id = $1::uuid`, [issue.id, JSON.stringify(dependency)]);
+  if (dependency.state === "cycle") await client.query(
+    `INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+     VALUES ($1::uuid, $2::uuid, 'system', 'rollup_dependency_cycle', $3::jsonb)`,
+    [issue.workspace_id, issue.id, JSON.stringify({ dependency_version: dependency.version,
+      cycle_path: dependency.cycle_path, wakeup_owner: dependency.wakeup_owner })]);
+}
+
+async function aggregateRollup(client, issue, dependency) {
+  const aggregated = { ...dependency, state: "aggregated", aggregated_version: dependency.version,
+    aggregated_at: new Date().toISOString(), next_eligible_at: new Date().toISOString() };
+  await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
+  const updated = await client.query(
+    `UPDATE issue SET status = $2,
+        metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{rollup_dependency}', $3::jsonb, true),
+        updated_at = NOW() WHERE id = $1::uuid AND status NOT IN ('Done','Cancelled','Archived') RETURNING id`,
+    [issue.id, dependency.outcome, JSON.stringify(aggregated)]);
+  if (updated.rows.length === 0) return { action: "unchanged" };
+  await client.query(`UPDATE relay_run_log SET status = 'completed',
+    parked_audit = COALESCE(parked_audit, '{}'::jsonb) || $2::jsonb
+    WHERE issue_id = $1::uuid AND status = 'pending'`, [issue.id, JSON.stringify({
+    reason: "rollup_aggregated", dependency_version: dependency.version, outcome: dependency.outcome })]);
+  await client.query(`INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
+    VALUES ($1::uuid, $2, $3, 'completed', $4::jsonb)`,
+  [issue.id, issue.status, dependency.outcome, JSON.stringify({ reason: "rollup_aggregated",
+    dependency_version: dependency.version, child_outcomes: dependency.child_outcomes })]);
+  await client.query(`INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+    VALUES ($1::uuid, $2::uuid, 'system', 'rollup_aggregated', $3::jsonb)`,
+  [issue.workspace_id, issue.id, JSON.stringify({ dependency_version: dependency.version,
+    outcome: dependency.outcome, child_outcomes: dependency.child_outcomes })]);
+  return { action: "aggregated", outcome: dependency.outcome, version: dependency.version };
+}
+
+async function reconcileRollupDependency(client, issueId) {
+  await client.query("BEGIN");
+  try {
+    const locked = await client.query(`SELECT id, workspace_id, status, metadata FROM issue
+      WHERE id = $1::uuid FOR UPDATE`, [issueId]);
+    const issue = locked.rows[0];
+    if (!issue || ROLLUP_TERMINAL.has(issue.status)) {
+      await client.query("COMMIT");
+      return { action: "unchanged" };
+    }
+    const children = await loadRollupChildren(client, issue.id);
+    if (!children.length) {
+      await client.query("COMMIT");
+      return { action: "unchanged" };
+    }
+    const dependency = nextRollupDependency(issue.metadata?.rollup_dependency,
+      classifyRollupChildren(children, await rollupCyclePath(client, issue.id)));
+    const previous = issue.metadata?.rollup_dependency || {};
+    if (dependency.state === "ready") {
+      const result = await aggregateRollup(client, issue, dependency);
+      await client.query("COMMIT");
+      return result;
+    }
+    if (dependency.version !== previous.version || dependency.state !== previous.state) {
+      await persistRollupBlock(client, issue, dependency);
+    }
+    await client.query("COMMIT");
+    return { action: dependency.state, version: dependency.version };
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  }
+}
+
+async function reconcileRollupDependencies(client) {
+  const parents = await client.query(`SELECT parent.id FROM issue parent
+    WHERE parent.status NOT IN ('Done','Cancelled','Archived')
+      AND EXISTS (SELECT 1 FROM issue child WHERE child.parent_issue_id = parent.id)
+    ORDER BY parent.id`);
+  const results = [];
+  for (const parent of parents.rows) {
+    try {
+      results.push(await reconcileRollupDependency(client, parent.id));
+    } catch (error) {
+      results.push({ action: "error", issueId: parent.id, message: error.message });
+      console.error(`[reconcile] rollup dependency error issue=${parent.id} ${error.message}`);
+    }
+  }
+  return results;
 }
 
 function liveTasksSql() {
@@ -313,7 +462,7 @@ async function reconcileIssue(client, issueId, options = {}) {
     const leaf = (await client.query(isLeafSql(), [issue.id])).rows[0];
     if (!leaf || leaf.is_leaf === false) {
       await client.query("COMMIT");
-      return { action: "skipped", reason: "rollup_has_open_children" };
+      return { action: "skipped", reason: "rollup_dependency_owned" };
     }
     if (options.skipStages.has(issue.status)) {
       // Operator-disabled stage (e.g. Spec handled off-belt). No task, no state change.
@@ -513,6 +662,7 @@ async function reconcileIssue(client, issueId, options = {}) {
 
 async function reconcileCycle(client, options = {}) {
   const settings = settingsFor({ ...options, budget: { created: 0, humanReview: 0, byAgent: new Map() } });
+  await reconcileRollupDependencies(client);
   const rows = (await client.query(issueCandidatesSql(), [[...DISPATCHABLE]])).rows;
   const counts = { created: 0, skipped: 0, humanReview: 0, alreadyLive: 0, error: 0 };
   const results = [];
@@ -544,4 +694,8 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql,
+  rollupChildSnapshot, classifyRollupChildren, nextRollupDependency, reconcileRollupDependency,
+  reconcileRollupDependencies, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql,
+  taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest,
+  mergedPullRequestNoop, reconcileIssue, reconcileCycle };

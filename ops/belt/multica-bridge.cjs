@@ -22,6 +22,7 @@ const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvide
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
+const { classifyRollupChildren, nextRollupDependency } = require("./reconciler.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -1084,37 +1085,40 @@ async function recordTransitionAudit(client, issue, {
 
 async function openChildAdmission(client, issue) {
   const children = await client.query(
-    `SELECT (to_jsonb(child)->>'number')::int AS number
+    `SELECT child.id::text, child.status, (to_jsonb(child)->>'number')::int AS number,
+            (SELECT latest_task.status FROM agent_task_queue AS latest_task
+              WHERE latest_task.issue_id = child.id
+              ORDER BY latest_task.created_at DESC, latest_task.id DESC LIMIT 1) latest_task_status
        FROM "issue" child
       WHERE child.parent_issue_id = $1
-        AND child.status NOT IN ('Done', 'Cancelled', 'Archived')
-      ORDER BY (to_jsonb(child)->>'number')::int NULLS LAST`,
+      ORDER BY child.id`,
     [issue.id]
   );
-  const childNumbers = children.rows.map((row) => Number(row.number));
-  if (childNumbers.length === 0) return { ok: true, childNumbers: [] };
-
-  const recent = await client.query(
-    `SELECT 1 FROM activity_log
-      WHERE issue_id = $1
-        AND action = 'relay_admission_skipped'
-        AND details->>'reason' = 'rollup_has_open_children'
-        AND created_at >= NOW() - INTERVAL '1 hour'
-      LIMIT 1`,
-    [issue.id]
-  );
-  const auditWritten = recent.rows.length === 0;
+  if (children.rows.length === 0) return { ok: true, childNumbers: [] };
+  const classification = classifyRollupChildren(children.rows);
+  const previous = issue.metadata?.rollup_dependency || {};
+  const dependency = nextRollupDependency(previous, classification);
+  if (dependency.state === 'ready') dependency.next_eligible_at = new Date().toISOString();
+  const childNumbers = children.rows.filter((row) => !['Done', 'Cancelled', 'Archived'].includes(row.status))
+    .map((row) => Number(row.number));
+  const auditWritten = dependency.version !== previous.version || dependency.state !== previous.state;
   if (auditWritten) {
     await client.query(
+      `UPDATE issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb),
+          '{rollup_dependency}', $2::jsonb, true), updated_at = NOW() WHERE id = $1::uuid`,
+      [issue.id, JSON.stringify(dependency)]
+    );
+    await client.query(
       `INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
-       VALUES ($1::uuid, $2::uuid, 'system', 'relay_admission_skipped', $3::jsonb)`,
+       VALUES ($1::uuid, $2::uuid, 'system', 'relay_accepted_deferred', $3::jsonb)`,
       [issue.workspace_id, issue.id, JSON.stringify({
-        reason: 'rollup_has_open_children', child_numbers: childNumbers,
-        timestamp: new Date().toISOString()
+        reason: 'rollup_dependency_wait', dependency_version: dependency.version,
+        blocked_on_child_ids: dependency.blocked_on_child_ids,
+        retry_condition: dependency.retry_condition || 'rollup_aggregation'
       })]
     );
   }
-  return { ok: false, childNumbers, auditWritten };
+  return { ok: false, childNumbers, auditWritten, dependency };
 }
 
 function isCicdReturn(fromStage, toStage, reason) {
@@ -2701,23 +2705,30 @@ async function relayAdvance(req, res, body) {
         throw new Error(`no-artifact re-scope authorization already consumed: ${issue.id}`);
       }
 
-      // Keep the database trigger as the last leaf-rule defence, but refuse
-      // before mutating the rollup or attempting a queue insert.
+      // Keep the database trigger as the last leaf-rule defence. A rollup is
+      // accepted as a durable dependency wait; the reconciler owns its wake.
       const rollupAdmission = await openChildAdmission(client, issue);
       if (!rollupAdmission.ok) {
         await client.query('COMMIT');
         if (rollupAdmission.auditWritten) {
           console.info(JSON.stringify({
-            event: 'relay_admission_skipped', reason: 'rollup_has_open_children',
-            issue_id: issue.id, child_numbers: rollupAdmission.childNumbers
+            event: 'relay_advance_deferred', reason: 'rollup_dependency_wait',
+            issue_id: issue.id, dependency_version: rollupAdmission.dependency.version
           }));
         }
-        res.writeHead(202, { 'Content-Type': 'application/json', 'Retry-After': '3600' });
+        res.writeHead(202, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
-          error: 'rollup_has_open_children',
-          message: 'rollup waits for its children; no stage change or task was created',
+          disposition: 'accepted_deferred',
+          error: 'rollup_dependency_wait',
+          message: 'the reconciler owns this rollup; no stage change or task was created',
           child_numbers: rollupAdmission.childNumbers,
-          retry_after_seconds: 3600
+          blocked_on_child_ids: rollupAdmission.dependency.blocked_on_child_ids,
+          dependency_version: rollupAdmission.dependency.version,
+          next_eligible_at: rollupAdmission.dependency.next_eligible_at,
+          retry_condition: {
+            type: rollupAdmission.dependency.retry_condition || 'rollup_aggregation',
+            after_version: rollupAdmission.dependency.version
+          }
         }));
         return;
       }

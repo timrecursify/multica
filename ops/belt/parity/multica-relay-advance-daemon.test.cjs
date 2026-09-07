@@ -6,7 +6,8 @@ const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
-  readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition } = require('./multica-relay-advance-daemon.cjs');
+  readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, classifyRelayResponse,
+  holdRelayLogDeferred } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
@@ -1083,6 +1084,57 @@ test('completed-task advance scans the 100-row head-of-line hold window', () => 
   const advance = source.slice(source.indexOf('async function findAndAdvanceTasks'),
     source.indexOf('async function recoveryAdvanceTasks'));
   assert.match(advance, /ORDER BY rrl\.created_at ASC\s+LIMIT 100/);
+});
+
+test('relay responses distinguish accepted-deferred, refused, and failed', () => {
+  const versionWait = classifyRelayResponse(202, {}, {
+    error: 'rollup_dependency_wait',
+    retry_condition: { type: 'child_state_change', after_version: 7 }
+  });
+  assert.equal(versionWait.classification, 'accepted-deferred');
+  assert.deepEqual(versionWait.retryCondition, { type: 'child_state_change', after_version: 7 });
+  assert.equal(versionWait.nextEligibleAt, null);
+
+  const timed = classifyRelayResponse(202, { 'retry-after': '15' }, {}, '', () => 0);
+  assert.equal(timed.nextEligibleAt, '1970-01-01T00:00:15.000Z');
+  assert.deepEqual(timed.retryCondition, { type: 'after_seconds', seconds: 15 });
+  assert.equal(classifyRelayResponse(409).refused, true);
+  assert.equal(classifyRelayResponse(503).failed, true);
+  assert.equal(classifyRelayResponse(201).ok, true);
+});
+
+test('accepted-deferred receipts remain pending with their retry condition', async () => {
+  const calls = [];
+  await holdRelayLogDeferred({ query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rows: [] };
+  } }, 'log-1', classifyRelayResponse(202, {}, {
+    error: 'rollup_dependency_wait',
+    retry_condition: { type: 'child_state_change', after_version: 3 }
+  }));
+  assert.match(calls[0].sql, /parked_audit/);
+  assert.match(calls[0].sql, /status = 'pending'/);
+  const receipt = JSON.parse(calls[0].values[1]);
+  assert.equal(receipt.classification, 'accepted-deferred');
+  assert.equal(receipt.retry_condition.after_version, 3);
+});
+
+test('every parent advance selector excludes issues with children', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  for (const [start, end] of [
+    ['async function enqueuePassWithoutRelayRows', 'async function advanceTick'],
+    ['async function findAndAdvanceTasks', 'async function recoveryAdvanceTasks'],
+    ['async function recoveryAdvanceTasks', 'function classifyRelayResponse'],
+    ['async function findAndAdvanceRegistered', '// A task killed by the fleet']
+  ]) {
+    const selection = source.slice(source.indexOf(start), source.indexOf(end));
+    assert.match(selection, /NOT EXISTS \(SELECT 1 FROM issue child WHERE child\.parent_issue_id = i\.id\)/);
+  }
+  const advance = source.slice(source.indexOf('async function findAndAdvanceTasks'),
+    source.indexOf('async function recoveryAdvanceTasks'));
+  assert.match(advance, /relay_deferred/);
+  assert.match(advance, /next_eligible_at/);
+  assert.match(advance, /after_version/);
 });
 
 test('manual gated completions close their relay ledger without an automatic transition', () => {
