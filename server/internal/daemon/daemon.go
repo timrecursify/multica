@@ -4818,6 +4818,12 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// is reference-counted, so the duplicate marks runTask installs are
 	// correctly nested within these.
 	predictedEnvRoot := execenv.PredictRootDir(d.cfg.WorkspacesRoot, task.WorkspaceID, task.ID)
+	// Reclaim daemon-owned task environments once this handler reaches any
+	// terminal return. The cleanup defer is registered before the active-root
+	// guards below, so those guards are released first.
+	defer func() {
+		d.cleanupCompletedTaskEnv(task, predictedEnvRoot, taskLog)
+	}()
 	if predictedEnvRoot != "" {
 		d.markActiveEnvRoot(predictedEnvRoot)
 		defer d.unmarkActiveEnvRoot(predictedEnvRoot)
@@ -4936,6 +4942,29 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 				taskLog.Warn("write gc meta failed (non-fatal)", "error", err)
 			}
 		}
+	}
+}
+
+// cleanupCompletedTaskEnv removes only a proven daemon-managed environment.
+// It is best-effort and intentionally non-fatal: the terminal callback has
+// already settled the task when this runs.
+func (d *Daemon) cleanupCompletedTaskEnv(task Task, envRoot string, logger *slog.Logger) {
+	if envRoot == "" {
+		return
+	}
+	if assignment, _ := localDirectoryAssignmentForTask(task, d.cfg.DaemonID); assignment != nil {
+		return
+	}
+	if _, err := execenv.ReadManagedEnvProvenance(envRoot); err != nil {
+		return
+	}
+	release, ok := d.reserveEnvRootForGC(envRoot)
+	if !ok {
+		return
+	}
+	defer release()
+	if err := os.RemoveAll(envRoot); err != nil {
+		logger.Warn("terminal task environment cleanup failed", "path", envRoot, "error", err)
 	}
 }
 
