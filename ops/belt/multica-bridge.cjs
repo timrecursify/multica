@@ -22,6 +22,7 @@ const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvide
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
+const { evaluate: evaluateTransitionPolicy } = require("./transition-policy.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -1040,13 +1041,34 @@ function rejectInvalidRelayTransition(res, fromStage, toStage) {
 // updating the issue, when a read would naturally see the destination stage
 // and turn a committed transition into a false `transition_denied` response.
 function admitConfiguredTransition({ fromStage, toStage, expectedStage, altStages = [],
-  exceptional = false }) {
+  exceptional = false, actor, evidence = {} }) {
   const allowed = [expectedStage, ...altStages].filter(Boolean);
+  const configured = exceptional || allowed.includes(toStage);
+  // Cancellation is the policy boundary being added here. Other bridge routes
+  // already have route-specific authentication and evidence gates; applying
+  // the whole canonical matrix a second time would reject legacy operator
+  // recoveries and would change which existing guard explains a refusal.
+  const policy = !configured
+    ? { ok: false, code: 'transition_denied' }
+    : toStage !== 'Cancelled'
+      ? { ok: true }
+      : evaluateTransitionPolicy({ from: fromStage, to: toStage, actor, evidence });
   return {
     fromStage,
     toStage,
-    ok: exceptional || allowed.includes(toStage)
+    ok: configured && policy.ok,
+    ...(policy.ok ? {} : { code: policy.code })
   };
+}
+
+function transitionPolicyActor({ requestedActor, authenticatedOperator = false,
+  archiverRequest = false, operatorRequest = false, fromStage, toStage }) {
+  if (archiverRequest) return 'archiver';
+  if (requestedActor === 'operator') return authenticatedOperator ? 'operator' : null;
+  if (operatorRequest) return 'operator';
+  if (requestedActor) return requestedActor;
+  return fromStage === 'Spec' || (fromStage === 'In Progress' && toStage === 'In Review')
+    ? 'worker' : 'system';
 }
 
 // Every committed relay transition gets one compact, secret-free audit event.
@@ -2042,6 +2064,9 @@ async function relayAdvance(req, res, body) {
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
     const operatorCapBypass = explicitTerminalExit || explicitOperatorRelease ||
       explicitOperatorCapRelease || explicitOperatorRecovery;
+    const authenticatedOperator = !OPERATOR_SECRET_DISABLED &&
+      typeof RELAY_OPERATOR_SECRET === "string" && RELAY_OPERATOR_SECRET.length > 0 &&
+      (req.headers || {})["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
 
 
     // Check the durable gate before the same-stage/idempotency fast path. A
@@ -2287,11 +2312,36 @@ async function relayAdvance(req, res, body) {
     // which additionally requires the newest verdict to be a PASS. Excluding
     // that candidate here keeps the operator marker from bypassing it.
     const operatorTerminalExitAdmission = explicitTerminalExit && !rejectedPassCandidate;
+    const requestedPolicyActor = typeof body.actor === 'string' ? body.actor : null;
+    const policyActor = transitionPolicyActor({ requestedActor: requestedPolicyActor,
+      authenticatedOperator, archiverRequest,
+      operatorRequest: explicitOperatorRelease || explicitTerminalExit,
+      fromStage: issue.status, toStage: to_stage });
+    const policyEvidence = {
+      ...(body.evidence && typeof body.evidence === 'object' ? body.evidence : {}),
+      ...(typeof reason === 'string' ? { reason } : {}),
+      ...(to_stage === 'Cancelled' && authenticatedOperator ? { boardOwnerAuthority: true } : {}),
+      ...(issue.status === 'In Progress' && to_stage === 'In Review' ? {
+        reviewRequiredRoute: true, pr: issue.metadata?.pr_url, boundSha: issue.metadata?.bound_sha
+      } : {}),
+      ...(issue.status === 'In Review' && to_stage === 'In Progress' ? {
+        implementationFail: true, retryRemaining: true
+      } : {}),
+      ...(issue.status === 'In Review' && to_stage === 'CI/CD & Deploy' &&
+          typeof current_work_product_md5 === 'string' && current_work_product_md5 ? {
+        qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: true
+      } : {}),
+      ...(issue.status === 'CI/CD & Deploy' && to_stage === 'Parked' ? {
+        retry_escalation: parkedAudit?.trigger || parkedAudit?.cicd_worker?.reason || reason
+      } : {})
+    };
     const transitionAdmission = admitConfiguredTransition({
       fromStage: issue.status,
       toStage: to_stage,
       expectedStage,
       altStages,
+      actor: policyActor,
+      evidence: policyEvidence,
       exceptional: retryEscalation || parkedRelease || parkedEvidenceQcRelease ||
         parkedDiagnosisDone || noArtifactRescope || evidenceTransition ||
         rejectedPassTerminalExit || operatorTerminalExitAdmission ||
@@ -3212,6 +3262,7 @@ module.exports = {
   relayAdvance,
   writeJsonResponse,
   admitConfiguredTransition,
+  transitionPolicyActor,
   relayOperatorRespec,
   operatorRespec,
   setTestClientFactory(factory) { testClientFactory = factory; },

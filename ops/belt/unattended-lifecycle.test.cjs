@@ -76,7 +76,7 @@ function waitOn(harness, blockerOwner) {
 
 function advance(harness, toStage, actor, evidence) {
   const endpoint = admitConfiguredTransition({
-    fromStage: harness.stage, toStage, expectedStage: toStage
+    fromStage: harness.stage, toStage, expectedStage: toStage, actor, evidence
   });
   assert.equal(endpoint.ok, true, `${harness.stage} -> ${toStage} endpoint admission`);
   const verdict = evaluate({ from: harness.stage, to: toStage, actor, evidence });
