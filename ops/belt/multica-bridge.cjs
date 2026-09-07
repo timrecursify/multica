@@ -1900,7 +1900,8 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
-    if (explicitOperatorReleaseRequested && !explicitOperatorRelease) {
+    if (explicitOperatorReleaseRequested && !explicitOperatorRelease &&
+        (issue.status !== "Parked" || issue.metadata?.parked_release_once === true)) {
       await client.query("ROLLBACK");
       res.writeHead(403, { "Content-Type": "application/json" });
       res.end(JSON.stringify({
@@ -1949,9 +1950,7 @@ async function relayAdvance(req, res, body) {
     const parkedDiagnosisDone = issue.status === "Parked" && to_stage === "Done";
     // No reconciler/retry/outcome path may leave Parked. Only explicit
     // operator release or diagnosis admissions are exceptions.
-    const parkedOperatorRelease = issue.status === 'Parked' &&
-      !OPERATOR_SECRET_DISABLED && req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET &&
-      typeof reason === 'string' && reason.trim() !== '';
+    const parkedOperatorRelease = issue.status === 'Parked' && explicitOperatorRelease;
     const parkedSystemExit = issue.status === 'Parked' &&
       (parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone);
     if (issue.status === 'Parked' && to_stage !== 'Parked' &&
@@ -1960,7 +1959,10 @@ async function relayAdvance(req, res, body) {
         [issue.workspace_id, issue.id, JSON.stringify({ from_stage: 'Parked', to_stage, reason: 'parked_hold' })]);
       await client.query('COMMIT');
       res.writeHead(409, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'parked_hold', message: 'Parked issues require explicit operator release or diagnosis' }));
+      res.end(JSON.stringify({
+        error: explicitOperatorReleaseRequested ? 'parked_release_required' : 'parked_hold',
+        message: 'Parked issues require explicit operator release or diagnosis'
+      }));
       return;
     }
     // A deploy worker return is a bounded change-of-hands, not another blind
@@ -2088,7 +2090,7 @@ async function relayAdvance(req, res, body) {
       altStages,
       exceptional: retryEscalation || parkedRelease || parkedEvidenceQcRelease ||
         parkedDiagnosisDone || noArtifactRescope || evidenceTransition ||
-        rejectedPassTerminalExit || dispositionStages.has(to_stage)
+        rejectedPassTerminalExit || explicitOperatorRelease || dispositionStages.has(to_stage)
     });
     if (!transitionAdmission.ok) {
       await client.query("ROLLBACK");
@@ -2096,7 +2098,8 @@ async function relayAdvance(req, res, body) {
       return;
     }
     if (issue.status === "Parked" && to_stage !== "Parked" &&
-        !(parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone || explicitTerminalExit)) {
+        !(parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone ||
+          explicitOperatorRelease || explicitTerminalExit)) {
       await client.query("ROLLBACK");
       console.warn(JSON.stringify({
         event: "relay_parked_skipped", reason: "parked_hold",
