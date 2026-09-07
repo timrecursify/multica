@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-readonly BELT_CANONICAL_WORKSPACES_ROOT="/var/lib/gsp/multica/workspaces"
+# The gsp desk gate (/usr/local/bin/codex) admits a codex invocation only when
+# its resolved cwd is under "$HOME/dev/".  The belt worker runs as gsp-multica
+# with HOME=/var/lib/gsp-multica (gsp-multica-worker.service ->
+# /etc/gsp/multica/daemon.env), so every per-ticket workdir must live under
+# /var/lib/gsp-multica/dev or the gate refuses the desk with exit 77 and the
+# ticket dead-ends in Human Review.  The gate resolves the cwd with `pwd -P`,
+# so a symlink from the old root does NOT satisfy it: the workspaces have to
+# physically live here.  Do not move this back under /var/lib/gsp.
+readonly BELT_CANONICAL_WORKSPACES_ROOT="/var/lib/gsp-multica/dev/workspaces"
 readonly BELT_WORKSPACE_UUIDS=("da3c5c5c-a123-4567-b999-c3ed1820da00" "f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f")
 workspace_root_resolve() {
   local configured="${MULTICA_DAEMON_WORKSPACES_ROOT-${MULTICA_WORKSPACES_ROOT-$BELT_CANONICAL_WORKSPACES_ROOT}}"
