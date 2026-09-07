@@ -10,9 +10,10 @@
 #   runtime_root  deployment root (production: /opt/gsp/multica-workers)
 #
 # Layout is measured from the running box, where the belt services run out of
-# /opt/gsp/multica-workers/<service>/. Ten files are deployed to more than one
+# /opt/gsp/multica-workers/<service>/. Nine files are deployed to more than one
 # service directory; transition-policy.cjs goes to three. Duplicate source rows
-# are intentional -- every apply/backup/rollback loop iterates by index.
+# are intentional where a file is required by multiple runtimes; the bridge is
+# canonical in gsp-multica-bridge only.
 #
 # The wrapper sources belt-concurrency.sh and workspace-root.sh by absolute
 # path, so a runtime missing either cannot start at all. They belong here for
@@ -24,7 +25,6 @@
 # MODULE_NOT_FOUND at daemon start, not a deploy error.
 
 declare -a sources=(
-  "$root_dir/multica-bridge.cjs"
   "$root_dir/multica-bridge.cjs"
   "$root_dir/guardrails.cjs"
   "$root_dir/guardrails.cjs"
@@ -67,7 +67,6 @@ declare -a sources=(
 
 declare -a targets=(
   "$runtime_root/gsp-multica-bridge/multica-bridge.cjs"
-  "$runtime_root/multica-relay-advance/app/multica-bridge.cjs"
   "$runtime_root/gsp-multica-bridge/guardrails.cjs"
   "$runtime_root/multica-relay-advance/app/guardrails.cjs"
   "$runtime_root/gsp-multica-bridge/parked-diagnosis.cjs"
