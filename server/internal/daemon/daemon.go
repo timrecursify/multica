@@ -324,6 +324,12 @@ type Daemon struct {
 	skillCache *SkillBundleCache
 	logger     *slog.Logger
 
+	// repoCacheRoot is the directory repoCache actually writes bare mirrors
+	// into. The GC needs it because the mirrors are no longer guaranteed to
+	// sit under WorkspacesRoot. Empty means the historic
+	// <WorkspacesRoot>/.repos location.
+	repoCacheRoot string
+
 	mu           sync.Mutex
 	workspaces   map[string]*workspaceState
 	runtimeIndex map[string]Runtime // runtimeID -> Runtime for provider lookups
@@ -575,7 +581,10 @@ type profileLaunchSpec struct {
 
 // New creates a new Daemon instance.
 func New(cfg Config, logger *slog.Logger) *Daemon {
-	cacheRoot := filepath.Join(cfg.WorkspacesRoot, ".repos")
+	cacheRoot := cfg.RepoMirrorsRoot
+	if strings.TrimSpace(cacheRoot) == "" {
+		cacheRoot = filepath.Join(cfg.WorkspacesRoot, ".repos")
+	}
 	skillCacheRoot := filepath.Join(cfg.WorkspacesRoot, ".skill-cache", "v1")
 	client := NewClient(cfg.ServerBaseURL)
 	// Tag every daemon HTTP request with the daemon's CLI version so the
@@ -585,6 +594,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		cfg:                       cfg,
 		client:                    client,
 		repoCache:                 repocache.New(cacheRoot, logger),
+		repoCacheRoot:             cacheRoot,
 		skillCache:                NewSkillBundleCache(skillCacheRoot),
 		logger:                    logger,
 		workspaces:                make(map[string]*workspaceState),
