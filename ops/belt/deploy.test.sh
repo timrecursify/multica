@@ -20,7 +20,8 @@ trap 'rm -rf -- "$tmp_dir"' EXIT
 # systemctl from this fixture's PATH.
 fake_bin="$tmp_dir/bin"
 fake_state="$tmp_dir/systemd"
-mkdir -p -- "$fake_bin" "$fake_state"
+fake_proc="$tmp_dir/proc"
+mkdir -p -- "$fake_bin" "$fake_state" "$fake_proc"
 printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -Eeuo pipefail' \
@@ -37,13 +38,24 @@ printf '%s\n' \
   'case "$command_name" in' \
   '  show)' \
   '    if [[ " $* " == *" --value "* ]]; then printf "%s\\n" "$pid"' \
-  '    else printf "MainPID=%s\\nSubState=%s\\nActiveEnterTimestamp=%s\\n" "$pid" "$substate" "$entered"; fi ;;' \
+  '    elif [[ " $* " == *" ActiveState "* && -e "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.health-fail" ]]; then' \
+  '      printf "MainPID=%s\\nActiveState=failed\\nSubState=%s\\n" "$pid" "$substate"' \
+  '    else printf "MainPID=%s\\nActiveState=%s\\nSubState=%s\\nActiveEnterTimestamp=%s\\n" "$pid" "$active" "$substate" "$entered"; fi ;;' \
   '  is-active) [[ "$active" == active ]] ;;' \
   '  restart)' \
   '    if [[ -e "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.fail" ]]; then' \
   '      printf "0|failed|failed|n/a\\n" > "$state_file"; exit 0' \
   '    fi' \
   '    new_pid=$((pid + 100))' \
+  '    case "$unit" in' \
+  '      gsp-multica-bridge) executable=/usr/bin/node; entrypoint="$BELT_DEPLOY_RUNTIME_ROOT/gsp-multica-bridge/multica-bridge.cjs" ;;' \
+  '      multica-relay-advance) executable=/usr/bin/node; entrypoint="$BELT_DEPLOY_RUNTIME_ROOT/multica-relay-advance/app/parity/multica-relay-advance-launcher.cjs" ;;' \
+  '      multica-cicd-worker) executable=/usr/bin/node; entrypoint="$BELT_DEPLOY_RUNTIME_ROOT/multica-cicd-worker/multica-cicd-worker.cjs" ;;' \
+  '      multica-archiver) executable=/usr/bin/node; entrypoint="$BELT_DEPLOY_RUNTIME_ROOT/multica-archiver/multica-archiver.cjs" ;;' \
+  '      gsp-multica-worker|gsp-multica-worker-ppp) executable=/bin/bash; entrypoint="$BELT_DEPLOY_RUNTIME_ROOT/gsp-multica-worker/multica-daemon-wrapper.sh" ;;' \
+  '    esac' \
+  '    mkdir -p -- "$BELT_DEPLOY_PROC_ROOT/$new_pid"' \
+  '    printf "%s\\0%s\\0" "$executable" "$entrypoint" > "$BELT_DEPLOY_PROC_ROOT/$new_pid/cmdline"' \
   '    printf "%s|active|running|Mon 2026-09-07 14:00:00 UTC\\n" "$new_pid" > "$state_file"' \
   '    printf "%s|%s|%s\\n" "$unit" "$pid" "$new_pid" >> "$BELT_DEPLOY_SYSTEMCTL_STATE/restarts.log" ;;' \
   '  *) exit 2 ;;' \
@@ -54,9 +66,15 @@ printf '%s\n' \
 chmod +x -- "$fake_bin/sudo" "$fake_bin/systemctl" "$fake_bin/journalctl"
 export PATH="$fake_bin:$PATH"
 export BELT_DEPLOY_SYSTEMCTL_STATE="$fake_state"
+export BELT_DEPLOY_PROC_ROOT="$fake_proc"
+receipt_root="$tmp_dir/receipts"
+source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
+export MULTICA_RECEIPT_ROOT="$receipt_root"
+fake_pid=1000
 for unit in multica-relay-advance gsp-multica-worker gsp-multica-worker-ppp \
   multica-cicd-worker multica-archiver gsp-multica-bridge; do
-  printf '1000|active|running|Mon 2026-09-07 13:30:00 UTC\n' > "$fake_state/$unit.state"
+  printf '%s|active|running|Mon 2026-09-07 13:30:00 UTC\n' "$fake_pid" > "$fake_state/$unit.state"
+  fake_pid=$((fake_pid + 1000))
 done
 
 # Expectations come from the canonical manifest, never a second copy of it.
@@ -140,8 +158,8 @@ rm -f -- "$worker_dir/multica-daemon-wrapper.sh"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-daemon-wrapper.sh >"$tmp_dir/missing-wrapper.log"
 cmp -s -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
 grep -q "Copied .*/multica-daemon-wrapper.sh to $worker_dir/multica-daemon-wrapper.sh" "$tmp_dir/missing-wrapper.log"
-grep -q '^Restarted gsp-multica-worker: 1000 -> 1100 ' "$tmp_dir/missing-wrapper.log"
-grep -q '^Restarted gsp-multica-worker-ppp: 1000 -> 1100 ' "$tmp_dir/missing-wrapper.log"
+grep -q '^Restarted gsp-multica-worker: 2000 -> 2100 ' "$tmp_dir/missing-wrapper.log"
+grep -q '^Restarted gsp-multica-worker-ppp: 3000 -> 3100 ' "$tmp_dir/missing-wrapper.log"
 
 # Remove a dependency from a disposable manifest copy. Validation must fail
 # before copy, proving the deploy cannot restart with an incomplete runtime.
@@ -203,21 +221,26 @@ fi
 [[ "$(grep -c '^Backed up ' "$tmp_dir/selective.log")" -eq 1 ]]
 selective_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-cicd-worker$/\1/p' "$tmp_dir/selective.log")"
 [[ "$selective_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
-node -e 'const r=require(process.argv[1]);if(r.restarted_units.length!==1||r.restarted_units[0].unit!=="multica-cicd-worker"||r.restarted_units[0].pid<=0)process.exit(1)' \
-  "$tmp_dir/gsp-multica/deploy-receipts/belt-$selective_receipt.json"
+activation_receipt="$receipt_root/timrecursify/multica/gsp-belt/$source_sha.json"
+node -e 'const r=require(process.argv[1]),s=process.argv[2],a=Date.parse(r.activation?.activated_at),h=Date.parse(r.health?.checked_at);if(r.schema_version!==1||r.repository!=="timrecursify/multica"||r.target!=="gsp-belt"||r.deployment_owner!=="ops/belt/deploy.sh"||r.source_sha!==s||r.activation?.status!=="activated"||r.activation?.process_sha!==s||r.activation?.release!==`git:timrecursify/multica@${s}`||!Number.isFinite(a)||!Number.isFinite(h)||h<a||r.health?.status!=="ok"||r.health?.probe!=="systemd-active-mainpid-runtime-parity-v1")process.exit(1)' \
+  "$activation_receipt" "$source_sha"
+grep -q "^Receipt: $activation_receipt$" "$tmp_dir/selective.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$selective_receipt" --only multica-cicd-worker >/dev/null
 
 # A no-op apply and an explicit copy-only apply must restart nothing.
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-bridge.cjs > "$tmp_dir/noop.log"
+noop_receipt_root="$tmp_dir/noop-receipts"
+MULTICA_RECEIPT_ROOT="$noop_receipt_root" BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
+  "$root_dir/deploy.sh" --apply --only multica-bridge.cjs > "$tmp_dir/noop.log"
 grep -q '^No processes were restarted.$' "$tmp_dir/noop.log"
-noop_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-bridge.cjs$/\1/p' "$tmp_dir/noop.log")"
-node -e 'const r=require(process.argv[1]);if(r.restarted_units.length!==0)process.exit(1)' \
-  "$tmp_dir/gsp-multica/deploy-receipts/belt-$noop_receipt.json"
+[[ ! -e "$noop_receipt_root/timrecursify/multica/gsp-belt/$source_sha.json" ]]
 restart_count="$(wc -l < "$fake_state/restarts.log")"
 printf '\nstale-runtime\n' >> "$tmp_dir/multica-archiver/multica-archiver.cjs"
-BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --no-restart --only multica-archiver > "$tmp_dir/no-restart.log"
+no_restart_receipt_root="$tmp_dir/no-restart-receipts"
+MULTICA_RECEIPT_ROOT="$no_restart_receipt_root" BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
+  "$root_dir/deploy.sh" --apply --no-restart --only multica-archiver > "$tmp_dir/no-restart.log"
 [[ "$restart_count" -eq "$(wc -l < "$fake_state/restarts.log")" ]]
 grep -q '^Restarts disabled (--no-restart).$' "$tmp_dir/no-restart.log"
+[[ ! -e "$no_restart_receipt_root/timrecursify/multica/gsp-belt/$source_sha.json" ]]
 
 # A missing nested directory below an existing canonical service root is
 # created by selective deployment.
@@ -242,6 +265,20 @@ if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only mult
   exit 1
 fi
 grep -q 'Wrapper preflight: source/runtime parity mismatch (wrapper not selected)' "$tmp_dir/wrapper-selective.log"
+
+# A successful restart is not enough: a failed named health probe must refuse
+# the receipt even when the post-copy runtime still matches the source.
+cp -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
+printf '\nstale-runtime\n' >> "$cicd_dir/multica-cicd-worker.cjs"
+: > "$fake_state/multica-cicd-worker.health-fail"
+health_fail_receipt_root="$tmp_dir/health-fail-receipts"
+if MULTICA_RECEIPT_ROOT="$health_fail_receipt_root" BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
+   "$root_dir/deploy.sh" --apply --only multica-cicd-worker > "$tmp_dir/health-fail.log" 2>&1; then
+  echo 'expected failed health probe to fail deployment' >&2
+  exit 1
+fi
+grep -q '^Health probe systemd-active-mainpid-runtime-parity-v1 failed: multica-cicd-worker ' "$tmp_dir/health-fail.log"
+[[ ! -e "$health_fail_receipt_root/timrecursify/multica/gsp-belt/$source_sha.json" ]]
 
 # A restart command that exits zero can still leave the service failed. The
 # deploy must reject that state and include journal evidence.
