@@ -37,7 +37,24 @@ health() {
 }
 require_graph() { local tree="$1" src dep rel; for src in "${manifest[@]}"; do [[ "$src" == *.cjs ]] || continue; while IFS= read -r dep; do [[ "$dep" == ./* || "$dep" == ../* ]] || continue; rel="$(realpath -m --relative-to="$tree" "$tree/$(dirname "$src")/$dep")"; [[ -f "$tree/$rel" ]] || rel+='.cjs'; [[ -f "$tree/$rel" ]] || { echo "Missing manifest runtime dependency: $src requires $rel" >&2; return 65; }; done < <(grep -oE "require\\([[:space:]]*[\"'][^\"']+[\"'][[:space:]]*\\)" "$tree/$src" | sed -E "s/^require\\([[:space:]]*[\"']([^\"']+)[\"'][[:space:]]*\\)$/\\1/"); done; }
 manifest_checksum() { local tree="$1"; (cd "$tree" && sha256sum "${manifest[@]}" | sha256sum | awk '{print $1}'); }
-preflight() { local tree="$1"; [[ -x "$tree/ops/belt/build-daemon-artifact.sh" ]] || { echo 'required belt files missing' >&2; exit 65; }; for file in "${manifest[@]}"; do [[ -f "$tree/$file" ]] || { echo "missing release manifest file: $file" >&2; exit 65; }; done; require_graph "$tree"; node -e 'const fs=require("fs");const s=fs.readFileSync(process.argv[1],"utf8");if((s.match(/script:/g)||[]).length!==6 || !s.includes("multica-relay-advance-wrapper.sh"))process.exit(1)' "$tree/ops/belt/ecosystem.gsp-belt.config.js"; }
+preflight() { local tree="$1"; [[ -x "$tree/ops/belt/build-daemon-artifact.sh" ]] || { echo 'required belt files missing' >&2; exit 65; }; for file in "${manifest[@]}"; do [[ -f "$tree/$file" ]] || { echo "missing release manifest file: $file" >&2; exit 65; }; done; require_graph "$tree"; 
+  TREE="$tree" node <<'NODE' || { echo 'release ecosystem/app integrity check failed' >&2; exit 65; }
+const fs=require('fs'), path=require('path');
+const tree=process.env.TREE, file=path.join(tree,'ops/belt/ecosystem.gsp-belt.config.js');
+const source=fs.readFileSync(file,'utf8');
+const required={
+  'gsp-multica-worker':'ops/belt/multica-daemon-wrapper.sh',
+  'multica-relay-advance':'ops/gsp-belt/relay/multica-relay-advance-wrapper.sh',
+  'multica-cicd-worker':'ops/belt/multica-cicd-worker.cjs',
+  'multica-archiver':'ops/belt/multica-archiver.cjs'
+};
+for(const [name,rel] of Object.entries(required)) {
+  if(!source.includes("name: '"+name+"'")) throw new Error('ecosystem missing required app: '+name);
+  if(!fs.existsSync(path.join(tree,rel))) throw new Error('release missing required app entrypoint: '+rel);
+}
+if((source.match(/script:/g)||[]).length!==6) throw new Error('ecosystem must declare six apps');
+NODE
+}
 if [[ "$mode" == --rollback ]]; then
   [[ -f "$ecosystem" ]] || { echo "release missing: $release" >&2; exit 66; }
   MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env
