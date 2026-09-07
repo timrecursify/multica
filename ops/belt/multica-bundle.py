@@ -9,20 +9,27 @@ leaving it open gives a worker two competing canonical tickets. Neither is
 acceptable, so the content moves first and the archive is conditional on proof
 that it moved.
 
-The proof is a substring check per child against the MEGA description that was
-actually read back from the database after the write. A child is archived only
-when its own content is demonstrably present in its parent. Nothing is deleted:
-the child keeps its row, its thread and its number, takes the terminal
+The proof is an exact comparison against the MEGA description that was actually
+read back from the database after the write. Children are archived only when
+the complete value matches. Nothing is deleted: the child keeps its row, its
+thread and its number, takes the terminal
 'Archived' status the archiver already uses, and records where it went in
 metadata.bundled_into so the move is reversible.
 
 Idempotent: a child already folded in with an unchanged content hash is skipped,
 so a crashed or re-run scoper never doubles a MEGA description.
 """
-import hashlib, json, subprocess, sys, argparse
+import argparse
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
 
-DSN = ['docker', 'exec', '-i', 'gsp-multica-v2-postgres-1',
-       'psql', '-U', 'gsp_multica', '-d', 'gsp_multica']
+# Existing belt services use this root:gsp-multica environment file.
+DATABASE_ENV_FILE = '/etc/gsp/multica/remote-bridge.env'
+PSQL = ['/usr/bin/psql', '-X', '-w']
 MARK = '## Bundled work (this MEGA is the only unit of work)'
 PREAMBLE = (
     'Each section below is a ticket folded into this MEGA. Those tickets are\n'
@@ -30,11 +37,58 @@ PREAMBLE = (
     'Deliver every section as one change set against one shared root cause.\n')
 
 
+def database_url():
+    value = os.environ.get('DATABASE_URL')
+    if value:
+        return value
+    path = os.environ.get('GSP_BELT_SECRETS_ENV_FILE', DATABASE_ENV_FILE)
+    try:
+        with open(path, encoding='utf-8') as env_file:
+            for raw_line in env_file:
+                if raw_line.startswith('DATABASE_URL='):
+                    value = raw_line.split('=', 1)[1].strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+                        value = value[1:-1]
+                    if value:
+                        return value
+    except OSError as exc:
+        raise RuntimeError('database environment is not readable') from exc
+    raise RuntimeError('DATABASE_URL is missing from the database environment')
+
+
+def postgres_env():
+    try:
+        parsed = urllib.parse.urlsplit(database_url())
+        port = parsed.port or 5432
+        user = urllib.parse.unquote(parsed.username or '')
+        password = urllib.parse.unquote(parsed.password or '')
+        database = urllib.parse.unquote(parsed.path.lstrip('/'))
+    except ValueError as exc:
+        raise RuntimeError('DATABASE_URL is invalid') from exc
+    if parsed.scheme not in ('postgres', 'postgresql') or not all(
+            (parsed.hostname, user, password, database)):
+        raise RuntimeError('DATABASE_URL is incomplete')
+    child_env = os.environ.copy()
+    for key in ('DATABASE_URL', 'PGHOST', 'PGPORT', 'PGDATABASE', 'PGUSER',
+                'PGPASSWORD', 'PGPASSFILE', 'PGSERVICE', 'PGSERVICEFILE', 'PGSSLMODE'):
+        child_env.pop(key, None)
+    child_env.update(PGHOST=parsed.hostname, PGPORT=str(port), PGDATABASE=database,
+                     PGUSER=user, PGPASSWORD=password)
+    sslmode = urllib.parse.parse_qs(parsed.query).get('sslmode', [])
+    if sslmode:
+        child_env['PGSSLMODE'] = sslmode[0]
+    return child_env
+
+
 def q(sql, rows=True):
     # SQL goes in on stdin, never as argv: a folded MEGA description reaches
     # six figures of bytes and `-c` died with E2BIG (Argument list too long).
-    r = subprocess.run(DSN + (['-At', '-f', '-'] if rows else ['-q', '-f', '-']),
-                       input=sql, capture_output=True, text=True)
+    try:
+        env = postgres_env()
+    except RuntimeError as exc:
+        sys.exit('psql configuration failed: ' + str(exc))
+    args = PSQL + (['-At', '-f', '-'] if rows else ['-q', '-f', '-'])
+    r = subprocess.run(args, input=sql, capture_output=True, text=True, env=env)
     if r.returncode:
         sys.exit('psql failed: ' + r.stderr.strip()[:400])
     return r.stdout
@@ -149,16 +203,16 @@ def main():
           % (lit(newd), m['mega_id']), rows=False)
         # Read back what the database actually holds. A write that silently
         # truncated must not be allowed to authorise an archive.
-        live = q("SELECT description FROM issue WHERE id='%s'" % m['mega_id'])
+        live = json.loads(q("SELECT to_json(description) FROM issue WHERE id='%s'"
+                            % m['mega_id']))
+        if live != newd:
+            print('BLOCKED MEGA #%s: description read-back mismatch after write'
+                  % m['mega_number'])
+            blocked += len(todo)
+            continue
         folded += 1
 
         for c, h in todo:
-            blk = child_block(c)
-            if blk not in live:
-                print('BLOCKED #%s: content not present in MEGA #%s after write'
-                      % (c['number'], m['mega_number']))
-                blocked += 1
-                continue
             prov = json.dumps({'bundled_into': m['mega_number'],
                                'bundled_into_id': m['mega_id'],
                                'content_md5': h, 'bundled_by': 'multica-bundle'})
