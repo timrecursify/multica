@@ -576,6 +576,9 @@ func TestTaskMulticaEnvironmentIncludesPrivateConfigRoot(t *testing.T) {
 		"TMPDIR":                       "/task/tmp",
 		"TMP":                          "/task/tmp",
 		"TEMP":                         "/task/tmp",
+		"MULTICA_CODE_REVIEW_GRAPH_VENV": "/task/private-multica-config/shared-cache/code-review-graph/2.3.8",
+		"PNPM_HOME": "/task/private-multica-config/shared-cache/pnpm",
+		"PNPM_STORE_DIR": "/task/private-multica-config/shared-cache/pnpm/store",
 	}
 	if !maps.Equal(env, want) {
 		t.Fatalf("taskMulticaEnvironment() = %#v, want %#v", env, want)
