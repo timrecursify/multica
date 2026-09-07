@@ -1864,6 +1864,25 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(res.status, 403); assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
       assert.equal((await admin.query(`SELECT count(*)::int AS n FROM "${schema}".agent_task_queue WHERE issue_id = $1`, [issueId])).rows[0].n, 0);
     });
+    await t.test('authenticated operator release admits Parked to the requested stage', async () => {
+      const issueId = '57555555-5555-5555-5555-555555555555';
+      await insertIssue(issueId, 'Parked');
+      const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true,
+        reason: 'approved Parked release' }, { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`,
+        [issueId])).rows[0].status, 'Queue');
+    });
+    await t.test('Parked operator release without the secret remains held', async () => {
+      const issueId = '58555555-5555-5555-5555-555555555555';
+      await insertIssue(issueId, 'Parked');
+      const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true,
+        reason: 'uncredentialed Parked release' });
+      assert.equal(res.status, 409);
+      assert.equal(JSON.parse(res.body).error, 'parked_release_required');
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`,
+        [issueId])).rows[0].status, 'Parked');
+    });
     await t.test('requires retry escalation source evidence without the marker', async () => {
       const issueId = '66666666-6666-6666-6666-666666666666'; await insertIssue(issueId);
       await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context) VALUES
