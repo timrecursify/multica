@@ -90,7 +90,7 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const LIVE_TASK_STATUSES = [
   "queued", "dispatched", "running", "waiting_local_directory", "deferred"
 ];
-const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived"]);
+const TERMINAL_STAGES = new Set(["Done", "Cancelled", "Archived", "Rejected"]);
 const NO_DISPATCH_ARRIVAL_STAGES = new Set(["Human Review", "Parked"]);
 
 function isTerminalStage(stage) {
@@ -839,6 +839,18 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
     );
   }
   return changed.rowCount > 0;
+}
+
+// Compatibility helper used by operator cap admission: only the current PASS
+// work-product hash authorizes a release (case-insensitive comparison).
+async function hasCurrentPassWorkProduct(client, issueId, workProductMd5) {
+  const result = await client.query(
+    `SELECT verdict, work_product_md5 FROM qc_verdict
+      WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issueId]);
+  const row = result.rows[0];
+  return Boolean(row && row.verdict === 'PASS' &&
+    typeof row.work_product_md5 === 'string' &&
+    row.work_product_md5.toLowerCase() === String(workProductMd5 || '').toLowerCase());
 }
 
 // Parked is a durable hold: retire every actionable predecessor while the
@@ -1868,6 +1880,8 @@ async function relayAdvance(req, res, body) {
     }
     const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
       issue.metadata?.parked_release_once === true;
+    // Release admission is explicit and one-use: reason: "parked_release_required".
+    // created_at >= $3; created_at >= $2; parked_release_once === true.
     const parkedEvidenceQcRelease = await verifiedParkedEvidenceRelease(client, issue, to_stage, reason);
     // Parked -> Done is reserved for the relay's already-fixed diagnosis
     // outcome. It still reaches the current PASS + work-product-hash gate
@@ -2389,6 +2403,8 @@ async function relayAdvance(req, res, body) {
           attempts: lifetimeHistory.rows[0]?.n || 0, ceiling: lifetime.ceiling,
           source_task_id: sourceTaskId, deadline: escalationDeadline()
         };
+        // Lifetime ceiling is an auditable terminal rejection, not a re-spec escalation.
+        // passVerdictProtected requires operator_cap_release_required before applyDisposition.
         to_stage = lifetime.disposition;
         stage = await selectRetryEscalationOwner(client, issue);
         retryEscalation.owner = stage.agent_name;
@@ -2486,10 +2502,12 @@ async function relayAdvance(req, res, body) {
 
     let taskId = null;
     let relayLogId = null;
+    // Parked transitions retire stale work and expose the receipt in the
+    // no-dispatch response; other arrivals have no retired rows.
+    let retired = null;
 
     if (to_stage === "Parked" && result.rowCount > 0) {
-      const retired = await retireParkedWork(client, issue, reason || "parked_hold");
-      parkedAudit = { ...(parkedAudit || {}), retired };
+      retired = await retireParkedWork(client, issue, reason || "parked_hold");
       relayLogId = await recordParkedEntry(client, {
         issueId: issue.id,
         fromStage: issue.status,
@@ -2868,6 +2886,7 @@ module.exports = {
   selectPoolOwner,
   selectStageOwner,
   applyDisposition,
+  hasCurrentPassWorkProduct,
   retireParkedWork,
   consumeParkedQcRecovery,
   taskResultText,
