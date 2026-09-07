@@ -207,6 +207,7 @@ test('no linked PR completion routes directly to Done and never In Review', () =
   assert.match(route, /FROM issue_pull_request/);
   assert.match(route, /FROM comment/);
   assert.match(route, /kind: 'no_pr', toStage: 'Done'/);
+  assert.match(route, /kind: 'no_pr_noop', toStage: 'Parked', reason: 'completed_spec_noop'/);
   assert.doesNotMatch(route.slice(0, route.indexOf("kind: 'no_pr'")), /toStage: 'In Review'/);
 });
 
@@ -283,23 +284,24 @@ test('green open non-runtime PR advances from review to CI/CD without daemon mer
   assert.equal(calls[0][1], 'view');
 });
 
-test('red open non-runtime PR remains held before CI/CD', async () => {
+test('red open non-runtime PR routes to Human Review with evidence', async () => {
   const route = await buildCompletionRoute(linkedPrClient(), {
     issue_id: 'issue-1', to_stage: 'In Review', next_stage: 'CI/CD & Deploy'
   }, { githubCommand: () => JSON.stringify({ state: 'OPEN', files: [{ path: 'web/app.ts' }],
     headRefOid: 'e'.repeat(40), mergeStateStatus: 'CLEAN',
     statusCheckRollup: [{ conclusion: 'FAILURE' }] }) });
-  assert.equal(route.toStage, null);
+  assert.equal(route.toStage, 'Human Review');
+  assert.equal(route.kind, 'ci_blocked');
+  assert.match(route.evidence, /ci=red_or_absent/);
   assert.equal(route.reason, 'non_runtime_pr_not_merged');
 });
 
-test('non-green completion route enters the existing respec path', () => {
+test('409 relay refusals are memoized by issue state and PR head', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  const start = source.indexOf('const route = await buildCompletionRoute(client, row);');
-  const routeHold = source.slice(start, source.indexOf('const targetStage', start));
-  assert.match(routeHold, /requestRetryEscalation\(row, route\.reason\)/);
-  assert.match(routeHold, /markRelayLogFailedById\(client, row\.log_id\)/);
-  assert.doesNotMatch(routeHold, /PENDING:/);
+  assert.match(source, /const relayRefusalMemo = new Map\(\)/);
+  assert.match(source, /row\.issue_updated_at.*route\?\.boundSha/s);
+  assert.match(source, /relayRefusalMemo\.get\(row\.issue_id\) === refusalFingerprint/);
+  assert.match(source, /response\.status === 409.*relayRefusalMemo\.set/s);
 });
 
 async function noPrDoneEvidence(noShaComment) {

@@ -39,6 +39,7 @@ const RECONCILE_INTERVAL_MS = 30000;
 const QC_GATE_PENDING_RECHECK_MS = Number.parseInt(process.env.QC_GATE_PENDING_RECHECK_MS || '300000', 10);
 const QC_GATE_GH_COOLDOWN_MS = Number.parseInt(process.env.QC_GATE_GH_COOLDOWN_MS || '600000', 10);
 const qcGatePending = new Map();
+const relayRefusalMemo = new Map();
 let qcGateGhCooldownUntil = 0;
 let lastCooldownLog = 0;
 function scheduleEvery(fn, ms, label) {
@@ -315,6 +316,10 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
     return { reviewRequiredRoute: route?.kind || 'review', pr: route?.pr_url || pointer,
       boundSha: route?.boundSha || pointer };
   }
+  if (row.to_stage === 'In Progress' && targetStage === 'Human Review') {
+    return { blockerEvidence: route?.evidence || pointer,
+      retryEscalationTaskId: row.task_id };
+  }
   if (row.to_stage === 'In Progress' && targetStage === 'Done') {
     const resultText = typeof row.task_result === 'string' ? row.task_result : JSON.stringify(row.task_result || '');
     return { noDeployRoute: route?.kind || 'no_pr',
@@ -367,8 +372,17 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   const commentMatch = commentPr?.rows
     .map(({ content }) => String(content || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i))
     .find(Boolean);
-  // Coordination and parent issues without a linked PR close from their work product.
-  if (!linked.rows[0] && !commentMatch) return { kind: 'no_pr', toStage: 'Done' };
+  // A completed NO_OP has no deployable artifact. Park it instead of asking
+  // the bridge to admit an independently checked NO-SHA Done transition.
+  if (!linked.rows[0] && !commentMatch) {
+    const outcome = await client.query(
+      `SELECT content FROM task_message WHERE task_id = $1::uuid ORDER BY seq DESC LIMIT 1`,
+      [row.task_id]);
+    if (/^OUTCOME:\s*(?:NO_OP|ALREADY_IMPLEMENTED)\b/im.test(String(outcome.rows[0]?.content || ''))) {
+      return { kind: 'no_pr_noop', toStage: 'Parked', reason: 'completed_spec_noop' };
+    }
+    return { kind: 'no_pr', toStage: 'Done' };
+  }
   const issuePr = linked.rows[0];
   const repo = issuePr
     ? `${issuePr.repo_owner}/${issuePr.repo_name}`
@@ -391,6 +405,11 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
       greenChecks(pr.statusCheckRollup)) {
     return { ...route, toStage: qcHandoff ? 'CI/CD & Deploy' : 'In Review',
       kind: 'merge_only_ready', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
+  }
+  if (route.reason === 'non_runtime_pr_not_merged') {
+    return { ...route, toStage: 'Human Review', kind: 'ci_blocked', repo,
+      pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid,
+      evidence: `pr=${prUrl} head=${pr.headRefOid || 'absent'} ci=red_or_absent` };
   }
   return { ...route, repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
 }
@@ -1067,7 +1086,7 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
     // daemon outage delays an advance instead of stranding it forever.
     const evidenceSql = completedTaskEvidenceSql({ taskAlias: 'atq', issueAlias: 'i', modelParam: 2, effortParam: 3 });
     const query = `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id,
-             ${evidenceSql.columns}, rrl.to_stage, rsc.next_stage
+             ${evidenceSql.columns}, rrl.to_stage, rsc.next_stage, i.updated_at AS issue_updated_at
       FROM agent_task_queue atq
       INNER JOIN relay_run_log rrl ON rrl.task_id = atq.id AND rrl.status = $1
       INNER JOIN issue i ON atq.issue_id = i.id
@@ -1175,6 +1194,9 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
           continue;
         }
         const targetStage = route?.toStage || row.next_stage;
+        const refusalFingerprint = [targetStage, route?.reason || '', row.issue_updated_at || '',
+          route?.boundSha || ''].join(':');
+        if (relayRefusalMemo.get(row.issue_id) === refusalFingerprint) continue;
         const payload = { issue_id: row.issue_id, to_stage: targetStage,
           agent_token: RELAY_AGENT_SECRET,
           relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
@@ -1200,7 +1222,8 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
           // The relay's own error text was parsed and then discarded, so 76 of every
           // 400 log lines were a bare `status 409` with no cause. Print the reason.
           logger.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
-          await markRelayLogFailedById(client, row.log_id);
+          if (response.status === 409) relayRefusalMemo.set(row.issue_id, refusalFingerprint);
+          else await markRelayLogFailedById(client, row.log_id);
         }
       } catch (err) {
         logger.error(`${LOG_PREFIX} Error: ${err.message}`);
