@@ -600,7 +600,7 @@ function completedTaskEvidenceSql({ taskAlias, issueAlias, modelParam, effortPar
                   ON evidence_agent.id = evidence_task.agent_id
                  AND evidence_agent.workspace_id = ${issueAlias}.workspace_id
          WHERE evidence_task.issue_id = ${taskAlias}.issue_id
-           AND evidence_task.agent_id = verdict.checker_id
+           AND evidence_task.agent_id = attempt.checker_id
            AND evidence_task.status = 'completed'
            AND COALESCE(evidence_agent.model,
                         evidence_agent.runtime_config->>'model') = ANY($${modelParam}::text[])
