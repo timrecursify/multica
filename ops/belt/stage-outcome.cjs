@@ -300,7 +300,11 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
   }
   const ttl = Number(failedTtlMinutes);
   const outcomeAt = Date.parse(prior.outcome_at);
-  if (prior.outcome === "FAILED" && Number.isFinite(ttl) && ttl > 0 && Number.isFinite(outcomeAt) &&
+  // A human blocker is terminal, not a transient builder failure.  Let the
+  // reconciler route it to Human Review instead of reopening it after the
+  // generic failure TTL and reaching build admission first.
+  if (prior.outcome === "FAILED" && prior.blocked_on !== "human" &&
+      Number.isFinite(ttl) && ttl > 0 && Number.isFinite(outcomeAt) &&
       Number(now) - outcomeAt >= ttl * 60 * 1000) {
     return { eligible: true, reason: "failed_ttl_expired", prior };
   }
