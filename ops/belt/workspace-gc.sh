@@ -9,6 +9,26 @@ limit="${WORKSPACE_GC_BATCH_LIMIT:-200}"
 [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 && "$limit" -le 200 ]] || exit 64
 if [[ "${KEEP_WORKDIR:-}" == 1 ]]; then printf 'total\t0\t0\n'; exit 0; fi
 
+declare -A busy_tasks=()
+proc_root=/proc
+if [[ "${BELT_TEST_MODE:-}" == 1 && -n "${WORKSPACE_GC_PROC_ROOT:-}" ]]; then
+  proc_root="$WORKSPACE_GC_PROC_ROOT"
+fi
+for proc in "$proc_root"/[0-9]*; do
+  [[ -d "$proc" ]] || continue
+  for target in "$proc/cwd" "$proc"/fd/*; do
+    [[ -e "$target" || -L "$target" ]] || continue
+    path="$(readlink -f -- "$target" 2>/dev/null || :)"
+    [[ "$path" == "$root"/* ]] || continue
+    rel="${path#"$root"/}"
+    workspace_id="${rel%%/*}"
+    rest="${rel#*/}"
+    task_prefix="${rest%%/*}"
+    [[ "$workspace_id" != "$rel" && -n "$rest" ]] || continue
+    busy_tasks["$workspace_id/$task_prefix"]=1
+  done
+done
+
 descriptor_stream() {
   if [[ -n "${WORKSPACE_GC_DESCRIPTOR_FILE:-}" ]]; then
     [[ "${BELT_TEST_MODE:-}" == 1 ]] || exit 64
@@ -41,6 +61,8 @@ while IFS=$'\t' read -r task_id status completed_at issue_id work_dir; do
   [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
   meta="$task_dir/.gc_meta.json"
   [[ -f "$meta" && "$(jq -r '.task_id // empty' "$meta")" == "$task_id" && "$(jq -r '.issue_id // empty' "$meta")" == "$issue_id" ]] || continue
+  workspace_id="${task_dir#"$root"/}"; workspace_id="${workspace_id%%/*}"
+  [[ -z "${busy_tasks[$workspace_id/$prefix]+x}" ]] || continue
   safe=1
   for checkout in "$work_dir" "$work_dir"/*; do
     [[ -d "$checkout/.git" || -f "$checkout/.git" ]] || continue
