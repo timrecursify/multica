@@ -28,6 +28,7 @@ grep -q "$task" "$fixture/docker.args"
 grep -q 'WITH disk_task(id) AS (VALUES' "$fixture/docker.args"
 ! grep -q ':batch_limit' "$fixture/docker.args"
 grep -q 'skipped_missing_meta=1' "$fixture/disk.err"
+[[ "$(tr -cd '(' < "$fixture/docker.args" | wc -c)" == "$(tr -cd ')' < "$fixture/docker.args" | wc -c)" ]]
 
 sleep 30 < "$gcroot/$workspace/${task:0:8}/workdir/tracked" & busy_pid=$!
 busy_out="$(BELT_TEST_MODE=1 BELT_WORKSPACES_ROOT_OVERRIDE="$gcroot" WORKSPACE_GC_DESCRIPTOR_FILE="$fixture/descriptors" "$dir/workspace-gc.sh")"
