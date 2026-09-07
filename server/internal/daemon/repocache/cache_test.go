@@ -1433,6 +1433,27 @@ func TestGitFetchRefreshesOriginHeadAfterDefaultChange(t *testing.T) {
 	}
 }
 
+// TestGitFetchRejectsShallowCache ensures shallow bare repositories fail
+// explicitly instead of allowing an isolated checkout to fail later with
+// the opaque "reference is not a tree" error.
+func TestGitFetchRejectsShallowCache(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cacheRoot := t.TempDir()
+	cache := New(cacheRoot, testLogger())
+	if err := cache.Sync("ws-shallow", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	barePath := cache.Lookup("ws-shallow", sourceRepo)
+	if err := os.WriteFile(filepath.Join(barePath, "shallow"), []byte("deadbeef\n"), 0o644); err != nil {
+		t.Fatalf("mark cache shallow: %v", err)
+	}
+	err := gitFetch(barePath)
+	if err == nil || !strings.Contains(err.Error(), "shallow repository cache") {
+		t.Fatalf("gitFetch error = %v, want explicit shallow repository cache error", err)
+	}
+}
+
 // TestGetRemoteDefaultBranchUsesBareHeadHintForCustomDefault verifies step 3
 // of the resolver: when the cache has a non-standard default branch name
 // (trunk, develop, …) and `git remote set-head origin --auto` didn't
