@@ -505,7 +505,9 @@ async function reconcileCycle(client, options = {}) {
       result = await reconcileIssue(client, issue.id, settings);
     } catch (error) {
       result = { action: "error", issueId: issue.id, message: error.message };
-      console.error(`Reconcile issue error: issue=${issue.id} status=${issue.status} ${error.message}`);
+      console.error(
+        `Reconcile issue error: issue=${issue.id} status=${issue.status} ${error.message}`,
+      );
     }
     results.push(result);
     if (result.action === "created") counts.created += 1;
