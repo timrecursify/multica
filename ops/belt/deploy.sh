@@ -30,12 +30,12 @@ if [[ -n "$source_commit" && ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'Invalid source commit: %s\n' "$source_commit" >&2
   exit 2
 fi
-actual_commit="$(git -C "$root_dir/../.." rev-parse HEAD 2>/dev/null || true)"
-[[ "$actual_commit" =~ ^[0-9a-f]{40}$ ]] || { printf 'Unable to resolve checkout source commit\n' >&2; exit 2; }
+source_sha=""
 if [[ -n "$source_commit" ]]; then
+  actual_commit="$(git -C "$root_dir/../.." rev-parse HEAD 2>/dev/null || true)"
   [[ "$actual_commit" == "$source_commit" ]] || { printf 'Source commit mismatch: checkout=%s requested=%s\n' "$actual_commit" "$source_commit" >&2; exit 2; }
+  source_sha="$actual_commit"
 fi
-source_sha="$actual_commit"
 
 if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
   printf 'Invalid rollback timestamp: %s\n' "$rollback_timestamp" >&2
@@ -340,6 +340,11 @@ done
 
 if (( invalid )); then
   exit 1
+fi
+
+if [[ "$mode" == apply && -z "$source_sha" ]]; then
+  source_sha="$(git -C "$root_dir/../.." rev-parse HEAD 2>/dev/null || true)"
+  [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || { printf 'Unable to resolve checkout source commit\n' >&2; exit 2; }
 fi
 
 if [[ "$mode" == rollback ]]; then
