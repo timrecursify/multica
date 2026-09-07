@@ -42,8 +42,9 @@ let pool;
 let relayToken;
 let readReceipt = (repo, target, sha) =>
   JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/${repo}/${target}/${sha}.json`, 'utf8'));
-let readChangedPaths = async (repo, number) => {
-  const files = JSON.parse(await gh(['api', `repos/${repo}/pulls/${number}/files?per_page=100`]));
+let readChangedPaths = async (repo, number, sha) => {
+  const files = JSON.parse(await gh(['api', `repos/${repo}/pulls/${number}/files?per_page=100`],
+    { cacheKey: sha ? `${repo}@${sha}:pr-files` : `${repo}:pr:${number}:files` }));
   if (!Array.isArray(files) || files.length >= 100) throw new Error('changed path manifest unavailable or truncated');
   return files.flatMap(file => [file.filename, file.previous_filename]).filter(Boolean);
 };
@@ -71,10 +72,11 @@ const repoMergeLocks = new Map();
 // path; main CI validates after the merge.
 const RETRO_REPOS = new Set((process.env.CICD_RETROACTIVE_REPOS || '').split(',').map(s => s.trim()).filter(Boolean));
 const RISK_PATH = /(^|\/)(migrations?|drizzle)\/|\.env|secret|credential|auth|billing\/.*flag|feature-flag|\.github\/workflows\//i;
-async function retroactiveEligible(repo, num) {
+async function retroactiveEligible(repo, num, sha) {
   if (!RETRO_REPOS.has(repo)) return { ok: false, why: 'repo not retroactive' };
   try {
-    const files = JSON.parse(await gh(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]));
+    const files = JSON.parse(await gh(['api', `repos/${repo}/pulls/${num}/files?per_page=100`],
+      { cacheKey: sha ? `${repo}@${sha}:pr-files` : `${repo}:pr:${num}:files` }));
     const risky = files.map(f => f.filename).filter(f => RISK_PATH.test(f));
     if (risky.length) return { ok: false, why: `risk path ${risky[0]}` };
     return { ok: true, why: `${files.length} files, no risk path` };
@@ -172,8 +174,8 @@ async function executeGithub(args) {
     throw e;
   }
 }
-let gh = async function github(args) {
-  const key = githubReadKey(args);
+let gh = async function github(args, { cacheKey } = {}) {
+  const key = cacheKey || githubReadKey(args);
   if (!key) return executeGithub(args);
   const hits = githubReadCache.stats.hits + githubReadCache.stats.inFlightHits;
   const value = await githubReadCache.get(key, () => executeGithub(args));
@@ -351,7 +353,8 @@ function receiptSummary(receipt) {
 
 async function changedPathManifest(repo, pr) {
   try {
-    const paths = Array.isArray(pr?.changedPaths) ? pr.changedPaths : await readChangedPaths(repo, pr?.num);
+    const paths = Array.isArray(pr?.changedPaths) ? pr.changedPaths
+      : await readChangedPaths(repo, pr?.num, pr?.headSha || pr?.headRefOid);
     if (!paths.length || paths.some(path => typeof path !== 'string' || !path)) {
       throw new Error('changed path manifest is empty or invalid');
     }
@@ -604,7 +607,7 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   // Re-check that authorization here, then continue to the deploy-evidence
   // gate; CI queue state alone must not strand an already deployed ticket.
   const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && pr.num != null
-    ? await retroactiveEligible(pr.repo, pr.num) : null;
+    ? await retroactiveEligible(pr.repo, pr.num, pr.headSha || mergedSha) : null;
   // A merged PR with no checks or only cancelled checks is already terminal:
   // retroactive eligibility authorizes a merge, but cannot veto one that
   // happened. Keep the risk-path veto for pending, pre-merge authorization.
@@ -893,7 +896,7 @@ async function sweep() {
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
         const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && info.mergeable !== 'CONFLICTING'
-          ? await retroactiveEligible(pr.repo, pr.num) : null;
+          ? await retroactiveEligible(pr.repo, pr.num, info.headRefOid) : null;
         if (!retro || !retro.ok) {
           const count = failures ? ` poll=${failures}/${CI_FAILURE_POLLS}` : '';
           log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci}${count}${retro ? ` retro=${retro.why}` : ''}`);
