@@ -46,6 +46,9 @@ test "$OBSERVED_SHA" = "$BOUND_SHA"
 WORK_PRODUCT_MD5="$(git -C "$CHECKOUT" ls-tree -r --full-tree "$BOUND_SHA" | LC_ALL=C sort | md5sum | cut -d' ' -f1)"
 FAILURE_CLASS=none; QUALIFYING=true
 # For a defect: FAILURE_CLASS=implementation; QUALIFYING=false.
+# Every FAIL must name its defect: set REWORK_SUMMARY to a path:line or a
+# failing check. It rides the marker as `rework_summary` and the bridge
+# rejects a FAIL that is generic, empty, or marked QUALIFYING=true.
 # For an unavailable prerequisite: FAILURE_CLASS=evidence|tool|access;
 # QUALIFYING=false; BLOCKED_REASON='actionable reason'
 IDEM_KEY="qc-${NUMBER}-${BOUND_SHA}-${VERDICT}"
@@ -59,14 +62,17 @@ fi
 QC_EVIDENCE_JSON="$(jq -cn --arg verdict "$VERDICT" --arg work_product_md5 "$WORK_PRODUCT_MD5" \
   --arg bound_sha "$BOUND_SHA" --arg observed_sha "$OBSERVED_SHA" \
   --arg failure_class "$FAILURE_CLASS" --arg model "$QC_MODEL" --arg effort "$QC_EFFORT" \
+  --arg rework_summary "$VERDICT_NOTES" \
   --argjson qualifying "$QUALIFYING" \
-  '{verdict:$verdict,work_product_md5:$work_product_md5,bound_sha:$bound_sha,observed_sha:$observed_sha,failure_class:$failure_class,qualifying:$qualifying,model:$model,effort:$effort}')"
+  '{verdict:$verdict,work_product_md5:$work_product_md5,bound_sha:$bound_sha,observed_sha:$observed_sha,failure_class:$failure_class,qualifying:$qualifying,model:$model,effort:$effort}
+   + (if $verdict == "FAIL" then {rework_summary:$rework_summary} else {} end)')"
 # Fail closed before submission if shell quoting or model edits changed the
 # marker contract. `qualifying` must remain a native JSON boolean.
 jq -e --arg sha "$BOUND_SHA" \
   '(.bound_sha|type)=="string" and (.observed_sha|type)=="string" and
    (.bound_sha|test("^[0-9a-f]{40}$";"i")) and .bound_sha == $sha and
-   .observed_sha == $sha and (.qualifying|type)=="boolean"' \
+   .observed_sha == $sha and (.qualifying|type)=="boolean" and
+   (.verdict != "FAIL" or ((.rework_summary|type)=="string" and (.rework_summary|length) >= 12 and .qualifying == false))' \
   <<<"$QC_EVIDENCE_JSON" >/dev/null || { echo 'BLOCKED: QC evidence self-check failed' >&2; exit 1; }
 printf 'QC_EVIDENCE_JSON=%s\n' "$QC_EVIDENCE_JSON"
 test -z "${BLOCKED_REASON:-}" || printf 'BLOCKED: %s\n' "$BLOCKED_REASON"

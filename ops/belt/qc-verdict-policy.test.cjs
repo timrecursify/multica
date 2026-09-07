@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const { validateQcVerdict } = require("./qc-verdict-policy.cjs");
+const { validateQcVerdict, validateEvidence } = require("./qc-verdict-policy.cjs");
 
 const sha = "a".repeat(40);
 const evidence = Object.freeze({ verdict: "PASS", work_product_md5: "b".repeat(32),
@@ -21,10 +21,39 @@ test("qualifying PASS derives binding from the authenticated Sol-low task", () =
     bound_sha: sha, model: "gpt-5.6-sol", effort: "low" });
 });
 
+const failEvidence = (overrides = {}) => ({ ...evidence, verdict: "FAIL",
+  failure_class: "implementation", qualifying: false,
+  rework_summary: "ops/belt/stage-routing.cjs:19 returns null toStage for a merged risk PR", ...overrides });
+
 test("implementation FAIL remains valid when task evidence matches", () => {
-  const fail = { ...evidence, verdict: "FAIL", failure_class: "implementation", qualifying: false };
+  const fail = failEvidence();
   const result = validateQcVerdict({ actor: worker, task: task({ result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(fail)}` } }), evidence: fail });
   assert.equal(result.ok, true);
+});
+
+test("a FAIL must name the defect it is rejecting", () => {
+  assert.equal(validateEvidence(failEvidence({ rework_summary: undefined })), "rework_summary_required");
+  assert.equal(validateEvidence(failEvidence({ rework_summary: "   " })), "rework_summary_required");
+  assert.equal(validateEvidence(failEvidence({ rework_summary: "implementation incomplete" })), "rework_summary_not_specific");
+  assert.equal(validateEvidence(failEvidence({ rework_summary: "failed QC" })), "rework_summary_not_specific");
+  assert.equal(validateEvidence(failEvidence({ rework_summary: "n/a" })), "rework_summary_not_specific");
+  assert.equal(validateEvidence(failEvidence()), null);
+});
+
+test("qualifying true is reserved for a PASS", () => {
+  assert.equal(validateEvidence(failEvidence({ qualifying: true })), "fail_must_not_qualify");
+  assert.equal(validateEvidence(evidence), null);
+});
+
+test("a PASS never needs a rework summary", () => {
+  assert.equal(validateEvidence({ ...evidence, rework_summary: undefined }), null);
+});
+
+test("the enforcement reaches the full verdict path, not just the validator", () => {
+  const fail = failEvidence({ rework_summary: "none" });
+  const result = validateQcVerdict({ actor: worker, task: task({ result: { output: `QC_EVIDENCE_JSON=${JSON.stringify(fail)}` } }), evidence: fail });
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "rework_summary_not_specific");
 });
 
 test("wrong SHA, non-Sol-low, stale attempt, and incomplete stage fail closed", () => {
