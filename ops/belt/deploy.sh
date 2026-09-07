@@ -136,14 +136,16 @@ done
 
 for index in "${!sources[@]}"; do
   selected "$index" || continue
-  # A missing target is allowed only when its service directory already
+  # A missing target is allowed only when its canonical service root already
   # exists. That is the real guard: it catches a wrong runtime root -- the
   # failure that shipped a manifest pointing at /var/lib/gsp/gsp-multica, a
   # tree absent on gsp -- while letting a genuinely new file be created. The
   # per-file allowlist this replaces had to be edited for every added file and
   # silently encoded the old layout.
   new_targets[$index]=0
-  [[ -d "$(dirname -- "${targets[$index]}")" ]] && new_targets[$index]=1
+  relative_target="${targets[$index]#"$runtime_root"/}"
+  service_root="$runtime_root/${relative_target%%/*}"
+  [[ -d "$service_root" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
     invalid=1
@@ -209,8 +211,16 @@ for index in "${!targets[@]}"; do
   backups[$index]="$backup_file"
   absence_markers[$index]="${backup_file}.absent"
   if [[ "$mode" == dry-run ]]; then
+    if [[ ! -d "$(dirname -- "$target_file")" ]]; then
+      printf 'Would create target directory %s\n' "$(dirname -- "$target_file")"
+    fi
     printf 'Would back up %s to %s\n' "$target_file" "$backup_file"
   else
+    target_parent="$(dirname -- "$target_file")"
+    if [[ ! -d "$target_parent" ]]; then
+      mkdir -p -- "$target_parent"
+      printf 'Created target directory %s\n' "$target_parent"
+    fi
     if [[ -f "$target_file" ]]; then
       cp --preserve=mode -- "$target_file" "$backup_file"
       printf 'Backed up %s to %s\n' "$target_file" "$backup_file"
