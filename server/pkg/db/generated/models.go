@@ -164,6 +164,8 @@ type AgentTaskQueue struct {
 	DaemonID                  pgtype.Text        `json:"daemon_id"`
 	WorkspaceID               pgtype.UUID        `json:"workspace_id"`
 	UpdatedAt                 pgtype.Timestamptz `json:"updated_at"`
+	RelayRetiredAt            pgtype.Timestamptz `json:"relay_retired_at"`
+	RelayRetiredReason        pgtype.Text        `json:"relay_retired_reason"`
 }
 
 type AgentToLabel struct {
