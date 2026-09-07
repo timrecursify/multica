@@ -68,6 +68,10 @@ selected() {
 # root is shared by the GSP and PPP worker units; all other roots are one-to-one.
 service_units_for_target() {
   local target="$1" relative service_root
+  if [[ "$target" == "$doctrine_root/"* ]]; then
+    printf '%s\n' gsp-multica-worker gsp-multica-worker-ppp
+    return
+  fi
   relative="${target#"$runtime_root"/}"
   [[ "$relative" != "$target" ]] || return 1
   service_root="${relative%%/*}"
