@@ -64,9 +64,20 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'printf "fake journal: unit=%s crashed after restart\\n" "${2:-unknown}"' > "$fake_bin/journalctl"
 chmod +x -- "$fake_bin/sudo" "$fake_bin/systemctl" "$fake_bin/journalctl"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'set -Eeuo pipefail' \
+  'input="$(cat)"' \
+  'if [[ "$input" == *"concat_ws"* ]]; then printf "%s\n" "${BELT_DEPLOY_TEST_SNAPSHOT:-leases=0 children=0 callbacks=0 cicd=0}"; fi' \
+  'printf "%s|%s\n" "$$" "$*" >> "${BELT_DEPLOY_TEST_PSQL_LOG:?}"' > "$fake_bin/psql"
+chmod +x -- "$fake_bin/psql"
 export PATH="$fake_bin:$PATH"
 export BELT_DEPLOY_SYSTEMCTL_STATE="$fake_state"
 export BELT_DEPLOY_PROC_ROOT="$fake_proc"
+export BELT_DEPLOY_STATE_ROOT="$tmp_dir/deploy-state"
+export BELT_DEPLOY_DATABASE_URL="postgres://fixture"
+export BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=2
+export BELT_DEPLOY_TEST_PSQL_LOG="$tmp_dir/psql.log"
 receipt_root="$tmp_dir/receipts"
 source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
 export MULTICA_RECEIPT_ROOT="$receipt_root"
@@ -151,6 +162,22 @@ if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$tmp_dir/
   exit 1
 fi
 grep -q 'Refusing an unscoped --apply' "$tmp_dir/unscoped.log"
+
+# A busy drain aborts before backup/copy/restart. The active task row is never
+# mutated by the controller, so it remains available to finish and publish.
+printf '\nstale-runtime\n' >> "$bridge_dir/multica-bridge.cjs"
+restart_lines() { if [[ -f "$fake_state/restarts.log" ]]; then wc -l < "$fake_state/restarts.log"; else printf '0\n'; fi; }
+restarts_before="$(restart_lines)"
+if BELT_DEPLOY_TEST_SNAPSHOT='leases=1 children=1 callbacks=1 cicd=1' \
+   BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=1 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
+   "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$tmp_dir/drain-timeout.log" 2>&1; then
+  echo 'expected busy drain to abort deployment' >&2
+  exit 1
+fi
+grep -q 'deployment aborted without restart' "$tmp_dir/drain-timeout.log"
+[[ "$restarts_before" == "$(restart_lines)" ]]
+grep -q 'stale-runtime' "$bridge_dir/multica-bridge.cjs"
+cp -- "$root_dir/multica-bridge.cjs" "$bridge_dir/multica-bridge.cjs"
 
 # A partial rollout can leave the wrapper absent. It is a named parity target and
 # must be recreated by a selective deployment.

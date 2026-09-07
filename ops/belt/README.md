@@ -85,11 +85,26 @@ as `python3 ops/belt/multica-bundle.py` from the Multica checkout.
 `./deploy.sh` is dry-run by default. It requires an explicit full immutable
 commit: `./deploy.sh --dry-run --source-commit <40-char-commit>`. Use
 `./deploy.sh --apply --source-commit <40-char-commit>` only when an operator
-has approved changing the live runtime. It archives that exact commit into
-private staging before it preflights every file,
-creates all backups before copying, and restores touched targets on a partial
-failure. A successful apply prints `./deploy.sh --rollback <UTC timestamp>`;
-that command restores the matching backup set. No process is restarted.
+has approved changing the live runtime. Apply and rollback require
+`BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS` to be set explicitly; there is deliberately
+no guessed timeout. They serialize through
+`/var/lib/gsp-multica/runtime/deployment.lock`, close the durable database
+admission fence, and wait for worker leases, child tasks, relay callbacks, and
+CI/CD deployment attempts to reach zero before touching files or restarting a
+unit. A timeout or later failure leaves the fence and the systemd hold closed;
+a subsequent locked controller may adopt it, while manual release remains a
+supervisor action. Successful activation records the invocation, controller
+PID, and each unit's old/new PID, then opens admission.
+
+The deployment archives the exact commit into private staging before it
+preflights every file, creates all backups before copying, and restores touched
+targets on a partial copy failure. A successful apply prints
+`./deploy.sh --rollback <UTC timestamp>`; that command uses the same lock,
+fence, drain, restart, and PID-verification path.
+
+`workspace-root.sh` still hard-pins `/var/lib/gsp/multica/workspaces`; that
+conflicts with the wrapper's caller-supplied root convention and is intentionally
+only documented here, not changed by the deployment-lock work.
 
 `./verify.sh <40-char-commit>` compares runtime files only with blobs staged
 from that commit and exits non-zero when any file is missing or differs.

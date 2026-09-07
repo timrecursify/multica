@@ -3,6 +3,13 @@ set -Eeuo pipefail
 units=(gsp-multica-bridge multica-relay-advance multica-archiver multica-cicd-worker gsp-multica-worker gsp-multica-worker-ppp)
 check=0
 [[ "${1:-}" == --check ]] && check=1
+database_url="${BELT_DEPLOY_DATABASE_URL:-${DATABASE_URL:-}}"
+deployment_hold_file="${BELT_DEPLOY_HOLD_FILE:-/var/lib/gsp-multica/runtime/deployment.hold}"
+if [[ -f "$deployment_hold_file" ]] || { [[ -n "$database_url" ]] && [[ "$(psql "$database_url" -XAtqc "SELECT admission_held FROM belt_deployment_control WHERE singleton" 2>/dev/null || true)" == t ]]; }; then
+  logger -t belt-unit-guard 'deployment admission fence held; automatic starts suppressed'
+  printf '%s\n' 'deployment admission fence held; automatic starts suppressed'
+  exit 0
+fi
 bad=0
 for unit in "${units[@]}"; do
   systemctl is-enabled --quiet "$unit.service" || continue
