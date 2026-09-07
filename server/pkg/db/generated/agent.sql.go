@@ -1584,6 +1584,27 @@ func (q *Queries) CompleteAgentTask(ctx context.Context, arg CompleteAgentTaskPa
 	return i, err
 }
 
+const countActiveAgentTasksByWorkDir = `-- name: CountActiveAgentTasksByWorkDir :one
+SELECT count(*) FROM agent_task_queue
+WHERE work_dir = $1
+  AND id <> $2
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+`
+
+type CountActiveAgentTasksByWorkDirParams struct {
+	WorkDir pgtype.Text `json:"work_dir"`
+	ID      pgtype.UUID `json:"id"`
+}
+
+// A terminal task directory is reclaimable only when no in-flight task still
+// owns the same checkout (resume and retry tasks can share work_dir).
+func (q *Queries) CountActiveAgentTasksByWorkDir(ctx context.Context, arg CountActiveAgentTasksByWorkDirParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveAgentTasksByWorkDir, arg.WorkDir, arg.ID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const countRunningTasks = `-- name: CountRunningTasks :one
 SELECT count(*) FROM agent_task_queue
 WHERE agent_id = $1 AND status IN ('dispatched', 'running', 'waiting_local_directory')

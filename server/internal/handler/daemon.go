@@ -3023,10 +3023,11 @@ func (h *Handler) ReportTaskProgress(w http.ResponseWriter, r *http.Request) {
 
 // CompleteTask marks a running task as completed.
 type TaskCompleteRequest struct {
-	PRURL     string `json:"pr_url"`
-	Output    string `json:"output"`
-	SessionID string `json:"session_id"` // Claude session ID for future resumption
-	WorkDir   string `json:"work_dir"`   // working directory used during execution
+	PRURL      string `json:"pr_url"`
+	BranchName string `json:"branch_name"`
+	Output     string `json:"output"`
+	SessionID  string `json:"session_id"` // Claude session ID for future resumption
+	WorkDir    string `json:"work_dir"`   // working directory used during execution
 	// SessionRolloutMissing: the daemon withheld this task's Codex session
 	// because its rollout was missing (MUL-5305). Clear the resume pointer and
 	// flag the continuity gap for the next claim.
@@ -4333,9 +4334,27 @@ func (h *Handler) GetTaskGCCheck(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	activeReferences := int64(0)
+	if task.WorkDir.Valid && task.WorkDir.String != "" {
+		var err error
+		activeReferences, err = h.Queries.CountActiveAgentTasksByWorkDir(r.Context(), db.CountActiveAgentTasksByWorkDirParams{
+			WorkDir: task.WorkDir,
+			ID:      task.ID,
+		})
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "failed to check task workdir ownership")
+			return
+		}
+	}
+	var result TaskCompleteRequest
+	_ = json.Unmarshal(task.Result, &result)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":       task.Status,
-		"completed_at": task.CompletedAt.Time,
+		"status":            task.Status,
+		"completed_at":      task.CompletedAt.Time,
+		"work_dir":          task.WorkDir.String,
+		"pr_url":            result.PRURL,
+		"branch_name":       result.BranchName,
+		"active_references": activeReferences,
 	})
 }
 

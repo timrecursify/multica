@@ -4949,13 +4949,22 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 // It is best-effort and intentionally non-fatal: the terminal callback has
 // already settled the task when this runs.
 func (d *Daemon) cleanupCompletedTaskEnv(task Task, envRoot string, logger *slog.Logger) {
-	if envRoot == "" {
+	if envRoot == "" || os.Getenv("KEEP_WORKDIR") == "1" {
 		return
 	}
 	if assignment, _ := localDirectoryAssignmentForTask(task, d.cfg.DaemonID); assignment != nil {
 		return
 	}
 	if _, err := execenv.ReadManagedEnvProvenance(envRoot); err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), terminalTaskReportTimeout)
+	defer cancel()
+	descriptor, err := d.client.GetTaskGCCheck(ctx, task.ID)
+	if err != nil || !taskWorkdirReclaimable(descriptor, filepath.Join(envRoot, "workdir")) {
+		return
+	}
+	if !d.reapCheckoutIsSafe(envRoot) {
 		return
 	}
 	release, ok := d.reserveEnvRootForGC(envRoot)
@@ -4966,6 +4975,16 @@ func (d *Daemon) cleanupCompletedTaskEnv(task Task, envRoot string, logger *slog
 	if err := os.RemoveAll(envRoot); err != nil {
 		logger.Warn("terminal task environment cleanup failed", "path", envRoot, "error", err)
 	}
+}
+
+func taskWorkdirReclaimable(task *TaskGCStatus, expectedWorkDir string) bool {
+	if task == nil || !isAgentTaskTerminal(task.Status) || task.ActiveReferences != 0 {
+		return false
+	}
+	if filepath.Clean(task.WorkDir) != filepath.Clean(expectedWorkDir) {
+		return false
+	}
+	return task.Status != "completed" || task.PRURL != "" || task.BranchName == ""
 }
 
 func taskRunFailureReason(err error) string {
