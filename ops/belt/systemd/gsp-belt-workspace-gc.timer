@@ -1,0 +1,8 @@
+[Unit]
+Description=Hourly belt workspace garbage collection
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=gsp-belt-workspace-gc.service
+[Install]
+WantedBy=timers.target

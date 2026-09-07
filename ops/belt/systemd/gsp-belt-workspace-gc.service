@@ -1,0 +1,5 @@
+[Unit]
+Description=Garbage-collect idle belt task workspaces
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/gsp-belt-workspace-gc --apply
