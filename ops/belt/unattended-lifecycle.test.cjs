@@ -362,6 +362,13 @@ test('known defects execute as packet-owned expected-red contracts', () => {
   assert.equal(evidenceResult.outcome, 'discovery_unavailable');
   assert.equal(evidenceResult.evidence, undefined,
     'outage must hold instead of fabricating merge_is_deploy');
+  // Pin the shape of the hold, not just the absence of evidence: a regression
+  // that swapped this for a terminal blocker would strand the ticket instead
+  // of retrying once GitHub returns, and would still satisfy the assertions
+  // above.
+  assert.equal(evidenceResult.blocker.type, 'changed_path_discovery_unavailable');
+  assert.equal(evidenceResult.blocker.retry_eligible, true,
+    'a transient outage stays retry eligible rather than failing the ticket');
   const evidence = { status: 'verified-green', packet: 'rec-2 fabricated-deployment-evidence',
     outcome: evidenceResult.outcome };
   emittedMetrics.push({ case: 'known-defects', outcomes: [activation, evidence] });
