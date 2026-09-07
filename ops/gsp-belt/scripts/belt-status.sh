@@ -11,6 +11,10 @@ relay_baseline=""
 burst_threshold="${GSP_WORKER_RESTART_BURST_THRESHOLD:-3}"
 burst_window="${GSP_WORKER_RESTART_BURST_WINDOW_SECONDS:-300}"
 burst_state="${GSP_WORKER_RESTART_BURST_STATE:-${TMPDIR:-/tmp}/gsp-multica-worker-restart-burst.json}"
+runtime_root="${RUNTIME_ROOT:-/var/lib/gsp/multica-runtime}"
+hold_file="${MULTICA_AI_HOLD_FILE:-$runtime_root/.local/state/multica-ai-hold}"
+release_file="${MULTICA_OPERATOR_RELEASE_FILE:-$runtime_root/.local/state/multica-operator-release}"
+approval_file="${MULTICA_SUPERVISOR_APPROVAL_FILE:-$runtime_root/.local/state/multica-supervisor-approval}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --release) release_dir="$2"; shift 2;;
@@ -37,6 +41,14 @@ trap 'rm -f "$snapshot"' EXIT
 "$PM2" jlist > "$snapshot"
 
 echo "release commit = $commit_sha"
+if [[ -e "$hold_file" ]]; then
+  worker_release_state=held
+elif [[ -e "$release_file" && -e "$approval_file" ]]; then
+  worker_release_state=released
+else
+  worker_release_state=unreleased
+fi
+echo "worker remediation = $worker_release_state (hold=$hold_file release=$release_file approval=$approval_file)"
 fail=0
 IFS=',' read -r -a app_arr <<< "$apps"
 for app in "${app_arr[@]}"; do
