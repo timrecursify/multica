@@ -1,0 +1,21 @@
+[Unit]
+Description=GSP 14-runner federation CI pool
+After=network-online.target
+Wants=network-online.target
+Wants=gsp-runner-fedci@gspdesk-1.service
+Wants=gsp-runner-fedci@skcli-1.service
+Wants=gsp-runner-fedci@skcli-2.service
+Wants=gsp-runner-fedci@skcli-3.service
+Wants=gsp-runner-fedci@pppci-1.service
+Wants=gsp-runner-fedci@pppci-2.service
+Wants=gsp-runner-fedci@pppci-3.service
+Wants=gsp-runner-fedci@pppci-4.service
+Wants=gsp-runner-fedci@pppci-5.service
+Wants=gsp-runner-fedci@pppci-6.service
+Wants=gsp-runner-fedci@pppci-7.service
+Wants=gsp-runner-fedci@pppci-8.service
+Wants=gsp-runner-fedci@pppci-9.service
+Wants=gsp-runner-fedci@pppci-10.service
+
+[Install]
+WantedBy=multi-user.target

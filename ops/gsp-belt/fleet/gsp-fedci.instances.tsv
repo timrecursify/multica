@@ -1,0 +1,15 @@
+instance	runner_name	registration_scope	labels	state_before_seat_apply
+gspdesk-1	gsp-gsp-desk-1	timrecursify/gsp-desk	gsp-desk,gsp	running
+skcli-1	gsp-skci-1	timrecursify/sk-cli	sk-ci,gsp	running
+skcli-2	gsp-skci-2	timrecursify/sk-cli	sk-ci,gsp	running
+skcli-3	gsp-skci-3	timrecursify/sk-cli	sk-ci,gsp	running
+pppci-1	gsp-ppp-ci-1	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-2	gsp-ppp-ci-2	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-3	gsp-ppp-ci-3	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-4	gsp-ppp-ci-4	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-5	gsp-ppp-ci-5	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-6	gsp-ppp-ci-6	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-7	gsp-ppp-ci-7	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-8	gsp-ppp-ci-8	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-9	gsp-ppp-ci-9	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
+pppci-10	gsp-ppp-ci-10	timrecursify/ppp	ppp-ci,ci-only,ci-build,gsp	staged
