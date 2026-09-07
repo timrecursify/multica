@@ -49,7 +49,6 @@ descriptor_stream() {
           AND live.status NOT IN ('completed','failed','cancelled')
           AND live.issue_id = t.issue_id
           AND live.work_dir = COALESCE(t.work_dir, '$sql_root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir'))
-      )
       ORDER BY t.completed_at" | awk -v limit="$limit" 'NR <= limit'
 }
 
