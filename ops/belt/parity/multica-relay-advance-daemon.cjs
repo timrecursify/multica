@@ -427,6 +427,16 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   if (row.to_stage === 'In Progress' && route.kind !== 'no_pr' && route.toStage !== 'In Review') {
     return { ...route, toStage: 'In Review', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
   }
+  // A risk route sends work to In Review so a Sol-low QC pass can qualify it.
+  // Once the ticket IS In Review that requirement is already met by the pass
+  // that admitted this completion, so re-targeting In Review advanced the
+  // ticket against itself. Risk-path tickets looped In Review -> In Review
+  // until retry escalation pushed them back to Spec or cancelled them, and
+  // none ever reached CI/CD & Deploy. Hand them to the configured next stage.
+  if (row.to_stage === 'In Review' && route.toStage === 'In Review') {
+    return { ...route, kind: 'risk_reviewed', toStage: row.next_stage, repo,
+      pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
+  }
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
       greenChecks(pr.statusCheckRollup)) {
     return { ...route, toStage: qcHandoff ? 'CI/CD & Deploy' : 'In Review',
