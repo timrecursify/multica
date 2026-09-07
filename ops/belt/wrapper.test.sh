@@ -22,6 +22,7 @@ fi
 printf '%s\n' "$*" >"${CAPTURE_FILE:?}"
 printf 'cap=%s root=%s daemon_root=%s workspaces=%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" "${MULTICA_DAEMON_WORKSPACES_ROOT:-}" "${MULTICA_WORKSPACES_ROOT:-}" "${DISCOVERED_WORKSPACES:-2}" >>"${CAPTURE_FILE}"
 printf 'go_path=%s\n' "${PATH%%:*}" >>"${CAPTURE_FILE}"
+printf 'codex_path=%s\n' "${MULTICA_CODEX_PATH:-}" >>"${CAPTURE_FILE}"
 printf 'cwd=%s\n' "$PWD" >>"${CAPTURE_FILE}"
 if [ "${HOLD_DAEMON:-0}" = 1 ]; then sleep 3; fi
 EOF
@@ -38,6 +39,8 @@ grep -q -- "--max-concurrent-tasks=2" "$capture"
 grep -q 'cap=2 root=.* daemon_root=.* workspaces=2' "$capture"
 grep -qx 'go_path=/usr/local/go/bin' "$capture"
 grep -q "cwd=$daemon_cwd" "$capture"
+grep -q '^codex_path=/opt/gsp-noc/providers/codex/bin/codex.js$' "$capture"
+! grep -q '/usr/local/bin/codex' "$capture"
 env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/empty.lock" "$root_dir/multica-daemon-wrapper.sh"
 grep -q -- '--max-concurrent-tasks=2' "$capture"
 DAEMON_SUPPORTS_WORKSPACES_FLAG=0 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 12' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/new.lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=12 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/new-workspaces" "$root_dir/multica-daemon-wrapper.sh"

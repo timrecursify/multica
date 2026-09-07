@@ -3,7 +3,7 @@ set -euo pipefail
 # gsp-multica-fleet daemon entrypoint. Host secrets/tool paths are externalized
 # via env with documented defaults (see README.md "Host dependencies"); the
 # tracked script is self-relative and env-driven.
-export CODEX_BIN="${GSP_BELT_CODEX_BIN:-${CODEX_BIN:-/home/newadmin/tools/codex-openrouter}}"
+export CODEX_BIN="${GSP_BELT_CODEX_BIN:-${CODEX_BIN:-/opt/gsp-noc/providers/codex/bin/codex.js}}"
 _secrets_dir="${GSP_BELT_SECRETS_DIR:-/home/newadmin/.secrets}"
 if [[ -f "$_secrets_dir/openrouter.env" ]]; then
   set -a; source "$_secrets_dir/openrouter.env"; set +a
