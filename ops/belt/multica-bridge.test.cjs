@@ -1756,11 +1756,12 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       work_product_md5 text, created_at timestamptz DEFAULT now());`);
     await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
     await admin.query(`INSERT INTO "${schema}".agent (id, workspace_id, name, runtime_id, status, instructions, model, thinking_level, max_concurrent_tasks)
-      VALUES ($1, $2, 'builder', $3, 'idle', 'In Progress\nCI/CD & Deploy', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
+      VALUES ($1, $2, 'builder', $3, 'idle', 'Queue\nIn Progress\nCI/CD & Deploy', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_pool VALUES
-      ($1, 'In Progress', true), ($1, 'CI/CD & Deploy', true)`, [workspaceId]);
+      ($1, 'Queue', true), ($1, 'In Progress', true), ($1, 'CI/CD & Deploy', true)`, [workspaceId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_agent_pool VALUES
-      ($1, 'In Progress', $2, true, NULL), ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
+      ($1, 'Queue', $2, true, NULL), ($1, 'In Progress', $2, true, NULL),
+      ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage) VALUES
       ($1, 'Human Review', 'In Progress'), ($1, 'Done', 'CI/CD & Deploy'),
       ($1, 'CI/CD & Deploy', 'Done'), ($1, 'In Progress', 'In Review'),
@@ -1907,8 +1908,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
         reason: 'reopen', current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' }, { 'x-relay-operator-secret': 'test-operator-secret' });
       assert.equal(res.status, 409);
     });
-    await t.test('authenticated operator release exits Parked and audits the reason', async () => {
+    await t.test('authenticated operator release from Parked bypasses an exhausted cap and audits the reason', async () => {
       const issueId = '88888888-8888-8888-8888-888888888888'; await insertIssue(issueId, 'Parked');
+      await admin.query(`UPDATE "${schema}".issue SET metadata = '{"parked_release_once": true}'::jsonb WHERE id = $1`, [issueId]);
       await admin.query(`INSERT INTO "${schema}".agent_task_queue
         (agent_id, issue_id, workspace_id, status, priority, context)
         SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"Queue"}'
@@ -1920,6 +1922,18 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log WHERE issue_id = $1`, [issueId]);
       assert.deepEqual(audit.rows[0].parked_audit, { parked_release: { operator_marker: true,
         reason: 'approved' }, operator_cap_bypass: true, reason: 'approved' });
+    });
+    await t.test('Parked operator release without the secret remains forbidden at an exhausted cap', async () => {
+      const issueId = '89898989-8989-8989-8989-898989898989'; await insertIssue(issueId, 'Parked');
+      await admin.query(`UPDATE "${schema}".issue SET metadata = '{"parked_release_once": true}'::jsonb WHERE id = $1`, [issueId]);
+      await admin.query(`INSERT INTO "${schema}".agent_task_queue
+        (agent_id, issue_id, workspace_id, status, priority, context)
+        SELECT $1, $2, $3, 'completed', 1, '{"to_stage":"Queue"}'
+          FROM generate_series(1, 7)`, [agentId, issueId, workspaceId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'Queue', operator_release: true, reason: 'approved' });
+      assert.equal(res.status, 403);
+      assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_secret_conflict');
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`, [issueId])).rows[0].status, 'Parked');
     });
   } finally {
     setTestClientFactory(null);
