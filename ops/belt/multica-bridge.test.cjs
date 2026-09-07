@@ -65,6 +65,8 @@ const {
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
+  specBlockedFingerprint,
+  specCompletionDisposition,
   capEscalationVerified,
   retryEscalationLoop,
   consumesRetryEscalation,
@@ -77,6 +79,33 @@ const {
   isNoDispatchArrivalStage,
   normalizeRelayStage
 } = require('./multica-bridge.cjs');
+
+test('Spec completion advances a written spec and bounds repeated blockers', async () => {
+  const issueId = '00000000-0000-4000-8000-000000000277';
+  const taskId = '00000000-0000-4000-8000-000000000278';
+  const priorId = '00000000-0000-4000-8000-000000000279';
+  const client = {
+    rows: [],
+    async query(sql) {
+      if (/WITH source AS/.test(sql)) return { rows: this.rows };
+      if (/FROM comment/.test(sql)) return { rows: [{ content: '## Spec\nBuild it\n## Evidence\nverified' }] };
+      throw new Error(`unexpected query: ${sql}`);
+    }
+  };
+
+  client.rows = [{ id: taskId, result: { output: 'spec posted\nOUTCOME: ADVANCED' } }];
+  assert.deepEqual(await specCompletionDisposition(client, issueId, taskId),
+    { toStage: 'Queue', reason: 'completed_spec_work_product' });
+
+  client.rows = [
+    { id: taskId, result: { output: 'OUTCOME: BLOCKED blocked_on=dependency' } },
+    { id: priorId, result: { output: 'OUTCOME: BLOCKED   blocked_on=dependency' } }
+  ];
+  assert.deepEqual(await specCompletionDisposition(client, issueId, taskId),
+    { toStage: 'Parked', reason: 'repeated_spec_blocked_outcome' });
+  assert.equal(specBlockedFingerprint({ output: 'NEEDS-INFO: choose a repository' }),
+    'needs-info:choose a repository');
+});
 
 test('PPP relay aliases normalize to configured canonical stages', () => {
   const ppp = 'da3c5c5c-a123-4567-b999-c3ed1820da00';
@@ -712,7 +741,7 @@ test('technical QC block cannot route to Human Review and exact re-scope bypasse
   assert.match(source, /consumeNoArtifactRescope\(client, issue\)/);
   assert.match(source, /operator_rescope_issue_id: issue\.id/);
   assert.match(source, /if \(noArtifactRescope && to_stage === "In Progress"\) \{\s+to_stage = "Spec";/);
-  assert.match(source, /let retryEscalation = noArtifactRescope \? null/);
+  assert.match(source, /let retryEscalation = \(noArtifactRescope \|\| specCompletion\) \? null/);
   assert.match(source, /to_stage === "Spec" && !noArtifactRescope/);
 });
 

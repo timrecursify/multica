@@ -520,6 +520,42 @@ function taskResultText(result) {
     .filter((value) => typeof value === "string").join("\n");
 }
 
+function specBlockedFingerprint(result) {
+  const text = taskResultText(result);
+  const outcome = text.match(/^\s*OUTCOME\s*:\s*BLOCKED\b([^\r\n]*)/im);
+  if (outcome) return `blocked:${outcome[1].trim().toLowerCase().replace(/\s+/g, " ")}`;
+  const needsInfo = text.match(/^\s*(?:OUTCOME\s*:\s*)?NEEDS?[-_ ]INFO\b\s*[:—-]?\s*([^\r\n]*)/im);
+  return needsInfo
+    ? `needs-info:${needsInfo[1].trim().toLowerCase().replace(/\s+/g, " ")}`
+    : null;
+}
+
+async function specCompletionDisposition(client, issueId, requestedTaskId) {
+  if (!UUID_RE.test(String(requestedTaskId || ""))) return null;
+  const completed = await client.query(
+    `WITH source AS (
+       SELECT completed_at FROM agent_task_queue
+        WHERE id = $2::uuid AND issue_id = $1::uuid AND status = 'completed'
+          AND context->>'to_stage' = 'Spec')
+     SELECT id, result FROM agent_task_queue
+      WHERE issue_id = $1::uuid AND status = 'completed'
+        AND context->>'to_stage' = 'Spec'
+        AND completed_at <= (SELECT completed_at FROM source)
+      ORDER BY completed_at DESC, created_at DESC, id DESC LIMIT 2 FOR UPDATE`,
+    [issueId, requestedTaskId]
+  );
+  if (String(completed.rows[0]?.id || "") !== String(requestedTaskId)) return null;
+  const blocked = specBlockedFingerprint(completed.rows[0].result);
+  if (blocked) {
+    const repeated = blocked === specBlockedFingerprint(completed.rows[1]?.result);
+    return { toStage: repeated ? "Parked" : "Spec",
+      reason: repeated ? "repeated_spec_blocked_outcome" : "spec_blocked_outcome" };
+  }
+  return await latestSpecComment(client, issueId)
+    ? { toStage: "Queue", reason: "completed_spec_work_product" }
+    : null;
+}
+
 function isNoArtifactQcBlock(text) {
   if (typeof text !== "string" || !/^\s*QC[- ]BLOCKED\b/im.test(text)) return false;
   if (/^\s*QC\s+VERDICT\s*:\s*(?:PASS|FAIL)\b/im.test(text) || /QC_EVIDENCE_JSON=/m.test(text)) return false;
@@ -1668,6 +1704,17 @@ async function relayAdvance(req, res, body) {
 
     const issue = issueResult.rows[0];
     to_stage = normalizeRelayStage(issue.workspace_id, to_stage);
+    const specCompletion = issue.status === "Spec" && to_stage === "Spec"
+      ? await specCompletionDisposition(client, issue.id, body.relay_source_task_id)
+      : null;
+    if (specCompletion) {
+      to_stage = specCompletion.toStage;
+      reason = reason || specCompletion.reason;
+      if (to_stage === "Parked") {
+        parkedAudit = { trigger: specCompletion.reason, intendedStage: "Spec",
+          attempts: 2, taskCount: 2 };
+      }
+    }
     if (archiverRequest && (issue.status !== "Done" || !validArchiveReceipt(issue.id, archiveEvidence))) {
       await client.query("ROLLBACK");
       res.writeHead(403, { "Content-Type": "application/json" });
@@ -1794,7 +1841,7 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
-    let retryEscalation = noArtifactRescope ? null :
+    let retryEscalation = (noArtifactRescope || specCompletion) ? null :
       await verifiedRetryEscalation(client, issue, body);
     if (retryEscalation === false) {
       await client.query("ROLLBACK");
@@ -3019,6 +3066,8 @@ module.exports = {
   retryEscalationReason,
   verifiedRetryEscalation,
   retryEscalationSourceTask,
+  specBlockedFingerprint,
+  specCompletionDisposition,
   capEscalationVerified,
   retryEscalationLoop,
   consumesRetryEscalation,
