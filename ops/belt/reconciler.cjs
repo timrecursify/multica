@@ -138,11 +138,18 @@ async function moveToHumanReview(client, issue, reason, options) {
     from: issue.status, to: "Human Review", actor: "operator", evidence: { blocker: reason }
   });
   if (!verdict?.ok) throw new Error(`reconcile policy rejected Human Review: ${reason} (${verdict?.code})`);
+  // The UPDATE below performs the advance itself, so the relay row is audit-only
+  // and records 'completed', like every other audit-only writer (parked-entry-
+  // audit.cjs, the merged-PR no-op below, operator respec, ensureCompletedRelayLog).
+  // Written 'pending' it was unclosable: findAndAdvanceTasks inner-joins
+  // agent_task_queue on rrl.task_id, which is NULL here; closeDeadRelayRows closes
+  // only to_stage IN (Done, Cancelled, Archived); and cleanupStalePendingRows needs
+  // the issue past Human Review, which is exactly what it was parked to wait for.
   await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
   await client.query("UPDATE issue SET status = 'Human Review', updated_at = NOW() WHERE id = $1::uuid", [issue.id]);
   await client.query(
     `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
-     VALUES ($1::uuid, $2, 'Human Review', 'pending', jsonb_build_object('reason', $3::text))`,
+     VALUES ($1::uuid, $2, 'Human Review', 'completed', jsonb_build_object('reason', $3::text))`,
     [issue.id, issue.status, reason]
   );
   return { action: "human_review", reason };
