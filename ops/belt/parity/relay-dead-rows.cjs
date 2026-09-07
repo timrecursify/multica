@@ -215,6 +215,29 @@ async function closeDeadRelayRows(client, { terminalStages, requestRetryEscalati
     logger.log(`${logPrefix} Closed ${terminal.rowCount} terminal relay log(s)`);
   }
 
+  // Retire terminal queue rows durably. The conditional predicate makes this
+  // idempotent and allows a later update (updated_at > relay_retired_at) to
+  // re-enter the scan set.
+  const retired = await client.query(
+    `UPDATE agent_task_queue t
+        SET relay_retired_at = NOW(), relay_retired_reason = COALESCE(t.failure_reason, 'terminal')
+      WHERE t.status IN ('completed', 'cancelled', 'failed')
+        AND (t.relay_retired_at IS NULL OR t.updated_at > t.relay_retired_at)
+      RETURNING t.id AS task_id, t.issue_id, t.status, t.attempt, t.max_attempts,
+                t.relay_retired_reason AS reason`, []);
+  for (const row of retired.rows || []) {
+    let escalated = false;
+    if (row.issue_id && Number(row.attempt || 0) >= Number(row.max_attempts || 0)) {
+      const issue = await client.query(`SELECT id, status FROM issue WHERE id = $1 FOR UPDATE`, [row.issue_id]);
+      const stage = issue.rows[0]?.status;
+      if (stage && ![...(terminalStages || []), 'Human Review'].includes(stage)) {
+        await requestRetryEscalation?.(row, 'retry_exhausted', postRelay);
+        escalated = true;
+      }
+    }
+    logger.log(`${logPrefix} [relay-task-retired] task_id=${row.task_id} status=${row.status} attempt=${row.attempt} max_attempts=${row.max_attempts} reason=${row.reason} issue_id=${row.issue_id || 'null'} escalated=${escalated}`);
+  }
+
   await convertCompletedQcEvidence(client, { postRelay: postVerdict, logger, logPrefix, env });
   await rescopeCompletedNoArtifactQc(client, { postRelay: postNoArtifactRescope, logger, logPrefix, env });
 
