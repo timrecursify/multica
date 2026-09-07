@@ -7,7 +7,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, runBounded,
-  parseGateCheckConcurrency, claimAdvanceRow } = require('./multica-relay-advance-daemon.cjs');
+  parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
@@ -225,6 +225,7 @@ test('completion route falls back to a PR URL in recent comments', async () => {
   const client = { query: async (sql) => {
     queries.push(sql);
     if (sql.includes('FROM issue_pull_request')) return { rows: [] };
+    if (sql.includes('FROM task_message')) return { rows: [] };
     if (sql.includes('FROM comment')) {
       return { rows: [{ content: 'Build PR: https://github.com/acme/widget/pull/42' }] };
     }
@@ -241,7 +242,7 @@ test('completion route falls back to a PR URL in recent comments', async () => {
   assert.equal(route.repo, 'acme/widget');
   assert.equal(route.pr_url, 'https://github.com/acme/widget/pull/42');
   assert.equal(githubCalls[0][2], 'https://github.com/acme/widget/pull/42');
-  assert.equal(queries.length, 2);
+  assert.equal(queries.length, 3);
 });
 
 function linkedPrClient(pr) {
@@ -1662,4 +1663,88 @@ test('risk-path PR completing In Progress still enters In Review once', async ()
   }, { githubCommand: () => JSON.stringify(pr) });
   assert.equal(route.kind, 'risk');
   assert.equal(route.toStage, 'In Review');
+});
+
+function noPrClient(lastMessage, seen) {
+  return { release() {}, query: async (sql) => {
+    if (seen) seen.push(sql);
+    if (sql.includes('FROM issue_pull_request')) return { rows: [] };
+    if (sql.includes('FROM task_message')) return { rows: [{ content: lastMessage }] };
+    if (sql.includes('FROM comment')) {
+      return { rows: [{ content: 'Already delivered in https://github.com/acme/widget/pull/42' }] };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  }};
+}
+
+test('NO_OP build outcome reaches Done and never adopts the PR it cites', async () => {
+  const seen = [];
+  const githubCalls = [];
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: NO_OP', seen), {
+    issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: (args) => { githubCalls.push(args); return '{}'; } });
+  assert.equal(route.toStage, 'Done');
+  assert.equal(route.kind, 'no_pr');
+  assert.equal(route.noopDelivered, true);
+  assert.equal(route.reason, 'completed_noop_already_delivered');
+  // The cited merged PR is prior work: it must not be fetched or adopted.
+  assert.equal(githubCalls.length, 0);
+  assert.equal(seen.some((sql) => sql.includes('FROM comment')), false);
+});
+
+test('ALREADY_FIXED is treated as a NO_OP delivery', async () => {
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: ALREADY_FIXED'), {
+    issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: () => '{}' });
+  assert.equal(route.toStage, 'Done');
+  assert.equal(route.noopDelivered, true);
+});
+
+test('blocked_on=human reaches Human Review, not QC', async () => {
+  const githubCalls = [];
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: BLOCKED blocked_on=human'), {
+    issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: (args) => { githubCalls.push(args); return '{}'; } });
+  assert.equal(route.toStage, 'Human Review');
+  assert.equal(route.kind, 'blocked_human');
+  assert.match(route.evidence, /blocked_on=human/);
+  assert.equal(githubCalls.length, 0);
+});
+
+// #789 (In Review risk self-loop guard) and this change both rewrite the route
+// for a ticket sitting In Review. They cannot collide: a declared NO_OP or
+// blocked_on=human is decided before any PR is fetched, so it never reaches the
+// risk classifier the self-loop guard operates on. Pin that ordering.
+test('a blocked_on=human declaration wins over the In Review self-loop guard', async () => {
+  const githubCalls = [];
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: BLOCKED blocked_on=human'), {
+    issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Review', next_stage: 'CI/CD & Deploy'
+  }, { githubCommand: (args) => { githubCalls.push(args); return '{}'; } });
+  assert.equal(route.toStage, 'Human Review');
+  assert.equal(route.kind, 'blocked_human');
+  assert.notEqual(route.kind, 'risk_reviewed');
+  assert.equal(githubCalls.length, 0);
+});
+
+test('a non-human blocker is not diverted to Human Review', async () => {
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: BLOCKED blocked_on=ci'), {
+    issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: () => JSON.stringify({ state: 'OPEN', files: [{ path: 'web/app.ts' }],
+    headRefOid: 'a'.repeat(40), mergeStateStatus: 'CLEAN', statusCheckRollup: [] }) });
+  assert.notEqual(route.toStage, 'Human Review');
+});
+
+test('a NO_OP delivery does not re-enter the QC gate', () => {
+  const row = { task_result: { output: 'see https://github.com/acme/widget/pull/42' }, task_id: 't1' };
+  assert.equal(qcGateRequired(row, 'Done', { kind: 'no_pr', noopDelivered: true }), false);
+  // Without the flag the cited PR pulls the ticket back into QC.
+  assert.equal(qcGateRequired(row, 'Done', { kind: 'no_pr' }), true);
+});
+
+test('Human Review completion evidence satisfies the transition policy', () => {
+  const row = { task_id: 'task-1', task_result: { output: 'blocked' }, to_stage: 'In Progress' };
+  const evidence = completionEvidence(row, 'Human Review',
+    { kind: 'blocked_human', evidence: 'blocked_on=human task:task-1:result' }, { ok: false });
+  assert.equal(evidence.namedBlocker, true);
+  assert.equal(evaluate({ from: 'In Progress', to: 'Human Review', actor: 'operator', evidence }).ok, true);
 });

@@ -4,6 +4,7 @@ const { execFile } = require('child_process');
 const { promisify } = require('util');
 const { createGithubApi, createRateLimitState, createTtlCache } = require('../github-api-adapter.cjs');
 const { classifyStageRoute } = require('../stage-routing.cjs');
+const { parseOutcome } = require('../stage-outcome.cjs');
 const {
   instructionCompatibility,
   retryAdmission,
@@ -343,7 +344,10 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
       boundSha: route?.boundSha || pointer };
   }
   if (row.to_stage === 'In Progress' && targetStage === 'Human Review') {
-    return { blockerEvidence: route?.evidence || pointer,
+    // transition-policy admits `review` on evidence.blocker or namedBlocker;
+    // blockerEvidence alone was rejected as evidence_missing.
+    return { blocker: route?.evidence || pointer, namedBlocker: true,
+      blockerEvidence: route?.evidence || pointer,
       retryEscalationTaskId: row.task_id };
   }
   if (row.to_stage === 'In Progress' && targetStage === 'Done') {
@@ -374,6 +378,9 @@ async function completionEvidenceWithNoSha(client, row, targetStage, route, qcAd
 // happened to record the worker completion. Queue-produced PRs can skip the
 // In Progress outcome entirely.
 function qcGateRequired(row, targetStage, route) {
+  // The cited PR belongs to prior work, so resultPointer would otherwise
+  // pull this ticket back into QC on a diff it does not own.
+  if (route && route.noopDelivered) return false;
   if (targetStage === 'In Review') return true;
   if (targetStage !== 'Done') return false;
   const prUrl = route?.pr_url || resultPointer(row);
@@ -385,6 +392,39 @@ function greenChecks(checks) {
     ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(String(check.conclusion || check.state || '').toUpperCase()));
 }
 
+// A builder that finds the change already delivered reports NO_OP and cites the
+// merged PR that carries it. `already_fixed` is the parked-diagnosis spelling.
+const NOOP_DECLARATION = /^\s*(?:OUTCOME|OUTCOME_KIND)\s*:\s*(?:NO_OP|ALREADY_IMPLEMENTED|ALREADY_FIXED)\b/im;
+
+function outcomeText(row) {
+  const result = row.task_result;
+  if (result == null) return '';
+  if (typeof result === 'string') return result;
+  return [result.output, result.comment, result.error]
+    .filter((value) => typeof value === 'string').join('\n');
+}
+
+// The declared outcome of the run: the typed stage outcome when the caller
+// carries one, else the worker's own OUTCOME line. Only a typed line is
+// trusted; legacyOutcome guesses FAILED by default and must not route.
+async function declaredCompletionOutcome(client, row) {
+  if (row.outcome === 'NO_OP' || row.outcome === 'BLOCKED') {
+    return { outcome: row.outcome, blockedOn: row.blocked_on || null };
+  }
+  const texts = [outcomeText(row)];
+  const message = await client.query(
+    `SELECT content FROM task_message WHERE task_id = $1::uuid ORDER BY seq DESC LIMIT 1`,
+    [row.task_id]);
+  if (message.rows[0] && message.rows[0].content) texts.push(String(message.rows[0].content));
+  for (const text of texts) {
+    if (!text) continue;
+    if (NOOP_DECLARATION.test(text)) return { outcome: 'NO_OP', blockedOn: null };
+    const parsed = parseOutcome(text);
+    if (parsed.typed) return { outcome: parsed.outcome, blockedOn: parsed.blockedOn };
+  }
+  return { outcome: null, blockedOn: null };
+}
+
 async function buildCompletionRoute(client, row, { githubCommand = github } = {}) {
   const buildHandoff = row.to_stage === 'In Progress' && row.next_stage === 'In Review';
   const qcHandoff = row.to_stage === 'In Review' && row.next_stage === 'CI/CD & Deploy';
@@ -393,6 +433,20 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
     `SELECT p.html_url, p.repo_owner, p.repo_name
        FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
       WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1`, [row.issue_id]);
+  // A NO_OP or BLOCKED run has no work product of its own. The merged PR it
+  // cites is prior work, and the comment scan below would adopt that PR as
+  // this ticket's product and send it to QC, which opens an empty branch and
+  // returns failure_class=implementation. Decide these before that scan.
+  const declared = linked.rows[0] ? null : await declaredCompletionOutcome(client, row);
+  if (declared && declared.outcome === 'BLOCKED' && declared.blockedOn === 'human') {
+    return { kind: 'blocked_human', toStage: 'Human Review',
+      reason: 'completion_blocked_on_human',
+      evidence: `blocked_on=human ${resultPointer(row)}` };
+  }
+  if (declared && declared.outcome === 'NO_OP' && row.to_stage === 'In Progress') {
+    return { kind: 'no_pr', noopDelivered: true, toStage: 'Done',
+      reason: 'completed_noop_already_delivered' };
+  }
   const commentPr = linked.rows[0] ? null : await client.query(
     `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`, [row.issue_id]);
   const commentMatch = commentPr?.rows
@@ -401,10 +455,7 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   // A completed NO_OP has no deployable artifact. Park it instead of asking
   // the bridge to admit an independently checked NO-SHA Done transition.
   if (!linked.rows[0] && !commentMatch) {
-    const outcome = await client.query(
-      `SELECT content FROM task_message WHERE task_id = $1::uuid ORDER BY seq DESC LIMIT 1`,
-      [row.task_id]);
-    if (/^OUTCOME:\s*(?:NO_OP|ALREADY_IMPLEMENTED)\b/im.test(String(outcome.rows[0]?.content || ''))) {
+    if (declared && declared.outcome === 'NO_OP') {
       return { kind: 'no_pr_noop', toStage: 'Parked', reason: 'completed_spec_noop' };
     }
     return { kind: 'no_pr', toStage: 'Done' };
