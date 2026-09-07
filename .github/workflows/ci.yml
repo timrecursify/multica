@@ -323,6 +323,16 @@ jobs:
       - name: Test parked diagnosis backfill
         run: node --test ops/belt/backfill-parked-diagnosis.test.cjs
 
+      - name: Test reconciler against PostgreSQL (asserts 0 skipped)
+        run: |
+          set +e
+          output="$(node --test ops/belt/reconciler.test.cjs 2>&1)"
+          status=$?
+          set -e
+          printf '%s\n' "$output"
+          test "$status" -eq 0
+          printf '%s\n' "$output" | grep -Eq '^# skipped 0$'
+
       - name: Test MEGA bundling preserves the source pull-request trail
         run: python3 ops/belt/multica-bundle.test.py
 

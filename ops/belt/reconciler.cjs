@@ -439,19 +439,8 @@ async function reconcileIssue(client, issueId, options = {}) {
         // loop apply configured routing and QC gates without another build.
         // A pending row, or a completed row already consumed at this stage,
         // makes the conditional insert a no-op on every later cycle.
-        const armed = await client.query(
-          `WITH prior_stage_log AS (
-             UPDATE relay_run_log SET task_id = NULL
-              WHERE task_id = $3::uuid AND status = 'completed'
-                AND to_stage IS DISTINCT FROM $2::text
-              RETURNING id
-           )
-           INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
-           SELECT $1::uuid, $2::text, $2::text, task.agent_id, task.id, 'pending'
-             FROM agent_task_queue task
-            WHERE task.id = $3::uuid AND task.issue_id = $1::uuid AND task.status = 'completed'
-           ON CONFLICT (task_id) DO NOTHING
-           RETURNING task_id`, [issue.id, issue.status, admission.reuseTaskId]);
+        const armed = await armCompletedBuildWorkProduct(
+          client, issue.id, issue.status, admission.reuseTaskId);
         await client.query("COMMIT");
         if (armed.rows.length) return { action: "handoff", taskId: admission.reuseTaskId };
         return { action: "reused", taskId: admission.reuseTaskId, reason: admission.reason };
@@ -517,6 +506,29 @@ async function reconcileIssue(client, issueId, options = {}) {
   }
 }
 
+async function armCompletedBuildWorkProduct(client, issueId, stage, taskId) {
+  await client.query(
+    `UPDATE relay_run_log SET task_id = NULL
+      WHERE task_id = $1::uuid AND status = 'completed'
+        AND to_stage IS DISTINCT FROM $2::text`,
+    [taskId, stage]
+  );
+  return client.query(
+    `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
+     SELECT $1::uuid, $2::text, $2::text, task.agent_id, task.id, 'pending'
+       FROM agent_task_queue task
+      WHERE task.id = $3::uuid AND task.issue_id = $1::uuid AND task.status = 'completed'
+        AND NOT EXISTS (
+          SELECT 1 FROM relay_run_log existing
+           WHERE existing.task_id = task.id
+             AND existing.to_stage IS NOT DISTINCT FROM $2::text
+             AND existing.status IN ('pending', 'completed')
+        )
+     RETURNING task_id`,
+    [issueId, stage, taskId]
+  );
+}
+
 async function reconcileCycle(client, options = {}) {
   const settings = settingsFor({ ...options, budget: { created: 0, humanReview: 0, byAgent: new Map() } });
   const rows = (await client.query(issueCandidatesSql(), [[...DISPATCHABLE]])).rows;
@@ -550,4 +562,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };

@@ -3,7 +3,8 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
-  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql, mergedPullRequestNoop } = require("./reconciler.cjs");
+  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql, mergedPullRequestNoop,
+  armCompletedBuildWorkProduct } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
 const ok = () => ({ ok: true });
@@ -109,7 +110,7 @@ test("completed build work product is handed off once without another task", asy
       return { rows: [{ id: completed, completed_at: "2026-09-06T00:00:00Z" }] };
     }
     if (sql.includes("FROM qc_effective_verdict")) return { rows: [] };
-    if (sql.includes("INSERT INTO relay_run_log") && sql.includes("ON CONFLICT (task_id)")) {
+    if (sql.includes("INSERT INTO relay_run_log") && sql.includes("NOT EXISTS")) {
       handoff = { sql, values };
       if (relayArmed) return { rows: [] };
       relayArmed = true;
@@ -121,14 +122,64 @@ test("completed build work product is handed off once without another task", asy
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }),
     { action: "handoff", taskId: completed });
   assert.equal(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")), false);
-  assert.match(handoff.sql, /UPDATE relay_run_log SET task_id = NULL/);
-  assert.match(handoff.sql, /status = 'completed'/);
-  assert.match(handoff.sql, /to_stage IS DISTINCT FROM \$2::text/);
+  const priorLogUpdate = db.calls.find((call) => call.sql.includes("UPDATE relay_run_log SET task_id = NULL"));
+  assert.match(priorLogUpdate.sql, /status = 'completed'/);
+  assert.match(priorLogUpdate.sql, /to_stage IS DISTINCT FROM \$2::text/);
+  assert.match(handoff.sql, /AND NOT EXISTS/);
 
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
     action: "reused", taskId: completed, reason: "completed_build_work_product"
   });
   assert.equal(db.calls.filter((call) => call.sql.includes("INSERT INTO agent_task_queue")).length, 0);
+});
+
+test("completed build handoff statement runs against the production relay_run_log indexes", async () => {
+  assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for the real PostgreSQL regression test");
+  const { Client } = require("pg");
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  const schema = `reconciler_${process.pid}_${Date.now()}`;
+  const completed = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  await client.connect();
+  try {
+    await client.query(`CREATE SCHEMA "${schema}"`);
+    await client.query(`SET search_path TO "${schema}"`);
+    await client.query(`CREATE TABLE agent_task_queue (
+      id uuid PRIMARY KEY, issue_id uuid NOT NULL, agent_id uuid, status text NOT NULL
+    )`);
+    await client.query(`CREATE TABLE relay_run_log (
+      id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text NOT NULL,
+      to_stage text, agent_id uuid, task_id uuid, status text NOT NULL DEFAULT 'pending'
+    )`);
+    await client.query("CREATE INDEX idx_relay_run_log_issue_id ON relay_run_log (issue_id)");
+    const indexes = await client.query(
+      "SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = 'relay_run_log' ORDER BY indexname",
+      [schema]
+    );
+    assert.deepEqual(indexes.rows.map((row) => row.indexname),
+      ["idx_relay_run_log_issue_id", "relay_run_log_pkey"]);
+    await client.query(
+      "INSERT INTO agent_task_queue (id, issue_id, agent_id, status) VALUES ($1, $2, $3, 'completed')",
+      [completed, issue.id, "33333333-3333-4333-8333-333333333333"]
+    );
+    await client.query(
+      "INSERT INTO relay_run_log (issue_id, from_stage, to_stage, task_id, status) VALUES ($1, 'Spec', 'Queue', $2, 'completed')",
+      [issue.id, completed]
+    );
+    const first = await armCompletedBuildWorkProduct(client, issue.id, "In Progress", completed);
+    const second = await armCompletedBuildWorkProduct(client, issue.id, "In Progress", completed);
+    assert.equal(first.rowCount, 1);
+    assert.equal(second.rowCount, 0);
+    const rows = await client.query(
+      "SELECT to_stage, task_id, status FROM relay_run_log ORDER BY id"
+    );
+    assert.deepEqual(rows.rows, [
+      { to_stage: "Queue", task_id: null, status: "completed" },
+      { to_stage: "In Progress", task_id: completed, status: "pending" }
+    ]);
+  } finally {
+    await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await client.end();
+  }
 });
 
 test("completed build without a work product remains admitted", async () => {
