@@ -1,7 +1,8 @@
 const http = require('http');
 const { Pool } = require('pg');
-const { execFileSync } = require('child_process');
-const { createGithubApi } = require('../github-api-adapter.cjs');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
+const { createGithubApi, createRateLimitState, createTtlCache } = require('../github-api-adapter.cjs');
 const { classifyStageRoute } = require('../stage-routing.cjs');
 const {
   instructionCompatibility,
@@ -23,7 +24,7 @@ const { deploymentCompletionAdmission } = require('../relay-completion-admission
 const { recordParkedEntry } = require('../parked-entry-audit.cjs');
 const { closeDeadRelayRows } = require('./relay-dead-rows.cjs');
 const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
-const { runQcGate, getHardChecks } = require('../qc-gate.cjs');
+const { runQcGate, md5ForSha, getHardChecks } = require('../qc-gate.cjs');
 const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
 const { reconcileCycle } = require('../reconciler.cjs');
 const { recordStageOutcomes } = require('../stage-outcome.cjs');
@@ -37,11 +38,21 @@ const WORKSPACE_ID = process.env.GSP_WORKSPACE_ID;
 const LOG_PREFIX = '[relay-advance-daemon]';
 const RECONCILE_INTERVAL_MS = 30000;
 const QC_GATE_PENDING_RECHECK_MS = Number.parseInt(process.env.QC_GATE_PENDING_RECHECK_MS || '300000', 10);
-const QC_GATE_GH_COOLDOWN_MS = Number.parseInt(process.env.QC_GATE_GH_COOLDOWN_MS || '600000', 10);
 const qcGatePending = new Map();
 const relayRefusalMemo = new Map();
-let qcGateGhCooldownUntil = 0;
-let lastCooldownLog = 0;
+const githubReadCache = createTtlCache({ ttlMs: QC_GATE_PENDING_RECHECK_MS });
+const githubTokenCache = createTtlCache({ ttlMs: QC_GATE_PENDING_RECHECK_MS });
+const workProductCache = createTtlCache({ ttlMs: QC_GATE_PENDING_RECHECK_MS });
+const githubClients = new Map();
+const execFileAsync = promisify(execFile);
+function parseGateCheckConcurrency(value) {
+  if (value === undefined) return 1;
+  const parsed = Number(value);
+  if (/^[1-9]\d*$/.test(String(value).trim()) && Number.isSafeInteger(parsed)) return parsed;
+  console.warn(`GATE_CHECK_CONCURRENCY rejected value ${JSON.stringify(value)}; using 1`);
+  return 1;
+}
+const GATE_CHECK_CONCURRENCY = parseGateCheckConcurrency(process.env.GATE_CHECK_CONCURRENCY);
 function scheduleEvery(fn, ms, label) {
   return setInterval(
     () => Promise.resolve().then(fn)
@@ -165,9 +176,10 @@ function logCredentialHelperFailure(detail) {
 
 // Returns '' when the helper is absent or fails. That degrades exactly the way
 // a missing token already degraded, and never throws out of ghExec.
-function mintGithubToken(repo) {
+async function mintGithubToken(repo) {
   try {
-    const output = execFileSync(GIT_CREDENTIAL_HELPER, ['token', repo], { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
+    const { stdout: output } = await execFileAsync(GIT_CREDENTIAL_HELPER, ['token', repo],
+      { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
     const token = String(output).trim().split(/\r?\n/)[0] || '';
     if (token) { credentialHelperFailureLogged = false; return token; }
     logCredentialHelperFailure(`returned no token for ${repo}`);
@@ -190,24 +202,36 @@ function repoFromGhArgs(args) {
   return DEFAULT_GH_REPO;
 }
 
-// Built per call, never cached in module scope: a captured installation token
-// dies after an hour and the daemon outlives that many times over.
 function beltGithub(repo = DEFAULT_GH_REPO) {
-  const token = mintGithubToken(repo);
-  return createGithubApi({
-    env: token ? { ...process.env, GITHUB_APP_INSTALLATION_TOKEN: token } : process.env,
-    alert: ({ remaining, reset }) => console.error(`${LOG_PREFIX} [github-quota] sentinel remaining=${remaining} reset=${reset}`)
-  });
+  if (!githubClients.has(repo)) {
+    const alert = ({ remaining, reset }) =>
+      console.error(`${LOG_PREFIX} [github-quota] sentinel remaining=${remaining} reset=${reset}`);
+    githubClients.set(repo, createGithubApi({ env: process.env, cache: githubReadCache,
+      state: createRateLimitState({ scope: 'credential-helper', alert }),
+      tokenProvider: () => githubTokenCache.get(repo, () => mintGithubToken(repo)), alert }));
+  }
+  return githubClients.get(repo);
 }
-function ghExec(args) { return beltGithub(repoFromGhArgs(args)).command(args); }
+async function ghExec(args, options) { return beltGithub(repoFromGhArgs(args)).command(args, options); }
+function githubCallStats() {
+  return [...githubClients.values()].reduce((sum, api) => ({
+    externalCalls: sum.externalCalls + api.stats.externalCalls,
+    cacheHits: sum.cacheHits + api.stats.cacheHits
+  }), { externalCalls: 0, cacheHits: 0 });
+}
 
 // gh returns statusCheckRollup as one flat list of check contexts. REST splits
 // the same facts across check-runs and the combined commit status, so both are
 // read and renamed to the GraphQL field names greenChecks() consumes. A commit
 // with no checks stays null, which is what GraphQL returns for that case.
-function restStatusCheckRollup(repo, sha, run = ghExec) {
-  const runs = JSON.parse(run(['api', `repos/${repo}/commits/${sha}/check-runs?per_page=100`])).check_runs || [];
-  const statuses = JSON.parse(run(['api', `repos/${repo}/commits/${sha}/status`])).statuses || [];
+async function restStatusCheckRollup(repo, sha, run = ghExec) {
+  const [runPayload, statusPayload] = await Promise.all([
+    run(['api', `repos/${repo}/commits/${sha}/check-runs?per_page=100`],
+      { cacheKey: `${repo}@${sha}:check-runs` }),
+    run(['api', `repos/${repo}/commits/${sha}/status`], { cacheKey: `${repo}@${sha}:status` })
+  ]);
+  const runs = JSON.parse(runPayload).check_runs || [];
+  const statuses = JSON.parse(statusPayload).statuses || [];
   const rollup = [
     ...runs.map((r) => ({ __typename: 'CheckRun', name: r.name,
       status: String(r.status || '').toUpperCase(), conclusion: String(r.conclusion || '').toUpperCase() })),
@@ -221,7 +245,7 @@ function restStatusCheckRollup(repo, sha, run = ghExec) {
 // state,files,headRefOid,mergeStateStatus,statusCheckRollup`. GraphQL selects
 // files(first: 100); per_page=100 is the same window. REST reports a merged PR
 // as state=closed plus merged=true, so MERGED is restored here.
-function restPrView(repo, num, run = ghExec) {
+async function restPrView(repo, num, run = ghExec) {
   return restPrViewFields(repo, num, GATE_PR_FIELDS, run);
 }
 
@@ -233,9 +257,10 @@ const GATE_PR_FIELDS = ['state', 'files', 'headRefOid', 'mergeStateStatus', 'sta
 // mergeable as a boolean where GraphQL answers MERGEABLE/CONFLICTING/UNKNOWN.
 // Both are restored to the GraphQL spelling the callers already consume.
 // files(first: 100) in GraphQL is per_page=100 here.
-function restPrViewFields(repo, num, fields, run = ghExec) {
+async function restPrViewFields(repo, num, fields, run = ghExec) {
   const want = new Set(fields);
-  const pr = JSON.parse(run(['api', `repos/${repo}/pulls/${num}`]));
+  const pr = JSON.parse(await run(['api', `repos/${repo}/pulls/${num}`],
+    { cacheKey: `${repo}:pr:${num}` }));
   const sha = pr.head && pr.head.sha;
   const out = {};
   if (want.has('number')) out.number = pr.number;
@@ -257,10 +282,11 @@ function restPrViewFields(repo, num, fields, run = ghExec) {
   }
   if (want.has('mergeStateStatus')) out.mergeStateStatus = String(pr.mergeable_state || 'unknown').toUpperCase();
   if (want.has('files')) {
-    out.files = JSON.parse(run(['api', `repos/${repo}/pulls/${num}/files?per_page=100`]))
+    out.files = JSON.parse(await run(['api', `repos/${repo}/pulls/${num}/files?per_page=100`],
+      { cacheKey: `${repo}@${sha}:pr-files` }))
       .map((f) => ({ path: f.filename }));
   }
-  if (want.has('statusCheckRollup')) out.statusCheckRollup = restStatusCheckRollup(repo, sha, run);
+  if (want.has('statusCheckRollup')) out.statusCheckRollup = await restStatusCheckRollup(repo, sha, run);
   return JSON.stringify(out);
 }
 
@@ -269,7 +295,7 @@ function restPrViewFields(repo, num, fields, run = ghExec) {
 // logged and left pr_url empty, and mergedPullRequestNoop swallowed the error
 // whole, which is why a merged PR never completed its ticket. Hand the
 // reconciler this authenticated REST reader instead.
-function reconcileGithubCommand(args, run = ghExec) {
+async function reconcileGithubCommand(args, run = ghExec) {
   if (args[0] !== 'pr' || args[1] !== 'view') {
     throw new Error(`unsupported GitHub command: ${args.join(' ')}`);
   }
@@ -281,7 +307,7 @@ function reconcileGithubCommand(args, run = ghExec) {
   return restPrViewFields(`${match[1]}/${match[2]}`, Number(match[3]), fields, run);
 }
 
-function github(args, run = ghExec) {
+async function github(args, run = ghExec) {
   const target = args[0] === 'pr' ? PR_URL_RE.exec(String(args[2] || '')) : null;
   if (target) {
     const repo = `${target[1]}/${target[2]}`;
@@ -388,7 +414,7 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
     ? `${issuePr.repo_owner}/${issuePr.repo_name}`
     : `${commentMatch[1]}/${commentMatch[2]}`;
   const prUrl = issuePr?.html_url || commentMatch[0];
-  const pr = JSON.parse(githubCommand(['pr', 'view', prUrl, '--json',
+  const pr = JSON.parse(await githubCommand(['pr', 'view', prUrl, '--json',
     'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
   const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
   // The bridge (#528) refuses In Progress -> CI/CD & Deploy unless a qualifying
@@ -1007,23 +1033,18 @@ async function applyQcGate(client, row, postRelay, logger, gateRunner = runQcGat
   const hintedKey = `${row.issue_id}:${hintedSha}`;
   const cached = qcGatePending.get(hintedKey) || [...qcGatePending].find(([key]) => key.startsWith(`${row.issue_id}:`))?.[1];
   const current = now();
-  if (current < qcGateGhCooldownUntil) {
-    if (current - lastCooldownLog >= 60000) {
-      logger.log(`${LOG_PREFIX} [qc-gate] COOLDOWN until=${new Date(qcGateGhCooldownUntil).toISOString()}`);
-      lastCooldownLog = current;
-    }
-    return 'pending';
-  }
   if (cached && current - cached.at < QC_GATE_PENDING_RECHECK_MS) return 'pending';
   let gate;
   try {
-    gate = await gateRunner({ issue, workspace: { id: issue.workspace_id || row.workspace_id }, evidence: issue.metadata || {}, gh: ghExec, db: client });
+    gate = await gateRunner({ issue, workspace: { id: issue.workspace_id || row.workspace_id },
+      evidence: issue.metadata || {}, gh: ghExec, db: client,
+      workProduct: (sha, workspace, repo) => workProductCache.get(`${repo}@${sha}:git-tree`,
+        () => md5ForSha(sha, workspace, repo)) });
   } catch (err) {
     const message = String(err?.message || err);
     const transient = /rate limit|secondary rate|abuse|timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|502|503|504/i.test(message);
     const cls = transient ? 'transient' : 'tool_error';
     logger.log(`${LOG_PREFIX} [qc-gate] ERROR issue=${row.issue_id} class=${cls} ${message.slice(0, 160)}`);
-    if (transient) qcGateGhCooldownUntil = current + QC_GATE_GH_COOLDOWN_MS;
     const key = `${row.issue_id}:${hintedSha}`;
     const prior = qcGatePending.get(key);
     qcGatePending.set(key, prior || { at: current, firstAt: current });
@@ -1074,20 +1095,163 @@ async function applyQcGate(client, row, postRelay, logger, gateRunner = runQcGat
   return 'returned';
 }
 
-async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
-  logger = console } = {}) {
-  const client = await dbPool.connect();
+function advanceClaimKey(row) {
+  const sha = row.qc_attempt_bound_sha || row.qc_attempt_observed_sha || row.task_id;
+  return `${row.issue_id}:${sha}`;
+}
+
+async function claimAdvanceRow(client, row, now = Date.now) {
+  const until = new Date(now() + QC_GATE_PENDING_RECHECK_MS).toISOString();
+  const claimed = await client.query(`WITH claimed_issue AS (
+    UPDATE issue SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{advance_claim}',
+      jsonb_build_object('key', $2::text, 'until', $3::timestamptz))
+    WHERE id = $4::uuid
+      AND COALESCE((metadata->'advance_claim'->>'until')::timestamptz, '-infinity') <= NOW()
+    RETURNING id
+  )
+  UPDATE relay_run_log
+    SET parked_audit = jsonb_set(COALESCE(parked_audit, '{}'::jsonb), '{advance_claim}',
+      jsonb_build_object('key', $2::text, 'until', $3::timestamptz))
+    WHERE id = $1 AND status = 'pending'
+      AND COALESCE((parked_audit->'advance_claim'->>'until')::timestamptz, '-infinity') <= NOW()
+      AND COALESCE((parked_audit->>'advance_retry_at')::timestamptz, '-infinity') <= NOW()
+      AND EXISTS (SELECT 1 FROM claimed_issue)
+    RETURNING id`, [row.log_id, advanceClaimKey(row), until, row.issue_id]);
+  return claimed.rowCount > 0;
+}
+
+async function releaseAdvanceClaim(client, row, retry, now = Date.now) {
+  const retryAt = retry ? new Date(now() + QC_GATE_PENDING_RECHECK_MS).toISOString() : null;
+  await client.query(`WITH released_issue AS (
+    UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) - 'advance_claim'
+    WHERE id = $3::uuid AND metadata->'advance_claim'->>'key' = $4::text
+    RETURNING id
+  )
+  UPDATE relay_run_log
+    SET parked_audit = (COALESCE(parked_audit, '{}'::jsonb) - 'advance_claim' - 'advance_retry_at') ||
+      CASE WHEN $2::timestamptz IS NULL THEN '{}'::jsonb
+        ELSE jsonb_build_object('advance_retry_at', $2::timestamptz) END
+    WHERE id = $1 AND status = 'pending'`,
+  [row.log_id, retryAt, row.issue_id, advanceClaimKey(row)]);
+}
+
+async function runBounded(items, concurrency, operation) {
+  let next = 0;
+  async function worker() {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      await operation(items[index]);
+    }
+  }
+  const count = Math.min(concurrency, items.length);
+  await Promise.all(Array.from({ length: count }, () => worker()));
+}
+
+async function processAdvanceRow(client, row, { postRelay, logger, gateRunner }) {
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
+  try {
+    if (TERMINAL_STAGES.has(row.to_stage)) {
+      await markRelayLogCompletedById(client, row.log_id);
+      logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
+      return false;
+    }
+    const completion = deploymentCompletionAdmission(row.task_status, row.task_result ??
+      (row.task_error ? { error: row.task_error } : null));
+    if (!completion.ok) {
+      const escalation = await requestRetryEscalation(row, completion.reason);
+      logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
+      await markRelayLogFailedById(client, row.log_id);
+      return false;
+    }
+    const qcAdvance = qcCompletionAdvance(row);
+    if (gatedStages.includes(row.next_stage) && !qcAdvance.ok) {
+      if (qcAdvance.reason === 'qc_work_product_md5_required') {
+        logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
+        return false;
+      }
+      if (['qc_attempt_mismatch', 'legacy_qc_evidence_mismatch'].includes(qcAdvance.reason)) {
+        const held = await holdQcEvidenceMismatch(client, row.log_id);
+        const state = held.rows[0];
+        logger.log(`${LOG_PREFIX} QC evidence mismatch: issue=${row.issue_id}, relay=${row.log_id}, ` +
+          `attempt=${state?.mismatch_count || 'unknown'}, status=${state?.status || 'unknown'}`);
+      }
+      if (['completed_sol_low_pass_required', 'qc_attempt_binding_required'].includes(qcAdvance.reason)) {
+        await markRelayLogFailedById(client, row.log_id);
+      }
+      if (qcAdvance.reason === 'manual_gated_stage') await markRelayLogCompletedById(client, row.log_id);
+      logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
+      return false;
+    }
+
+    if (qcAdvance.ok) {
+      const currentMd5 = await currentPassWorkProductMD5(client, row.issue_id);
+      if (!currentMd5 || currentMd5.toLowerCase() !== qcAdvance.workProductMd5) {
+        const reason = currentMd5 ? 'stale_pass_md5_mismatch' : 'pass_without_md5';
+        logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=${reason}`);
+        return false;
+      }
+    }
+
+    const route = await buildCompletionRoute(client, row);
+    if (route && !route.toStage) {
+      const escalation = await requestRetryEscalation(row, route.reason);
+      logger.log(`${LOG_PREFIX} [route] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', ` +
+        `reason=${route.reason}, relay=${escalation.status}`);
+      if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
+      return false;
+    }
+    const targetStage = route?.toStage || row.next_stage;
+    const refusalFingerprint = [targetStage, route?.reason || '', row.issue_updated_at || '',
+      route?.boundSha || ''].join(':');
+    if (relayRefusalMemo.get(row.issue_id) === refusalFingerprint) return false;
+    const payload = { issue_id: row.issue_id, to_stage: targetStage,
+      agent_token: RELAY_AGENT_SECRET,
+      relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
+      evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
+      ...(route ? { routing_classification: route } : {}),
+      ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
+    if (process.env.QC_GATE_ENABLED === '1' && qcGateRequired(row, targetStage, route)) {
+      const gate = await applyQcGate(client, row, postRelay, logger, gateRunner);
+      if (gate === 'pending') return true;
+      if (gate === 'returned') return false;
+    }
+    const response = await postRelay(payload);
+    if (response.ok) {
+      const proof = qcAdvance.ok ? ` sha=${qcAdvance.boundSha} md5=${qcAdvance.workProductMd5}` : '';
+      logger.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${targetStage}' ` +
+        `route=${route?.kind || 'configured'} (task-correlated log ${row.log_id})${proof}`);
+      await markRelayLogCompletedById(client, row.log_id);
+    } else if (response.deferred) {
+      logger.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
+    } else {
+      logger.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}` +
+        `${response.error ? ` reason=${response.error}` : ''}`);
+      if (response.status === 409) relayRefusalMemo.set(row.issue_id, refusalFingerprint);
+      else await markRelayLogFailedById(client, row.log_id);
+    }
+    return false;
+  } catch (err) {
+    const retryable = err?.rateLimited ||
+      /rate limit|secondary rate|abuse|timeout|ETIMEDOUT|ECONNRESET|EAI_AGAIN|502|503|504/i.test(String(err?.message || err));
+    logger.error(`${LOG_PREFIX} Error: ${err.message}`);
+    if (retryable) return true;
+    await markRelayLogFailedById(client, row.log_id);
+    return false;
+  }
+}
+
+async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
+  logger = console, gateConcurrency = GATE_CHECK_CONCURRENCY, gateRunner = runQcGate } = {}) {
+  const startedAt = Date.now();
+  const before = githubCallStats();
+  const client = await dbPool.connect();
+  let candidateCount = 0;
   try {
     await closeDeadRelayRows(client, { terminalStages: [...TERMINAL_STAGES],
       requestRetryEscalation, postRelay, postVerdict: postQcVerdict,
       postNoArtifactRescope: (payload) => postRelay({ ...payload, agent_token: RELAY_AGENT_SECRET }),
       logger, logPrefix: LOG_PREFIX });
-
-    // Correlate strictly on the task that owns the relay log. Advance only
-    // genuinely completed tasks; a failed task must never move work forward.
-    // No completed_at window: eligibility is the task's terminal state, so a
-    // daemon outage delays an advance instead of stranding it forever.
     const evidenceSql = completedTaskEvidenceSql({ taskAlias: 'atq', issueAlias: 'i', modelParam: 2, effortParam: 3 });
     const query = `SELECT rrl.id AS log_id, atq.id AS task_id, atq.issue_id,
              ${evidenceSql.columns}, rrl.to_stage, rsc.next_stage, i.updated_at AS issue_updated_at
@@ -1096,149 +1260,37 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       INNER JOIN issue i ON atq.issue_id = i.id
       INNER JOIN relay_stage_config rsc ON rrl.to_stage = rsc.stage_name AND rsc.workspace_id = i.workspace_id
       ${evidenceSql.joins}
-      WHERE atq.status = 'completed'
-        AND i.status = rrl.to_stage
-        AND rsc.next_stage IS NOT NULL
-      ORDER BY rrl.created_at ASC
+      WHERE atq.status = 'completed' AND i.status = rrl.to_stage AND rsc.next_stage IS NOT NULL
+        AND COALESCE((rrl.parked_audit->'advance_claim'->>'until')::timestamptz, '-infinity') <= NOW()
+        AND COALESCE((rrl.parked_audit->>'advance_retry_at')::timestamptz, '-infinity') <= NOW()
+      ORDER BY rrl.created_at ASC, rrl.id ASC
       LIMIT 100`;
-
     const result = await client.query(query, ['pending', qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
-
-    // A failed or cancelled task must not advance, but its pending log must not
-    // linger either -- otherwise the row is retried forever. Close it as failed
-    // and leave the issue where it is; the build worker owns returning its own
-    // incomplete work to Queue.
-    const failed = await client.query(
-      `UPDATE relay_run_log rrl
-       SET status = 'failed'
-       FROM agent_task_queue atq
-       WHERE rrl.task_id = atq.id
-         AND rrl.status = 'pending'
-         AND atq.status IN ('failed', 'cancelled')
-       RETURNING rrl.id, rrl.issue_id`
-    );
+    const failed = await client.query(`UPDATE relay_run_log rrl SET status = 'failed'
+      FROM agent_task_queue atq WHERE rrl.task_id = atq.id AND rrl.status = 'pending'
+        AND atq.status IN ('failed', 'cancelled') RETURNING rrl.id, rrl.issue_id`);
     if (failed.rowCount > 0) {
       logger.log(`${LOG_PREFIX} Closed ${failed.rowCount} relay log(s) whose task failed/cancelled; NOT advanced`);
     }
-
-    if (result.rows.length === 0) return;
-
-    logger.log(`${LOG_PREFIX} Found ${result.rows.length} tasks ready to advance`);
-
-    for (const row of result.rows) {
-      try {
-        // A completed terminal arrival is a final ledger entry, not an exit
-        // trigger. This also neutralizes old rows created before the bridge
-        // stopped terminal-stage dispatch.
-        if (TERMINAL_STAGES.has(row.to_stage)) {
-          await markRelayLogCompletedById(client, row.log_id);
-          logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
-          continue;
-        }
-        const completion = deploymentCompletionAdmission(row.task_status, row.task_result ??
-          (row.task_error ? { error: row.task_error } : null));
-        if (!completion.ok) {
-          // Process exit 0 is not a work-product guarantee. A completed task
-          // carrying an explicit blocker/FAIL (or no result at all) must not
-          // buy another same-lane attempt. The bridge changes hands to re-spec.
-          const escalation = await requestRetryEscalation(row, completion.reason);
-          logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
-          await markRelayLogFailedById(client, row.log_id);
-          continue;
-        }
-        // A QC worker records its verdict before its own execution row becomes
-        // terminal. The bridge correctly defers its in-task advance, so replay
-        // that exact handoff here only after completion and only when the same
-        // Sol-low task carries a SHA-bound PASS plus the current artifact MD5.
-        const qcAdvance = qcCompletionAdvance(row);
-        if (gatedStages.includes(row.next_stage) && !qcAdvance.ok) {
-          if (qcAdvance.reason === 'qc_work_product_md5_required') {
-            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
-            continue;
-          }
-          if (qcAdvance.reason === 'qc_attempt_mismatch' ||
-              qcAdvance.reason === 'legacy_qc_evidence_mismatch') {
-            const held = await holdQcEvidenceMismatch(client, row.log_id);
-            const state = held.rows[0];
-            logger.log(`${LOG_PREFIX} QC evidence mismatch: issue=${row.issue_id}, ` +
-              `relay=${row.log_id}, attempt=${state?.mismatch_count || 'unknown'}, ` +
-              `status=${state?.status || 'unknown'}`);
-          }
-          if (['completed_sol_low_pass_required', 'qc_attempt_binding_required'].includes(qcAdvance.reason)) {
-            // A finished QC task with no bound PASS cannot advance; close its ledger row.
-            // The reconciler dispatches the next QC attempt with its own row.
-            await markRelayLogFailedById(client, row.log_id);
-          }
-          if (qcAdvance.reason === 'manual_gated_stage') {
-            // The CI/CD worker owns this exit; a completed desk task here is a ledger entry, not a trigger.
-            await markRelayLogCompletedById(client, row.log_id);
-          }
-          logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, to_stage='${row.to_stage}', reason=${qcAdvance.reason}`);
-          continue;
-        }
-
-        if (qcAdvance.ok) {
-          const currentWorkProductMd5 = await currentPassWorkProductMD5(client, row.issue_id);
-          if (!currentWorkProductMd5) {
-            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=pass_without_md5`);
-            continue;
-          }
-          if (currentWorkProductMd5.toLowerCase() !== qcAdvance.workProductMd5) {
-            logger.log(`${LOG_PREFIX} PENDING: issue=${row.issue_id}, reason=stale_pass_md5_mismatch`);
-            continue;
-          }
-        }
-
-        const route = await buildCompletionRoute(client, row);
-        if (route && !route.toStage) {
-          const escalation = await requestRetryEscalation(row, route.reason);
-          logger.log(`${LOG_PREFIX} [route] RESPEC: issue=${row.issue_id}, ` +
-            `stage='${row.to_stage}', reason=${route.reason}, relay=${escalation.status}`);
-          if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
-          continue;
-        }
-        const targetStage = route?.toStage || row.next_stage;
-        const refusalFingerprint = [targetStage, route?.reason || '', row.issue_updated_at || '',
-          route?.boundSha || ''].join(':');
-        if (relayRefusalMemo.get(row.issue_id) === refusalFingerprint) continue;
-        const payload = { issue_id: row.issue_id, to_stage: targetStage,
-          agent_token: RELAY_AGENT_SECRET,
-          relay_source_task_id: qcAdvance.evidenceTaskId || row.task_id,
-          evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
-          ...(route ? { routing_classification: route } : {}),
-          ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}) };
-        if (process.env.QC_GATE_ENABLED === '1' && qcGateRequired(row, targetStage, route)) {
-          const gate = await applyQcGate(client, row, postRelay, logger);
-          if (gate === 'pending' || gate === 'returned') continue;
-        }
-        const response = await postRelay(payload);
-
-        if (response.ok) {
-          const proof = qcAdvance.ok ? ` sha=${qcAdvance.boundSha} md5=${qcAdvance.workProductMd5}` : '';
-          logger.log(`${LOG_PREFIX} Advanced ${row.issue_id} '${row.to_stage}' → '${targetStage}' route=${route?.kind || 'configured'} (task-correlated log ${row.log_id})${proof}`);
-          await markRelayLogCompletedById(client, row.log_id);
-        } else if (response.deferred) {
-          // Preserve the task-correlated pending log. The same advance becomes
-          // eligible once the predecessor is terminal; recording failure here
-          // would strand it permanently.
-          logger.log(`${LOG_PREFIX} DEFERRED: ${row.issue_id} reason=${response.error || 'prior_execution_active'}`);
-        } else {
-          // The relay's own error text was parsed and then discarded, so 76 of every
-          // 400 log lines were a bare `status 409` with no cause. Print the reason.
-          logger.log(`${LOG_PREFIX} Failed: ${row.issue_id} status ${response.status}${response.error ? ` reason=${response.error}` : ''}`);
-          if (response.status === 409) relayRefusalMemo.set(row.issue_id, refusalFingerprint);
-          else await markRelayLogFailedById(client, row.log_id);
-        }
-      } catch (err) {
-        logger.error(`${LOG_PREFIX} Error: ${err.message}`);
-        await markRelayLogFailedById(client, row.log_id);
-      }
-    }
+    candidateCount = result.rows.length;
+    if (candidateCount > 0) logger.log(`${LOG_PREFIX} Found ${candidateCount} tasks ready to advance`);
+    await runBounded(result.rows, gateConcurrency, async row => {
+      if (!await claimAdvanceRow(client, row)) return;
+      let retry = false;
+      try { retry = await processAdvanceRow(client, row, { postRelay, logger, gateRunner }); }
+      finally { await releaseAdvanceClaim(client, row, retry); }
+    });
   } catch (err) {
     logger.error(`${LOG_PREFIX} DB error: ${err.message}`);
   } finally {
     client.release();
   }
+  const after = githubCallStats();
+  const metrics = { duration_ms: Date.now() - startedAt, candidates: candidateCount,
+    external_calls: after.externalCalls - before.externalCalls,
+    cache_hits: after.cacheHits - before.cacheHits, concurrency: gateConcurrency };
+  logger.log(`${LOG_PREFIX} [advance-metrics] ${Object.entries(metrics).map(([k, v]) => `${k}=${v}`).join(' ')}`);
+  return metrics;
 }
 
 async function recoveryAdvanceTasks() {
@@ -2428,4 +2480,5 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
-  github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup };
+  github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup,
+  advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency };

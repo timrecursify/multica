@@ -245,7 +245,7 @@ test('worker retains no self-deploy or direct database writes', () => {
   assert.doesNotMatch(source, /UPDATE |INSERT INTO /);
   assert.match(source, /transition-policy\.cjs/);
   assert.match(source, /DEFAULT_SK_COMMAND = '\/opt\/gsp\/.sk\/bin\/sk'/);
-  assert.match(source, /execFileSync\(SK_COMMAND, \['multica', 'comment'/);
+  assert.match(source, /await execFileAsync\(SK_COMMAND, \['multica', 'comment'/);
 });
 
 test('SK_COMMAND defaults safely and honors an explicit override', () => {
@@ -515,13 +515,13 @@ test('third return for the same reason escalates once instead of looping', async
   assert.deepEqual(calls.map(call => call[1]), ['In Progress', 'In Progress', 'Parked']);
 });
 
-test('a just-merged sha stays pending inside the deploy trigger grace window', () => {
+test('a just-merged sha stays pending inside the deploy trigger grace window', async () => {
   worker.setTestDependencies({ gh: () => JSON.stringify({ workflow_runs: [] }) });
-  assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, new Date().toISOString()), false);
-  assert.equal(worker.noDeployRunTriggered('timrecursify/ppp', sha, undefined), false);
+  assert.equal(await worker.noDeployRunTriggered('timrecursify/ppp', sha, new Date().toISOString()), false);
+  assert.equal(await worker.noDeployRunTriggered('timrecursify/ppp', sha, undefined), false);
 });
 
-test('wrongly named successful workflow refuses Done without a receipt', () => {
+test('wrongly named successful workflow refuses Done without a receipt', async () => {
   const gh = (args) => {
     const path = args[1] || '';
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
@@ -531,13 +531,13 @@ test('wrongly named successful workflow refuses Done without a receipt', () => {
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
   assert.equal(result.outcome, 'pending');
   assert.equal(result.blocker.type, 'activation_receipt_missing');
   worker.setTestDependencies({ log: defaultLog });
 });
 
-test('workflow with zero jobs refuses Done without a receipt', () => {
+test('workflow with zero jobs refuses Done without a receipt', async () => {
   const gh = (args) => {
     const path = args[1] || '';
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
@@ -548,11 +548,11 @@ test('workflow with zero jobs refuses Done without a receipt', () => {
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
   assert.equal(result.outcome, 'pending');
 });
 
-test('skipped dispatch deploy still refuses Done without a receipt', () => {
+test('skipped dispatch deploy still refuses Done without a receipt', async () => {
   const gh = (args) => {
     const path = args[1] || '';
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
@@ -566,43 +566,43 @@ test('skipped dispatch deploy still refuses Done without a receipt', () => {
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
   assert.equal(result.outcome, 'pending');
   assert.equal(result.blocker.type, 'activation_receipt_missing');
 });
 
-test('GitHub changed-path outage is retryable and refuses Done', () => {
+test('GitHub changed-path outage is retryable and refuses Done', async () => {
   worker.setTestDependencies({ readChangedPaths: () => { throw new Error('GitHub unavailable'); } });
-  const result = worker.mergeDeployEvidence('timrecursify/multica', sha, { num: 17 });
+  const result = await worker.mergeDeployEvidence('timrecursify/multica', sha, { num: 17 });
   assert.equal(result.outcome, 'discovery_unavailable');
   assert.equal(result.blocker.type, 'changed_path_discovery_unavailable');
   assert.equal(result.blocker.retry_eligible, true);
 });
 
-test('one receipt for several applicable deploy targets refuses Done', () => {
+test('one receipt for several applicable deploy targets refuses Done', async () => {
   worker.setTestDependencies({ readReceipt: (_repo, target) => {
     if (target === 'gsp-belt') return activationReceipt(target);
     const error = new Error('missing'); error.code = 'ENOENT'; throw error;
   } });
-  const result = worker.mergeDeployEvidence('timrecursify/multica', sha,
+  const result = await worker.mergeDeployEvidence('timrecursify/multica', sha,
     { changedPaths: ['ops/belt/worker.cjs', 'server/main.go'] });
   assert.equal(result.outcome, 'pending');
   assert.deepStrictEqual(result.blocker.missing_targets, ['gsp-multica']);
 });
 
-test('non-exact source SHA refuses Done before receipt lookup', () => {
+test('non-exact source SHA refuses Done before receipt lookup', async () => {
   worker.setTestDependencies({ readReceipt: () => { throw new Error('receipt lookup must not run'); } });
-  const result = worker.mergeDeployEvidence('timrecursify/multica', 'A'.repeat(40),
+  const result = await worker.mergeDeployEvidence('timrecursify/multica', 'A'.repeat(40),
     { changedPaths: ['ops/belt/worker.cjs'] });
   assert.equal(result.outcome, 'failed');
   assert.equal(result.blocker.type, 'source_sha_invalid');
 });
 
-test('health recorded before activation invalidates the receipt', () => {
+test('health recorded before activation invalidates the receipt', async () => {
   const receipt = activationReceipt();
   receipt.health.checked_at = '2026-09-07T13:59:59Z';
   worker.setTestDependencies({ readReceipt: () => receipt });
-  const result = worker.mergeDeployEvidence('timrecursify/multica', sha,
+  const result = await worker.mergeDeployEvidence('timrecursify/multica', sha,
     { changedPaths: ['ops/belt/worker.cjs'] });
   assert.equal(result.outcome, 'failed');
   assert.equal(result.blocker.field, 'health');
@@ -751,4 +751,29 @@ test('an unauthenticated gh failure escalates on the first attempt, not after th
   assert.ok(lines.some(line => line.includes('TERMINAL #4242') && line.includes('credential unavailable')),
     lines.join(' | '));
   worker.setTestDependencies({ log: defaultLog });
+});
+
+test('CICD read keys bind repository and full SHA for both gh argument forms', () => {
+  const head = 'e'.repeat(40);
+  assert.match(worker.githubReadKey(['run', 'list', '--repo', 'acme/widget', '--commit', head]),
+    new RegExp(`^acme/widget@${head}:`));
+  assert.match(worker.githubReadKey(['api', `repos/acme/widget/contents/a.js?ref=${head}`]),
+    new RegExp(`^acme/widget@${head}:`));
+});
+
+test('merge operations serialize per repository without blocking another repository', async () => {
+  const started = [];
+  let releaseFirst;
+  const firstBlocked = new Promise(resolve => { releaseFirst = resolve; });
+  const first = worker.withRepoMergeLock('acme/widget', async () => {
+    started.push('first');
+    await firstBlocked;
+  });
+  const sameRepo = worker.withRepoMergeLock('acme/widget', async () => started.push('same-repo'));
+  const otherRepo = worker.withRepoMergeLock('acme/other', async () => started.push('other-repo'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(started.sort(), ['first', 'other-repo']);
+  releaseFirst();
+  await Promise.all([first, sameRepo, otherRepo]);
+  assert.ok(started.includes('same-repo'));
 });

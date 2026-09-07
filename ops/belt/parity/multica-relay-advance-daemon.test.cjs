@@ -6,7 +6,8 @@ const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
-  readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition } = require('./multica-relay-advance-daemon.cjs');
+  readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, runBounded,
+  parseGateCheckConcurrency, claimAdvanceRow } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
@@ -1082,7 +1083,7 @@ test('completed-task advance scans the 100-row head-of-line hold window', () => 
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   const advance = source.slice(source.indexOf('async function findAndAdvanceTasks'),
     source.indexOf('async function recoveryAdvanceTasks'));
-  assert.match(advance, /ORDER BY rrl\.created_at ASC\s+LIMIT 100/);
+  assert.match(advance, /ORDER BY rrl\.created_at ASC, rrl\.id ASC\s+LIMIT 100/);
 });
 
 test('manual gated completions close their relay ledger without an automatic transition', () => {
@@ -1479,9 +1480,9 @@ const OPEN_PR_RESPONSES = {
   '/status': JSON.stringify({ statuses: [{ context: 'legacy', state: 'success' }] })
 };
 
-test('pr view is rebuilt from REST with the GraphQL field names', () => {
+test('pr view is rebuilt from REST with the GraphQL field names', async () => {
   const { run, calls } = stubGh(OPEN_PR_RESPONSES);
-  const pr = JSON.parse(restPrView('acme/widget', '42', run));
+  const pr = JSON.parse(await restPrView('acme/widget', '42', run));
   assert.equal(pr.state, 'OPEN');
   assert.equal(pr.headRefOid, 'a'.repeat(40));
   assert.equal(pr.mergeStateStatus, 'CLEAN');
@@ -1494,13 +1495,13 @@ test('pr view is rebuilt from REST with the GraphQL field names', () => {
   assert.equal(calls.some((c) => c.includes('graphql')), false);
 });
 
-test('a merged PR reads as MERGED and an unchecked commit rolls up to null', () => {
+test('a merged PR reads as MERGED and an unchecked commit rolls up to null', async () => {
   const { run } = stubGh({ ...OPEN_PR_RESPONSES,
     'pulls/42': JSON.stringify({ state: 'closed', merged: true, mergeable_state: 'unknown',
       head: { sha: 'b'.repeat(40) } }),
     'check-runs': JSON.stringify({ check_runs: [] }),
     '/status': JSON.stringify({ statuses: [] }) });
-  const pr = JSON.parse(restPrView('acme/widget', '42', run));
+  const pr = JSON.parse(await restPrView('acme/widget', '42', run));
   assert.equal(pr.state, 'MERGED');
   assert.equal(pr.mergeStateStatus, 'UNKNOWN');
   assert.equal(pr.statusCheckRollup, null);
@@ -1509,14 +1510,14 @@ test('a merged PR reads as MERGED and an unchecked commit rolls up to null', () 
 // reconciler.cjs reads these exact names off the parsed result and writes them
 // straight into github_pull_request. A REST name reaching that insert is a
 // silently empty column, so the translation is asserted field by field.
-test('the reconciler PR read translates every REST name it consumes', () => {
+test('the reconciler PR read translates every REST name it consumes', async () => {
   const { run, calls } = stubGh({ 'pulls/42': JSON.stringify({
     number: 42, title: 'Fix the belt', state: 'open', merged: false, html_url: 'https://github.com/acme/widget/pull/42',
     head: { sha: 'c'.repeat(40), ref: 'fix/belt' }, user: { login: 'gsp-multica-belt' },
     created_at: '2026-09-01T00:00:00Z', updated_at: '2026-09-02T00:00:00Z',
     merged_at: null, closed_at: null, additions: 3, deletions: 1, changed_files: 2,
     mergeable: true, mergeable_state: 'clean' }) });
-  const pr = JSON.parse(reconcileGithubCommand(['pr', 'view', 'https://github.com/acme/widget/pull/42',
+  const pr = JSON.parse(await reconcileGithubCommand(['pr', 'view', 'https://github.com/acme/widget/pull/42',
     '--json', 'number,title,state,url,headRefOid,createdAt,updatedAt,mergedAt,closedAt,author,headRefName,' +
     'additions,deletions,changedFiles,mergeable,mergeStateStatus'], run));
   assert.equal(pr.number, 42);
@@ -1539,30 +1540,64 @@ test('the reconciler PR read translates every REST name it consumes', () => {
   assert.equal(calls.length, 1);
 });
 
-test('the reconciler merged-PR check sees MERGED through the same reader', () => {
+test('the reconciler merged-PR check sees MERGED through the same reader', async () => {
   const { run } = stubGh({ 'pulls/7': JSON.stringify({ state: 'closed', merged: true,
     merged_at: '2026-09-03T00:00:00Z', html_url: 'https://github.com/acme/widget/pull/7',
     head: { sha: 'd'.repeat(40) }, mergeable_state: 'unknown' }) });
-  const pr = JSON.parse(reconcileGithubCommand(['pr', 'view', 'https://github.com/acme/widget/pull/7',
+  const pr = JSON.parse(await reconcileGithubCommand(['pr', 'view', 'https://github.com/acme/widget/pull/7',
     '--json', 'state,mergedAt,headRefOid,url'], run));
   assert.equal(pr.state, 'MERGED');
   assert.equal(pr.mergedAt, '2026-09-03T00:00:00Z');
   assert.equal(pr.url, 'https://github.com/acme/widget/pull/7');
 });
 
-test('the reconciler reader refuses a command it cannot serve', () => {
-  assert.throws(() => reconcileGithubCommand(['pr', 'merge', 'https://github.com/acme/widget/pull/7']),
+test('the reconciler reader refuses a command it cannot serve', async () => {
+  await assert.rejects(() => reconcileGithubCommand(['pr', 'merge', 'https://github.com/acme/widget/pull/7']),
     /unsupported GitHub command/);
-  assert.throws(() => reconcileGithubCommand(['pr', 'view', 'not-a-pr-url', '--json', 'state']),
+  await assert.rejects(() => reconcileGithubCommand(['pr', 'view', 'not-a-pr-url', '--json', 'state']),
     /unsupported pull request reference/);
 });
 
-test('pr merge becomes a REST squash merge and other gh verbs pass through', () => {
+test('pr merge becomes a REST squash merge and other gh verbs pass through', async () => {
   const { run, calls } = stubGh({ 'pulls/42/merge': '{"merged":true}', 'repo view': 'acme/widget' });
-  githubRest(['pr', 'merge', 'https://github.com/acme/widget/pull/42', '--squash', '--admin'], run);
+  await githubRest(['pr', 'merge', 'https://github.com/acme/widget/pull/42', '--squash', '--admin'], run);
   assert.deepEqual(calls, ['api -X PUT repos/acme/widget/pulls/42/merge -f merge_method=squash']);
-  githubRest(['repo', 'view'], run);
+  await githubRest(['repo', 'view'], run);
   assert.equal(calls[1], 'repo view');
+});
+
+test('gate-check concurrency defaults to the former sequential value', () => {
+  assert.equal(parseGateCheckConcurrency(undefined), 1);
+  assert.equal(parseGateCheckConcurrency('3'), 3);
+  assert.equal(parseGateCheckConcurrency('0'), 1);
+});
+
+test('a slow gate worker does not delay another worker or the event loop', async () => {
+  const order = [];
+  let releaseSlow;
+  const slow = new Promise(resolve => { releaseSlow = resolve; });
+  const heartbeat = new Promise(resolve => setTimeout(() => { order.push('heartbeat'); resolve(); }, 5));
+  const running = runBounded(['slow', 'fast'], 2, async item => {
+    if (item === 'slow') await slow;
+    order.push(item);
+  });
+  await heartbeat;
+  assert.deepEqual(order.sort(), ['fast', 'heartbeat']);
+  releaseSlow();
+  await running;
+});
+
+test('advance claim is one atomic issue-SHA lease without an external transaction', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rowCount: 1, rows: [{ id: values[0] }] };
+  } };
+  const row = { log_id: 7, issue_id: 'issue-1', qc_attempt_bound_sha: 'a'.repeat(40) };
+  assert.equal(await claimAdvanceRow(client, row, () => 1000), true);
+  assert.match(calls[0].sql, /status = 'pending'/);
+  assert.match(calls[0].sql, /advance_retry_at/);
+  assert.equal(calls[0].values[1], `issue-1:${'a'.repeat(40)}`);
 });
 
 test('a 409 relay refusal parks the outcome instead of re-posting it every cycle', async () => {
