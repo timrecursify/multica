@@ -1,0 +1,19 @@
+[Unit]
+Description=GSP Multica Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gsp-multica
+Group=gsp-multica
+Slice=gsp.slice
+WorkingDirectory=/opt/gsp/multica-workers/gsp-multica-bridge
+EnvironmentFile=/etc/gsp/multica/gsp-multica-bridge.env
+ExecStart=/usr/bin/node /opt/gsp/multica-workers/gsp-multica-bridge/multica-bridge.cjs
+ProtectSystem=strict
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

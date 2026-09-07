@@ -1,0 +1,19 @@
+[Unit]
+Description=Multica Relay Advance
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gsp-multica
+Group=gsp-multica
+Slice=gsp.slice
+WorkingDirectory=/opt/gsp/multica-workers/multica-relay-advance
+EnvironmentFile=/etc/gsp/multica/multica-relay-advance.env
+ExecStart=/bin/bash /opt/gsp/multica-workers/multica-relay-advance/multica-relay-advance-wrapper.sh
+ProtectSystem=strict
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
