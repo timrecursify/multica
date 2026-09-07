@@ -7,7 +7,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition } = require('./multica-relay-advance-daemon.cjs');
-const { createGuardedRunner } = require('./multica-relay-advance-daemon.cjs');
+const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
@@ -43,6 +43,14 @@ test('guarded runner contains startup rejection and allows the next pass', async
   await runner();
   assert.equal(calls, 2);
   assert.match(errors[0], /startup-test.*injected startup rejection/);
+});
+
+test('relay pool covers all independent passes without reserving worker task slots', () => {
+  assert.equal(resolveRelayPoolMax(), 12);
+  assert.equal(resolveRelayPoolMax('10'), 10);
+  assert.equal(resolveRelayPoolMax('64'), 16);
+  assert.equal(resolveRelayPoolMax('0'), 12);
+  assert.equal(resolveRelayPoolMax('invalid'), 12);
 });
 
 test('provider quota aliases remain retryable infrastructure failures', () => {
