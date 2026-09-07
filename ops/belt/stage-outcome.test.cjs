@@ -100,6 +100,17 @@ test("stageEligibility retries FAILED after TTL but not before or at the attempt
   assert.deepEqual({ eligible: capped.eligible, reason: capped.reason }, { eligible: false, reason: "attempt_budget_exhausted" });
 });
 
+test("FAILED/human remains terminal after the generic failure TTL", async () => {
+  const now = Date.parse("2026-09-05T20:00:00Z");
+  const c = fakeClient([[{ outcome: "FAILED", blocked_on: "human", input_hash: "h1",
+    outcome_at: "2026-09-05T19:00:00Z" }], [{ input_hash: "h1", issue_status: "In Progress" }]]);
+  const result = await so.stageEligibility(c, "i-human", "In Progress", {
+    failedTtlMinutes: 15, now
+  });
+  assert.equal(result.eligible, false);
+  assert.equal(result.reason, "outcome_unchanged:FAILED/human");
+});
+
 test("stageEligibility re-arms an aged unchanged ADVANCED outcome only while still in that stage", async () => {
   const previous = process.env.MULTICA_ADVANCED_STALL_TTL_MINUTES;
   process.env.MULTICA_ADVANCED_STALL_TTL_MINUTES = "15";

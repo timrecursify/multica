@@ -182,6 +182,59 @@ test("completed build handoff statement runs against the production relay_run_lo
   }
 });
 
+test("own-stage FAILED build with no QC verdict is admitted as a bounded retry in PostgreSQL", async () => {
+  assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for the real PostgreSQL regression test");
+  const { Client } = require("pg");
+  const { buildTaskAdmission } = require("./build-admission.cjs");
+  const client = new Client({ connectionString: process.env.DATABASE_URL });
+  const schema = `build_admission_${process.pid}_${Date.now()}`;
+  const issueId = "11111111-1111-4111-8111-111111111111";
+  const taskId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  await client.connect();
+  try {
+    await client.query(`CREATE SCHEMA "${schema}"`);
+    await client.query(`SET search_path TO "${schema}"`);
+    await client.query(`CREATE TABLE agent_task_queue (
+      id uuid PRIMARY KEY, issue_id uuid NOT NULL, status text NOT NULL,
+      context jsonb NOT NULL, result jsonb, completed_at timestamptz, created_at timestamptz NOT NULL,
+      retry_of_task_id uuid
+    )`);
+    await client.query(`CREATE TABLE qc_effective_verdict (
+      id bigserial PRIMARY KEY, issue_id uuid NOT NULL, verdict text NOT NULL,
+      failure_class text, qualifying boolean, created_at timestamptz NOT NULL
+    )`);
+    await client.query(`CREATE TABLE issue_stage_outcome (
+      issue_id uuid NOT NULL, stage text NOT NULL, outcome text NOT NULL,
+      blocked_on text, task_id uuid, outcome_at timestamptz NOT NULL
+    )`);
+    await client.query(
+      `INSERT INTO agent_task_queue
+         (id, issue_id, status, context, result, completed_at, created_at)
+       VALUES ($1, $2, 'completed', '{"to_stage":"In Progress"}',
+         '{"output":"work product https://github.com/acme/widget/pull/7\\nOUTCOME: FAILED"}',
+         '2026-09-07T20:00:00Z', '2026-09-07T19:00:00Z')`, [taskId, issueId]);
+    await client.query(
+      `INSERT INTO issue_stage_outcome (issue_id, stage, outcome, blocked_on, task_id, outcome_at)
+       VALUES ($1, 'In Progress', 'FAILED', NULL, $2, '2026-09-07T20:00:01Z')`,
+      [issueId, taskId]);
+
+    assert.deepEqual(await buildTaskAdmission(client, {
+      issueId, toStage: "In Progress"
+    }), { admit: true, retryOfTaskId: taskId });
+
+    await client.query(
+      `INSERT INTO qc_effective_verdict
+         (issue_id, verdict, failure_class, qualifying, created_at)
+       VALUES ($1, 'FAIL', 'evidence', false, '2026-09-07T20:00:02Z')`, [issueId]);
+    assert.deepEqual(await buildTaskAdmission(client, {
+      issueId, toStage: "In Progress"
+    }), { admit: false, reuseTaskId: taskId, reason: "completed_build_work_product" });
+  } finally {
+    await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+    await client.end();
+  }
+});
+
 test("completed build without a work product remains admitted", async () => {
   const db = harness();
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }),

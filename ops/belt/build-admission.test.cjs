@@ -2,12 +2,13 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { buildTaskAdmission } = require("./build-admission.cjs");
 
-function db({ prior, failure, successor } = {}) {
+function db({ prior, failure, unreviewedFailure, successor } = {}) {
   return { calls: [], async query(sql, values) {
     this.calls.push({ sql, values });
     if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
     if (sql.includes("SELECT task.id")) return { rows: prior ? [prior] : [] };
     if (sql.includes("SELECT id FROM qc_effective_verdict")) return { rows: failure ? [failure] : [] };
+    if (sql.includes("SELECT outcome.task_id")) return { rows: unreviewedFailure ? [unreviewedFailure] : [] };
     if (sql.includes("retry_of_task_id")) return { rows: successor ? [successor] : [] };
     throw new Error(`unexpected SQL: ${sql}`);
   }};
@@ -32,6 +33,13 @@ test("GSP-2403 qualifying implementation failure admits exactly one linked retry
     { issueId: "gsp-2403", toStage: "In Progress" });
   assert.deepEqual(replay, { admit: false, reuseTaskId: "b4277af2", reason: "implementation_retry_exists" });
   assert.equal(replay.admit, false, "the effective failure event admits only one corrective task");
+});
+
+test("correlated FAILED build without any QC verdict admits a retry", async () => {
+  const prior = { id: "failed-build", completed_at: "2026-09-07T00:00:00Z" };
+  assert.deepEqual(await buildTaskAdmission(db({ prior, unreviewedFailure: { task_id: prior.id } }),
+    { issueId: "stranded", toStage: "In Progress" }),
+  { admit: true, retryOfTaskId: prior.id });
 });
 
 test("non-build stages bypass admission", async () => {
