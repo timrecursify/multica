@@ -211,6 +211,57 @@ func TestIssuePullRequestResponseHidesUnavailableSnapshot(t *testing.T) {
 	}
 }
 
+func TestListPullRequestsForIssueIncludesLatestQCVerdict(t *testing.T) {
+	ctx := context.Background()
+	issueID := createTestIssue(t, "PR QC verdict response", "todo", "medium")
+	if _, err := testPool.Exec(ctx, `CREATE TABLE IF NOT EXISTS qc_verdict (
+		id bigserial PRIMARY KEY, issue_id uuid NOT NULL, checker_id uuid NOT NULL,
+		checker_name text NOT NULL, verdict text NOT NULL, work_product_md5 text NOT NULL,
+		notes text, created_at timestamptz DEFAULT now()
+	)`); err != nil {
+		t.Fatalf("create qc_verdict fixture table: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM qc_verdict WHERE issue_id = $1`, issueID) })
+
+	var prID string
+	err := testPool.QueryRow(ctx, `INSERT INTO github_pull_request
+		(workspace_id, installation_id, repo_owner, repo_name, pr_number, title, state, html_url, pr_created_at, pr_updated_at, head_sha)
+		VALUES ($1, 420, 'multica', 'api', 420, 'Expose QC verdict', 'open', 'https://example.test/pr/420', now(), now(), 'abc')
+		RETURNING id`, testWorkspaceID).Scan(&prID)
+	if err != nil {
+		t.Fatalf("insert pull request: %v", err)
+	}
+	t.Cleanup(func() { _, _ = testPool.Exec(context.Background(), `DELETE FROM github_pull_request WHERE id = $1`, prID) })
+	if _, err := testPool.Exec(ctx, `INSERT INTO issue_pull_request (issue_id, pull_request_id) VALUES ($1, $2)`, issueID, prID); err != nil {
+		t.Fatalf("link pull request: %v", err)
+	}
+	if _, err := testPool.Exec(ctx, `INSERT INTO qc_verdict
+		(issue_id, checker_id, checker_name, verdict, work_product_md5, created_at)
+		VALUES ($1, $2, 'checker', 'FAIL', '11111111111111111111111111111111', '2026-09-07T20:00:00Z'),
+		       ($1, $2, 'checker', 'NEEDS_WORK', '22222222222222222222222222222222', '2026-09-07T21:00:00Z')`, issueID, testUserID); err != nil {
+		t.Fatalf("insert QC verdicts: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req := withURLParam(newRequest("GET", "/api/issues/"+issueID+"/pull-requests", nil), "id", issueID)
+	testHandler.ListPullRequestsForIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("ListPullRequestsForIssue: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		PullRequests []GitHubPullRequestResponse `json:"pull_requests"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(body.PullRequests) != 1 || body.PullRequests[0].QCVerdict == nil || *body.PullRequests[0].QCVerdict != "NEEDS_WORK" {
+		t.Fatalf("latest QC verdict missing from response: %+v", body.PullRequests)
+	}
+	if body.PullRequests[0].QCVerdictCreatedAt == nil || *body.PullRequests[0].QCVerdictCreatedAt != "2026-09-07T21:00:00Z" {
+		t.Fatalf("latest QC verdict timestamp missing from response: %+v", body.PullRequests[0])
+	}
+}
+
 func TestVerifyWebhookSignature(t *testing.T) {
 	secret := "shared-secret"
 	body := []byte(`{"action":"opened"}`)
