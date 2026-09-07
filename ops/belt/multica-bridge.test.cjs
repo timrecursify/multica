@@ -2156,6 +2156,59 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       const res = await invoke({ issue_id: issueId, to_stage: 'In Review', operator_terminal_exit: true, reason: 'reopen' });
       assert.equal(res.status, 409);
     });
+    // Cancelled is the one terminal stage with no configured successor on
+    // either board, so a ticket routed into it by mistake had no way back.
+    // On 2026-09-07 four tickets whose PR was merged and whose only verdict
+    // was a PASS ended Cancelled. Automatic routing must never resurrect a
+    // cancelled ticket -- cancelled has to keep meaning cancelled -- but an
+    // authenticated operator with a reason must be able to pull one back.
+    await t.test('automatic routing cannot leave Cancelled', async () => {
+      const issueId = 'ca11ed00-0000-4000-8000-000000000001';
+      await insertIssue(issueId, 'Cancelled');
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
+        VALUES ($1, $2, 'PASS', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      for (const toStage of ['Done', 'Queue']) {
+        const res = await invoke({ issue_id: issueId, to_stage: toStage,
+          current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' });
+        assert.equal(res.status, 409, toStage);
+        assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_marker_required', toStage);
+      }
+      // The marker alone is not authority: without the operator secret the
+      // same request stays refused.
+      const unsigned = await invoke({ issue_id: issueId, to_stage: 'Done',
+        operator_terminal_exit: true, reason: 'belt cancelled a delivered ticket',
+        current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' });
+      assert.equal(unsigned.status, 409);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`,
+        [issueId])).rows[0].status, 'Cancelled');
+    });
+    await t.test('an authenticated operator recovers a Cancelled ticket with a reason', async () => {
+      const issueId = 'ca11ed00-0000-4000-8000-000000000002';
+      await insertIssue(issueId, 'Cancelled');
+      await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
+        VALUES ($1, $2, 'PASS', 'd41d8cd98f00b204e9800998ecf8427e')`, [issueId, agentId]);
+      const res = await invoke({ issue_id: issueId, to_stage: 'Done',
+        operator_terminal_exit: true, reason: 'PASS + merged PR, cancelled in error',
+        current_work_product_md5: 'd41d8cd98f00b204e9800998ecf8427e' },
+        { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`,
+        [issueId])).rows[0].status, 'Done');
+      const audit = await admin.query(`SELECT parked_audit FROM "${schema}".relay_run_log
+        WHERE issue_id = $1 AND from_stage = 'Cancelled' ORDER BY id DESC LIMIT 1`, [issueId]);
+      assert.equal(audit.rows[0].parked_audit.terminal_exit.operator_marker, true);
+      assert.equal(audit.rows[0].parked_audit.terminal_exit.reason, 'PASS + merged PR, cancelled in error');
+    });
+    await t.test('a Cancelled recovery without a reason is refused', async () => {
+      const issueId = 'ca11ed00-0000-4000-8000-000000000003';
+      await insertIssue(issueId, 'Cancelled');
+      const res = await invoke({ issue_id: issueId, to_stage: 'Done', operator_terminal_exit: true, reason: '   ' },
+        { 'x-relay-operator-secret': 'test-operator-secret' });
+      assert.equal(res.status, 409);
+      assert.equal(JSON.parse(res.body).error, 'terminal_stage_operator_marker_required');
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`,
+        [issueId])).rows[0].status, 'Cancelled');
+    });
     await t.test('refuses a Rejected terminal exit when the latest verdict is FAIL', async () => {
       const issueId = 'adadadad-adad-adad-adad-adadadadadad'; await insertIssue(issueId, 'Rejected');
       await admin.query(`INSERT INTO "${schema}".qc_verdict (issue_id, checker_id, verdict, work_product_md5)
@@ -2242,7 +2295,10 @@ test('operator recovery admits an authenticated same-stage redispatch', () => {
   const fs = require('node:fs');
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /!explicitOperatorRecovery &&\n\s*!dispositionStages\.has\(to_stage\)/);
-  assert.match(source, /rejectedPassTerminalExit \|\| explicitOperatorRelease \|\| explicitOperatorRecovery \|\|/);
+  // An authenticated operator terminal exit is admitted here too, or it is
+  // accepted by the guard above and then refused as invalid_transition.
+  assert.match(source, /rejectedPassTerminalExit \|\| operatorTerminalExitAdmission \|\|\n\s*explicitOperatorRelease \|\| explicitOperatorRecovery \|\|/);
+  assert.match(source, /const operatorTerminalExitAdmission = explicitTerminalExit && !rejectedPassCandidate;/);
 });
 
 test('operator cap release requires the current PASS work-product hash', async () => {
