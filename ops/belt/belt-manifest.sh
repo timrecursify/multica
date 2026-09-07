@@ -8,6 +8,8 @@
 # Callers must set:
 #   root_dir      absolute path of this ops/belt directory
 #   runtime_root  deployment root (production: /opt/gsp/multica-workers)
+# Optional:
+#   BELT_DEPLOY_DOCTRINE_ROOT (production: /opt/gsp/multica-doctrine)
 #
 # Layout is measured from the running box, where the belt services run out of
 # /opt/gsp/multica-workers/<service>/. Ten files are deployed to more than one
@@ -22,6 +24,8 @@
 # github-api-adapter.cjs ships to app/, not app/parity/. deploy.test.sh resolves
 # every such require against this list; a target in the wrong directory is a
 # MODULE_NOT_FOUND at daemon start, not a deploy error.
+
+doctrine_root="${BELT_DEPLOY_DOCTRINE_ROOT:-${runtime_root%/multica-workers}/multica-doctrine}"
 
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
@@ -64,6 +68,11 @@ declare -a sources=(
   "$root_dir/belt-concurrency.sh"
   "$root_dir/workspace-root.sh"
   "$root_dir/workspace-gc.sh"
+  "$root_dir/multica-bundle.py"
+  "$root_dir/RUNBOOK_SPEC_WORKER.md"
+  "$root_dir/RUNBOOK_BUILD_WORKER.md"
+  "$root_dir/RUNBOOK_QC_WORKER.md"
+  "$root_dir/WORKER_COMMON.md"
 )
 
 declare -a targets=(
@@ -107,4 +116,9 @@ declare -a targets=(
   "$runtime_root/gsp-multica-worker/belt-concurrency.sh"
   "$runtime_root/gsp-multica-worker/workspace-root.sh"
   "$runtime_root/gsp-multica-worker/workspace-gc.sh"
+  "$doctrine_root/multica-bundle.py"
+  "$doctrine_root/RUNBOOK_SPEC_WORKER.md"
+  "$doctrine_root/RUNBOOK_BUILD_WORKER.md"
+  "$doctrine_root/RUNBOOK_QC_WORKER.md"
+  "$doctrine_root/WORKER_COMMON.md"
 )
