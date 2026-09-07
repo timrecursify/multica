@@ -315,6 +315,32 @@ jobs:
       - name: Test Multica bridge integration
         run: node --test ops/belt/multica-bridge.test.cjs
 
+  unattended-lifecycle:
+    # Release acceptance binds the production manifest, relay policy, CI/CD
+    # evidence, activation, terminal accounting, and clock-controlled archive.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Test unattended belt lifecycle contract
+        run: node --test ops/belt/unattended-lifecycle.test.cjs
+
+      - name: Test persisted relay restart decision
+        run: node --test --test-name-pattern 'a restarted relay preserves the persisted QC handoff decision' ops/belt/parity/relay-advance.integration.test.cjs
+
   backend:
     runs-on: ubuntu-latest
     services:
