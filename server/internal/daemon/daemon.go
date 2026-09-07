@@ -135,6 +135,10 @@ func taskScopedAuthToken(task Task) (string, error) {
 }
 
 func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesRoot, serverURL string, healthPort, slot int, tempDir string) map[string]string {
+	// Dependency caches are daemon-owned and shared by tasks. Keep them outside
+	// each task's temporary directory so repeated pnpm/code-graph setup can
+	// reuse the same version-keyed artifacts without sharing node_modules.
+	cacheRoot := filepath.Join(workspacesRoot, ".dependency-cache")
 	return map[string]string{
 		"MULTICA_TOKEN":        token,
 		cli.TaskConfigRootEnv:  configRoot,
@@ -149,6 +153,8 @@ func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesR
 		"TMPDIR":               tempDir,
 		"TMP":                  tempDir,
 		"TEMP":                 tempDir,
+		"PNPM_HOME":            filepath.Join(cacheRoot, "pnpm"),
+		"MULTICA_CODE_REVIEW_GRAPH_CACHE": filepath.Join(cacheRoot, "code-review-graph", "2.3.8"),
 	}
 }
 

@@ -606,8 +606,18 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 	}
 
 	// If worktree already exists (reused environment from a prior task),
-	// update it to the latest remote code instead of creating a new one.
+	// update it to the latest remote code instead of creating a new one. Never
+	// reset a dirty checkout: doing so can destroy another task's uncommitted
+	// work. The caller can retry with a fresh task directory, preserving
+	// isolation under concurrent or abandoned work.
 	if isGitWorktree(worktreePath) {
+		clean, err := gitWorktreeIsClean(worktreePath)
+		if err != nil {
+			return nil, fmt.Errorf("inspect existing worktree: %w", err)
+		}
+		if !clean {
+			return nil, fmt.Errorf("existing worktree is dirty and cannot be reused: %s", worktreePath)
+		}
 		actualBranch, err := updateExistingWorktree(worktreePath, branchName, baseRef)
 		if err != nil {
 			return nil, fmt.Errorf("update existing worktree: %w", err)
@@ -681,6 +691,17 @@ func (c *Cache) CreateWorktree(params WorktreeParams) (*WorktreeResult, error) {
 		Path:       worktreePath,
 		BranchName: actualBranch,
 	}, nil
+}
+
+// gitWorktreeIsClean reports whether a checkout has no staged, unstaged, or
+// untracked changes. It is deliberately checked before reuse so cleanup never
+// crosses a task boundary.
+func gitWorktreeIsClean(path string) (bool, error) {
+	out, err := runGitOutput("-C", path, "status", "--porcelain", "--untracked-files=all")
+	if err != nil {
+		return false, fmt.Errorf("git status: %w", err)
+	}
+	return strings.TrimSpace(string(out)) == "", nil
 }
 
 const (
