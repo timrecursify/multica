@@ -1926,7 +1926,7 @@ async function relayAdvance(req, res, body) {
       }));
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "parked_release_required",
-        message: "a completed Sol-low diagnosis must authorize one deliberate release" }));
+        message: "parked_release_once authorization is required for one deliberate release" }));
       return;
     }
 
