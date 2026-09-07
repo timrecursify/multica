@@ -300,6 +300,12 @@ jobs:
       - name: Test daemon deployment contract
         run: bash ops/belt/deploy.test.sh
 
+      - name: Test deployment drain lock (asserts 3 run, 0 skipped)
+        run: bash ops/belt/deployment-drain.test.sh
+
+      - name: Test deployment admission fence (asserts 3 run, 0 skipped)
+        run: bash ops/belt/deployment-lock.integration.test.sh
+
       - name: Test belt git token permission contract
         run: bash ops/belt/gsp-belt-git-credential.test.sh
 

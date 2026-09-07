@@ -42,12 +42,6 @@ if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]];
   exit 2
 fi
 
-if [[ "$only_target" == belt-unit-guard ]]; then
-  [[ "$mode" != rollback ]] || { printf 'belt-unit-guard rollback is not supported\n' >&2; exit 2; }
-  "$root_dir/../gsp-belt/scripts/deploy-belt-unit-guard.sh" "$mode" "$source_commit"
-  exit
-fi
-
 # A bare --apply would rewrite every managed target at once. Runtime and tracked
 # tree have drifted independently, so an unscoped apply must be asked for by name.
 if [[ "$mode" == apply && -z "$only_target" && $allow_full -eq 0 ]]; then
@@ -62,9 +56,24 @@ receipt_repository="timrecursify/multica"
 receipt_target="gsp-belt"
 receipt_owner="ops/belt/deploy.sh"
 receipt_probe="systemd-active-mainpid-runtime-parity-v1"
+deployment_fence_closed=0
+
+. "$root_dir/deployment-drain.sh"
 
 # Manifest lives in one place; see belt-manifest.sh.
 . "$root_dir/belt-manifest.sh"
+
+if [[ "$only_target" == belt-unit-guard ]]; then
+  [[ "$mode" != rollback ]] || { printf 'belt-unit-guard rollback is not supported\n' >&2; exit 2; }
+  if [[ "$mode" == apply ]]; then
+    deployment_lock_acquire
+    deployment_fence_close
+    deployment_wait_for_drain
+  fi
+  "$root_dir/../gsp-belt/scripts/deploy-belt-unit-guard.sh" "$mode" "$source_commit"
+  [[ "$mode" != apply ]] || deployment_fence_open
+  exit
+fi
 
 selected() {
   local name="${sources[$1]##*/}"
@@ -348,6 +357,9 @@ if [[ "$mode" == apply && -z "$source_sha" ]]; then
 fi
 
 if [[ "$mode" == rollback ]]; then
+  deployment_lock_acquire
+  deployment_fence_close
+  deployment_wait_for_drain
   for index in "${!targets[@]}"; do
     selected "$index" || continue
     if [[ -f "${targets[$index]}.bak-${rollback_timestamp}.absent" ]]; then
@@ -358,8 +370,24 @@ if [[ "$mode" == rollback ]]; then
       printf 'Restored %s from %s.bak-%s\n' "${targets[$index]}" "${targets[$index]}" "$rollback_timestamp"
     fi
   done
+  declare -A rollback_unit_seen=()
+  for index in "${!targets[@]}"; do
+    selected "$index" || continue
+    while IFS= read -r unit; do
+      [[ -n "${rollback_unit_seen[$unit]-}" ]] && continue
+      rollback_unit_seen[$unit]=1
+      restart_unit "$unit"
+    done < <(service_units_for_target "${targets[$index]}")
+  done
+  deployment_fence_open
   printf 'Rollback complete for %s.\n' "$rollback_timestamp"
   exit 0
+fi
+
+if [[ "$mode" == apply ]]; then
+  deployment_lock_acquire
+  deployment_fence_close
+  deployment_wait_for_drain
 fi
 
 declare -a backups=()
@@ -492,4 +520,5 @@ if [[ "$mode" == apply ]]; then
   printf 'Rollback receipt: %s --rollback %s' "$0" "$timestamp"
   [[ -n "$only_target" ]] && printf ' --only %s' "$only_target"
   printf '\n'
+  deployment_fence_open
 fi
