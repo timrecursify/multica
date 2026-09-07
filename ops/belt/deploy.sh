@@ -30,9 +30,11 @@ if [[ -n "$source_commit" && ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
   printf 'Invalid source commit: %s\n' "$source_commit" >&2
   exit 2
 fi
+source_sha=""
 if [[ -n "$source_commit" ]]; then
   actual_commit="$(git -C "$root_dir/../.." rev-parse HEAD 2>/dev/null || true)"
   [[ "$actual_commit" == "$source_commit" ]] || { printf 'Source commit mismatch: checkout=%s requested=%s\n' "$actual_commit" "$source_commit" >&2; exit 2; }
+  source_sha="$actual_commit"
 fi
 
 if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]; then
@@ -55,6 +57,11 @@ fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/opt/gsp/multica-workers}"
+receipt_root="${MULTICA_RECEIPT_ROOT:-/var/lib/gsp-multica/runtime/receipts}"
+receipt_repository="timrecursify/multica"
+receipt_target="gsp-belt"
+receipt_owner="ops/belt/deploy.sh"
+receipt_probe="systemd-active-mainpid-runtime-parity-v1"
 
 # Manifest lives in one place; see belt-manifest.sh.
 . "$root_dir/belt-manifest.sh"
@@ -130,6 +137,82 @@ restart_unit() {
     "$unit" "$old_pid" "$new_pid" "$substate" "$active_enter"
   restarted_units+=("$unit")
   restarted_pids+=("$new_pid")
+}
+
+process_entrypoint_for_unit() {
+  case "$1" in
+    gsp-multica-bridge) printf '%s\n' "$runtime_root/gsp-multica-bridge/multica-bridge.cjs" ;;
+    multica-relay-advance) printf '%s\n' "$runtime_root/multica-relay-advance/app/parity/multica-relay-advance-launcher.cjs" ;;
+    multica-cicd-worker) printf '%s\n' "$runtime_root/multica-cicd-worker/multica-cicd-worker.cjs" ;;
+    multica-archiver) printf '%s\n' "$runtime_root/multica-archiver/multica-archiver.cjs" ;;
+    gsp-multica-worker|gsp-multica-worker-ppp) printf '%s\n' "$runtime_root/gsp-multica-worker/multica-daemon-wrapper.sh" ;;
+    *) return 1 ;;
+  esac
+}
+
+process_reports_entrypoint() {
+  local unit="$1" pid="$2" expected arg proc_root
+  local -a argv=()
+  proc_root="${BELT_DEPLOY_PROC_ROOT:-/proc}"
+  expected="$(process_entrypoint_for_unit "$unit")" || return 1
+  [[ -r "$proc_root/$pid/cmdline" ]] || return 1
+  mapfile -d '' -t argv < "$proc_root/$pid/cmdline"
+  for arg in "${argv[@]}"; do
+    [[ "$arg" == "$expected" ]] && return 0
+  done
+  return 1
+}
+
+health_probe_unit() {
+  local unit="$1" expected_pid="$2" state_output key value target_unit index
+  local main_pid="" active_state="" substate="" belongs
+  if ! state_output="$(systemctl show -p MainPID -p ActiveState -p SubState "$unit")"; then
+    printf 'Health probe %s failed: %s systemctl show failed\n' "$receipt_probe" "$unit" >&2
+    return 1
+  fi
+  while IFS='=' read -r key value; do
+    case "$key" in
+      MainPID) main_pid="$value" ;;
+      ActiveState) active_state="$value" ;;
+      SubState) substate="$value" ;;
+    esac
+  done <<< "$state_output"
+  if [[ "$main_pid" != "$expected_pid" || "$active_state" != active || "$substate" != running ]]; then
+    printf 'Health probe %s failed: %s expected_pid=%s main_pid=%s active=%s substate=%s\n' \
+      "$receipt_probe" "$unit" "$expected_pid" "${main_pid:-unknown}" "${active_state:-unknown}" "${substate:-unknown}" >&2
+    return 1
+  fi
+  if ! process_reports_entrypoint "$unit" "$main_pid"; then
+    printf 'Health probe %s failed: %s pid=%s did not report the deployed entrypoint\n' "$receipt_probe" "$unit" "$main_pid" >&2
+    return 1
+  fi
+  for index in "${!changed_index_set[@]}"; do
+    belongs=0
+    while IFS= read -r target_unit; do
+      [[ "$target_unit" == "$unit" ]] && belongs=1
+    done < <(service_units_for_target "${targets[$index]}")
+    (( belongs )) || continue
+    cmp -s -- "${sources[$index]}" "${targets[$index]}" || {
+      printf 'Health probe %s failed: %s runtime parity mismatch: %s\n' "$receipt_probe" "$unit" "${targets[$index]}" >&2
+      return 1
+    }
+  done
+  printf 'Health probe %s passed: %s pid=%s\n' "$receipt_probe" "$unit" "$main_pid"
+}
+
+write_activation_receipt() {
+  local source_sha="$1" activated_at="$2" checked_at="$3"
+  local receipt_dir receipt temporary release
+  receipt_dir="$receipt_root/$receipt_repository/$receipt_target"
+  receipt="$receipt_dir/$source_sha.json"
+  release="git:$receipt_repository@$source_sha"
+  mkdir -p -- "$receipt_dir"
+  temporary="$(mktemp "$receipt_dir/.$source_sha.XXXXXX")"
+  printf '{"schema_version":1,"repository":"%s","target":"%s","deployment_owner":"%s","source_sha":"%s","activation":{"status":"activated","activated_at":"%s","process_sha":"%s","release":"%s"},"health":{"status":"ok","checked_at":"%s","probe":"%s"}}\n' \
+    "$receipt_repository" "$receipt_target" "$receipt_owner" "$source_sha" "$activated_at" "$source_sha" "$release" "$checked_at" "$receipt_probe" > "$temporary"
+  chmod 0644 -- "$temporary"
+  mv -f -- "$temporary" "$receipt"
+  printf 'Receipt: %s\n' "$receipt"
 }
 
 if [[ -n "$only_target" ]]; then
@@ -259,6 +342,11 @@ if (( invalid )); then
   exit 1
 fi
 
+if [[ "$mode" == apply && -z "$source_sha" ]]; then
+  source_sha="$(git -C "$root_dir/../.." rev-parse HEAD 2>/dev/null || true)"
+  [[ "$source_sha" =~ ^[0-9a-f]{40}$ ]] || { printf 'Unable to resolve checkout source commit\n' >&2; exit 2; }
+fi
+
 if [[ "$mode" == rollback ]]; then
   for index in "${!targets[@]}"; do
     selected "$index" || continue
@@ -375,29 +463,27 @@ if [[ "$mode" == dry-run ]]; then
 fi
 
 restart_failed=0
+activation_time=""
+health_check_time=""
 if [[ "$mode" == apply ]] && (( restart_enabled )); then
   for unit in "${restart_units[@]}"; do
     restart_unit "$unit" || restart_failed=1
   done
   (( restart_failed == 0 )) || exit 1
+  if (( ${#restarted_units[@]} > 0 )); then
+    activation_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    for index in "${!restarted_units[@]}"; do
+      health_probe_unit "${restarted_units[$index]}" "${restarted_pids[$index]}" || restart_failed=1
+    done
+    (( restart_failed == 0 )) || exit 1
+    health_check_time="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  fi
 elif [[ "$mode" == apply ]] && (( ${#restart_units[@]} > 0 )); then
   printf 'Restarts disabled (--no-restart).\n'
 fi
 
-if [[ "$mode" == apply ]]; then
-  receipt_dir="$runtime_root/gsp-multica/deploy-receipts"
-  mkdir -p -- "$receipt_dir"
-  source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
-  manifest_sha256="$(sha256sum "${sources[@]}" | sha256sum | awk '{print $1}')"
-  receipt="$receipt_dir/belt-${timestamp}.json"
-  restart_json=""
-  for index in "${!restarted_units[@]}"; do
-    [[ -z "$restart_json" ]] || restart_json+=','
-    restart_json+="{\"unit\":\"${restarted_units[$index]}\",\"pid\":${restarted_pids[$index]}}"
-  done
-  printf '{"repo":"timrecursify/multica","source_sha":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"],"restarted_units":[%s]}\n' \
-    "$source_sha" "$manifest_sha256" "$restart_json" > "$receipt"
-  printf 'Receipt: %s\n' "$receipt"
+if [[ "$mode" == apply && ${#restarted_units[@]} -gt 0 ]]; then
+  write_activation_receipt "$source_sha" "$activation_time" "$health_check_time"
 fi
 if [[ "$mode" == apply && ${#restarted_units[@]} -eq 0 && $restart_enabled -eq 1 ]]; then
   printf 'No processes were restarted.\n'
