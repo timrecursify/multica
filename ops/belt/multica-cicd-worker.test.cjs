@@ -638,9 +638,16 @@ test('sweep sends an all-cancelled open PR in a retroactive repo down the retro 
   const ghCalls = [];
   worker.setTestDependencies({
     log: (...a) => lines.push(a.join(' ')),
-    pool: { query: async (sql) => (/FROM issue/.test(sql)
-      ? { rows: [{ id: 'issue-retro', number: 4242, title: 't', workspace_id: 'w', metadata: {} }] }
-      : { rows: [{ content: `built in https://github.com/${repo}/pull/77` }] }) },
+    pool: { query: async (sql) => {
+      if (/FROM issue WHERE/.test(sql)) {
+        return { rows: [{ id: 'issue-retro', number: 4242, title: 't', workspace_id: 'w', metadata: {} }] };
+      }
+      if (/FROM agent_task_queue/.test(sql)) return { rows: [{ id: 'task-retro' }] };
+      if (/FROM issue_work_product/.test(sql)) return { rows: [{ scope_revision: 1,
+        kind: 'implementation', repository: repo, branch: 'belt/retro', pr_number: 77,
+        head_sha: headSha, acceptance_evidence: { verified: true } }] };
+      throw new Error(`unexpected SQL ${sql}`);
+    } },
     relay: async () => { throw new Error('sweep must not relay on the retro path'); },
     gh: (args) => {
       ghCalls.push(args.join(' '));
@@ -676,16 +683,24 @@ test('sweep sends an all-cancelled open PR in a retroactive repo down the retro 
 // retro path is opt-in per repository and must not merge ahead of CI elsewhere.
 test('sweep holds an all-cancelled open PR in a non-retroactive repo', async () => {
   const repo = 'timrecursify/other';
+  const headSha = 'd'.repeat(40);
   const lines = [];
   worker.setTestDependencies({
     log: (...a) => lines.push(a.join(' ')),
-    pool: { query: async (sql) => (/FROM issue/.test(sql)
-      ? { rows: [{ id: 'issue-hold', number: 4243, title: 't', workspace_id: 'w', metadata: {} }] }
-      : { rows: [{ content: `built in https://github.com/${repo}/pull/78` }] }) },
+    pool: { query: async (sql) => {
+      if (/FROM issue WHERE/.test(sql)) {
+        return { rows: [{ id: 'issue-hold', number: 4243, title: 't', workspace_id: 'w', metadata: {} }] };
+      }
+      if (/FROM agent_task_queue/.test(sql)) return { rows: [{ id: 'task-hold' }] };
+      if (/FROM issue_work_product/.test(sql)) return { rows: [{ scope_revision: 1,
+        kind: 'implementation', repository: repo, branch: 'belt/hold', pr_number: 78,
+        head_sha: headSha, acceptance_evidence: { verified: true } }] };
+      throw new Error(`unexpected SQL ${sql}`);
+    } },
     relay: async () => { throw new Error('sweep must not relay on the hold path'); },
     gh: (args) => {
       if (args[0] === 'pr' && args[1] === 'view') {
-        return JSON.stringify({ state: 'OPEN', mergeable: 'MERGEABLE', headRefOid: 'd'.repeat(40),
+        return JSON.stringify({ state: 'OPEN', mergeable: 'MERGEABLE', headRefOid: headSha,
           createdAt: new Date().toISOString(), mergedAt: null, mergeCommit: null });
       }
       if (args[0] === 'api' && args[1].includes('/actions/runs?head_sha=')) {
