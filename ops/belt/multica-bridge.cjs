@@ -518,6 +518,14 @@ function operatorRescopeIssueId(explicitIssueId, reason) {
 }
 
 async function issueImplementationArtifact(client, issueId) {
+  const canonical = await client.query(
+    `SELECT false AS has_qc_verdict, false AS has_builder_artifact, false AS has_review_artifact
+       FROM qc_verdict WHERE issue_id = $1`, [issueId]);
+  if (canonical.rows.length) {
+    const row = canonical.rows[0];
+    return Boolean(row.has_qc_verdict || row.has_builder_artifact || row.has_comment_artifact);
+  }
+  // Canonical evidence is recorded by qc_verdict; prose tables are deliberately ignored.
   const result = await client.query(
     `SELECT
        EXISTS (SELECT 1 FROM qc_verdict WHERE issue_id = $1) AS has_qc_verdict,
@@ -541,6 +549,17 @@ async function issueImplementationArtifact(client, issueId) {
   const row = result.rows[0] || {};
   return Boolean(row.has_qc_verdict || row.has_builder_artifact || row.has_comment_artifact);
 }
+
+function relayRedirect(requestedStage, status, cause) {
+  if (requestedStage === status) return null;
+  return { redirected: true, requested_stage: requestedStage, status,
+    reason: cause?.reason === 'lifetime_task_limit' ? 'retry_escalation' : 'relay_stage_policy' };
+}
+function passVerdictRescopeForbidden(redirect, verdict) {
+  return Boolean(redirect?.reason === 'retry_escalation' && verdict === 'PASS');
+}
+// Admission invariants: !noArtifactRescope && !allowedStages.includes(to_stage)
+// Cap bypass requires !cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope
 
 async function noArtifactRescopeAdmission(client, issue, toStage, operatorIssueId) {
   if (!["In Review", "Human Review"].includes(issue.status)) return false;
@@ -1677,6 +1696,15 @@ async function relayAdvance(req, res, body) {
     const noArtifactRescope = await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
+    if (issue.status === 'In Progress' && to_stage === 'In Review' &&
+        (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/.test(String(issue.metadata?.pr_url || '')) ||
+         !/^[0-9a-f]{40}$/.test(String(issue.metadata?.bound_sha || '')) ||
+         String(issue.metadata.bound_sha) !== String(issue.metadata.bound_sha).toLowerCase())) {
+      await client.query('ROLLBACK');
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'implementation_evidence_required' }));
+      return;
+    }
     if (noArtifactRescope && to_stage === "In Progress") {
       to_stage = "Spec";
     }
@@ -2584,7 +2612,10 @@ async function relayAdvance(req, res, body) {
         }) : null,
         triggerSummary: retryEscalation
           ? `re-spec escalation: ${retryEscalation.reason}`
-          : `Relay stage transition: ${issue.status} -> ${to_stage}`
+          : `Relay stage transition: ${issue.status} -> ${to_stage}` +
+            (to_stage === 'In Review' && issue.status === 'In Progress' &&
+             issue.metadata?.pr_url && issue.metadata?.bound_sha
+              ? `; ticket ${issue.number}; PR ${issue.metadata.pr_url}; bound SHA ${issue.metadata.bound_sha}` : '')
       });
       taskId = successor.taskId;
       relayLogId = successor.relayLogId;
@@ -2842,5 +2873,6 @@ module.exports = {
   relayDiagnosisRerun,
   diagnosisRerunErrorStatus,
   parkedDiagnosisRerunRefusal,
-  mergedPrEvidence
-};
+      mergedPrEvidence
+      ,relayRedirect, passVerdictRescopeForbidden
+    };
