@@ -46,6 +46,7 @@ const {
   relayAdvance,
   writeJsonResponse,
   admitConfiguredTransition,
+  openChildAdmission,
   setTestClientFactory,
   isCicdReturn,
   consumeCicdReturnAuthorization,
@@ -79,6 +80,26 @@ const {
   isNoDispatchArrivalStage,
   normalizeRelayStage
 } = require('./multica-bridge.cjs');
+
+test('rollup admission with an open child is skipped before a task insert attempt', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (/parent_issue_id/.test(sql)) return { rows: [{ number: 23886 }, { number: 23887 }] };
+    if (/SELECT 1 FROM activity_log/.test(sql)) return { rows: [] };
+    if (/INSERT INTO activity_log/.test(sql)) return { rows: [] };
+    assert.fail(`unexpected query: ${sql}`);
+  } };
+
+  const admission = await openChildAdmission(client, {
+    id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '223e4567-e89b-42d3-a456-426614174000'
+  });
+
+  assert.deepEqual(admission, { ok: false, childNumbers: [23886, 23887], auditWritten: true });
+  assert.equal(calls.some(({ sql }) => /INSERT INTO agent_task_queue/.test(sql)), false);
+  assert.match(calls.at(-1).values[2], /"child_numbers":\[23886,23887\]/);
+});
 
 test('Spec completion advances a written spec and bounds repeated blockers', async () => {
   const issueId = '00000000-0000-4000-8000-000000000277';
