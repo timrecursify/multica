@@ -34,6 +34,10 @@ test("query builders hold the live status invariant", () => {
   assert.match(ownerSql(), /a.archived_at IS NULL/);
   assert.match(ownerSql(), /a.status IN \('idle', 'working'\)/);
   assert.match(ownerSql(), /COALESCE\(own_runtime.id, online_runtime.id\) IS NOT NULL/);
+  assert.match(ownerSql(), /task.status = 'running'/);
+  assert.match(ownerSql(), /COALESCE\(running.task_count, 0\) < a.max_concurrent_tasks/);
+  assert.match(ownerSql(), /available_capacity/);
+  assert.match(ownerSql(), /ORDER BY pool.last_selected_at NULLS FIRST, pool.agent_id LIMIT 1/);
   assert.match(stageAttemptsSql(), /\$3::int/);
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
 });

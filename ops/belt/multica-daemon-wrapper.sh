@@ -73,6 +73,7 @@ export MULTICA_DAEMON_WORKSPACES_ROOT="$root"
 # Current daemon binaries consume this environment variable. Keep the fleet
 # wrapper variable above for the belt guard and rollback scripts.
 export MULTICA_WORKSPACES_ROOT="$root"
+export MULTICA_REPO_MIRRORS_ROOT="${MULTICA_REPO_MIRRORS_ROOT:-/var/lib/gsp/multica/mirrors}"
 
 lock_file="${MULTICA_DAEMON_LOCK_FILE:-/var/lib/gsp/.local/state/gsp-multica-worker.lock}"
 mkdir -p -- "$(dirname -- "$lock_file")"

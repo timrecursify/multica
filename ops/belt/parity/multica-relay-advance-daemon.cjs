@@ -398,7 +398,7 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   // to deploy (qcCompletionAdvance).
   // The same applies to a merged non-runtime PR: In Progress -> Done is
   // reserved for NO-SHA work products, so a code-bearing route reviews first.
-  if (row.to_stage === 'In Progress' && route.kind !== 'no_pr' && route.toStage && route.toStage !== 'In Review') {
+  if (row.to_stage === 'In Progress' && route.kind !== 'no_pr' && route.toStage !== 'In Review') {
     return { ...route, toStage: 'In Review', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
   }
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
@@ -688,10 +688,20 @@ async function reconcileQuotaPauses({ connect = () => pool.connect(), now = () =
   }
 }
 
-const configuredPoolMax = Number.parseInt(process.env.RELAY_PG_POOL_MAX || '2', 10);
-const poolMax = Number.isInteger(configuredPoolMax) && configuredPoolMax > 0
-  ? Math.min(configuredPoolMax, 4)
-  : 2;
+// Ten guarded pass types can overlap. They do not share an in-flight lock, so
+// the pool must be able to lend one client to every pass plus a small margin
+// for pool.query calls made around client-owned transactions. Worker task
+// slots use their own processes and connections; sizing this pool to the
+// Tower's task ceiling would reserve connections that this process cannot use.
+const RELAY_PG_POOL_DEFAULT = 12;
+const RELAY_PG_POOL_LIMIT = 16;
+function resolveRelayPoolMax(value = process.env.RELAY_PG_POOL_MAX) {
+  const configured = Number.parseInt(value || String(RELAY_PG_POOL_DEFAULT), 10);
+  return Number.isInteger(configured) && configured > 0
+    ? Math.min(configured, RELAY_PG_POOL_LIMIT)
+    : RELAY_PG_POOL_DEFAULT;
+}
+const poolMax = resolveRelayPoolMax();
 const pool = new Pool({
   connectionString: MULTICA_DB,
   max: poolMax,
@@ -2423,5 +2433,5 @@ if (require.main === module) startDaemon();
 module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestCapDisposition, requestRetryEscalation,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
-  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner,
+  runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup };

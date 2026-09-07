@@ -1859,3 +1859,43 @@ func TestShouldCleanTaskDir_LocalDirectoryFalsePreservesNormalClean(t *testing.T
 		t.Fatalf("expected gcActionClean for normal task, got %d", got)
 	}
 }
+
+// TestPruneRepoWorktrees_FollowsConfiguredMirrorRoot pins the coupling between
+// the repo cache and the GC. Once RepoMirrorsRoot moves the bare mirrors off
+// the workspaces root, a GC that still walked <WorkspacesRoot>/.repos would
+// find nothing and let the mirrors grow without bound.
+func TestPruneRepoWorktrees_FollowsConfiguredMirrorRoot(t *testing.T) {
+	mirrors := t.TempDir()
+	srv := httptest.NewServer(http.NewServeMux())
+	t.Cleanup(srv.Close)
+
+	d := New(Config{
+		WorkspacesRoot:  t.TempDir(),
+		RepoMirrorsRoot: mirrors,
+		GCEnabled:       true,
+		GCRepoTTL:       24 * time.Hour,
+	}, slog.Default())
+	d.client = NewClient(srv.URL)
+	d.client.SetToken("test-token")
+
+	if got := d.reposRoot(d.cfg.WorkspacesRoot); got != mirrors {
+		t.Fatalf("reposRoot() = %q, want the configured mirror root %q", got, mirrors)
+	}
+
+	wsID := "11111111-1111-1111-1111-111111111111"
+	barePath := newEvictTestRepo(t, d, wsID, testRepoURL)
+	if !strings.HasPrefix(barePath, mirrors) {
+		t.Fatalf("bare path %q is not under the mirror root %q", barePath, mirrors)
+	}
+	writeLastUsed(t, barePath, time.Now().Add(-48*time.Hour))
+
+	stats := &gcStats{byPattern: map[string]int{}}
+	d.pruneRepoWorktrees(d.cfg.WorkspacesRoot, stats)
+
+	if _, err := os.Stat(barePath); !os.IsNotExist(err) {
+		t.Fatalf("expected the mirror to be evicted, stat err = %v", err)
+	}
+	if stats.repoCachesReclaimed != 1 {
+		t.Errorf("repo_caches_reclaimed = %d, want 1", stats.repoCachesReclaimed)
+	}
+}

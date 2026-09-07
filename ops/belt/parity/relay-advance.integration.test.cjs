@@ -9,7 +9,8 @@ process.env.RELAY_AGENT_SECRET = process.env.RELAY_AGENT_SECRET || 'test-relay-s
 process.env.MULTICA_WORKSPACE_ID = process.env.MULTICA_WORKSPACE_ID || 'test-workspace';
 
 const { qcBounceDecision } = require('../multica-bridge.cjs');
-const { enqueuePassWithoutRelayRows, findAndAdvanceTasks } = require('./multica-relay-advance-daemon.cjs');
+const { enqueuePassWithoutRelayRows, findAndAdvanceTasks,
+  qcCompletionAdvance } = require('./multica-relay-advance-daemon.cjs');
 const { parseArgs, recover } = require('../recover-stranded-qc-pass.cjs');
 const { closeDeadRelayRows, convertCompletedQcEvidence,
   rescopeCompletedNoArtifactQc } = require('./relay-dead-rows.cjs');
@@ -481,6 +482,14 @@ function advanceHarness(row, currentPass = { verdict: 'PASS', work_product_md5: 
       logger: { log: (line) => logs.push(line), error: (line) => logs.push(line) } })
   };
 }
+
+test('a restarted relay preserves the persisted QC handoff decision', () => {
+  const persistedRow = JSON.parse(JSON.stringify(advanceRow()));
+  const beforeRestart = qcCompletionAdvance(persistedRow);
+  const afterRestart = qcCompletionAdvance(JSON.parse(JSON.stringify(persistedRow)));
+  assert.deepEqual(afterRestart, beforeRestart);
+  assert.deepEqual(afterRestart, { ok: false, reason: 'qc_attempt_binding_required' });
+});
 
 test('PASS written after its completed relay row is enqueued for normal admission', async () => {
   const queries = [];

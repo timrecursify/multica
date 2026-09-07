@@ -195,12 +195,14 @@ async function operatorRespec(client, payload) {
       new_stage: "Spec", reason, idempotency_key: idem, audit_row_id: prior.rows[0].id,
       accounting_baseline: recorded.accounting_baseline } };
   }
-  if (issue.status !== "Human Review") return { ok: false, status: 409, error: "human_review_stage_required" };
+  if (issue.status !== "Human Review") return { ok: false, status: 409, error: "human_review_stage_required",
+    current_stage: issue.status, expected_stage: "Human Review" };
   const [cycle, lifetime] = await Promise.all([
     capEscalationVerified(client, issue, "stage_cycle_limit", "Human Review"),
     capEscalationVerified(client, issue, "lifetime_task_limit", "Human Review")
   ]);
-  if (!cycle && !lifetime) return { ok: false, status: 409, error: "cap_evidence_required" };
+  if (!cycle && !lifetime) return { ok: false, status: 409, error: "cap_evidence_required",
+    current_stage: issue.status, required_evidence: ["stage_cycle_limit", "lifetime_task_limit"] };
   const baseline = new Date().toISOString();
   const metadata = JSON.stringify({ ...(issue.metadata || {}),
     retry_escalation_at: baseline, operator_respec_at: baseline,
@@ -2935,7 +2937,12 @@ async function relayOperatorRespec(req, res, body) {
     if (!result.ok) {
       await client.query("ROLLBACK");
       res.writeHead(result.status, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: result.error }));
+      res.end(JSON.stringify({ error: result.error, ...(result.current_stage ? { current_stage: result.current_stage } : {}),
+        ...(result.expected_stage ? { expected_stage: result.expected_stage } : {}),
+        ...(result.required_evidence ? { required_evidence: result.required_evidence } : {}),
+        message: result.error === "human_review_stage_required"
+          ? `operator respec requires Human Review; ticket is currently ${result.current_stage}`
+          : "operator respec requires verified retry-cap evidence" }));
       return;
     }
     await client.query("COMMIT");

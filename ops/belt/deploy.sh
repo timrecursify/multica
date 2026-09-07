@@ -6,6 +6,7 @@ rollback_timestamp=""
 only_target=""
 source_commit=""
 allow_full=0
+restart_enabled=1
 
 while (( $# )); do
   case "$1" in
@@ -15,8 +16,9 @@ while (( $# )); do
     --only) only_target="${2:-}"; shift 2 ;;
     --all) allow_full=1; shift ;;
     --source-commit) source_commit="${2:-}"; shift 2 ;;
+    --no-restart) restart_enabled=0; shift ;;
     *)
-      printf 'Usage: %s [--dry-run|--apply] [--all] [--source-commit SHA] [--only TARGET] | %s --rollback YYYYMMDDTHHMMSSZ [--only TARGET]\n' "$0" "$0" >&2
+      printf 'Usage: %s [--dry-run|--apply] [--all] [--source-commit SHA] [--only TARGET] [--no-restart] | %s --rollback YYYYMMDDTHHMMSSZ [--only TARGET]\n' "$0" "$0" >&2
       exit 2
       ;;
   esac
@@ -60,6 +62,74 @@ runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/opt/gsp/multica-workers}"
 selected() {
   local name="${sources[$1]##*/}"
   [[ -z "$only_target" || "$name" == "$only_target" || "${name%.cjs}" == "$only_target" ]]
+}
+
+# Resolve units from each manifest target's runtime service root. The worker
+# root is shared by the GSP and PPP worker units; all other roots are one-to-one.
+service_units_for_target() {
+  local target="$1" relative service_root
+  if [[ "$target" == "$doctrine_root/"* ]]; then
+    printf '%s\n' gsp-multica-worker gsp-multica-worker-ppp
+    return
+  fi
+  relative="${target#"$runtime_root"/}"
+  [[ "$relative" != "$target" ]] || return 1
+  service_root="${relative%%/*}"
+  case "$service_root" in
+    gsp-multica-bridge) printf '%s\n' gsp-multica-bridge ;;
+    multica-relay-advance) printf '%s\n' multica-relay-advance ;;
+    multica-cicd-worker) printf '%s\n' multica-cicd-worker ;;
+    multica-archiver) printf '%s\n' multica-archiver ;;
+    gsp-multica-worker) printf '%s\n' gsp-multica-worker gsp-multica-worker-ppp ;;
+    *) return 1 ;;
+  esac
+}
+
+print_restart_journal() {
+  local unit="$1"
+  printf '%s\n' "Last journal lines for $unit:" >&2
+  journalctl -u "$unit" -n 40 --no-pager >&2 ||
+    printf 'Unable to read journal for %s\n' "$unit" >&2
+}
+
+declare -a restarted_units=()
+declare -a restarted_pids=()
+restart_unit() {
+  local unit="$1" old_pid state_output key value
+  local new_pid="" substate="" active_enter="" active=0
+  if ! old_pid="$(systemctl show --value -p MainPID "$unit")"; then
+    printf 'Restart preflight failed: %s MainPID unavailable\n' "$unit" >&2
+    print_restart_journal "$unit"
+    return 1
+  fi
+  if ! sudo -n /bin/bash -c 'systemctl restart "$1"' belt-deploy "$unit"; then
+    printf 'Restart command failed: %s old_pid=%s\n' "$unit" "$old_pid" >&2
+    print_restart_journal "$unit"
+    return 1
+  fi
+  if ! state_output="$(systemctl show -p MainPID -p SubState -p ActiveEnterTimestamp "$unit")"; then
+    printf 'Restart verification failed: %s systemctl show failed\n' "$unit" >&2
+    print_restart_journal "$unit"
+    return 1
+  fi
+  while IFS='=' read -r key value; do
+    case "$key" in
+      MainPID) new_pid="$value" ;;
+      SubState) substate="$value" ;;
+      ActiveEnterTimestamp) active_enter="$value" ;;
+    esac
+  done <<< "$state_output"
+  systemctl is-active --quiet "$unit" && active=1
+  if (( ! active )) || [[ ! "$new_pid" =~ ^[1-9][0-9]*$ || "$new_pid" == "$old_pid" || "$substate" != running ]]; then
+    printf 'Restart verification failed: %s old_pid=%s new_pid=%s substate=%s active_enter=%s\n' \
+      "$unit" "$old_pid" "${new_pid:-unknown}" "${substate:-unknown}" "${active_enter:-unknown}" >&2
+    print_restart_journal "$unit"
+    return 1
+  fi
+  printf 'Restarted %s: %s -> %s substate=%s active_enter=%s\n' \
+    "$unit" "$old_pid" "$new_pid" "$substate" "$active_enter"
+  restarted_units+=("$unit")
+  restarted_pids+=("$new_pid")
 }
 
 if [[ -n "$only_target" ]]; then
@@ -136,15 +206,19 @@ done
 
 for index in "${!sources[@]}"; do
   selected "$index" || continue
-  # A missing target is allowed only when its canonical service root already
-  # exists. That is the real guard: it catches a wrong runtime root -- the
+  # A missing target is allowed only when its canonical runtime or doctrine
+  # root already exists. That is the real guard: it catches a wrong root -- the
   # failure that shipped a manifest pointing at /var/lib/gsp/gsp-multica, a
   # tree absent on gsp -- while letting a genuinely new file be created. The
   # per-file allowlist this replaces had to be edited for every added file and
   # silently encoded the old layout.
   new_targets[$index]=0
-  relative_target="${targets[$index]#"$runtime_root"/}"
-  service_root="$runtime_root/${relative_target%%/*}"
+  if [[ "${targets[$index]}" == "$doctrine_root/"* ]]; then
+    service_root="$doctrine_root"
+  else
+    relative_target="${targets[$index]#"$runtime_root"/}"
+    service_root="$runtime_root/${relative_target%%/*}"
+  fi
   [[ -d "$service_root" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
@@ -158,6 +232,26 @@ for index in "${!sources[@]}"; do
         ! -f "${targets[$index]}.bak-${rollback_timestamp}.absent" ]]; then
     printf 'Missing rollback backup: %s.bak-%s\n' "${targets[$index]}" "$rollback_timestamp" >&2
     invalid=1
+  fi
+done
+
+declare -A changed_index_set=()
+declare -a restart_units=()
+declare -A restart_unit_seen=()
+for index in "${!sources[@]}"; do
+  selected "$index" || continue
+  if ! unit_list="$(service_units_for_target "${targets[$index]}")"; then
+    printf 'Unmapped manifest runtime target: %s\n' "${targets[$index]}" >&2
+    invalid=1
+    continue
+  fi
+  if [[ ! -f "${targets[$index]}" ]] || ! cmp -s -- "${sources[$index]}" "${targets[$index]}"; then
+    changed_index_set[$index]=1
+    while IFS= read -r unit; do
+      [[ -n "${restart_unit_seen[$unit]-}" ]] && continue
+      restart_unit_seen[$unit]=1
+      restart_units+=("$unit")
+    done <<< "$unit_list"
   fi
 done
 
@@ -245,6 +339,13 @@ for index in "${!sources[@]}"; do
     false
   fi
   cp --preserve=mode -- "$source_file" "$target_file"
+  if [[ "$target_file" == "$doctrine_root/"* ]]; then
+    chgrp --reference="$doctrine_root" -- "$target_file"
+    case "$target_file" in
+      *.py) chmod 0750 -- "$target_file" ;;
+      *) chmod 0640 -- "$target_file" ;;
+    esac
+  fi
   printf 'Copied %s to %s\n' "$source_file" "$target_file"
 done
 
@@ -261,16 +362,46 @@ if [[ "$mode" == apply ]]; then
 fi
 
 trap - ERR
+if [[ "$mode" == dry-run ]]; then
+  if (( ! restart_enabled )) && (( ${#restart_units[@]} > 0 )); then
+    printf 'Restarts disabled (--no-restart).\n'
+  elif (( ${#restart_units[@]} == 0 )); then
+    printf 'No processes would be restarted.\n'
+  else
+    for unit in "${restart_units[@]}"; do
+      printf 'Would restart %s\n' "$unit"
+    done
+  fi
+fi
+
+restart_failed=0
+if [[ "$mode" == apply ]] && (( restart_enabled )); then
+  for unit in "${restart_units[@]}"; do
+    restart_unit "$unit" || restart_failed=1
+  done
+  (( restart_failed == 0 )) || exit 1
+elif [[ "$mode" == apply ]] && (( ${#restart_units[@]} > 0 )); then
+  printf 'Restarts disabled (--no-restart).\n'
+fi
+
 if [[ "$mode" == apply ]]; then
   receipt_dir="$runtime_root/gsp-multica/deploy-receipts"
   mkdir -p -- "$receipt_dir"
   source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
   manifest_sha256="$(sha256sum "${sources[@]}" | sha256sum | awk '{print $1}')"
   receipt="$receipt_dir/belt-${timestamp}.json"
-  printf '{"repo":"timrecursify/multica","source_sha":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"]}\n' "$source_sha" "$manifest_sha256" > "$receipt"
+  restart_json=""
+  for index in "${!restarted_units[@]}"; do
+    [[ -z "$restart_json" ]] || restart_json+=','
+    restart_json+="{\"unit\":\"${restarted_units[$index]}\",\"pid\":${restarted_pids[$index]}}"
+  done
+  printf '{"repo":"timrecursify/multica","source_sha":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"],"restarted_units":[%s]}\n' \
+    "$source_sha" "$manifest_sha256" "$restart_json" > "$receipt"
   printf 'Receipt: %s\n' "$receipt"
 fi
-printf 'No processes were restarted.\n'
+if [[ "$mode" == apply && ${#restarted_units[@]} -eq 0 && $restart_enabled -eq 1 ]]; then
+  printf 'No processes were restarted.\n'
+fi
 if [[ "$mode" == apply ]]; then
   printf 'Rollback receipt: %s --rollback %s' "$0" "$timestamp"
   [[ -n "$only_target" ]] && printf ' --only %s' "$only_target"
