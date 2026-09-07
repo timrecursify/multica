@@ -398,7 +398,7 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   // to deploy (qcCompletionAdvance).
   // The same applies to a merged non-runtime PR: In Progress -> Done is
   // reserved for NO-SHA work products, so a code-bearing route reviews first.
-  if (row.to_stage === 'In Progress' && route.kind !== 'no_pr' && route.toStage && route.toStage !== 'In Review') {
+  if (row.to_stage === 'In Progress' && route.kind !== 'no_pr' && route.toStage !== 'In Review') {
     return { ...route, toStage: 'In Review', repo, pr_url: prUrl, pr_state: pr.state, boundSha: pr.headRefOid };
   }
   if (route.reason === 'non_runtime_pr_not_merged' && ['CLEAN', 'HAS_HOOKS', 'MERGEABLE'].includes(pr.mergeStateStatus) &&
