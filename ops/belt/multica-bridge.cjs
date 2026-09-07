@@ -817,6 +817,28 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
   return changed.rowCount > 0;
 }
 
+// Parked is a durable hold: retire every actionable predecessor while the
+// issue row/advisory lock is held.  The diagnosis task is intentionally kept.
+async function retireParkedWork(client, issue, reason) {
+  const tasks = await client.query(
+    `UPDATE agent_task_queue
+        SET status = 'cancelled', completed_at = NOW(),
+            prepare_lease_expires_at = NULL, failure_reason = $2
+      WHERE issue_id = $1
+        AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')
+        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'
+      RETURNING id`, [issue.id, reason]);
+  const relays = await client.query(
+    `UPDATE relay_run_log
+        SET status = 'noop',
+            parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
+              jsonb_build_object('parked_retired', true, 'parked_retired_reason', $2)
+      WHERE issue_id = $1 AND status = 'pending'
+      RETURNING id`, [issue.id, reason]);
+  return { task_count: tasks.rowCount, task_ids: tasks.rows.map(r => r.id),
+    relay_count: relays.rowCount, relay_ids: relays.rows.map(r => r.id) };
+}
+
 // The spec agent's output is recognised by its required headings, not by author:
 // re-running the spec lane under a different agent must keep working.
 async function latestSpecComment(client, issueId) {
@@ -1918,15 +1940,21 @@ async function relayAdvance(req, res, body) {
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
     }
-    if (issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) && !parkedRelease) {
+    if (issue.status === "Parked" && to_stage !== "Parked" &&
+        !(parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone || explicitTerminalExit)) {
       await client.query("ROLLBACK");
       console.warn(JSON.stringify({
-        event: "relay_advance_rejected", reason: "parked_release_required",
+        event: "relay_parked_skipped", reason: "parked_hold",
         issue_id: issue.id, target_stage: to_stage
       }));
+      await client.query("BEGIN");
+      await client.query(`INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+        VALUES ($1, $2, 'system', 'relay_parked_skipped', $3::jsonb)`,
+        [issue.workspace_id, issue.id, JSON.stringify({ target_stage: to_stage, reason: 'parked_hold' })]);
+      await client.query("COMMIT");
       res.writeHead(409, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "parked_release_required",
-        message: "a completed Sol-low diagnosis must authorize one deliberate release" }));
+        message: "parked issues are held until an explicit operator release or diagnosis" }));
       return;
     }
 
@@ -2401,6 +2429,8 @@ async function relayAdvance(req, res, body) {
     let relayLogId = null;
 
     if (to_stage === "Parked" && result.rowCount > 0) {
+      const retired = await retireParkedWork(client, issue, reason || "parked_hold");
+      parkedAudit = { ...(parkedAudit || {}), retired };
       relayLogId = await recordParkedEntry(client, {
         issueId: issue.id,
         fromStage: issue.status,
@@ -2457,7 +2487,8 @@ async function relayAdvance(req, res, body) {
         success: true,
         issue: result.rows[0],
         task_id: null,
-        relay_log_id: relayLogId
+        relay_log_id: relayLogId,
+        retired
       }));
       return;
     }
@@ -2775,6 +2806,7 @@ module.exports = {
   selectPoolOwner,
   selectStageOwner,
   applyDisposition,
+  retireParkedWork,
   consumeParkedQcRecovery,
   taskResultText,
   isNoArtifactQcBlock,
