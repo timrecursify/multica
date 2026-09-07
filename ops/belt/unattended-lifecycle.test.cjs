@@ -259,17 +259,31 @@ test('verified NO_OP closes without pretending a PR or merge shipped', () => {
 });
 
 test('rollup waits for open children, then closes after every child is terminal', async () => {
-  let openChildren = [{ number: 11 }, { number: 12 }];
-  const client = { query: async (sql) => {
-    if (sql.includes('parent_issue_id')) return { rows: openChildren };
-    if (sql.includes('SELECT 1 FROM activity_log')) return { rows: [] };
+  let children = [
+    { id: 'child-11', status: 'Queue', number: 11, latest_task_status: 'running' },
+    { id: 'child-12', status: 'Spec', number: 12, latest_task_status: null }
+  ];
+  const issue = { id: 'rollup', workspace_id: 'gsp', metadata: {} };
+  const client = { query: async (sql, values = []) => {
+    if (sql.includes('parent_issue_id')) return { rows: children };
+    if (sql.includes('UPDATE issue SET metadata')) {
+      issue.metadata.rollup_dependency = JSON.parse(values[1]);
+      return { rows: [] };
+    }
     if (sql.includes('INSERT INTO activity_log')) return { rows: [] };
     throw new Error(`unexpected rollup query: ${sql.slice(0, 60)}`);
   } };
-  const issue = { id: 'rollup', workspace_id: 'gsp' };
-  assert.deepEqual((await openChildAdmission(client, issue)).childNumbers, [11, 12]);
-  openChildren = [];
-  assert.equal((await openChildAdmission(client, issue)).ok, true);
+  const blocked = await openChildAdmission(client, issue);
+  assert.deepEqual(blocked.childNumbers, [11, 12]);
+  assert.equal(blocked.dependency.state, 'blocked');
+  children = [
+    { id: 'child-11', status: 'Done', number: 11, latest_task_status: 'completed' },
+    { id: 'child-12', status: 'Cancelled', number: 12, latest_task_status: 'cancelled' }
+  ];
+  const ready = await openChildAdmission(client, issue);
+  assert.equal(ready.ok, false);
+  assert.equal(ready.dependency.state, 'ready');
+  assert.equal(ready.dependency.version, blocked.dependency.version + 1);
   const harness = createHarness('rollup');
   runCodeClosure(harness);
   emittedMetrics.push(report(harness, 'rollup-with-children'));
