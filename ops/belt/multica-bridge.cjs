@@ -791,6 +791,21 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
     const diagnosisTaskId = await recordParkAndQueueDiagnosis(client, issue,
       { ...evidence, reason });
     if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
+    // Parked is a durable hold: retire every other live task and relay row
+    // while the issue lock is held, so reconciliation cannot observe stale
+    // work and advance it later. The dedicated diagnosis task is preserved.
+    const retiredTasks = await client.query(
+      `UPDATE agent_task_queue SET status = 'cancelled', completed_at = NOW(),
+              prepare_lease_expires_at = NULL, failure_reason = 'parked_hold'
+         WHERE issue_id = $1 AND status::text NOT IN ('completed','failed','cancelled')
+           AND COALESCE(context->>'kind','') <> 'parked_diagnosis' RETURNING id`, [issue.id]);
+    const retiredRelay = await client.query(
+      `UPDATE relay_run_log SET status = 'failed', parked_audit =
+              COALESCE(parked_audit,'{}'::jsonb) || jsonb_build_object('retired_by_park', true)
+         WHERE issue_id = $1 AND status = 'pending'
+           AND to_stage <> 'Parked' RETURNING id`, [issue.id]);
+    evidence = { ...evidence, retired_task_ids: retiredTasks.rows.map(r => r.id),
+      retired_relay_log_ids: retiredRelay.rows.map(r => r.id) };
   }
   await client.query(
     `UPDATE agent_task_queue
@@ -1734,6 +1749,7 @@ async function relayAdvance(req, res, body) {
       req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET;
     const operatorCapBypass = explicitTerminalExit || explicitHumanReviewRelease;
 
+
     // Check the durable gate before the same-stage/idempotency fast path. A
     // replay of a Done request must not turn a newly recorded QC FAIL into a
     // successful 200 noop; every route that asks to reach Done is subject to
@@ -1794,6 +1810,22 @@ async function relayAdvance(req, res, body) {
     // outcome. It still reaches the current PASS + work-product-hash gate
     // below; the relay secret is the authority boundary for this exception.
     const parkedDiagnosisDone = issue.status === "Parked" && to_stage === "Done";
+    // No reconciler/retry/outcome path may leave Parked. Only explicit
+    // operator release or diagnosis admissions are exceptions.
+    const parkedOperatorRelease = issue.status === 'Parked' &&
+      !OPERATOR_SECRET_DISABLED && req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET &&
+      typeof reason === 'string' && reason.trim() !== '';
+    const parkedSystemExit = issue.status === 'Parked' &&
+      (parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone);
+    if (issue.status === 'Parked' && to_stage !== 'Parked' &&
+        !parkedOperatorRelease && !parkedSystemExit) {
+      await client.query("INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details) VALUES ($1,$2,'system','relay_parked_skipped',$3::jsonb)",
+        [issue.workspace_id, issue.id, JSON.stringify({ from_stage: 'Parked', to_stage, reason: 'parked_hold' })]);
+      await client.query('COMMIT');
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'parked_hold', message: 'Parked issues require explicit operator release or diagnosis' }));
+      return;
+    }
     // A deploy worker return is a bounded change-of-hands, not another blind
     // retry. It admits one repair task after a named terminal deploy blocker
     // (merge conflict or absent CI), even when historical retry counts are
@@ -2401,6 +2433,16 @@ async function relayAdvance(req, res, body) {
     let relayLogId = null;
 
     if (to_stage === "Parked" && result.rowCount > 0) {
+      const retiredTasks = await client.query(`UPDATE agent_task_queue
+        SET status='cancelled', completed_at=NOW(), prepare_lease_expires_at=NULL,
+            failure_reason='parked_hold'
+        WHERE issue_id=$1 AND status::text NOT IN ('completed','failed','cancelled')
+          AND COALESCE(context->>'kind','') <> 'parked_diagnosis' RETURNING id`, [issue.id]);
+      const retiredRelay = await client.query(`UPDATE relay_run_log SET status='failed',
+        parked_audit=COALESCE(parked_audit,'{}'::jsonb)||jsonb_build_object('retired_by_park',true)
+        WHERE issue_id=$1 AND status='pending' AND to_stage <> 'Parked' RETURNING id`, [issue.id]);
+      parkedAudit = { ...(parkedAudit || {}), retired_task_ids: retiredTasks.rows.map(r=>r.id),
+        retired_relay_log_ids: retiredRelay.rows.map(r=>r.id) };
       relayLogId = await recordParkedEntry(client, {
         issueId: issue.id,
         fromStage: issue.status,
