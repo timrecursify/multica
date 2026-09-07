@@ -394,6 +394,11 @@ function relayVerdictError(res, status, error) {
   res.end(JSON.stringify({ error }));
 }
 
+function validQcScopeRevision(value) {
+  const text = String(value);
+  return /^[1-9][0-9]{0,18}$/.test(text) && BigInt(text) <= 9223372036854775807n;
+}
+
 function validateRelayVerdict(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return "invalid_payload";
   const required = ["issue_id", "checker", "verdict", "work_product_md5", "bound_sha", "observed_sha", "failure_class", "qualifying", "model", "effort", "idem_key"];
@@ -408,6 +413,13 @@ function validateRelayVerdict(payload) {
   if (payload.bound_sha.toLowerCase() !== payload.observed_sha.toLowerCase()) return "sha_binding_mismatch";
   if (!FAILURE_CLASSES.has(payload.failure_class)) return "invalid_failure_class";
   if (typeof payload.qualifying !== "boolean") return "invalid_qualifying";
+  if (payload.event_kind != null &&
+      !["reviewer_verdict", "post_gate_disposition"].includes(payload.event_kind)) {
+    return "invalid_event_kind";
+  }
+  if (payload.scope_revision != null && !validQcScopeRevision(payload.scope_revision)) {
+    return "invalid_scope_revision";
+  }
   // QC lane is Sol or Luna at low effort (qc-lane.cjs); Sol alone rejected every
   // Luna verdict as invalid_qc_lane after the 2026-09-02 order moved QC to Luna.
   if (!isQcLane(payload.model, payload.effort)) return "invalid_qc_lane";
@@ -477,7 +489,8 @@ async function directDeployQcAdmission(client, issueId) {
 
 async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explicitTaskId = null) {
   const result = await client.query(
-      `SELECT t.id, t.agent_id, t.status, t.context, t.result, t.completed_at,
+      `SELECT t.id, t.agent_id, t.status, t.context, t.result, t.created_at, t.completed_at,
+              floor(extract(epoch FROM t.created_at) * 1000000)::bigint AS scope_revision,
               a.name AS agent_name
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
@@ -496,7 +509,9 @@ async function latestCompletedSolLowQcTask(client, issueId, workspaceId, explici
 
 async function latestRunningSolLowQcTask(client, issueId, workspaceId, checker, explicitTaskId = null) {
   const result = await client.query(
-    `SELECT t.id, t.issue_id, t.workspace_id, t.agent_id, t.status, t.context, t.result, t.completed_at,
+    `SELECT t.id, t.issue_id, t.workspace_id, t.agent_id, t.status, t.context, t.result,
+            t.created_at, t.completed_at,
+            floor(extract(epoch FROM t.created_at) * 1000000)::bigint AS scope_revision,
             a.name AS agent_name, a.model, a.thinking_level, a.runtime_config
        FROM agent_task_queue t
        JOIN issue i ON i.id = t.issue_id AND i.workspace_id = t.workspace_id
@@ -1550,6 +1565,68 @@ async function selectStageOwner(client, workspaceId, ownerStage, toStage, option
   return pooled || canonicalStageOwner(client, workspaceId, ownerStage);
 }
 
+const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
+
+function qcEventKind(payload, priorRows) {
+  if (payload.event_kind) return payload.event_kind;
+  const sameArtifactPass = priorRows.some((row) => row.verdict === 'PASS' &&
+    String(row.bound_sha).toLowerCase() === payload.bound_sha.toLowerCase() &&
+    String(row.work_product_md5).toLowerCase() === payload.work_product_md5.toLowerCase());
+  return payload.verdict === 'FAIL' && sameArtifactPass
+    ? 'post_gate_disposition' : 'reviewer_verdict';
+}
+
+function qcTaskScopeRevision(task) {
+  const contextRevision = task?.context?.scope_revision;
+  if (contextRevision != null && validQcScopeRevision(contextRevision)) {
+    return String(contextRevision);
+  }
+  if (task?.scope_revision != null && validQcScopeRevision(task.scope_revision)) {
+    return String(task.scope_revision);
+  }
+  const createdAt = new Date(task?.created_at || 0).getTime();
+  return Number.isFinite(createdAt) && createdAt > 0 ? String(createdAt * 1000) : null;
+}
+
+async function qcScopeRevision(client, payload, qcTask, priorRows) {
+  const taskRevision = qcTaskScopeRevision(qcTask);
+  if (taskRevision) return taskRevision;
+  if (payload.scope_revision != null) return String(payload.scope_revision);
+  const priorArtifact = priorRows.find((row) =>
+    String(row.bound_sha).toLowerCase() === payload.bound_sha.toLowerCase());
+  if (priorArtifact?.scope_revision) return String(priorArtifact.scope_revision);
+  const result = await client.query(
+    `SELECT COALESCE((SELECT scope_revision FROM qc_attempt
+                       WHERE issue_id=$1 AND lower(bound_sha)=lower($2)
+                       ORDER BY scope_revision DESC LIMIT 1),
+                     (SELECT COALESCE(max(scope_revision), 0) + 1 FROM qc_attempt
+                       WHERE issue_id=$1)) AS scope_revision`,
+    [payload.issue_id, payload.bound_sha]);
+  return String(result.rows[0].scope_revision);
+}
+
+function qcEventPayloadHash(event) {
+  return crypto.createHash('sha256').update(JSON.stringify([
+    event.issueId, event.checkerId, event.checkerName, event.eventKind,
+    event.evidenceTaskId, event.scopeRevision, event.verdict, event.workProductMd5,
+    event.boundSha, event.observedSha, event.failureClass, event.qualifying,
+    event.model, event.effort, event.notes
+  ])).digest('hex');
+}
+
+function sameQcEvent(row, event) {
+  if (row.payload_hash === event.payloadHash) return true;
+  if (String(row.payload_hash || '').length !== 32) return false;
+  return row.issue_id === event.issueId && row.checker_id === event.checkerId &&
+    row.checker_name === event.checkerName && row.event_kind === event.eventKind &&
+    row.evidence_task_id === event.evidenceTaskId && String(row.scope_revision) === event.scopeRevision &&
+    row.verdict === event.verdict && String(row.work_product_md5).toLowerCase() === event.workProductMd5 &&
+    String(row.bound_sha).toLowerCase() === event.boundSha &&
+    String(row.observed_head).toLowerCase() === event.observedSha &&
+    row.failure_class === event.failureClass && row.qualifying === event.qualifying &&
+    row.model === event.model && row.effort === event.effort && row.notes === event.notes;
+}
+
 async function relayVerdict(req, res, payload) {
   if (!RELAY_AGENT_SECRET || payload.agent_token !== RELAY_AGENT_SECRET) {
     relayVerdictError(res, 403, "invalid_token");
@@ -1566,34 +1643,13 @@ async function relayVerdict(req, res, payload) {
     await client.query("BEGIN");
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1))", [payload.idem_key]);
     const prior = await client.query(
-      `SELECT issue_id, checker_name, verdict, work_product_md5, bound_sha,
-              observed_head, failure_class, qualifying, model, effort
-         FROM qc_attempt WHERE idem_key = $1 FOR UPDATE`, [payload.idem_key]
+      `SELECT id, issue_id, checker_id, checker_name, event_kind, evidence_task_id,
+              scope_revision, verdict, work_product_md5, bound_sha, observed_head,
+              failure_class, qualifying, model, effort, payload_hash, notes
+         FROM qc_attempt
+        WHERE source_idem_key = $1 AND issue_id = $2::uuid
+        ORDER BY id FOR UPDATE`, [payload.idem_key, payload.issue_id]
     );
-    const replay = prior.rows.length > 0;
-    if (replay) {
-      const existing = prior.rows[0];
-      const same = existing.issue_id === payload.issue_id && existing.verdict === payload.verdict &&
-        String(existing.work_product_md5).toLowerCase() === payload.work_product_md5.toLowerCase() &&
-        String(existing.bound_sha).toLowerCase() === payload.bound_sha.toLowerCase() &&
-        String(existing.observed_head).toLowerCase() === payload.observed_sha.toLowerCase() &&
-        existing.failure_class === payload.failure_class && existing.qualifying === payload.qualifying &&
-        existing.model === payload.model && existing.effort === payload.effort;
-      if (!same) {
-        await client.query("COMMIT");
-        return relayVerdictError(res, 409, "idempotency_conflict");
-      }
-      // FAIL replays are immutable acknowledgements. Only PASS replays repair
-      // a missing verdict row so they cannot alter FAIL behavior.
-      if (payload.verdict !== "PASS") {
-        await client.query("COMMIT");
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ success: true, replay: true, issue_id: payload.issue_id,
-          work_product_md5: existing.work_product_md5 }));
-        return;
-      }
-    }
-
     const issue = await client.query(
       `SELECT id, workspace_id FROM issue WHERE id = $1 FOR UPDATE`, [payload.issue_id]
     );
@@ -1628,6 +1684,7 @@ async function relayVerdict(req, res, payload) {
     }
     const checkerId = externalQc ? '00000000-0000-0000-0000-000000000000' : qcTask.agent_id;
     const checkerName = externalQc ? payload.checker : qcTask.agent_name;
+    const evidenceTaskId = qcTask?.id || ZERO_UUID;
     const notes = [
       qcTask ? `relay_task_id=${qcTask.id}` : null,
       qcTask ? `relay_agent_id=${qcTask.agent_id}` : null,
@@ -1635,53 +1692,54 @@ async function relayVerdict(req, res, payload) {
       externalQc ? `operator_external_qc=${payload.reason || 'external QC'}` : null,
       typeof payload.notes === "string" && payload.notes.length <= 2000 ? payload.notes : null,
     ].filter(Boolean).join("\n");
-    const current = await client.query(
-      `SELECT issue_id, checker_id, notes, created_at
-         FROM qc_verdict WHERE issue_id = $1 FOR UPDATE`, [payload.issue_id]
-    );
-    const currentVerdict = current.rows[0];
-    const currentFromBoundTask = currentVerdict && qcTask &&
-      currentVerdict.checker_id === qcTask.agent_id &&
-      String(currentVerdict.notes || "").includes(`relay_task_id=${qcTask.id}`);
-    if (replay && currentVerdict && !currentFromBoundTask &&
-        qcTask && new Date(currentVerdict.created_at) > new Date(qcTask.completed_at || 0)) {
-      await client.query("ROLLBACK");
-      return relayVerdictError(res, 409, "qc_verdict_newer_than_bound_qc_task");
-    }
+    const eventKind = qcEventKind(payload, prior.rows);
+    const scopeRevision = await qcScopeRevision(client, payload, qcTask, prior.rows);
+    const event = { issueId: payload.issue_id, checkerId, checkerName, eventKind,
+      evidenceTaskId, scopeRevision, verdict: payload.verdict,
+      workProductMd5: payload.work_product_md5.toLowerCase(),
+      boundSha: payload.bound_sha.toLowerCase(), observedSha: payload.observed_sha.toLowerCase(),
+      failureClass: payload.failure_class, qualifying: payload.qualifying,
+      model: payload.model, effort: payload.effort, notes };
+    event.payloadHash = qcEventPayloadHash(event);
+    const existing = prior.rows.find((row) => sameQcEvent(row, event));
+    const replay = Boolean(existing);
+    let eventId = existing?.id || null;
     if (!replay) {
-      await client.query(
+      const internalIdemKey = prior.rows.length === 0 ? payload.idem_key :
+        `qce-${crypto.createHash('sha256').update(`${payload.idem_key}\0${event.payloadHash}`).digest('hex')}`;
+      const inserted = await client.query(
         `INSERT INTO qc_attempt
            (issue_id, checker_name, verdict, work_product_md5, bound_sha, observed_head,
-            failure_class, qualifying, model, effort, idem_key, notes)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+            failure_class, qualifying, model, effort, idem_key, notes, source_idem_key,
+            event_kind, checker_id, evidence_task_id, scope_revision, payload_hash)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                 $13, $14, $15, $16, $17, $18)
+         RETURNING id`,
         [payload.issue_id, checkerName, payload.verdict, payload.work_product_md5,
           payload.bound_sha, payload.observed_sha, payload.failure_class, payload.qualifying,
-          payload.model, payload.effort, payload.idem_key, notes]
+          payload.model, payload.effort, internalIdemKey, notes, payload.idem_key,
+          eventKind, checkerId, evidenceTaskId, scopeRevision, event.payloadHash]
       );
+      eventId = inserted.rows[0]?.id || null;
     }
-    if (!currentFromBoundTask) {
-      if (currentVerdict) {
-        await client.query(
-          `UPDATE qc_verdict SET checker_id = $2, checker_name = $3, verdict = $4,
-                  work_product_md5 = $5, notes = $6, created_at = NOW()
-            WHERE issue_id = $1`,
-          [payload.issue_id, checkerId, checkerName, payload.verdict,
-            payload.work_product_md5, notes]
-        );
-      } else {
-        await client.query(
-          `INSERT INTO qc_verdict
-             (issue_id, checker_id, checker_name, verdict, work_product_md5, notes)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [payload.issue_id, checkerId, checkerName, payload.verdict,
-            payload.work_product_md5, notes]
-        );
-      }
-    }
+    const effective = (await client.query(
+      `SELECT id, checker_id, checker_name, verdict, work_product_md5, notes, created_at
+         FROM qc_effective_verdict WHERE issue_id=$1`, [payload.issue_id])).rows[0];
+    if (!effective) throw new Error('effective_qc_verdict_missing');
+    await client.query(
+      `INSERT INTO qc_verdict
+         (issue_id, checker_id, checker_name, verdict, work_product_md5, notes, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (issue_id) DO UPDATE SET checker_id=EXCLUDED.checker_id,
+         checker_name=EXCLUDED.checker_name, verdict=EXCLUDED.verdict,
+         work_product_md5=EXCLUDED.work_product_md5, notes=EXCLUDED.notes,
+         created_at=EXCLUDED.created_at`,
+      [payload.issue_id, effective.checker_id, effective.checker_name, effective.verdict,
+        effective.work_product_md5, effective.notes, effective.created_at]);
     await client.query("COMMIT");
     res.writeHead(replay ? 200 : 201, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ success: true, replay, issue_id: payload.issue_id,
-      checker_id: checkerId,
+      event_id: eventId, checker_id: checkerId, effective_verdict: effective.verdict,
       work_product_md5: payload.work_product_md5 }));
   } catch (err) {
     await client.query("ROLLBACK").catch(() => {});

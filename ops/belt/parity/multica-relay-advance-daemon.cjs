@@ -459,11 +459,11 @@ function completedTaskEvidenceSql({ taskAlias, issueAlias, modelParam, effortPar
              ${taskAlias}.completed_at AS task_completed_at,
              task_agent.model AS task_agent_model,
              task_agent.thinking_level AS task_agent_effort,
-             verdict.checker_id AS qc_verdict_checker_id,
-             verdict.verdict AS qc_verdict,
-             verdict.work_product_md5 AS qc_verdict_work_product_md5,
-             verdict.notes AS qc_verdict_notes,
-             verdict.created_at AS qc_verdict_created_at,
+             attempt.checker_id AS qc_verdict_checker_id,
+             attempt.verdict AS qc_verdict,
+             attempt.work_product_md5 AS qc_verdict_work_product_md5,
+             attempt.notes AS qc_verdict_notes,
+             attempt.created_at AS qc_verdict_created_at,
              attempt.verdict AS qc_attempt_verdict,
              attempt.work_product_md5 AS qc_attempt_work_product_md5,
              attempt.bound_sha AS qc_attempt_bound_sha,
@@ -478,30 +478,24 @@ function completedTaskEvidenceSql({ taskAlias, issueAlias, modelParam, effortPar
              ${issueAlias}.workspace_id, ${issueAlias}.priority, ${issueAlias}.title AS issue_title`,
     joins: `LEFT JOIN agent task_agent ON task_agent.id = ${taskAlias}.agent_id
       LEFT JOIN LATERAL (
-        SELECT checker_id, verdict, work_product_md5, notes, created_at
-          FROM qc_verdict WHERE issue_id = ${taskAlias}.issue_id
-         ORDER BY created_at DESC LIMIT 1
-      ) verdict ON true
-      LEFT JOIN LATERAL (
-        SELECT qa.verdict, qa.work_product_md5, qa.bound_sha, qa.observed_head,
-               qa.qualifying,
+        SELECT effective.checker_id, effective.verdict, effective.work_product_md5,
+               effective.bound_sha, effective.observed_head, effective.qualifying,
+               effective.notes, effective.created_at,
                evidence_task.id AS evidence_task_id,
                evidence_task.status AS evidence_task_status,
                evidence_task.agent_id AS evidence_agent_id,
                evidence_agent.model AS evidence_agent_model,
                evidence_agent.thinking_level AS evidence_agent_effort
-          FROM qc_attempt qa
+          FROM qc_effective_verdict effective
           INNER JOIN agent_task_queue evidence_task
-                  ON evidence_task.issue_id = qa.issue_id
-                 AND evidence_task.id::text = substring(
-                       qa.notes FROM 'relay_task_id=([0-9a-f-]{36})')
+                  ON evidence_task.issue_id = effective.issue_id
+                 AND evidence_task.id = effective.evidence_task_id
           INNER JOIN agent evidence_agent
                   ON evidence_agent.id = evidence_task.agent_id
                  AND evidence_agent.workspace_id = ${issueAlias}.workspace_id
-         WHERE qa.issue_id = ${taskAlias}.issue_id
-           AND evidence_task.agent_id = verdict.checker_id
-           AND qa.work_product_md5 = verdict.work_product_md5
-         ORDER BY qa.created_at DESC LIMIT 1
+         WHERE effective.issue_id = ${taskAlias}.issue_id
+           AND evidence_task.agent_id = effective.checker_id
+         LIMIT 1
       ) attempt ON true
       LEFT JOIN LATERAL (
         SELECT jsonb_agg(jsonb_build_object(

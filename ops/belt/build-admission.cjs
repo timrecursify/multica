@@ -15,7 +15,7 @@ async function buildTaskAdmission(client, { issueId, toStage, locked = false }) 
     [issueId, [...BUILD_STAGES]])).rows[0];
   if (!prior) return { admit: true };
   const failure = (await client.query(
-    `SELECT id FROM qc_attempt WHERE issue_id=$1::uuid AND verdict='FAIL'
+    `SELECT id FROM qc_effective_verdict WHERE issue_id=$1::uuid AND verdict='FAIL'
        AND failure_class='implementation' AND qualifying IS TRUE AND created_at>$2::timestamptz
      ORDER BY created_at DESC, id DESC LIMIT 1`, [issueId, prior.completed_at])).rows[0];
   if (!failure) return { admit: false, reuseTaskId: prior.id, reason: "completed_build_work_product" };
