@@ -366,6 +366,8 @@ test("agent without a runtime is skipped for the next eligible pool agent", asyn
 });
 
 // A recorded BLOCKED outcome only leaves the belt when nothing observable remains.
+// FAILED/human is equally terminal: only a person can resolve it, regardless of
+// which terminal outcome label the worker recorded.
 test("terminalBlocker routes only unobservable blockers", async () => {
   const unlinked = { query: async () => ({ rows: [] }) };
   const linked = { query: async () => ({ rows: [{ "?column?": 1 }] }) };
@@ -373,15 +375,20 @@ test("terminalBlocker routes only unobservable blockers", async () => {
 
   assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "human")), "blocked_human");
   assert.equal(await terminalBlocker(linked, issue, b("BLOCKED", "human")), "blocked_human");
+  assert.equal(await terminalBlocker(unlinked, issue, b("FAILED", "human")), "blocked_human");
   assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "ci")), "blocked_ci_unobservable");
   assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "sha")), "blocked_sha_unobservable");
   assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "dependency")), "blocked_dependency_unobservable");
   // A linked PR or dependency still supplies a hash term, so the belt keeps it.
   assert.equal(await terminalBlocker(linked, issue, b("BLOCKED", "ci")), null);
   assert.equal(await terminalBlocker(linked, issue, b("BLOCKED", "dependency")), null);
-  // quota clears itself; non-BLOCKED outcomes are not this function's business.
+  // quota clears itself. FAILED only routes for a human blocker: ci, sha, and
+  // dependency retain machine-observable inputs and are not widened here.
   assert.equal(await terminalBlocker(unlinked, issue, b("BLOCKED", "quota")), null);
   assert.equal(await terminalBlocker(unlinked, issue, b("FAILED", null)), null);
+  assert.equal(await terminalBlocker(unlinked, issue, b("FAILED", "ci")), null);
+  assert.equal(await terminalBlocker(unlinked, issue, b("FAILED", "sha")), null);
+  assert.equal(await terminalBlocker(unlinked, issue, b("FAILED", "dependency")), null);
   assert.equal(await terminalBlocker(unlinked, issue, null), null);
 });
 
