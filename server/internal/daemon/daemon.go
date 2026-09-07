@@ -135,7 +135,7 @@ func taskScopedAuthToken(task Task) (string, error) {
 }
 
 func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesRoot, serverURL string, healthPort, slot int, tempDir string) map[string]string {
-	sharedCache := filepath.Join(configRoot, "shared-cache")
+	sharedCache := filepath.Join(filepath.Dir(workspacesRoot), "cache")
 	return map[string]string{
 		"MULTICA_TOKEN":        token,
 		cli.TaskConfigRootEnv:  configRoot,
@@ -155,6 +155,7 @@ func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesR
 		"MULTICA_CODE_REVIEW_GRAPH_VENV": filepath.Join(sharedCache, "code-review-graph", "2.3.8"),
 		"PNPM_HOME":                       filepath.Join(sharedCache, "pnpm"),
 		"PNPM_STORE_DIR":                  filepath.Join(sharedCache, "pnpm", "store"),
+		"npm_config_cache":                filepath.Join(sharedCache, "npm"),
 	}
 }
 
@@ -4949,7 +4950,7 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 // It is best-effort and intentionally non-fatal: the terminal callback has
 // already settled the task when this runs.
 func (d *Daemon) cleanupCompletedTaskEnv(task Task, envRoot string, logger *slog.Logger) {
-	if envRoot == "" || os.Getenv("KEEP_WORKDIR") == "1" {
+	if envRoot == "" || retainTaskWorkspace() {
 		return
 	}
 	if assignment, _ := localDirectoryAssignmentForTask(task, d.cfg.DaemonID); assignment != nil {
@@ -4972,8 +4973,25 @@ func (d *Daemon) cleanupCompletedTaskEnv(task Task, envRoot string, logger *slog
 		return
 	}
 	defer release()
-	if err := os.RemoveAll(envRoot); err != nil {
-		logger.Warn("terminal task environment cleanup failed", "path", envRoot, "error", err)
+	removeTerminalTaskArtifacts(envRoot, logger)
+}
+
+func retainTaskWorkspace() bool {
+	return os.Getenv("MULTICA_WORKSPACE_RETAIN") == "1" || os.Getenv("KEEP_WORKDIR") == "1"
+}
+
+func removeTerminalTaskArtifacts(envRoot string, logger *slog.Logger) {
+	for _, name := range []string{"workdir", "codex-home", "multica-config"} {
+		path := filepath.Join(envRoot, name)
+		bytes := dirSize(path)
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			continue
+		}
+		if err := os.RemoveAll(path); err != nil {
+			logger.Warn("terminal task artifact cleanup failed", "path", path, "error", err)
+			continue
+		}
+		logger.Info("terminal task artifact deleted", "path", path, "bytes", bytes)
 	}
 }
 
@@ -6234,7 +6252,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Provision the daemon-owned graph environment before launching the task.
 	// This is shared and version-pinned; failed/partial installs are removed by
 	// the provisioner so the next task can retry safely.
-	sharedCacheRoot := filepath.Join(env.MulticaConfigRoot, "shared-cache")
+	sharedCacheRoot := filepath.Join(filepath.Dir(d.cfg.WorkspacesRoot), "cache")
 	graphVenv, err := ensureCodeReviewGraphCache(sharedCacheRoot)
 	if err != nil {
 		taskLog.Error("code-review-graph cache provisioning failed", "error", err)
