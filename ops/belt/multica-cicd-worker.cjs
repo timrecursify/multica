@@ -13,7 +13,11 @@ const { evaluate } = require('./transition-policy.cjs');
 const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
 const { mintGithubToken, repoFromGhArgs } = require('./github-token.cjs');
 const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multica-runtime/receipts';
-const SK_COMMAND = process.env.SK_COMMAND || '/opt/gsp/.sk/bin/sk';
+const DEFAULT_SK_COMMAND = '/opt/gsp/.sk/bin/sk';
+function resolveSkCommand(env = process.env) {
+  return env.SK_COMMAND || DEFAULT_SK_COMMAND;
+}
+const SK_COMMAND = resolveSkCommand();
 let pool;
 let relayToken;
 let readReceipt = (sha) => JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/belt-${sha}.json`, 'utf8'));
@@ -827,4 +831,4 @@ function setTestDependencies(dependencies) {
 module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview, retryEscalation,
   routeFinishedPR, receiptFor, mergeDeployEvidence, noDeployRunTriggered, terminalFailedDeployRuns,
   terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, parseRelayResponse,
-  setTestDependencies, sweep, watchdogFailure, closureWatchdog };
+  setTestDependencies, sweep, watchdogFailure, closureWatchdog, resolveSkCommand };
