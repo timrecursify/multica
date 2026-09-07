@@ -2128,6 +2128,19 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
   assert.deepEqual(persisted.agent_task_queue, []);
   assert.equal(persisted.issue.status, 'Parked');
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
+  // Parking must retire stale work as part of the same locked transition.
+  assert.ok(queries.some(({ sql }) => /UPDATE agent_task_queue/i.test(sql) && /cancel|retir/i.test(sql)),
+    'parking did not retire in-flight tasks');
+  assert.ok(queries.some(({ sql }) => /UPDATE relay_run_log/i.test(sql) && /pending|retir/i.test(sql)),
+    'parking did not retire pending relay rows');
+});
+
+test('parked admission skips stale system exits while retaining operator release', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /relay_parked_skipped/);
+  assert.match(source, /issue\.status === "Parked"/);
+  assert.match(source, /explicitOperatorRelease|explicitHumanReviewRelease|parkedDiagnosis/);
+  assert.match(source, /Parked.*operator.*diagnos|operator.*diagnos/s);
 });
 
 test('terminal exits preserve the configured archiver path and require an authenticated operator marker otherwise', () => {
