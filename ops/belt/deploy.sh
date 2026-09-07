@@ -47,6 +47,7 @@ fi
 
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/opt/gsp/multica-workers}"
+codex_agents="${BELT_CODEX_AGENTS:-${HOME:-}/.codex/AGENTS.md}"
 
 # Manifest lives in one place; see belt-manifest.sh.
 . "$root_dir/belt-manifest.sh"
@@ -168,6 +169,7 @@ if [[ "$mode" == rollback ]]; then
       printf 'Restored %s from %s.bak-%s\n' "${targets[$index]}" "${targets[$index]}" "$rollback_timestamp"
     fi
   done
+  [[ -f "$codex_agents.bak-${rollback_timestamp}" ]] && cp -- "$codex_agents.bak-${rollback_timestamp}" "$codex_agents"
   printf 'Rollback complete for %s.\n' "$rollback_timestamp"
   exit 0
 fi
