@@ -1433,6 +1433,36 @@ func TestGitFetchRefreshesOriginHeadAfterDefaultChange(t *testing.T) {
 	}
 }
 
+// TestCreateIsolatedCheckoutSyncsRemoteOnlyCommitBeforeDetach covers caches
+// whose requested commit is advertised only by refs/remotes/origin/* (the
+// layout used by migrated caches), including a shallow-cache marker.
+func TestCreateIsolatedCheckoutSyncsRemoteOnlyCommitBeforeDetach(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	branch := currentBranchName(t, sourceRepo)
+	commit := gitRefCommit(t, sourceRepo, "HEAD")
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	barePath := cache.Lookup("ws-1", sourceRepo)
+	// Reproduce the migrated, shallow bare-cache shape: the commit is
+	// reachable through origin/main (or the source branch), not refs/heads/*.
+	runGitAuthored(t, barePath, "update-ref", "refs/remotes/origin/"+branch, commit)
+	_ = exec.Command("git", "-C", barePath, "update-ref", "-d", "refs/heads/"+branch).Run()
+	if err := os.WriteFile(filepath.Join(barePath, "shallow"), []byte(commit+"\n"), 0o644); err != nil {
+		t.Fatalf("mark cache shallow: %v", err)
+	}
+
+	checkoutPath := filepath.Join(t.TempDir(), "checkout")
+	if _, err := createIsolatedCheckout(barePath, sourceRepo, checkoutPath, "work", "refs/remotes/origin/"+branch, commit); err != nil {
+		t.Fatalf("createIsolatedCheckout failed for remote-only commit: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(checkoutPath, ".git")); err != nil {
+		t.Fatalf("checkout missing .git: %v", err)
+	}
+}
+
 // TestGetRemoteDefaultBranchUsesBareHeadHintForCustomDefault verifies step 3
 // of the resolver: when the cache has a non-standard default branch name
 // (trunk, develop, …) and `git remote set-head origin --auto` didn't
