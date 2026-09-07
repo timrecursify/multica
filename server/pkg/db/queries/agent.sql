@@ -796,6 +796,14 @@ SET status = 'completed', completed_at = now(), result = $2,
 WHERE id = $1 AND status = 'running'
 RETURNING *;
 
+-- name: CountActiveAgentTasksByWorkDir :one
+-- A terminal task directory is reclaimable only when no in-flight task still
+-- owns the same checkout (resume and retry tasks can share work_dir).
+SELECT count(*) FROM agent_task_queue
+WHERE work_dir = $1
+  AND id <> $2
+  AND status NOT IN ('completed', 'failed', 'cancelled');
+
 -- name: GetLastTaskSession :one
 -- Returns the session_id and work_dir from the most recent task for a given
 -- (agent_id, issue_id) pair, used for session resumption on the auto-retry

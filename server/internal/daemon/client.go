@@ -747,8 +747,12 @@ func (c *Client) GetAutopilotRunGCCheck(ctx context.Context, runID string) (*Aut
 // Quick-create tasks have no separate parent record, so GC keys directly on
 // the task itself.
 type TaskGCStatus struct {
-	Status      string    `json:"status"`
-	CompletedAt time.Time `json:"completed_at"`
+	Status           string    `json:"status"`
+	CompletedAt      time.Time `json:"completed_at"`
+	WorkDir          string    `json:"work_dir"`
+	PRURL            string    `json:"pr_url"`
+	BranchName       string    `json:"branch_name"`
+	ActiveReferences int64 `json:"active_references"`
 }
 
 // GetTaskGCCheck returns the status of an agent task for GC decisions.

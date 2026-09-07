@@ -2,16 +2,48 @@
 set -euo pipefail
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "$root_dir/workspace-root.sh"
-min_age=2; apply=0
-while (($#)); do case "$1" in --apply) apply=1;; --min-age-hours) min_age="$2"; shift;; *) exit 64;; esac; shift; done
-root="$(workspace_root_resolve)"; cutoff=$(( $(date +%s) - min_age * 3600 )); total=0; paths=(); bytes=()
-while IFS= read -r -d '' task; do
-  [[ -d "$task" && ! -L "$task" ]] || continue; (( $(stat -c %Y -- "$task") < cutoff )) || continue; busy=0
-  for proc in /proc/[0-9]*; do
-    [[ "$(readlink -e -- "$proc/cwd" 2>/dev/null || :)" == "$task" ]] && { busy=1; break; }
-    for fd in "$proc"/fd/*; do [[ "$(readlink -e -- "$fd" 2>/dev/null || :)" == "$task"/* ]] && { busy=1; break 2; }; done
-  done
-  (( busy == 0 )) || continue; size="$(du -sb -- "$task" | awk '{print $1}')"; paths+=("$task"); bytes+=("$size"); total=$((total + size)); printf '%s %s\n' "$task" "$size"
-done < <(find "$root" -mindepth 2 -maxdepth 2 -type d -name '????????' -print0)
-printf 'total %s\n' "$total"
-if (( apply )); then state="${WORKSPACE_GC_STATE_DIR-/var/lib/gsp-multica/state}"; ts="$(date -u +%Y%m%dT%H%M%SZ)"; mkdir -p "$state"; receipt="$state/workspace-gc-$ts.txt"; : > "$receipt"; for i in "${!paths[@]}"; do printf '%s %s %s\n' "$ts" "${paths[$i]}" "${bytes[$i]}" >> "$receipt"; rm -rf -- "${paths[$i]}"; done; printf '%s total %s\n' "$ts" "$total" >> "$receipt"; fi
+apply=0
+while (($#)); do case "$1" in --apply) apply=1;; --min-age-hours) shift;; *) exit 64;; esac; shift; done
+root="$(workspace_root_resolve)"
+limit="${WORKSPACE_GC_BATCH_LIMIT:-200}"
+[[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 && "$limit" -le 200 ]] || exit 64
+if [[ "${KEEP_WORKDIR:-}" == 1 ]]; then printf 'total\t0\t0\n'; exit 0; fi
+
+descriptor_stream() {
+  if [[ -n "${WORKSPACE_GC_DESCRIPTOR_FILE:-}" ]]; then
+    [[ "${BELT_TEST_MODE:-}" == 1 ]] || exit 64
+    head -n "$limit" -- "$WORKSPACE_GC_DESCRIPTOR_FILE"
+    return
+  fi
+  docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -F $'\t' -v batch_limit="$limit" -c "
+    SELECT t.id, t.status, t.completed_at,
+           COALESCE(t.work_dir, '$root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir')
+    FROM agent_task_queue t
+    WHERE t.status IN ('completed','failed','cancelled')
+      AND t.completed_at < now() - interval '1 hour'
+      AND (t.status <> 'completed' OR COALESCE(t.result->>'pr_url','') <> ''
+           OR COALESCE(t.result->>'branch_name','') = '')
+      AND NOT EXISTS (
+        SELECT 1 FROM agent_task_queue live
+        WHERE live.id <> t.id
+          AND live.status NOT IN ('completed','failed','cancelled')
+          AND live.work_dir = COALESCE(t.work_dir, '$root/' || t.workspace_id || '/' || left(t.id::text, 8) || '/workdir'))
+      ORDER BY t.completed_at LIMIT :batch_limit"
+}
+
+total=0; count=0
+while IFS=$'\t' read -r task_id status completed_at work_dir; do
+  [[ "$task_id" =~ ^[0-9a-fA-F-]{36}$ ]] || continue
+  prefix="${task_id:0:8}"
+  [[ "$work_dir" == "$root"/*/"$prefix"/workdir ]] || continue
+  task_dir="${work_dir%/workdir}"
+  [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
+  [[ -z "$(git -C "$work_dir" status --porcelain 2>/dev/null | head -1)" ]] || continue
+  head_sha="$(git -C "$work_dir" rev-parse HEAD 2>/dev/null || :)"
+  [[ -n "$head_sha" && -n "$(git -C "$work_dir" branch -r --contains "$head_sha" 2>/dev/null | head -1)" ]] || continue
+  size="$(du -sb -- "$task_dir" | awk '{print $1}')"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$size" "$task_id" "$status" "$completed_at" "$task_dir"
+  total=$((total + size)); count=$((count + 1))
+  if ((apply)); then rm -rf --one-file-system -- "$task_dir"; fi
+done < <(descriptor_stream)
+printf 'total\t%s\t%s\n' "$count" "$total"
