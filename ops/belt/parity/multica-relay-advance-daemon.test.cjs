@@ -254,6 +254,41 @@ test('merged non-runtime PR completing In Progress reviews before Done', async (
   assert.equal(route.boundSha, 'c'.repeat(40));
 });
 
+test('green open non-runtime PR advances from review to CI/CD without daemon merge', async () => {
+  const pr = { state: 'OPEN', files: [{ path: 'web/app.ts' }], headRefOid: 'd'.repeat(40),
+    mergeStateStatus: 'CLEAN', statusCheckRollup: [{ conclusion: 'SUCCESS' }] };
+  const calls = [];
+  const route = await buildCompletionRoute(linkedPrClient(pr), {
+    issue_id: 'issue-1', to_stage: 'In Review', next_stage: 'CI/CD & Deploy'
+  }, { githubCommand: (args) => { calls.push(args); return JSON.stringify(pr); } });
+  assert.equal(route.kind, 'merge_only_ready');
+  assert.equal(route.toStage, 'CI/CD & Deploy');
+  assert.equal(route.pr_state, 'OPEN');
+  assert.equal(route.boundSha, 'd'.repeat(40));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0], 'pr');
+  assert.equal(calls[0][1], 'view');
+});
+
+test('red open non-runtime PR remains held before CI/CD', async () => {
+  const route = await buildCompletionRoute(linkedPrClient(), {
+    issue_id: 'issue-1', to_stage: 'In Review', next_stage: 'CI/CD & Deploy'
+  }, { githubCommand: () => JSON.stringify({ state: 'OPEN', files: [{ path: 'web/app.ts' }],
+    headRefOid: 'e'.repeat(40), mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ conclusion: 'FAILURE' }] }) });
+  assert.equal(route.toStage, null);
+  assert.equal(route.reason, 'non_runtime_pr_not_merged');
+});
+
+test('non-green completion route enters the existing respec path', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const start = source.indexOf('const route = await buildCompletionRoute(client, row);');
+  const routeHold = source.slice(start, source.indexOf('const targetStage', start));
+  assert.match(routeHold, /requestRetryEscalation\(row, route\.reason\)/);
+  assert.match(routeHold, /markRelayLogFailedById\(client, row\.log_id\)/);
+  assert.doesNotMatch(routeHold, /PENDING:/);
+});
+
 async function noPrDoneEvidence(noShaComment) {
   const payloads = [];
   await readvanceRecordedOutcomes({ dbPool: { connect: async () => ({ release() {}, query: async (sql) => {
