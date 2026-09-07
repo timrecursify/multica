@@ -202,6 +202,25 @@ async function operatorRespec(client, payload) {
     accounting_baseline: baseline } };
 }
 
+// Reserve the one-shot authorization used by the normal advance path.  This
+// keeps parked release auditable and prevents operators from mutating issue
+// metadata out of band.
+async function operatorUnpark(client, payload) {
+  const issueId = String(payload.issue_id || "");
+  const reason = typeof payload.reason === "string" ? payload.reason.trim() : "";
+  const idem = String(payload.idempotency_key || "");
+  if (!UUID_RE.test(issueId) || !reason || !IDEM_KEY_RE.test(idem)) return { ok: false, status: 400, error: "invalid_request" };
+  await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 807))", [issueId]);
+  const q = await client.query(`SELECT id, status, metadata FROM issue WHERE id=$1::uuid FOR UPDATE`, [issueId]);
+  if (!q.rows[0]) return { ok: false, status: 404, error: "issue_not_found" };
+  const issue = q.rows[0];
+  if (issue.status !== "Parked") return { ok: false, status: 409, error: "parked_stage_required" };
+  if (issue.metadata?.parked_release_once === true) return { ok: false, status: 409, error: "release_already_reserved" };
+  const at = new Date().toISOString();
+  await client.query(`UPDATE issue SET metadata=COALESCE(metadata,'{}'::jsonb)||$2::jsonb, updated_at=NOW() WHERE id=$1::uuid`, [issueId, JSON.stringify({ parked_release_once: true, parked_release_at: at, parked_release_reason: reason, parked_release_idempotency_key: idem })]);
+  return { ok: true, issue_id: issueId, prior_stage: "Parked", new_stage: "Queue", reason, idempotency_key: idem };
+}
+
 // This deliberately reads only the canonical link tables.  issue.pr_url and
 // comment text are presentation/provenance data, not authority to skip work.
 async function mergedPrEvidence(client, issue, evidence, dependencies = {}) {
@@ -2653,6 +2672,19 @@ async function relayOperatorRespec(req, res, body) {
   } finally { await client.end().catch(() => {}); }
 }
 
+async function relayOperatorUnpark(req, res, body) {
+  if (!RELAY_OPERATOR_SECRET || OPERATOR_SECRET_DISABLED || (req.headers || {})["x-relay-operator-secret"] !== RELAY_OPERATOR_SECRET) {
+    res.writeHead(403, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "operator_secret_required" })); return;
+  }
+  const client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
+  try { await client.connect(); await client.query("BEGIN"); await authorizeRelayStatusWrites(client);
+    const result = await operatorUnpark(client, body || {});
+    if (!result.ok) { await client.query("ROLLBACK"); res.writeHead(result.status, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: result.error })); return; }
+    await client.query("COMMIT"); res.writeHead(201, { "Content-Type": "application/json" }); res.end(JSON.stringify({ success: true, ...result }));
+  } catch (err) { await client.query("ROLLBACK").catch(() => {}); res.writeHead(500, { "Content-Type": "application/json" }); res.end(JSON.stringify({ error: "internal_error" })); }
+  finally { await client.end().catch(() => {}); }
+}
+
 async function relayDiagnosisRerun(req, res, payload) {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload) ||
       !RELAY_AGENT_SECRET || payload.agent_token !== RELAY_AGENT_SECRET) {
@@ -2711,6 +2743,10 @@ const server = http.createServer(async (req, res) => {
         req.on("end", () => {
           try { relayOperatorRespec(req, res, JSON.parse(body)); } catch { relayVerdictError(res, 400, "invalid_json"); }
         });
+      } else if (req.method === "POST" && req.url === "/relay/unpark") {
+        let body = "";
+        req.on("data", chunk => body += chunk);
+        req.on("end", () => { try { relayOperatorUnpark(req, res, JSON.parse(body)); } catch { relayVerdictError(res, 400, "invalid_json"); } });
       } else if (req.method === "POST" && req.url === "/relay/parked-diagnosis-rerun") {
         let body = "";
         req.on("data", chunk => body += chunk);
@@ -2835,4 +2871,5 @@ module.exports = {
   diagnosisRerunErrorStatus,
   parkedDiagnosisRerunRefusal,
   mergedPrEvidence
+  ,operatorUnpark
 };
