@@ -62,6 +62,13 @@ test("query builders hold the live status invariant", () => {
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
 });
 
+test("stage attempt ceiling stays fixed across replays", () => {
+  assert.deepEqual(stageAttemptBudget(0, 2, 2), { attempt: 1, maxAttempts: 2 });
+  assert.deepEqual(stageAttemptBudget(1, 2, 2), { attempt: 2, maxAttempts: 2 });
+  assert.deepEqual(stageAttemptBudget(2, 2, 2), { attempt: 3, maxAttempts: 2 });
+  assert.deepEqual(stageAttemptBudget(0, 0, 2), { attempt: 1, maxAttempts: 2 });
+});
+
 test("zero-task issue creates exactly one reconcile task and pending log", async () => {
   const db = harness();
   const result = await reconcileIssue(db, issue.id, { evaluate: ok });
@@ -421,7 +428,7 @@ test("cycle rolls back a throwing issue and reconciles the next issue", async ()
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")));
 });
 
-test("per-stage attempt ceiling grows to admit a new task", async () => {
+test("per-stage attempt ceiling remains fixed across a new task", async () => {
   const db = harness();
   const original = db.query;
   db.query = async (sql, values) => sql.includes("max(attempt)")
@@ -429,7 +436,7 @@ test("per-stage attempt ceiling grows to admit a new task", async () => {
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), { action: "created", taskId: "task-1" });
   const insert = db.calls.find((call) => call.sql.includes("INSERT INTO agent_task_queue"));
   assert.equal(insert.values[7], 3);
-  assert.equal(insert.values[8], 3);
+  assert.equal(insert.values[8], 2);
 });
 
 test("typed outcome eligibility runs before creating a retry task", async () => {

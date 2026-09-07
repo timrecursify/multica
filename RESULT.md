@@ -51,3 +51,8 @@ Verification:
 Implementation commit: `14b603d34e6db06152f3de4cc5d5ed0b43fe3da0`
 
 PR: https://github.com/timrecursify/multica/pull/785
+
+# Rebase follow-up
+
+- Same-stage replay eligibility now stops before outcome lookup when `attempt >= maxAttempts` (`ops/belt/stage-outcome.cjs`).
+- Reconciler preserves operator-release epoch handling, retry lineage, completed-build handoff, and exports the attempt-budget helper.

@@ -1725,9 +1725,13 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
                 -- may not record a verdict, and build stages may not write a
                 -- completed relay row. Wait the existing queue TTL so a
                 -- normal asynchronous completion still has time to land.
-                OR (
-                  t.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
-                  AND (
+                    OR (
+                      t.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM agent_task_queue replay
+                         WHERE replay.retry_of_task_id = t.id
+                      )
+                      AND (
                     (i.status = 'In Review' AND NOT EXISTS (
                       SELECT 1 FROM qc_verdict qv
                        WHERE qv.issue_id = i.id
@@ -2042,7 +2046,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           to_stage: row.stage,
           requeue_of_task: row.dead_task_id,
           requeue_of_relay_log: row.requeue_marker_log_id || row.closed_relay_log_id,
-          dead_task_reason: row.failure_reason
+          dead_task_reason: row.failure_reason,
+          replay_reason: coldStart ? 'stage_entry_recovery' : 'same_stage_no_advance'
         });
         const task = await client.query(
           `INSERT INTO agent_task_queue (

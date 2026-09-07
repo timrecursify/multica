@@ -102,6 +102,11 @@ function stageAttemptsSql() {
              AND trigger_comment_id IS NULL`;
 }
 
+function stageAttemptBudget(attempt, configuredMax, fallbackMax) {
+  const maxAttempts = Number.isInteger(configuredMax) && configuredMax > 0 ? configuredMax : fallbackMax;
+  return { attempt: Number(attempt || 0) + 1, maxAttempts };
+}
+
 function taskContext(stage) {
   return { source: "reconcile", kind: "stage_task", to_stage: stage };
 }
@@ -393,7 +398,7 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
     const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
-    const maxAttempts = Math.max(Number(stageAttempts.rows[0]?.max_attempts || 0), options.defaultMaxAttempts, attempt + 1);
+    const budget = stageAttemptBudget(attempt, Number(stageAttempts.rows[0]?.max_attempts || 0), options.defaultMaxAttempts);
     if (options.typedOutcomes) {
       // GSP-1826: a recorded outcome for this stage with unchanged inputs is final until the inputs change.
       const eligibility = await stageEligibility(client, issue.id, issue.status, {
@@ -608,4 +613,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };

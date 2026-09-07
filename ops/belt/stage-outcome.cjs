@@ -276,6 +276,9 @@ async function persistOutcome(client, row, parsed, logger) {
 // the inputs changed since. BLOCKED/human never re-opens without a hash change.
 // FAILED is retryable after a bounded TTL; callers may pass a clock/config for tests.
 async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Number.parseInt(process.env.MULTICA_FAILED_TTL_MINUTES || "15", 10), now = Date.now(), attempt, maxAttempts, releaseAt } = {}) {
+  if (Number.isInteger(attempt) && Number.isInteger(maxAttempts) && attempt >= maxAttempts) {
+    return { eligible: false, reason: "attempt_budget_exhausted" };
+  }
   const prior = (await client.query(outcomeForStageSql(), [issueId, stage])).rows[0];
   if (!prior) return { eligible: true, reason: "no_outcome" };
   // An authenticated operator release starts a new decision epoch. Outcomes
