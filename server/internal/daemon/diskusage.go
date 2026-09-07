@@ -69,6 +69,11 @@ type DiskUsageReport struct {
 	// against per-task numbers that do not contain it.
 	RepoCacheSizeBytes int64 `json:"repo_cache_size_bytes"`
 	RepoCacheCount     int   `json:"repo_cache_count"`
+	// RepoCacheRoot is the directory those two numbers were measured from.
+	// It is not always a child of WorkspacesRoot: MULTICA_REPO_MIRRORS_ROOT
+	// can move the mirrors to a shared location, and several profile roots
+	// then report the same directory, so the aggregate counts it once.
+	RepoCacheRoot string `json:"repo_cache_root,omitempty"`
 }
 
 // DiskUsageRoot pairs a workspaces root with the profile it was derived from
@@ -114,6 +119,7 @@ func ScanDiskUsageRoots(roots []DiskUsageRoot, artifactPatterns []string) (Aggre
 	matcher := newArtifactMatcher(artifactPatterns, execenv.ManagedReclaimableArtifactSubpaths())
 	agg.ArtifactPatterns = sortedKeys(matcher.basenames)
 	agg.ManagedArtifactSubpaths = matcher.managedSubpaths()
+	countedRepoCacheRoots := map[string]bool{}
 
 	for _, r := range roots {
 		report, err := ScanDiskUsage(r.Root, artifactPatterns)
@@ -125,8 +131,14 @@ func ScanDiskUsageRoots(roots []DiskUsageRoot, artifactPatterns []string) (Aggre
 		agg.TotalWorkspaceCount += report.TotalWorkspaceCount
 		agg.TotalSizeBytes += report.TotalSizeBytes
 		agg.TotalArtifactSizeBytes += report.TotalArtifactSizeBytes
-		agg.TotalRepoCacheSizeBytes += report.RepoCacheSizeBytes
-		agg.TotalRepoCacheCount += report.RepoCacheCount
+		// Several roots can share one mirror root (MULTICA_REPO_MIRRORS_ROOT is
+		// process-wide), and adding each root's copy would multiply the same
+		// bytes by the number of profiles scanned.
+		if report.RepoCacheRoot != "" && !countedRepoCacheRoots[report.RepoCacheRoot] {
+			countedRepoCacheRoots[report.RepoCacheRoot] = true
+			agg.TotalRepoCacheSizeBytes += report.RepoCacheSizeBytes
+			agg.TotalRepoCacheCount += report.RepoCacheCount
+		}
 	}
 	agg.TotalArtifactRatio = ratio(agg.TotalArtifactSizeBytes, agg.TotalSizeBytes)
 	return agg, nil
@@ -170,23 +182,26 @@ func ScanDiskUsage(workspacesRoot string, artifactPatterns []string) (DiskUsageR
 		return report, fmt.Errorf("disk-usage: read workspaces root: %w", err)
 	}
 
+	// The bare-repo cache is not a workspace. Measure it separately rather than
+	// skipping it outright: it is reclaimed on its own schedule (GCRepoTTL) and
+	// used to be invisible here, which made the reported total disagree with the
+	// user's file manager for no stated reason. Resolve it the way the daemon
+	// does, so a mirror root moved off the workspaces root stays reported
+	// instead of silently dropping out of the totals.
+	report.RepoCacheRoot = RepoMirrorsRootFor(workspacesRoot)
+	report.RepoCacheSizeBytes, report.RepoCacheCount = repoCacheSize(report.RepoCacheRoot)
+
 	wsAgg := map[string]*WorkspaceDiskUsage{}
 
 	for _, wsEntry := range wsEntries {
 		if !wsEntry.IsDir() {
 			continue
 		}
-		// The bare-repo cache is not a workspace. Measure it separately rather
-		// than skipping it outright: it is reclaimed on its own schedule
-		// (GCRepoTTL) and used to be invisible here, which made the reported
-		// total disagree with the user's file manager for no stated reason.
-		if wsEntry.Name() == reposDirName {
-			report.RepoCacheSizeBytes, report.RepoCacheCount = repoCacheSize(filepath.Join(workspacesRoot, wsEntry.Name()))
-			continue
-		}
-		// Other dot-directories are daemon-internal caches (skill bundles and
-		// friends), never workspaces. Counting them as workspaces put rows like
-		// ".skillca" in the per-workspace table.
+		// Dot-directories are daemon-internal caches (the bare-repo mirrors,
+		// skill bundles and friends), never workspaces. Counting them as
+		// workspaces put rows like ".skillca" in the per-workspace table. The
+		// mirror cache is measured from its configured root above, so finding
+		// it here is not what makes it appear in the report.
 		if strings.HasPrefix(wsEntry.Name(), ".") {
 			continue
 		}
@@ -242,6 +257,20 @@ func ScanDiskUsage(workspacesRoot string, artifactPatterns []string) (DiskUsageR
 	report.TotalArtifactRatio = ratio(report.TotalArtifactSizeBytes, report.TotalSizeBytes)
 
 	return report, nil
+}
+
+// RepoMirrorsRootFor resolves the bare-repo mirror cache for a workspaces root.
+// It mirrors LoadConfig: MULTICA_REPO_MIRRORS_ROOT wins when set, and an unset
+// value means the historic <workspacesRoot>/.repos. Read-only reporting paths
+// use this so they measure the same directory the daemon and GC operate on.
+func RepoMirrorsRootFor(workspacesRoot string) string {
+	if root := strings.TrimSpace(os.Getenv("MULTICA_REPO_MIRRORS_ROOT")); root != "" {
+		return root
+	}
+	if workspacesRoot == "" {
+		return ""
+	}
+	return filepath.Join(workspacesRoot, reposDirName)
 }
 
 // repoCacheSize measures the bare-repo cache and counts the repos in it.

@@ -693,6 +693,65 @@ func TestScanDiskUsage_ReportsRepoCacheSeparately(t *testing.T) {
 	}
 }
 
+// TestScanDiskUsage_FollowsConfiguredMirrorRoot pins the regression that
+// MULTICA_REPO_MIRRORS_ROOT introduced: the scan used to notice the mirror
+// cache only by finding a ".repos" entry while walking the workspaces root, so
+// moving the mirrors off that root dropped their footprint to zero and made
+// the line vanish from the report entirely rather than follow the mirrors.
+func TestScanDiskUsage_FollowsConfiguredMirrorRoot(t *testing.T) {
+	root := t.TempDir()
+	mirrors := t.TempDir()
+	wsID := "11111111-1111-1111-1111-111111111111"
+	writeFile(t, filepath.Join(root, wsID, "aaaaaaaa", "workdir/main.go"), 1000)
+	writeFile(t, filepath.Join(mirrors, wsID, "widgets.git", "objects/pack/x"), 4000)
+	writeFile(t, filepath.Join(mirrors, wsID, "gadgets.git", "objects/pack/y"), 2000)
+
+	t.Setenv("MULTICA_REPO_MIRRORS_ROOT", mirrors)
+
+	report, err := ScanDiskUsage(root, nil)
+	if err != nil {
+		t.Fatalf("ScanDiskUsage: %v", err)
+	}
+	if report.RepoCacheSizeBytes != 6000 {
+		t.Errorf("repo_cache_size_bytes = %d, want 6000 (measured from the configured mirror root)", report.RepoCacheSizeBytes)
+	}
+	if report.RepoCacheCount != 2 {
+		t.Errorf("repo_cache_count = %d, want 2", report.RepoCacheCount)
+	}
+	if report.RepoCacheRoot != mirrors {
+		t.Errorf("repo_cache_root = %q, want %q", report.RepoCacheRoot, mirrors)
+	}
+	if report.TotalSizeBytes != 1000 {
+		t.Errorf("total_size_bytes = %d, want 1000 (task dirs only)", report.TotalSizeBytes)
+	}
+}
+
+// TestScanDiskUsageRoots_CountsSharedMirrorRootOnce guards the aggregate against
+// multiplying one shared mirror cache by the number of profile roots scanned:
+// MULTICA_REPO_MIRRORS_ROOT is process-wide, so every root resolves to it.
+func TestScanDiskUsageRoots_CountsSharedMirrorRootOnce(t *testing.T) {
+	rootA := t.TempDir()
+	rootB := t.TempDir()
+	mirrors := t.TempDir()
+	wsID := "11111111-1111-1111-1111-111111111111"
+	writeFile(t, filepath.Join(rootA, wsID, "aaaaaaaa", "workdir/main.go"), 1000)
+	writeFile(t, filepath.Join(rootB, wsID, "bbbbbbbb", "workdir/main.go"), 1000)
+	writeFile(t, filepath.Join(mirrors, wsID, "widgets.git", "objects/pack/x"), 4000)
+
+	t.Setenv("MULTICA_REPO_MIRRORS_ROOT", mirrors)
+
+	agg, err := ScanDiskUsageRoots([]DiskUsageRoot{{Root: rootA}, {Root: rootB}}, nil)
+	if err != nil {
+		t.Fatalf("ScanDiskUsageRoots: %v", err)
+	}
+	if agg.TotalRepoCacheSizeBytes != 4000 {
+		t.Errorf("total_repo_cache_size_bytes = %d, want 4000 (counted once across both roots)", agg.TotalRepoCacheSizeBytes)
+	}
+	if agg.TotalRepoCacheCount != 1 {
+		t.Errorf("total_repo_cache_count = %d, want 1", agg.TotalRepoCacheCount)
+	}
+}
+
 // TestScanDiskUsage_SkipsDaemonInternalDotDirs keeps caches like .skill-cache
 // out of the per-workspace table, where they used to surface as bogus
 // workspace rows alongside the real ones.

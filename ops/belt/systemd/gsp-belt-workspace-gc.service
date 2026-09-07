@@ -2,4 +2,9 @@
 Description=Garbage-collect idle belt task workspaces
 [Service]
 Type=oneshot
+# The GC walks every task workspace while the belt is building. Run it at a
+# lower CPU and I/O priority so a sweep cannot compete with in-flight tasks
+# for the same saturated disk.
+Nice=10
+IOSchedulingClass=idle
 ExecStart=/opt/gsp/multica-workers/gsp-multica-worker/workspace-gc.sh --apply
