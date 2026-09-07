@@ -44,6 +44,7 @@ readonly RELEASE_MANIFEST=(
   ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md
   ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md
   ops/belt/WORKER_COMMON.md ops/belt/relay-completion-admission.cjs
+  ops/belt/build-admission.cjs
 )
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/belt-concurrency.sh"
 source "$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/workspace-root.sh"

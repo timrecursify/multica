@@ -3,11 +3,12 @@ const { stageEligibility } = require("./stage-outcome.cjs");
 const { execFileSync } = require("child_process");
 const { resolveBuilderRoute } = require("./guardrails.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
+const { buildTaskAdmission } = require("./build-admission.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
 const UNSTARTED = ["queued", "dispatched", "waiting_local_directory", "deferred"];
-const ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext('v3-reconciler:' || $1::text))";
+const ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1), hashtext('build'))";
 
 // A rollup (an issue that still has a non-terminal child) is dispositioned by
 // its children, not by a builder of its own. A leaf dispatches whether or not it
@@ -455,11 +456,19 @@ async function reconcileIssue(client, issueId, options = {}) {
       await client.query("COMMIT");
       return { action: "skipped", reason: route.reason };
     }
-    const context = { ...taskContext(issue.status), ...(route.route ? { builder_route: route.route } : {}) };
+    const admission = await buildTaskAdmission(client, { issueId: issue.id, toStage: issue.status, locked: true });
+    if (!admission.admit) {
+      await client.query("COMMIT");
+      return { action: "reused", taskId: admission.reuseTaskId, reason: admission.reason };
+    }
+    const context = { ...taskContext(issue.status), ...(route.route ? { builder_route: route.route } : {}),
+      ...(admission.qcAttemptId ? { qc_attempt_id: admission.qcAttemptId } : {}) };
+    const retryColumn = admission.retryOfTaskId ? ', retry_of_task_id' : '';
+    const retryValue = admission.retryOfTaskId ? ', $12::uuid' : '';
     const created = await client.query(
       `INSERT INTO agent_task_queue (agent_id, runtime_id, issue_id, workspace_id, status, priority, context,
-          trigger_summary, originator_source, attempt, max_attempts)
-       SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'queued', $5, $6::jsonb, $7, 'reconcile', $8, $9
+          trigger_summary, originator_source, attempt, max_attempts${retryColumn})
+       SELECT $1::uuid, $2::uuid, $3::uuid, $4::uuid, 'queued', $5, $6::jsonb, $7, 'reconcile', $8, $9${retryValue}
         WHERE NOT EXISTS (
           SELECT 1 FROM agent_task_queue active
            WHERE active.issue_id = $3::uuid AND active.status = ANY($10::text[])
@@ -467,7 +476,8 @@ async function reconcileIssue(client, issueId, options = {}) {
         )
        ON CONFLICT DO NOTHING RETURNING id`,
       [owner.agent_id, owner.selected_runtime_id, issue.id, issue.workspace_id, issue.priority === "urgent" ? 1 : 0,
-        JSON.stringify(context), `reconcile ${issue.status}`, attempt + 1, maxAttempts, LIVE, issue.status]
+        JSON.stringify(context), `reconcile ${issue.status}`, attempt + 1, maxAttempts, LIVE, issue.status,
+        ...(admission.retryOfTaskId ? [admission.retryOfTaskId] : [])]
     );
     if (created.rows.length === 0) {
       await client.query("COMMIT");
