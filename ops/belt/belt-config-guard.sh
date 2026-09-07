@@ -124,6 +124,27 @@ guard_database_preflight() {
   [[ "$probe" == 1 ]]
 }
 
+# Guardrails are part of the worker contract, not an optional PM2 default.
+# Fail closed when the worker entrypoint or its restart limits disappear.
+guard_worker_guardrails() {
+  local worker_script="$RUNTIME_ROOT/gsp-multica/fleet/multica-daemon-wrapper.sh"
+  [[ -r "$worker_script" ]] || {
+    unfixable+=("gsp-multica-worker guardrails missing: wrapper absent at ${worker_script}")
+    return 0
+  }
+  [[ -f "$ECOSYSTEM" ]] || {
+    unfixable+=("gsp-multica-worker guardrails missing: ecosystem config absent at ${ECOSYSTEM}")
+    return 0
+  }
+  if ! grep -q "name: 'gsp-multica-worker'" "$ECOSYSTEM" ||
+     ! grep -q 'max_restarts: 5' "$ECOSYSTEM" ||
+     ! grep -q 'exp_backoff_restart_delay: 5000' "$ECOSYSTEM"; then
+    unfixable+=("gsp-multica-worker guardrails missing: ecosystem guardrail policy is incomplete")
+  else
+    fixed+=("gsp-multica-worker guardrails present and verified")
+  fi
+}
+
 fixed=(); unfixable=()
 RELAY_PREFLIGHT_OK=1
 RELAY_PREFLIGHT_DIAGNOSTIC=''
@@ -1248,7 +1269,7 @@ guard_human_review_release() {
        relay_transition "$number" "Spec" "$board" >/dev/null 2>&1; then
       fixed+=("#${number} released from Human Review for scoping (not a money or structural call)")
     else
-      unfixable+=("#${number} could not be released from Human Review")
+      unfixable+=("#${number} could not be released from Human Review (class=${RELAY_TRANSITION_CLASS:-unknown} diagnostic=$(relay_transition_diagnostic)")
     fi
   done < <("${PSQL[@]}" -c "
     SELECT i.number, CASE WHEN i.workspace_id='${GSP_WS}' THEN 'gsp' ELSE 'prod' END FROM issue i
@@ -1468,7 +1489,7 @@ guard_ship_passed() {
     if [[ "$RELAY_TRANSITION_RC" -eq 0 ]] && done_receipt_valid "$RELAY_TRANSITION_OUTPUT"; then
       fixed+=("${board}#${number} shipped to Done on its PASS verdict${url:+ after ${url##*/} merged}")
     else
-      unfixable+=("${board}#${number} passed QC and its work is merged but it would not advance to Done")
+      unfixable+=("${board}#${number} passed QC and its work is merged but it would not advance to Done (class=${RELAY_TRANSITION_CLASS:-unknown} diagnostic=$(relay_transition_diagnostic)")
     fi
   done < <("${PSQL[@]}" -F'|' -c "
     SELECT i.number,
@@ -1577,7 +1598,7 @@ fi
 guard_relay_preflight
 repair_source_runtime_parity
 guard_source_runtime_parity
-guard_wrapper; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
+guard_wrapper; guard_worker_guardrails; guard_tower_process; guard_pm2; guard_relay_caps; guard_autopilot; guard_build_capacity; guard_pm2_liveness; guard_single_instance_and_paid_lane; guard_stale_stage_tasks; guard_relay_config; guard_workspace_repos; guard_stranded_review; guard_stranded_queue; guard_stranded_inprogress; guard_stranded_registered; guard_human_review_release; guard_bundled_children; guard_freed_children; guard_spec_gate; guard_stranded_spec; guard_ship_passed; guard_parked_dispatch; guard_unshipped_closures
 
 # Several guards can observe the same flight in one tick. Emit each exact
 # finding once so the P0 is stable and one-run idempotent.
