@@ -1463,6 +1463,27 @@ func TestCreateIsolatedCheckoutSyncsRemoteOnlyCommitBeforeDetach(t *testing.T) {
 	}
 }
 
+// TestCacheFetchRejectsShallowBareCache ensures fetches never proceed against
+// a shallow bare cache, which cannot reliably satisfy isolated checkout refs.
+func TestCacheFetchRejectsShallowBareCache(t *testing.T) {
+	t.Parallel()
+	sourceRepo := createTestRepo(t)
+	cache := New(t.TempDir(), testLogger())
+	if err := cache.Sync("ws-1", []RepoInfo{{URL: sourceRepo}}); err != nil {
+		t.Fatalf("sync failed: %v", err)
+	}
+	barePath := cache.Lookup("ws-1", sourceRepo)
+	commit := gitRefCommit(t, barePath, "HEAD")
+	if err := os.WriteFile(filepath.Join(barePath, "shallow"), []byte(commit+"\n"), 0o644); err != nil {
+		t.Fatalf("mark cache shallow: %v", err)
+	}
+
+	err := cache.Fetch(barePath)
+	if err == nil || !strings.Contains(err.Error(), "shallow") {
+		t.Fatalf("cache.Fetch error = %v, want clear shallow-state error", err)
+	}
+}
+
 // TestGetRemoteDefaultBranchUsesBareHeadHintForCustomDefault verifies step 3
 // of the resolver: when the cache has a non-standard default branch name
 // (trunk, develop, …) and `git remote set-head origin --auto` didn't
