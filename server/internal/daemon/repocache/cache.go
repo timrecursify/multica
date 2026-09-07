@@ -400,6 +400,11 @@ func gitCloneBare(url, dest string) error {
 // would keep basing new worktrees on the original default branch forever
 // after the remote flipped.
 func gitFetch(barePath string) error {
+	if out, err := runGitOutput("-C", barePath, "rev-parse", "--is-shallow-repository"); err == nil && strings.TrimSpace(string(out)) == "true" {
+		if out, err := runGitCombinedOutput("-C", barePath, "fetch", "--unshallow", "origin"); err != nil {
+			return fmt.Errorf("git fetch: repository is shallow; unshallow failed: %s: %w", strings.TrimSpace(string(out)), err)
+		}
+	}
 	if err := ensureRemoteTrackingLayout(barePath); err != nil {
 		return fmt.Errorf("ensure refspec: %w", err)
 	}
@@ -834,6 +839,9 @@ func createIsolatedCheckout(barePath, repoURL, checkoutPath, branchName, baseRef
 		if err := configurePromisorRemote(checkoutPath); err != nil {
 			return "", err
 		}
+	}
+	if err := syncIsolatedCheckoutRefs(barePath, checkoutPath, baseRef); err != nil {
+		return "", err
 	}
 
 	if out, err := runGitCombinedOutput("-C", checkoutPath, "checkout", "--detach", baseCommit); err != nil {
