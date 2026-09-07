@@ -12,7 +12,8 @@ const OLD_PAUSE = {
   budget_exhausted: false
 };
 const NOW = () => Date.parse('2026-09-01T12:16:00.000Z');
-const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+const TEST_DATABASE_URL = process.env.DATABASE_URL ||
+  'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
 
 function mockClient(responses, events) {
   return {
