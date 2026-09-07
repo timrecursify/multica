@@ -11,6 +11,9 @@ root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "$root_dir/../.." && pwd)"
 runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/opt/gsp/multica-workers}"
 systemd_root="${BELT_SYSTEMD_ROOT:-}"
+if [[ -z "$systemd_root" && "$runtime_root" != /opt/gsp/multica-workers ]]; then
+  systemd_root="$repo_root/ops/gsp-belt/systemd"
+fi
 resolved_commit="$(git -C "$repo_root" rev-parse --verify --quiet "${requested_commit}^{commit}")" || {
   echo "Unresolvable source commit: $requested_commit" >&2
   exit 1
@@ -70,7 +73,7 @@ verify_unit() {
   local unit="$1" exec_start command token path index owner binary_ok=0
   local -a argv=()
   exec_start="$(unit_execstart "$unit")" || { fail "Cannot read systemd ExecStart: $unit"; return; }
-  if [[ -z "$systemd_root" && "$runtime_root" != /opt/gsp/multica-workers ]]; then
+  if [[ "$runtime_root" != /opt/gsp/multica-workers ]]; then
     exec_start="${exec_start//\/opt\/gsp\/multica-workers/$runtime_root}"
   fi
   [[ -n "$exec_start" ]] || { fail "Missing systemd ExecStart: $unit"; return; }
@@ -107,7 +110,7 @@ verify_entry() {
   done
   for binary in ${belt_entry_binary_artifacts[$index]}; do
     if [[ ! -f "$binary" ]]; then
-      if [[ "$runtime_root" != /opt/gsp/multica-workers && "$binary" == "$runtime_root/"* ]]; then
+      if [[ "$runtime_root" != /opt/gsp/multica-workers ]]; then
         echo "Binary fixture omitted: ${belt_entry_names[$index]} $binary"
       else
         fail "Missing binary artifact: $binary"
