@@ -252,6 +252,90 @@ test("terminalBlocker routes only unobservable blockers", async () => {
   assert.equal(await terminalBlocker(unlinked, issue, null), null);
 });
 
+// ---------------------------------------------------------------------------
+// Relay-row consumability invariant.
+//
+// A pending relay_run_log row is a work item. Exactly three paths can ever close
+// one, and each is read below from the source that implements it rather than
+// restated here, so this test tracks the consumers instead of a copy of them:
+//
+//   1. findAndAdvanceTasks   - INNER JOIN agent_task_queue atq ON rrl.task_id =
+//                              atq.id, so a NULL task_id can never match.
+//   2. closeDeadRelayRows    - closes pending rows whose to_stage is terminal.
+//   3. cleanupStalePendingRows - closes a row only once the issue has moved PAST
+//                              the row's to_stage, so a producer that parks the
+//                              issue ON that stage can never satisfy it.
+//
+// A producer that trips all three writes a row nothing will ever close.
+const fs = require("node:fs");
+const path = require("node:path");
+const DAEMON_SRC = fs.readFileSync(path.join(__dirname, "parity", "multica-relay-advance-daemon.cjs"), "utf8");
+const DEAD_ROWS_SRC = fs.readFileSync(path.join(__dirname, "parity", "relay-dead-rows.cjs"), "utf8");
+
+// Split a SQL VALUES list on top-level commas so jsonb_build_object(a, b) stays whole.
+function splitTopLevel(text) {
+  const parts = []; let depth = 0, quoted = false, current = "";
+  for (const ch of text) {
+    if (ch === "'") quoted = !quoted;
+    if (!quoted && ch === "(") depth += 1;
+    if (!quoted && ch === ")") depth -= 1;
+    if (!quoted && depth === 0 && ch === ",") { parts.push(current.trim()); current = ""; continue; }
+    current += ch;
+  }
+  if (current.trim()) parts.push(current.trim());
+  return parts;
+}
+
+// The row a producer actually writes, read out of the SQL it issued.
+function producedRelayRow(calls) {
+  const insert = calls.find((c) => /INSERT INTO relay_run_log/.test(c.sql || ""));
+  assert.ok(insert, "producer issued no INSERT INTO relay_run_log");
+  const columns = splitTopLevel(insert.sql.match(/relay_run_log\s*\(([\s\S]*?)\)\s*\n?\s*VALUES/i)[1]);
+  const values = splitTopLevel(insert.sql.match(/VALUES\s*\(([\s\S]*)\)/i)[1]);
+  assert.equal(columns.length, values.length, "column/value arity mismatch in producer SQL");
+  const row = {};
+  columns.forEach((name, i) => { row[name] = values[i]; });
+  const literal = (v) => (v && /^'(.*)'$/.test(v) ? v.slice(1, -1) : null);
+  return { columns, status: literal(row.status), toStage: literal(row.to_stage) };
+}
+
+// Why, if at all, the produced row is unclosable. Empty means consumable.
+function strandedReasons(row, issueParkedAt) {
+  if (row.status !== "pending") return [];
+  const reasons = [];
+  const taskCorrelated = /INNER JOIN relay_run_log rrl ON rrl\.task_id = atq\.id AND rrl\.status = \$1/;
+  assert.match(DAEMON_SRC, taskCorrelated, "findAndAdvanceTasks no longer joins on rrl.task_id; update this invariant");
+  if (!row.columns.includes("task_id")) reasons.push("no task_id: findAndAdvanceTasks can never join it");
+
+  assert.match(DEAD_ROWS_SRC, /WHERE status = 'pending'\s*\n\s*AND to_stage = ANY\(\$1\)/,
+    "closeDeadRelayRows no longer sweeps by terminal to_stage; update this invariant");
+  const terminal = DAEMON_SRC.match(/const TERMINAL_STAGES = new Set\(\[([^\]]*)\]\)/)[1]
+    .split(",").map((v) => v.trim().replace(/^'|'$/g, ""));
+  if (!terminal.includes(row.toStage)) reasons.push(`to_stage '${row.toStage}' is not terminal: closeDeadRelayRows skips it`);
+
+  assert.match(DAEMON_SRC, /AND rsc\.stage_name = rrl\.to_stage\s*\n\s*AND i\.status = rsc\.next_stage/,
+    "cleanupStalePendingRows no longer requires the issue past to_stage; update this invariant");
+  if (issueParkedAt === row.toStage) reasons.push(`issue is parked on '${row.toStage}': cleanupStalePendingRows waits for the stage after it`);
+  return reasons;
+}
+
+// Fails on the pre-fix producer, which wrote 'pending' with no task_id for a
+// transition it had already performed itself, parking the issue on the row's own
+// to_stage. That stranded 195 Spec -> Human Review rows measured on gsp 2026-09-07.
+test("moveToHumanReview cannot strand an unconsumable pending relay row", async () => {
+  const calls = [];
+  const db = { query: async (sql, values) => { calls.push({ sql, values }); return { rows: [] }; } };
+  await moveToHumanReview(db, { ...issue, status: "Spec" }, "blocked_dependency_unobservable", { evaluate: ok });
+
+  // The producer performs the advance itself, so the issue is parked on to_stage.
+  const moved = calls.find((c) => /UPDATE issue SET status = 'Human Review'/.test(c.sql || ""));
+  assert.ok(moved, "moveToHumanReview must perform the advance itself");
+
+  const row = producedRelayRow(calls);
+  assert.deepEqual(strandedReasons(row, "Human Review"), [],
+    "moveToHumanReview wrote a relay row no consumer can ever close");
+});
+
 test("moveToHumanReview asks as the operator the belt acts for", async () => {
   const seen = [];
   const db = { query: async (sql, values) => { seen.push({ sql, values }); return { rows: [] }; } };
