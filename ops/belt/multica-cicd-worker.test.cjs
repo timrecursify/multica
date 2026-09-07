@@ -205,6 +205,8 @@ test('worker retains no self-deploy or direct database writes', () => {
   assert.match(source, /info\.mergeable === 'CONFLICTING'/);
   assert.doesNotMatch(source, /UPDATE |INSERT INTO /);
   assert.match(source, /transition-policy\.cjs/);
+  assert.match(source, /process\.env\.SK_COMMAND \|\| '\/home\/newadmin\/\.local\/bin\/sk'/);
+  assert.match(source, /execFileSync\(SK_COMMAND, \['multica', 'comment'/);
 });
 
 test('watchdog escalation forwards producing CI/CD task id', async () => {
