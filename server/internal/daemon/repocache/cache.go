@@ -125,6 +125,27 @@ type RepoInfo struct {
 	URL string
 }
 
+// SyncError reports failures independently for each repository. Successful
+// repositories remain usable even when siblings fail.
+type SyncError struct {
+	Failures []RepoSyncFailure
+}
+type RepoSyncFailure struct {
+	URL       string
+	Operation string
+	Err       error
+}
+
+func (e *SyncError) Error() string {
+	parts := make([]string, 0, len(e.Failures))
+	for _, f := range e.Failures { parts = append(parts, fmt.Sprintf("%s %s: %v", f.Operation, f.URL, f.Err)) }
+	return strings.Join(parts, "; ")
+}
+func (e *SyncError) FailureFor(url string) string {
+	for _, f := range e.Failures { if f.URL == url { return fmt.Sprintf("%s %s: %v", f.Operation, f.URL, f.Err) } }
+	return ""
+}
+
 // CachedRepo describes a cached bare clone ready for worktree creation.
 type CachedRepo struct {
 	URL       string // remote URL
@@ -173,7 +194,7 @@ func (c *Cache) Sync(workspaceID string, repos []RepoInfo) error {
 		return fmt.Errorf("create workspace cache dir: %w", err)
 	}
 
-	var firstErr error
+	var failures []RepoSyncFailure
 	for _, repo := range repos {
 		if repo.URL == "" {
 			continue
@@ -187,23 +208,20 @@ func (c *Cache) Sync(workspaceID string, repos []RepoInfo) error {
 			c.logger.Info("repo cache: fetching", "url", repo.URL, "path", barePath)
 			if err := gitFetch(barePath); err != nil {
 				c.logger.Warn("repo cache: fetch failed", "url", repo.URL, "error", err)
-				if firstErr == nil {
-					firstErr = err
-				}
+				failures = append(failures, RepoSyncFailure{URL: repo.URL, Operation: "fetch", Err: err})
 			}
 		} else {
 			// Not cached — bare clone.
 			c.logger.Info("repo cache: cloning", "url", repo.URL, "path", barePath)
 			if err := gitCloneBare(repo.URL, barePath); err != nil {
 				c.logger.Error("repo cache: clone failed", "url", repo.URL, "error", err)
-				if firstErr == nil {
-					firstErr = err
-				}
+				failures = append(failures, RepoSyncFailure{URL: repo.URL, Operation: "clone", Err: err})
 			}
 		}
 		repoLock.Unlock()
 	}
-	return firstErr
+	if len(failures) > 0 { return &SyncError{Failures: failures} }
+	return nil
 }
 
 // Lookup returns the local bare clone path for a repo URL within a workspace.

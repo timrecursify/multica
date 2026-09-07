@@ -275,6 +275,7 @@ type workspaceState struct {
 	taskRepoRefs    map[string]map[string]string // taskID -> repo URL -> checkout ref
 	settings        json.RawMessage              // workspace settings (JSONB)
 	lastRepoSyncErr string
+	lastRepoSyncFailures map[string]string
 	repoRefreshMu   sync.Mutex
 	// profileSetSig is a content hash of the workspace's custom runtime
 	// profile list (MUL-3332) as last seen from the server. An on-demand
@@ -2649,6 +2650,12 @@ func (d *Daemon) setWorkspaceRepoSyncError(workspaceID, syncErr string) {
 	}
 }
 
+func (d *Daemon) repoCacheSyncError(workspaceID, repoURL string) (string, bool) {
+	d.mu.Lock(); defer d.mu.Unlock()
+	ws, ok := d.workspaces[workspaceID]; if !ok { return "", false }
+	msg, exists := ws.lastRepoSyncFailures[repoURL]; return msg, exists
+}
+
 func (d *Daemon) workspaceRepoAllowed(workspaceID, repoURL string) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -2864,10 +2871,16 @@ func (d *Daemon) syncWorkspaceRepos(workspaceID string, repos []RepoData) {
 	}
 	if err := d.repoCache.Sync(workspaceID, repoDataToInfo(repos)); err != nil {
 		d.setWorkspaceRepoSyncError(workspaceID, err.Error())
+		failures := map[string]string{}
+		if structured, ok := err.(*repocache.SyncError); ok {
+			for _, f := range structured.Failures { failures[f.URL] = fmt.Sprintf("%s %s: %v", f.Operation, f.URL, f.Err) }
+		}
+		d.mu.Lock(); if ws, ok := d.workspaces[workspaceID]; ok { ws.lastRepoSyncFailures = failures }; d.mu.Unlock()
 		d.logger.Warn("repo cache sync failed", "workspace_id", workspaceID, "error", err)
 		return
 	}
 	d.setWorkspaceRepoSyncError(workspaceID, "")
+	d.mu.Lock(); if ws, ok := d.workspaces[workspaceID]; ok { ws.lastRepoSyncFailures = nil }; d.mu.Unlock()
 }
 
 func (d *Daemon) refreshWorkspaceRepos(ctx context.Context, workspaceID string) (*WorkspaceReposResponse, error) {
@@ -3136,6 +3149,9 @@ func (d *Daemon) ensureRepoReady(ctx context.Context, workspaceID, repoURL strin
 	}
 
 	if syncErr := d.workspaceLastRepoSyncErr(workspaceID); syncErr != "" {
+		if structured, ok := d.repoCacheSyncError(workspaceID, repoURL); ok && structured != "" {
+			return fmt.Errorf("repo is configured but not synced: %s", structured)
+		}
 		return fmt.Errorf("repo is configured but not synced: %s", syncErr)
 	}
 
