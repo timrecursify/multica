@@ -4,6 +4,10 @@
 set -euo pipefail
 
 PM2="${PM2:-pm2}"
+RUNTIME_ROOT="${MULTICA_RUNTIME_ROOT:-${GSP_RUNTIME_ROOT:-}}"
+AI_HOLD_FILE="${MULTICA_AI_HOLD_FILE:-${RUNTIME_ROOT:+$RUNTIME_ROOT/.local/state/multica-ai-hold}}"
+OPERATOR_RELEASE_FILE="${MULTICA_OPERATOR_RELEASE_FILE:-${RUNTIME_ROOT:+$RUNTIME_ROOT/.local/state/multica-operator-release}}"
+SUPERVISOR_APPROVAL_FILE="${MULTICA_SUPERVISOR_APPROVAL_FILE:-${RUNTIME_ROOT:+$RUNTIME_ROOT/.local/state/multica-supervisor-approval}}"
 release_dir=""
 baseline=""
 worker_baseline=""
@@ -37,6 +41,14 @@ trap 'rm -f "$snapshot"' EXIT
 "$PM2" jlist > "$snapshot"
 
 echo "release commit = $commit_sha"
+if [[ -n "$AI_HOLD_FILE" && -f "$AI_HOLD_FILE" ]]; then
+  worker_release_state=held
+elif [[ -n "$OPERATOR_RELEASE_FILE" && -f "$OPERATOR_RELEASE_FILE" && -n "$SUPERVISOR_APPROVAL_FILE" && -f "$SUPERVISOR_APPROVAL_FILE" ]]; then
+  worker_release_state=released
+else
+  worker_release_state=unreleased
+fi
+echo "worker remediation release state = $worker_release_state"
 fail=0
 IFS=',' read -r -a app_arr <<< "$apps"
 for app in "${app_arr[@]}"; do
