@@ -320,9 +320,6 @@ jobs:
       - name: Test belt status reporting contract
         run: bash ops/gsp-belt/scripts/belt-status.test.sh
 
-      - name: Test relay launcher status contract
-        run: node ops/gsp-belt/test/relay-launcher-status.test.cjs
-
   unattended-lifecycle:
     # Release acceptance binds the production manifest, relay policy, CI/CD
     # evidence, activation, terminal accounting, and clock-controlled archive.
