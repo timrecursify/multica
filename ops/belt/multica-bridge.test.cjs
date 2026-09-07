@@ -1843,6 +1843,8 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
+      CREATE TABLE "${schema}".issue_stage_outcome (issue_id uuid NOT NULL, stage text NOT NULL,
+      outcome text NOT NULL, blocked_on text, task_id uuid, input_hash text, outcome_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".comment (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, workspace_id uuid,
       author_type text, author_id uuid, content text, type text, created_at timestamptz DEFAULT now());
       CREATE TABLE "${schema}".qc_verdict (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, checker_id uuid, verdict text,
@@ -1869,6 +1871,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
         VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'),
                ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
+      await admin.query(`INSERT INTO "${schema}".issue_stage_outcome
+        (issue_id, stage, outcome, blocked_on, outcome_at)
+        VALUES ($1, 'In Progress', 'BLOCKED', 'human', now() - interval '1 hour')`, [issueId]);
       const res = await invoke({ issue_id: issueId, to_stage: 'In Progress', operator_release: true, reason: 'approved by operator' },
         { 'x-relay-operator-secret': 'test-operator-secret' });
       assert.equal(res.status, 200);
@@ -1880,6 +1885,8 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(issue.rows[0].metadata.human_review_release_reason, 'approved by operator');
       assert.ok(issue.rows[0].metadata.human_review_release_at);
       assert.equal(log.rows.length, 1);
+      assert.equal((await admin.query(`SELECT count(*)::int AS n FROM "${schema}".issue_stage_outcome
+        WHERE issue_id = $1`, [issueId])).rows[0].n, 0);
     });
     await t.test('verdict-less completed In Review tasks do not consume either cap, while verdict-bearing tasks do', async () => {
       const issueId = '55555555-5555-5555-5555-555555555555';
@@ -2072,6 +2079,13 @@ test('operator Human Review releases record actor, target, and reason in the aud
   assert.match(source, /operator_release:\s*\{[\s\S]*?actor:\s*"operator"/);
   assert.match(source, /operator_release:\s*\{[\s\S]*?target_stage:\s*to_stage/);
   assert.match(source, /operator_release:\s*\{[\s\S]*?reason:\s*reason\.trim\(\)/);
+});
+
+test('operator Human Review release consumes the stale destination verdict', () => {
+  const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
+  assert.match(source, /if \(explicitHumanReviewRelease\)[\s\S]*?DELETE FROM issue_stage_outcome/);
+  assert.match(source, /issue_id = \$1::uuid AND stage = \$2::text[\s\S]*?outcome_at < \$3::timestamptz/);
+  assert.match(source, /\[issue\.id, to_stage, issue\.metadata\.human_review_release_at\]/);
 });
 
 test('operator recovery admits an authenticated same-stage redispatch', () => {
