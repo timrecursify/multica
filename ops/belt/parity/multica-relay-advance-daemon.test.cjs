@@ -292,6 +292,15 @@ test('green open non-runtime PR advances from review to CI/CD without daemon mer
   assert.equal(calls[0][1], 'view');
 });
 
+test('red open non-runtime PR completing In Progress still enters review', async () => {
+  const route = await inProgressRoute({ state: 'OPEN', files: [{ path: 'web/app.ts' }],
+    headRefOid: 'e'.repeat(40), mergeStateStatus: 'CLEAN',
+    statusCheckRollup: [{ conclusion: 'FAILURE' }] });
+  assert.equal(route.toStage, 'In Review');
+  assert.equal(route.kind, 'merge_only');
+  assert.equal(route.boundSha, 'e'.repeat(40));
+});
+
 test('red open non-runtime PR routes to Human Review with evidence', async () => {
   const route = await buildCompletionRoute(linkedPrClient(), {
     issue_id: 'issue-1', to_stage: 'In Review', next_stage: 'CI/CD & Deploy'

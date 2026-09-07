@@ -883,10 +883,11 @@ guard_relay_config() {
     fi
   done
 
-  # Done means shipped. 'CI/CD & Deploy' is the only road to 'Done', so no review
-  # stage may list 'Done' as a successor: that loophole is how a passing review
-  # closed a flight whose pull request was still open. Rows 8 and 9 carry the
-  # recovery route back, so a flight closed without shipping can be re-flown.
+  # Code-bearing work reaches Done only through CI/CD & Deploy. Independently
+  # checked NO-SHA work is the one direct In Progress -> Done exception; the
+  # bridge verifies that evidence before it consults this configured edge.
+  # Rows 8 and 9 carry the recovery route back, so a flight closed without
+  # shipping can be re-flown.
   local id want why
   for id in 2 3 4 5 6 7 8 9; do
     case "$id" in
@@ -896,8 +897,8 @@ guard_relay_config() {
        why="Human Review is money-only; ordinary build failures park instead of escaping from Queue" ;;
     2) want="Cancelled"
          why="Human Review is money-only; a bundled Spec flight may still be cancelled explicitly" ;;
-      4) want="Queue"
-         why="Human Review is money-only; a failed build may take only the bounded rebuild route" ;;
+      4) want="Done,Queue"
+         why="verified NO-SHA work may finish without deployment; a failed build may take only the bounded rebuild route" ;;
       5) want="Human Review,In Progress"
          why="QC FAIL must reach the builder and Done must stay unreachable from review" ;;
       # 2026-08-31 09:2x. Two changes, both from measuring how the relay picks
