@@ -64,7 +64,9 @@ Required invariants:
 
 ## Target selection
 
-Changed PR paths are the applicability manifest. The worker currently declares:
+Changed PR paths are the applicability manifest. For a renamed file, both its
+current and previous path participate so a runtime deletion cannot appear to be
+docs-only. The worker currently declares:
 
 | Repository | Changed path | Target | Deployment owner |
 | --- | --- | --- | --- |
@@ -75,7 +77,8 @@ Changed PR paths are the applicability manifest. The worker currently declares:
 
 A PR can select multiple rows. Every selected target must provide its own valid
 receipt for the same source SHA. Only changes whose complete manifest consists
-of Markdown files or paths below `docs/` are `verified_not_applicable`.
+of Markdown files or paths below `docs/` or `apps/docs/` are
+`verified_not_applicable`.
 
 ## Consumer outcomes
 

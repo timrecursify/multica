@@ -590,6 +590,24 @@ test('one receipt for several applicable deploy targets refuses Done', () => {
   assert.deepStrictEqual(result.blocker.missing_targets, ['gsp-multica']);
 });
 
+test('non-exact source SHA refuses Done before receipt lookup', () => {
+  worker.setTestDependencies({ readReceipt: () => { throw new Error('receipt lookup must not run'); } });
+  const result = worker.mergeDeployEvidence('timrecursify/multica', 'A'.repeat(40),
+    { changedPaths: ['ops/belt/worker.cjs'] });
+  assert.equal(result.outcome, 'failed');
+  assert.equal(result.blocker.type, 'source_sha_invalid');
+});
+
+test('health recorded before activation invalidates the receipt', () => {
+  const receipt = activationReceipt();
+  receipt.health.checked_at = '2026-09-07T13:59:59Z';
+  worker.setTestDependencies({ readReceipt: () => receipt });
+  const result = worker.mergeDeployEvidence('timrecursify/multica', sha,
+    { changedPaths: ['ops/belt/worker.cjs'] });
+  assert.equal(result.outcome, 'failed');
+  assert.equal(result.blocker.field, 'health');
+});
+
 test('docs-only manifest completes Done as verified not applicable', async () => {
   const calls = dependencies({ receipt: null });
   const result = await worker.routeFinishedPR(issue, 'merged', sha,
