@@ -1056,6 +1056,41 @@ async function recordTransitionAudit(client, issue, {
   return details;
 }
 
+async function openChildAdmission(client, issue) {
+  const children = await client.query(
+    `SELECT (to_jsonb(child)->>'number')::int AS number
+       FROM "issue" child
+      WHERE child.parent_issue_id = $1
+        AND child.status NOT IN ('Done', 'Cancelled', 'Archived')
+      ORDER BY (to_jsonb(child)->>'number')::int NULLS LAST`,
+    [issue.id]
+  );
+  const childNumbers = children.rows.map((row) => Number(row.number));
+  if (childNumbers.length === 0) return { ok: true, childNumbers: [] };
+
+  const recent = await client.query(
+    `SELECT 1 FROM activity_log
+      WHERE issue_id = $1
+        AND action = 'relay_admission_skipped'
+        AND details->>'reason' = 'rollup_has_open_children'
+        AND created_at >= NOW() - INTERVAL '1 hour'
+      LIMIT 1`,
+    [issue.id]
+  );
+  const auditWritten = recent.rows.length === 0;
+  if (auditWritten) {
+    await client.query(
+      `INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+       VALUES ($1::uuid, $2::uuid, 'system', 'relay_admission_skipped', $3::jsonb)`,
+      [issue.workspace_id, issue.id, JSON.stringify({
+        reason: 'rollup_has_open_children', child_numbers: childNumbers,
+        timestamp: new Date().toISOString()
+      })]
+    );
+  }
+  return { ok: false, childNumbers, auditWritten };
+}
+
 function isCicdReturn(fromStage, toStage, reason) {
   return fromStage === "CI/CD & Deploy" && toStage === "In Progress" &&
     typeof reason === "string" &&
@@ -2598,6 +2633,27 @@ async function relayAdvance(req, res, body) {
       if (noArtifactRescope && !await consumeNoArtifactRescope(client, issue)) {
         throw new Error(`no-artifact re-scope authorization already consumed: ${issue.id}`);
       }
+
+      // Keep the database trigger as the last leaf-rule defence, but refuse
+      // before mutating the rollup or attempting a queue insert.
+      const rollupAdmission = await openChildAdmission(client, issue);
+      if (!rollupAdmission.ok) {
+        await client.query('COMMIT');
+        if (rollupAdmission.auditWritten) {
+          console.info(JSON.stringify({
+            event: 'relay_admission_skipped', reason: 'rollup_has_open_children',
+            issue_id: issue.id, child_numbers: rollupAdmission.childNumbers
+          }));
+        }
+        res.writeHead(202, { 'Content-Type': 'application/json', 'Retry-After': '3600' });
+        res.end(JSON.stringify({
+          error: 'rollup_has_open_children',
+          message: 'rollup waits for its children; no stage change or task was created',
+          child_numbers: rollupAdmission.childNumbers,
+          retry_after_seconds: 3600
+        }));
+        return;
+      }
     }
 
     const result = await client.query(
@@ -3032,6 +3088,7 @@ module.exports = {
   qcBounceDecision,
   directDeployQcAdmission,
   recordTransitionAudit,
+  openChildAdmission,
   latestCompletedSolLowQcTask,
   latestRunningSolLowQcTask,
   qcTaskEvidence,
