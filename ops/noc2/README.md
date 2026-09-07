@@ -30,3 +30,21 @@ timestamps from restic snapshots or pgBackRest manifests and writes atomically
 to the node-exporter textfile directory. A failed lane emits
 `backup_lane_query_ok=0` and the process exits nonzero so systemd records the
 failure while preserving the other lanes' metrics.
+
+For diagnosis, inspect the reason-labelled metric and the service journal:
+
+```sh
+curl -s http://127.0.0.1:9100/metrics | grep backup_lane_query_failure
+sudo journalctl -u gsp-backup-age-emitter.service -n 50 --no-pager
+```
+
+The `reason` label is one of `missing_repo`, `authentication`,
+`configuration`, `transport`, or `unknown`. Verify the corresponding
+repository, credential env-file permissions, or network dependency without
+printing the env file contents. After remediation, safely rerun the probe and
+confirm the resulting metrics:
+
+```sh
+sudo systemctl start gsp-backup-age-emitter.service
+curl -s http://127.0.0.1:9100/metrics | grep -E 'backup_lane_query_(ok|failure)'
+```

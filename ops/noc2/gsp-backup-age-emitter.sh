@@ -41,6 +41,16 @@ RUN_ERRORS=0
 LANE_COUNT=0
 SUCCESS_COUNT=0
 
+failure_reason() {
+  case "$1" in
+    10) echo missing_repo ;;
+    11) echo authentication ;;
+    91|92|93|94) echo configuration ;;
+    90) echo unknown ;;
+    *) echo transport ;;
+  esac
+}
+
 log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >&2; }
 
 # Latest snapshot epoch across every entry restic returns. --latest 1 is
@@ -207,9 +217,11 @@ while IFS='|' read -r lane type repo envs opts; do
       "$BOX" "$lane" "$repo" "$epoch" >>"$BODY"
     printf 'backup_lane_query_ok{box="%s",lane="%s"} 1\n' "$BOX" "$lane" >>"$BODY"
   else
-    log "lane $lane: query failed (rc=$rc epoch=$epoch)"
+    reason="$(failure_reason "$rc")"
+    log "lane $lane: query failed (reason=$reason)"
     RUN_ERRORS=$((RUN_ERRORS + 1))
     printf 'backup_lane_query_ok{box="%s",lane="%s"} 0\n' "$BOX" "$lane" >>"$BODY"
+    printf 'backup_lane_query_failure{box="%s",lane="%s",reason="%s"} 1\n' "$BOX" "$lane" "$reason" >>"$BODY"
   fi
 done < <(cat "$CONF" 2>/dev/null)
 
@@ -227,6 +239,9 @@ DURATION="$(awk -v s="$START_TS" -v e="$(date +%s.%N)" 'BEGIN{printf "%.3f", e-s
   echo '# HELP backup_lane_query_ok Whether the emitter could read this lane repository (1=yes, 0=no).'
   echo '# TYPE backup_lane_query_ok gauge'
   grep '^backup_lane_query_ok' "$BODY" 2>/dev/null
+  echo '# HELP backup_lane_query_failure Reason a lane repository query failed (1 when failed).'
+  echo '# TYPE backup_lane_query_failure gauge'
+  grep '^backup_lane_query_failure' "$BODY" 2>/dev/null
   echo '# HELP backup_emitter_last_run_timestamp_seconds Unix epoch the emitter last completed.'
   echo '# TYPE backup_emitter_last_run_timestamp_seconds gauge'
   printf 'backup_emitter_last_run_timestamp_seconds{box="%s"} %s\n' "$BOX" "$(date +%s)"
