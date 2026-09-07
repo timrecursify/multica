@@ -1,3 +1,8 @@
+-- Held admission is enforced on agent_task_queue and relay_run_log only.
+-- A cicd_deploy_attempt trigger used to live here too, but that table
+-- exists in no canonical migration, and DROP TRIGGER IF EXISTS still
+-- requires its table, so this whole transaction aborted and the fence
+-- never installed.
 BEGIN;
 
 CREATE TABLE IF NOT EXISTS belt_deployment_control (
@@ -30,10 +35,6 @@ BEGIN
        AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status) THEN
       RAISE EXCEPTION 'belt deployment admission is held' USING ERRCODE = '55000';
     END IF;
-    IF TG_TABLE_NAME = 'cicd_deploy_attempt' AND NEW.status = 'running'
-       AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status) THEN
-      RAISE EXCEPTION 'belt deployment admission is held' USING ERRCODE = '55000';
-    END IF;
   END IF;
   RETURN NEW;
 END;
@@ -47,11 +48,6 @@ FOR EACH ROW EXECUTE FUNCTION belt_reject_admission_while_deploying();
 DROP TRIGGER IF EXISTS belt_deployment_relay_hold ON relay_run_log;
 CREATE TRIGGER belt_deployment_relay_hold
 BEFORE INSERT OR UPDATE OF status ON relay_run_log
-FOR EACH ROW EXECUTE FUNCTION belt_reject_admission_while_deploying();
-
-DROP TRIGGER IF EXISTS belt_deployment_cicd_hold ON cicd_deploy_attempt;
-CREATE TRIGGER belt_deployment_cicd_hold
-BEFORE INSERT OR UPDATE OF status ON cicd_deploy_attempt
 FOR EACH ROW EXECUTE FUNCTION belt_reject_admission_while_deploying();
 
 COMMIT;

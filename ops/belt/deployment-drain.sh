@@ -53,13 +53,28 @@ SQL
   printf 'Admission fence opened: invocation=%s\n' "$BELT_DEPLOY_INVOCATION_ID"
 }
 
+# Every relation named here must exist in server/migrations, which is what the
+# Multica database is actually built from. deployment-drain-schema.test.sh
+# enforces that, because a term naming a missing relation aborts the whole
+# snapshot and the drain can then never confirm.
+#
+# There is deliberately no cicd term. `cicd_deploy_attempt` belongs to the
+# superseded ops/gsp-belt noc2 tree and appears in none of the canonical
+# migrations, so counting it aborted every poll. It is removed rather than
+# defaulted to zero: a term that always reports zero would claim a clean drain
+# while CI/CD work was live.
+#
+# The consequence is stated rather than hidden: the deployed CI/CD worker
+# (/opt/gsp/multica-workers/multica-cicd-worker) keeps no durable in-flight
+# record at all -- it writes only retry counters into issue.metadata -- so no
+# query can observe a merge it has in flight. Draining does not cover that
+# worker. Stop its unit before deploying if that matters.
 deployment_drain_snapshot() {
   deployment_psql -At <<'SQL'
 SELECT concat_ws(' ',
   'leases=' || count(*) FILTER (WHERE status IN ('dispatched','running') OR prepare_lease_expires_at IS NOT NULL),
   'children=' || count(*) FILTER (WHERE parent_task_id IS NOT NULL AND status IN ('dispatched','running')),
-  'callbacks=' || (SELECT count(*) FROM relay_run_log WHERE status = 'pending'),
-  'cicd=' || (SELECT count(*) FROM cicd_deploy_attempt WHERE status = 'running'))
+  'callbacks=' || (SELECT count(*) FROM relay_run_log WHERE status = 'pending'))
 FROM agent_task_queue;
 SQL
 }
@@ -74,7 +89,7 @@ deployment_wait_for_drain() {
   while true; do
     snapshot="$(deployment_drain_snapshot)" || return
     printf 'Drain snapshot: %s\n' "$snapshot"
-    if [[ "$snapshot" == 'leases=0 children=0 callbacks=0 cicd=0' ]]; then
+    if [[ "$snapshot" == 'leases=0 children=0 callbacks=0' ]]; then
       return 0
     fi
     now="$(date +%s)"

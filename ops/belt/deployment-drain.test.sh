@@ -12,7 +12,7 @@ input="$(cat)"
 if [[ "$input" == *concat_ws* ]]; then
   n=0; [[ -f "$DRAIN_COUNTER" ]] && n="$(<"$DRAIN_COUNTER")"
   printf '%s\n' "$((n + 1))" > "$DRAIN_COUNTER"
-  if (( n == 0 )); then echo 'leases=1 children=1 callbacks=1 cicd=1'; else echo 'leases=0 children=0 callbacks=0 cicd=0'; fi
+  if (( n == 0 )); then echo 'leases=1 children=1 callbacks=1'; else echo 'leases=0 children=0 callbacks=0'; fi
 fi
 if [[ "$input" == *'admission_held = true'* ]]; then : > "$FENCE_FILE"; fi
 if [[ "$input" == *'admission_held = false'* ]]; then rm -f -- "$FENCE_FILE"; fi
@@ -52,7 +52,7 @@ wait "$holder"
 cat >"$fixture/bin/psql" <<'SH'
 #!/usr/bin/env bash
 input="$(cat)"
-[[ "$input" == *concat_ws* ]] && echo 'leases=1 children=1 callbacks=1 cicd=1'
+[[ "$input" == *concat_ws* ]] && echo 'leases=1 children=1 callbacks=1'
 exit 0
 SH
 chmod +x "$fixture/bin/psql"

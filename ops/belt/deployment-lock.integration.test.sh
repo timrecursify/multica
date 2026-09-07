@@ -12,7 +12,6 @@ SET search_path TO $schema;
 CREATE TABLE agent_task_queue (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   status text NOT NULL, prepare_lease_expires_at timestamptz, parent_task_id bigint);
 CREATE TABLE relay_run_log (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, status text NOT NULL);
-CREATE TABLE cicd_deploy_attempt (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY, status text NOT NULL);
 \i $root_dir/deployment-lock.sql
 UPDATE belt_deployment_control SET admission_held = true WHERE singleton;
 SQL
@@ -25,7 +24,6 @@ rejects() {
 rejects "INSERT INTO agent_task_queue(status) VALUES ('queued')"
 rejects "INSERT INTO agent_task_queue(status) VALUES ('dispatched')"
 rejects "INSERT INTO relay_run_log(status) VALUES ('pending')"
-rejects "INSERT INTO cicd_deploy_attempt(status) VALUES ('running')"
 
 psql "$DATABASE_URL" -X -v ON_ERROR_STOP=1 <<SQL >/dev/null
 SET search_path TO $schema;

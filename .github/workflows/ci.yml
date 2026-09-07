@@ -306,6 +306,11 @@ jobs:
       - name: Test deployment admission fence (asserts 3 run, 0 skipped)
         run: bash ops/belt/deployment-lock.integration.test.sh
 
+      # The two steps above stub psql and build their own tables, so neither can
+      # tell whether the drain snapshot names a relation production actually has.
+      - name: Test drain snapshot against the canonical migrations
+        run: bash ops/belt/deployment-drain-schema.test.sh
+
       - name: Test belt git token permission contract
         run: bash ops/belt/gsp-belt-git-credential.test.sh
 
