@@ -30,12 +30,16 @@ unset MULTICA_TASK_ID MULTICA_TASK_SLOT MULTICA_TASK_CONFIG_ROOT \
 
 # Paid lane remains explicitly opt-in.
 export MULTICA_ALLOW_PAID_LANE="${MULTICA_ALLOW_PAID_LANE:-0}"
-requested_codex_bin="${CODEX_BIN:-/usr/local/bin/codex}"
+default_codex_path='/opt/gsp-noc/providers/codex/bin/codex.js'
+# The daemon consumes MULTICA_CODEX_PATH. Keep CODEX_BIN as the belt guard's
+# compatibility variable, while pinning the default to the provider directly.
+requested_codex_bin="${MULTICA_CODEX_PATH:-${CODEX_BIN:-$default_codex_path}}"
 if [[ "$requested_codex_bin" == */codex-openrouter && "$MULTICA_ALLOW_PAID_LANE" != 1 ]]; then
   echo "multica-daemon-wrapper: refusing paid OpenRouter lane; set MULTICA_ALLOW_PAID_LANE=1 explicitly" >&2
   exit 64
 fi
 export CODEX_BIN="$requested_codex_bin"
+export MULTICA_CODEX_PATH="$requested_codex_bin"
 
 # The belt executes repository build commands through this process. Keep the
 # system Go toolchain ahead of inherited user paths for every task.
