@@ -1689,6 +1689,12 @@ async function relayVerdict(req, res, payload) {
       qcTask ? `relay_task_id=${qcTask.id}` : null,
       qcTask ? `relay_agent_id=${qcTask.agent_id}` : null,
       qcTask ? `relay_agent_name=${qcTask.agent_name}` : null,
+      // The checker's machine-readable failure class. It reached qc_attempt but
+      // was dropped here, so qc_verdict recorded who failed a ticket and never
+      // why: returnFailedQcOutcomes could only tell the builder "QC FAIL <md5>;
+      // rework required". Same anchored `key=value` line shape the correlation
+      // IDs above already use, so existing substring() readers are unaffected.
+      payload.failure_class ? `failure_class=${payload.failure_class}` : null,
       externalQc ? `operator_external_qc=${payload.reason || 'external QC'}` : null,
       typeof payload.notes === "string" && payload.notes.length <= 2000 ? payload.notes : null,
     ].filter(Boolean).join("\n");

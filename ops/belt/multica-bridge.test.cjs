@@ -897,6 +897,63 @@ function verdictHarness({ getTask = () => null } = {}) {
   return state;
 }
 
+// A FAIL that records who failed a ticket but not why is not a verdict, it is a
+// receipt. Measured on gsp 2026-09-07: 73/73 FAIL verdicts in 24h carried notes
+// holding only relay_task_id / relay_agent_id / relay_agent_name, while the
+// checker's failure_class sat in scope on the same payload and reached
+// qc_attempt two statements later. returnFailedQcOutcomes then had nothing to
+// tell the builder but "QC FAIL <md5>; rework required".
+//
+// This asserts the PERSISTED row, not that a formatter ran: it reads the values
+// bound to the real INSERT INTO qc_verdict and parses notes back out with the
+// same anchored key=value convention the belt's own readers use
+// (escalation-loop-audit.cjs, relay-dead-rows.cjs, recover-stranded-qc-pass.cjs).
+const { FAILURE_CLASSES } = require('./qc-verdict-policy.cjs');
+
+function notesFromVerdictWrite(values) {
+  const notes = String(values[5] || '');
+  const read = (key) => {
+    const match = notes.match(new RegExp(`(^|\\n)${key}=([^\\n]*)($|\\n)`));
+    return match ? match[2] : null;
+  };
+  return { raw: notes, read };
+}
+
+test('a persisted FAIL verdict carries its machine-readable failure class', async () => {
+  const failVerdict = { ...validVerdict, verdict: 'FAIL', failure_class: 'implementation',
+    qualifying: false, idem_key: 'fail-reason-0001' };
+  const completed = { id: '33333333-3333-4333-8333-333333333333', issue_id: validVerdict.issue_id,
+    workspace_id: 'workspace-1', agent_id: 'checker-agent', agent_name: validVerdict.checker,
+    status: 'completed', context: { to_stage: 'In Review' }, model: 'gpt-5.6-sol',
+    thinking_level: 'low', result: qcResult(failVerdict),
+    created_at: '2026-09-07T10:00:00Z', completed_at: '2026-09-07T10:05:00Z' };
+  const harness = verdictHarness({ getTask: () => completed });
+  setTestClientFactory(() => harness.client);
+  try {
+    const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+    await relayVerdict({}, res, { agent_token: 'test-relay-secret', ...failVerdict });
+    assert.equal(res.status, 201);
+
+    assert.equal(harness.verdictWrites.length, 1, 'expected exactly one qc_verdict write');
+    const notes = notesFromVerdictWrite(harness.verdictWrites[0]);
+
+    // The correlation IDs are the only thing that worked before. Keep them.
+    assert.equal(notes.read('relay_task_id'), completed.id);
+    assert.equal(notes.read('relay_agent_id'), completed.agent_id);
+    assert.equal(notes.read('relay_agent_name'), completed.agent_name);
+
+    // The verdict must now say why, in a class a consumer can branch on.
+    const persistedClass = notes.read('failure_class');
+    assert.ok(persistedClass,
+      `persisted FAIL verdict states no failure class; notes were:\n${notes.raw}`);
+    assert.equal(persistedClass, 'implementation');
+    assert.ok(FAILURE_CLASSES.has(persistedClass),
+      `persisted failure class ${persistedClass} is not one the belt validates`);
+  } finally {
+    setTestClientFactory(null);
+  }
+});
+
 test('verdict validation accepts the sanctioned CLI checker field and rejects forged lane metadata', () => {
   assert.equal(validateRelayVerdict(validVerdict), null);
   assert.equal(validateRelayVerdict({ ...validVerdict, checker: undefined }), 'invalid_checker');
