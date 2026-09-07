@@ -24,11 +24,11 @@ test('agent registry rejects duplicates, blanks, and pooled zero-stage members',
 });
 
 test('builder route resolver rejects contradictory configuration and admits immutable route', () => {
-  const agent = { name: 'gsp-build-deepseek-low', model: 'deepseek/deepseek-v4-flash-0731',
-    runtime_config: { model: 'deepseek/deepseek-v4-flash-0731' } };
-  assert.deepEqual(resolveBuilderRoute(agent, { provider: 'openrouter' }).route,
-    { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash-0731', resolver_version: 'builder-route-v1' });
-  assert.equal(resolveBuilderRoute({ ...agent, runtime_config: { model: 'gpt-5.6-terra' } }, { provider: 'openrouter' }).reason,
+  const agent = { name: 'gsp-build-luna-low', model: 'gpt-5.6-luna',
+    runtime_config: { model: 'gpt-5.6-luna' } };
+  assert.deepEqual(resolveBuilderRoute(agent, { provider: 'codex' }).route,
+    { provider: 'codex', model: 'gpt-5.6-luna', resolver_version: 'builder-route-v1' });
+  assert.equal(resolveBuilderRoute({ ...agent, runtime_config: { model: 'gpt-5.6-sol' } }, { provider: 'codex' }).reason,
     'builder_route_mismatch');
   assert.equal(resolveBuilderRoute({ name: 'gsp-build' }, {}).reason, 'builder_route_unavailable');
 });
@@ -49,22 +49,21 @@ test('dispatch requires the target stage to be named by agent instructions', () 
   assert.equal(instructionCompatibility('', 'Queue').ok, false);
 });
 
-test('belt routing allows DeepSeek/Terra builders and QC-lane QC/spec only', () => {
-  assert.equal(beltRoutingAdmission({ name: 'gsp-build-deepseek', model: 'deepseek/v4', thinking_level: 'low' }).ok, true);
-  assert.equal(beltRoutingAdmission({ name: 'gsp-build-terra', model: 'gpt-5.6-terra', thinking_level: 'low' }).ok, true);
+test('belt routing admits only the configured OpenAI desk lanes', () => {
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-deepseek', model: 'deepseek/v4', thinking_level: 'low' }).reason, 'builder_requires_build_lane');
+  assert.equal(beltRoutingAdmission({ name: 'gsp-build-terra', model: 'gpt-5.6-terra', thinking_level: 'low' }).reason, 'builder_requires_build_lane');
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'low' }).ok, true);
-  assert.equal(beltRoutingAdmission({ name: 'gsp-build-terra', model: 'gpt-5.6-terra', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-opus', model: 'claude-opus-4-6', thinking_level: 'low' }).reason, 'builder_requires_build_lane');
   assert.equal(beltRoutingAdmission({ name: 'gsp-build-luna', model: 'gpt-5.6-luna', thinking_level: 'medium' }).reason, 'belt_low_reasoning_effort_required');
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-luna', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc', model: 'gpt-5.6-sol', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
   assert.equal(beltRoutingAdmission({ name: 'ppp-spec', model: 'gpt-5.6-terra', thinking_level: 'low' }).reason, 'qc_spec_requires_qc_lane');
-  // Scoping runs on opus by doctrine; QC must not.
-  assert.equal(beltRoutingAdmission({ name: 'gsp-spec-sol-low-public', model: 'claude-opus-4-6', thinking_level: 'low' }).ok, true);
+  // Astra is scoped to Spec; QC must not admit it.
+  assert.equal(beltRoutingAdmission({ name: 'gsp-spec-astra', model: 'gpt-6-astra', thinking_level: 'low' }).ok, true);
   assert.equal(beltRoutingAdmission({ name: 'gsp-qc-sol-low-1', model: 'claude-opus-4-6', thinking_level: 'low' }).reason, 'qc_spec_requires_qc_lane');
-  assert.equal(beltRoutingAdmission({ name: 'gsp-spec-opus', model: 'claude-opus-4-6', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
-  const configOnly = beltRoutingAdmission({ id: 'agent-1', name: 'gsp-build', model: 'gpt-5.6-luna', thinking_level: '', runtime_config: { model: 'gpt-5.6-terra', reasoning_effort: 'low' } });
+  assert.equal(beltRoutingAdmission({ name: 'gsp-spec-astra', model: 'gpt-6-astra', thinking_level: 'high' }).reason, 'belt_low_reasoning_effort_required');
+  const configOnly = beltRoutingAdmission({ id: 'agent-1', name: 'gsp-build', model: 'gpt-5.6-luna', thinking_level: '', runtime_config: { model: 'gpt-5.6-sol', reasoning_effort: 'low' } });
   assert.equal(configOnly.reason, 'belt_low_reasoning_effort_required');
   assert.deepEqual({ agent_name: configOnly.agent_name, agent_id: configOnly.agent_id, model: configOnly.model, effort: configOnly.effort }, { agent_name: 'gsp-build', agent_id: 'agent-1', model: 'gpt-5.6-luna', effort: '' });
 });
@@ -127,10 +126,9 @@ test('infrastructure recovery remains admissible at the attempt ceiling', () => 
   });
 });
 
-test('paid dispatch requires a live configured agent', () => {
-  assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter', token_budget: 1000 }).ok, true);
-  assert.equal(spendPreflight({ max_concurrent_tasks: 0, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter', token_budget: 1000 }).ok, false);
-  assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4' }, { provider: 'openrouter' }).ok, false);
+test('spend preflight rejects legacy builders and requires a live configured agent', () => {
+  assert.equal(spendPreflight({ name: 'gsp-build-deepseek', max_concurrent_tasks: 4, instructions: 'Queue', model: 'deepseek/v4', thinking_level: 'low' }, { provider: 'openrouter', token_budget: 1000 }).ok, false);
+  assert.equal(spendPreflight({ name: 'gsp-build-terra', max_concurrent_tasks: 4, instructions: 'Queue', model: 'gpt-5.6-terra', thinking_level: 'low' }, { provider: 'codex' }).ok, false);
   assert.equal(spendPreflight({ max_concurrent_tasks: null, instructions: 'Queue', model: 'gpt-5.6-luna' }, { provider: 'codex' }).ok, true);
   assert.equal(spendPreflight({ max_concurrent_tasks: 4, instructions: 'Queue', model: '' }, { provider: 'codex' }).ok, true);
   assert.deepEqual(spendPreflight({ id: 'a-1', name: 'DeepSeek Builder', instructions: 'Queue', runtime_config: { quota_paused: true } }, { provider: 'codex' }),

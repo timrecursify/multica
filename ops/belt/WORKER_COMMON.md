@@ -12,6 +12,26 @@ file once, then read the runbook selected by the issue's current stage.
 - Doctrine stays in these files. Agent database rows contain file references,
   not copies of doctrine.
 
+## Admission preflight
+
+Before the daemon can claim paid work, its existing executable-capability
+probe also validates the fleet route, required environment key names,
+repository write-permission metadata, and reachability of an approved
+deployment owner. It reads permission metadata only; it never rotates a
+credential or prints a value.
+
+A refusal has this machine-readable shape and exits temporarily with status 75:
+
+```text
+PREFLIGHT_BLOCKER code=<environment_keys_missing|routing_not_allowed|repository_push_unavailable|deployment_owner_unreachable|daemon_capability_unavailable> recoverable=true retry_consumed=false disposition=queued resume=same_work_product detail=<non-secret>
+```
+
+The task stays queued and no implementation attempt has started. After the
+capability is restored, restart through the supervisor-owned release path so
+the daemon claims the same task and reuses its existing work product; do not
+increment an implementation retry, move the issue to Human Review, or open a
+replacement pull request.
+
 ## Workspace routing
 
 Use `MULTICA_WORKSPACE_ID` as the authority for the board:

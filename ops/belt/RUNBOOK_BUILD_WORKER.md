@@ -8,13 +8,17 @@ Read `WORKER_COMMON.md` first. Use this runbook when the issue is in `Queue`.
 
 ## Lane
 
-The agent row must specify:
+The allowed route is generated from the fleet routing configuration; this
+runbook does not carry a second model or provider list. Read the current build
+contract before implementation:
 
-- model `deepseek/deepseek-v4-flash-0731`;
-- custom arguments `["-c", "model_provider=openrouter"]`.
+```bash
+node /opt/gsp/multica-workers/gsp-multica-bridge/qc-lane.cjs worker-instructions build
+```
 
-Do not select a different provider or model. A 402 response is a money blocker;
-comment with the error and stop.
+Use the emitted route exactly. The daemon wrapper has already validated the
+same configuration, repository permissions, deployment-owner reachability,
+and required environment key presence before it can claim this task.
 
 ## Procedure
 

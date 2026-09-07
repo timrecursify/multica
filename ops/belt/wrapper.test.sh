@@ -55,7 +55,8 @@ pid=$!; sleep 0.1
 if BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/hold.lock" "$root_dir/multica-daemon-wrapper.sh"; then exit 1; fi
 wait "$pid"
 assert_wrapper_rejects() {
-  local label="$1" expected="$2" stderr="$fake/$1.stderr" status
+  local label="$1" expected="$2" stderr="$fake/$1.stderr" status expected_status=64
+  [[ "$label" == help-* ]] && expected_status=75
   shift 2
   rm -f -- "$capture"
   if env BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_MAX_CONCURRENT_TASKS=2 "$@" DAEMON_LAUNCH_MARKER="$launch_marker" MULTICA_DAEMON_LOCK_FILE="$fake/$label.lock" "$root_dir/multica-daemon-wrapper.sh" 2>"$stderr"; then
@@ -64,7 +65,7 @@ assert_wrapper_rejects() {
   else
     status=$?
   fi
-  [[ "$status" -eq 64 ]]
+  [[ "$status" -eq "$expected_status" ]]
   [[ "$(<"$stderr")" == "$expected" ]]
   [[ ! -e "$launch_marker" ]]
   [[ ! -e "$capture" ]]
@@ -93,12 +94,12 @@ assert_wrapper_rejects cwd-missing \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$fake/missing" CAPTURE_FILE="$capture"
 rm -f -- "$capture"
 assert_wrapper_rejects help-nonzero \
-  'multica-daemon-wrapper: daemon start capability probe failed (exit 17)' \
+  'PREFLIGHT_BLOCKER code=daemon_capability_unavailable recoverable=true retry_consumed=false disposition=queued resume=same_work_product detail=help_exit:17' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" FAIL_HELP=1
 [[ ! -e "$capture" ]]
 start="$(date +%s)"
 assert_wrapper_rejects help-timeout \
-  'multica-daemon-wrapper: daemon start capability probe timed out' \
+  'PREFLIGHT_BLOCKER code=daemon_capability_unavailable recoverable=true retry_consumed=false disposition=queued resume=same_work_product detail=help_timeout' \
   MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" HANG_HELP=1 MULTICA_DAEMON_HELP_TIMEOUT_SECONDS=1
 [[ $(( $(date +%s) - start )) -lt 3 && ! -e "$capture" ]]
 echo 'wrapper launch regression passed'

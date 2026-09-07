@@ -592,7 +592,7 @@ function strandedFixture(overrides = {}) {
     runtime_provider: 'codex',
     runtime_mode: 'cloud',
     instructions: 'Queue',
-    model: 'deepseek/chat',
+    model: 'gpt-5.6-luna',
     thinking_level: 'low',
     max_concurrent_tasks: 1,
     token_budget: 1,

@@ -1273,20 +1273,15 @@ test('empty stage pool preserves the canonical relay owner fallback', async () =
   assert.match(calls[2], /FROM relay_stage_config/);
 });
 
-// A Claude-modelled owner bound to a Claude runtime was dispatched onto the
-// newest online *codex* runtime, because both the own-runtime join and the
-// fallback lateral hard-coded provider = 'codex'. Codex on a ChatGPT account
-// rejects a Claude model with HTTP 400, so the task was billed and thrown away:
-// 16 tasks burned that way on gsp on 2026-09-06 against agent
-// gsp-spec-sol-low-public (model claude-opus-4-6, runtime "Claude (gsp-codex)").
-// The provider must be derived from the owner's model, as reconciler.cjs does.
+// Runtime selection must remain derived from the owner model. The current
+// Astra Spec route resolves to Codex without a hand-maintained agent override.
 test('pool owner runtime resolution derives the provider from the agent model', async () => {
   const calls = [];
   const client = { query: async (sql, values) => {
     calls.push({ sql, values });
     if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
     if (/FROM relay_stage_agent_pool p/.test(sql)) {
-      return { rows: [scoper({ agent_id: 'agent-claude', model: 'claude-opus-4-6',
+      return { rows: [scoper({ agent_id: 'agent-astra', model: 'gpt-6-astra',
         instructions: 'Own Spec tickets only.' })] };
     }
     return { rows: [] };
@@ -1303,9 +1298,9 @@ test('pool owner runtime resolution derives the provider from the agent model', 
 test('pool selection applies to Queue and rotates equal-load agents', async () => {
   const calls = [];
   const builders = [
-    scoper({ agent_id: 'builder-older', agent_name: 'build-a', model: 'gpt-5.6-terra',
+    scoper({ agent_id: 'builder-older', agent_name: 'build-a', model: 'gpt-5.6-luna',
       instructions: 'Use this runbook when the issue is in Queue.', last_selected_at: '2026-01-01T00:00:00Z' }),
-    scoper({ agent_id: 'builder-newer', agent_name: 'build-b', model: 'gpt-5.6-terra',
+    scoper({ agent_id: 'builder-newer', agent_name: 'build-b', model: 'gpt-5.6-luna',
       instructions: 'Use this runbook when the issue is in Queue.', last_selected_at: '2026-02-01T00:00:00Z' })
   ];
   const client = { query: async (sql, values) => {
@@ -1863,7 +1858,7 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       details jsonb, created_at timestamptz DEFAULT now());`);
     await admin.query(`INSERT INTO "${schema}".agent_runtime (id, workspace_id, provider, status) VALUES ($1, $2, 'codex', 'online')`, [runtimeId, workspaceId]);
     await admin.query(`INSERT INTO "${schema}".agent (id, workspace_id, name, runtime_id, status, instructions, model, thinking_level, max_concurrent_tasks)
-      VALUES ($1, $2, 'builder', $3, 'idle', 'Queue\nIn Progress\nCI/CD & Deploy', 'gpt-5.6-terra', 'low', 2)`, [agentId, workspaceId, runtimeId]);
+      VALUES ($1, $2, 'builder', $3, 'idle', 'Queue\nIn Progress\nCI/CD & Deploy', 'gpt-5.6-luna', 'low', 2)`, [agentId, workspaceId, runtimeId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_pool VALUES
       ($1, 'Queue', true), ($1, 'In Progress', true), ($1, 'CI/CD & Deploy', true)`, [workspaceId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_agent_pool VALUES

@@ -1,6 +1,6 @@
 'use strict';
 // GSP-2332 follow-on: selectRetryEscalationOwner hard-coded gpt-5.6-sol, so the
-// GSP workspace's opus Spec owner was rejected and every retry escalation threw
+// GSP workspace's Spec owner was rejected and every retry escalation threw
 // "Sol-low re-spec owner has invalid lane: gsp-spec-sol-low-public" instead of
 // handing the ticket back for a re-spec. guardrails.cjs already admitted that
 // agent through isSpecLane; this path was the one place still naming a model.
@@ -44,8 +44,8 @@ async function outcomeFor(model, effort) {
   }
 }
 
-test('the opus spec lane is admitted as a re-spec owner', async () => {
-  assert.equal(await outcomeFor('claude-opus-4-6', 'low'), 'resolved');
+test('the Astra spec lane is admitted as a re-spec owner', async () => {
+  assert.equal(await outcomeFor('gpt-6-astra', 'low'), 'resolved');
 });
 
 test('the sol-low QC lane remains admitted', async () => {
@@ -57,7 +57,7 @@ test('a model on neither lane is rejected', async () => {
 });
 
 test('the right model at the wrong effort is rejected', async () => {
-  assert.match(await outcomeFor('claude-opus-4-6', 'high'), /invalid lane/);
+  assert.match(await outcomeFor('gpt-6-astra', 'high'), /invalid lane/);
 });
 
 test('the escalation record names the lane that was actually selected', async () => {
@@ -65,11 +65,11 @@ test('the escalation record names the lane that was actually selected', async ()
   const client = { query: async (_sql, params) => { seen.push(params); return { rows: [] }; } };
   await recordRetryEscalation(client, { id: 'i1', workspace_id: 'w1' }, {
     reason: 'completion_empty', trigger_stage: 'Queue', owner: 'gsp-spec-sol-low-public',
-    model: 'claude-opus-4-6', effort: 'low', deadline: 'later', source_task_id: 't1',
+    model: 'gpt-6-astra', effort: 'low', deadline: 'later', source_task_id: 't1',
   });
   const details = JSON.parse(seen[0][1]);
-  assert.equal(details.model, 'claude-opus-4-6');
+  assert.equal(details.model, 'gpt-6-astra');
   assert.equal(details.effort, 'low');
   assert.equal(details.target_stage, 'Spec');
-  assert.match(seen[1][3], /next_action: re-spec on claude-opus-4-6/);
+  assert.match(seen[1][3], /next_action: re-spec on gpt-6-astra/);
 });
