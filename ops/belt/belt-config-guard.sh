@@ -1498,7 +1498,7 @@ guard_parked_dispatch() {
 # rule: the running process keeps the code it started with. This checks the rule
 # is still in the source AND that the process is newer than the source, and
 # restarts the bridge when it is running stale code.
-readonly BRIDGE_SRC=/home/newadmin/gsp-multica/multica-bridge.cjs
+readonly BRIDGE_SRC=${BELT_RUNTIME_ROOT:-/var/lib/gsp}/gsp-multica/multica-bridge.cjs
 guard_spec_gate() {
   local src_mtime started
   if ! grep -q 'SPEC_ENFORCED_WORKSPACE' "$BRIDGE_SRC" 2>/dev/null; then
