@@ -4818,11 +4818,12 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	// is reference-counted, so the duplicate marks runTask installs are
 	// correctly nested within these.
 	predictedEnvRoot := execenv.PredictRootDir(d.cfg.WorkspacesRoot, task.WorkspaceID, task.ID)
+	actualEnvRoot := predictedEnvRoot
 	// Reclaim daemon-owned task environments once this handler reaches any
 	// terminal return. The cleanup defer is registered before the active-root
 	// guards below, so those guards are released first.
 	defer func() {
-		d.cleanupCompletedTaskEnv(task, predictedEnvRoot, taskLog)
+		d.cleanupCompletedTaskEnv(task, actualEnvRoot, taskLog)
 	}()
 	if predictedEnvRoot != "" {
 		d.markActiveEnvRoot(predictedEnvRoot)
@@ -4859,6 +4860,9 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 	}()
 
 	result, err := d.runner.run(runCtx, task, provider, slot, taskLog)
+	if result.EnvRoot != "" {
+		actualEnvRoot = result.EnvRoot
+	}
 
 	// Report usage before any early return — the agent accumulates tokens
 	// whether the task completes, errors, or is cancelled mid-run by the poll
@@ -4949,6 +4953,10 @@ func (d *Daemon) handleTask(ctx context.Context, task Task, slot int) {
 // It is best-effort and intentionally non-fatal: the terminal callback has
 // already settled the task when this runs.
 func (d *Daemon) cleanupCompletedTaskEnv(task Task, envRoot string, logger *slog.Logger) {
+	if v := strings.TrimSpace(os.Getenv("KEEP_WORKDIR")); v != "" && v != "0" && strings.ToLower(v) != "false" && strings.ToLower(v) != "no" {
+		logger.Info("terminal task environment retained", "path", envRoot, "reason", "KEEP_WORKDIR")
+		return
+	}
 	if envRoot == "" {
 		return
 	}
