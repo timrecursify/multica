@@ -30,26 +30,26 @@ environment variable is unset, those exceptional exits are refused.
 
 | Repository file | Runtime path | Current runner |
 | --- | --- | --- |
-| `multica-bridge.cjs` | `/home/newadmin/gsp-multica/multica-bridge.cjs` | PM2 app `gsp-multica-bridge` |
-| `guardrails.cjs` | `/home/newadmin/gsp-multica/guardrails.cjs` | Required by bridge and relay daemon |
-| `parity/multica-relay-advance-daemon.cjs` | `/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs` | PM2 app `multica-relay-advance`, through its wrapper and launcher |
-| `multica-cicd-worker.cjs` | `/home/newadmin/multica-cicd-worker.cjs` | PM2 app `multica-cicd-worker` |
-| `belt-config-guard.sh` | `/home/newadmin/tools/belt-config-guard.sh` | `belt-config-guard.timer`, which activates `belt-config-guard.service` |
+| `multica-bridge.cjs` | `/var/lib/gsp/gsp-multica/multica-bridge.cjs` | PM2 app `gsp-multica-bridge` |
+| `guardrails.cjs` | `/var/lib/gsp/gsp-multica/guardrails.cjs` | Required by bridge and relay daemon |
+| `parity/multica-relay-advance-daemon.cjs` | `/var/lib/gsp/gsp-multica/parity/multica-relay-advance-daemon.cjs` | PM2 app `multica-relay-advance`, through its wrapper and launcher |
+| `multica-cicd-worker.cjs` | `/var/lib/gsp/multica-cicd-worker.cjs` | PM2 app `multica-cicd-worker` |
+| `belt-config-guard.sh` | `/var/lib/gsp/tools/belt-config-guard.sh` | `belt-config-guard.timer`, which activates `belt-config-guard.service` |
 
 To intentionally hold the AI worker during spend investigations or guarded
-deploys, create `/home/newadmin/.local/state/multica-ai-hold`. The guard then
+deploys, create `/var/lib/gsp/.local/state/multica-ai-hold`. The guard then
 skips only `gsp-multica-worker`; bridge, CI/CD, archiver, and relay liveness
 checks continue. Remove the marker only after the worker may safely resume.
-| `multica-bundle.py` | `/home/newadmin/tools/multica-bundle.py` | No always-running PM2 app or systemd unit; the runbook invokes it with `python3` |
-| `RUNBOOK_SPEC_WORKER.md` | `/home/newadmin/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | No process; this is the operational runbook |
+| `multica-bundle.py` | `/var/lib/gsp/tools/multica-bundle.py` | No always-running PM2 app or systemd unit; the runbook invokes it with `python3` |
+| `RUNBOOK_SPEC_WORKER.md` | `/var/lib/gsp/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | No process; this is the operational runbook |
 
 ## Guard parity repair
 
 `belt-config-guard.sh` treats the guard and daemon wrapper as one deployment
 unit. Their canonical source paths are `ops/belt/belt-config-guard.sh` and
 `ops/belt/multica-daemon-wrapper.sh`; the runtime copies are
-`/home/newadmin/tools/belt-config-guard.sh` and
-`/home/newadmin/gsp-multica/fleet/multica-daemon-wrapper.sh`. A repair may use
+`/var/lib/gsp/tools/belt-config-guard.sh` and
+`/var/lib/gsp/gsp-multica/fleet/multica-daemon-wrapper.sh`. A repair may use
 only an immutable release containing both matching blobs and a readable
 `.gsp-belt-release.json` with a 40-character `source_sha` and 64-character
 `manifest_sha256`. Validation completes before either runtime file is touched.
@@ -78,7 +78,7 @@ belt-config-guard.timer belt-config-guard.service
 
 `multica-relay-advance` is a PM2 wrapper process; its launcher invokes the
 runtime daemon path shown above. The runbook currently names the bundle command
-as `python3 /home/newadmin/tools/multica-bundle.py`.
+as `python3 /var/lib/gsp/tools/multica-bundle.py`.
 
 ## Deploy and verify
 
