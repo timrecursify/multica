@@ -832,7 +832,7 @@ async function retireParkedWork(client, issue, reason) {
     `UPDATE relay_run_log
         SET status = 'noop',
             parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
-              jsonb_build_object('parked_retired', true, 'parked_retired_reason', $2)
+              jsonb_build_object('parked_retired', true, 'parked_retired_reason', $2::text)
       WHERE issue_id = $1 AND status = 'pending'
       RETURNING id`, [issue.id, reason]);
   return { task_count: tasks.rowCount, task_ids: tasks.rows.map(r => r.id),
