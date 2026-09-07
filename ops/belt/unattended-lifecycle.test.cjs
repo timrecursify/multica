@@ -357,10 +357,13 @@ test('known defects execute as packet-owned expected-red contracts', () => {
   });
   cicd.setTestDependencies({ readReceipt: () => { throw new Error('receipt unavailable'); },
     gh: () => { throw new Error('GitHub unavailable'); }, log() {} });
-  const evidence = expectedRed('rec-2 fabricated-deployment-evidence', () => {
-    const result = cicd.mergeDeployEvidence('timrecursify/multica', SHA, '2026-09-01T00:00:00Z');
-    assert.equal(result.evidence, undefined, 'outage must hold instead of fabricating merge_is_deploy');
-  });
+  const evidenceResult = cicd.mergeDeployEvidence(
+    'timrecursify/multica', SHA, '2026-09-01T00:00:00Z');
+  assert.equal(evidenceResult.outcome, 'discovery_unavailable');
+  assert.equal(evidenceResult.evidence, undefined,
+    'outage must hold instead of fabricating merge_is_deploy');
+  const evidence = { status: 'verified-green', packet: 'rec-2 fabricated-deployment-evidence',
+    outcome: evidenceResult.outcome };
   emittedMetrics.push({ case: 'known-defects', outcomes: [activation, evidence] });
 });
 

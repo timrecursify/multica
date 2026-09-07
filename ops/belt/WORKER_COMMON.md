@@ -29,6 +29,24 @@ QC runbook resolves that URL and its full bound SHA with `sk multica
 qc-checkout`; the JSON output supplies `CHECKOUT` from `.path` and confirms
 the SHA in `.sha`. Do not infer these values from the managed workdir.
 
+## Canonical work products
+
+- `issue_work_product` is the authority for work ownership. Exactly one active row
+  identifies an issue's current scope revision, kind, repository, branch, pull
+  request, exact head SHA, acceptance evidence, replacement revision, declared
+  dependency issue IDs, and consuming stage. Comments and historical PR links are
+  presentation only and never acquire ownership.
+- Rework keeps the same product identity. A red `qc_verdict` returns the existing
+  branch and pull request for an updated head SHA; it never creates a second PR.
+  `qc_attempt` is not verdict authority.
+- The named consumer owns merge, rebase, and disposition. A builder performs only
+  the requested rework and never independently merges, closes, or replaces its PR.
+- Admission and backpressure count distinct active products whose consuming stage is
+  unfinished, not accumulated task completions or PR-shaped text.
+- `no_change` and `operational` products carry independently verified acceptance
+  evidence and no repository, branch, PR, or SHA. Never manufacture a code or test
+  edit to make these results look like implementation work.
+
 ## Evidence and transitions
 
 - Read the issue and its comments before acting. Treat prior claims as

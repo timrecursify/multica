@@ -18,17 +18,28 @@ comment with the error and stop.
 
 ## Procedure
 
-1. Read the issue and comments. Identify the single requested outcome.
-2. Implement the minimum change in a fresh clone or managed worktree.
-3. Run the narrowest check that proves the acceptance criteria.
-4. Commit, push the ticket branch, and open a pull request when code changed. Resolve the
-   remote PR head and require it to be one reachable lowercase 40-character SHA equal to
-   the local pushed commit. Before advancing, record both values in one transaction:
-   `multica issue metadata implementation-evidence "$NUMBER" --pr-url "$PR_URL" --bound-sha "$SHA"`.
-   A missing, mismatched, or unreachable ref is a blocked build and must not advance. For
-   no-code work, record `NO-SHA` in the comment and create no implementation metadata.
-5. Post the work-product comment below.
-6. Advance `Queue` to `In Progress`, then `In Progress` to `In Review`, with
+1. Read the issue, the relay-provided `scope_revision`, and the explicitly active work
+   product. Comments are context only; a pull request or SHA mentioned in prose never owns
+   the work.
+2. For rework of the same scope revision, reuse the active work product's branch and pull
+   request. Update that branch and exact head SHA; never open a second pull request. For a
+   new scope revision, record which prior revision it replaces before creating new work.
+3. Implement the minimum change in a fresh clone or managed worktree. The consuming stage
+   owns merge, rebase, and disposition decisions; the builder never self-merges or closes a
+   pull request independently.
+4. Run the narrowest check that proves the acceptance criteria.
+5. For implementation work, commit and push the canonical branch, opening a pull request
+   only when no active implementation product exists for this scope revision. Resolve the
+   remote head and require one reachable lowercase 40-character SHA equal to the pushed
+   commit. The structured handoff must atomically record kind, repository, branch, PR
+   number, exact head SHA, acceptance evidence, replacement revision, declared dependency
+   issue IDs, and consuming stage. A missing or mismatched field is blocked evidence.
+6. For no-change or operational work, record kind plus independently verified acceptance
+   evidence and `NO-SHA`, with no repository, branch, or PR fields. Never manufacture a
+   test edit merely to create a diff.
+7. Post the human-readable work-product comment below. It is an audit view, not the
+   ownership record.
+8. Advance `Queue` to `In Progress`, then `In Progress` to `In Review`, with
    `sk multica advance "$NUMBER" --to "In Progress" --board "$BOARD"`.
 
 Write the stage names exactly as shown, capitals and space included. They are
@@ -73,5 +84,6 @@ real output
 List each acceptance criterion as met or not met.
 ```
 
-For a no-code operational test, state `NO-SHA`, run only the requested bounded
-check, and do not invent a repository change.
+For a no-change or operational result, state `NO-SHA`, include the exact command,
+timestamp, and observed output that verify acceptance, and do not invent a repository
+change.
