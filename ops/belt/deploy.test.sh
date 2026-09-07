@@ -4,6 +4,18 @@ set -Eeuo pipefail
 root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 node "$root_dir/multica-cicd-worker.test.cjs"
 
+# The drained fixture must be the exact string deployment_wait_for_drain compares
+# against. A second hardcoded copy is what broke this file: the cicd term was
+# removed from deployment_drain_snapshot and this stub kept emitting it, so every
+# deploy exercise waited on a drain that could never clear. Derive it, and fail
+# loudly if the comparison in deployment-drain.sh moves.
+drained_snapshot="$(sed -n "s/.*\[\[ \"\$snapshot\" == '\(.*\)' \]\].*/\1/p" "$root_dir/deployment-drain.sh")"
+if [[ -z "$drained_snapshot" ]]; then
+  echo 'could not derive the drained snapshot literal from deployment-drain.sh' >&2
+  exit 1
+fi
+export BELT_DEPLOY_TEST_SNAPSHOT="$drained_snapshot"
+
 # Regression: an operator hold must suppress only the AI worker's self-healing
 # path; the other pipeline services must remain in the liveness set.
 guard_source="$root_dir/belt-config-guard.sh"
@@ -68,7 +80,7 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -Eeuo pipefail' \
   'input="$(cat)"' \
-  'if [[ "$input" == *"concat_ws"* ]]; then printf "%s\n" "${BELT_DEPLOY_TEST_SNAPSHOT:-leases=0 children=0 callbacks=0 cicd=0}"; fi' \
+  'if [[ "$input" == *"concat_ws"* ]]; then printf "%s\n" "${BELT_DEPLOY_TEST_SNAPSHOT:?}"; fi' \
   'printf "%s|%s\n" "$$" "$*" >> "${BELT_DEPLOY_TEST_PSQL_LOG:?}"' > "$fake_bin/psql"
 chmod +x -- "$fake_bin/psql"
 export PATH="$fake_bin:$PATH"
@@ -168,7 +180,7 @@ grep -q 'Refusing an unscoped --apply' "$tmp_dir/unscoped.log"
 printf '\nstale-runtime\n' >> "$bridge_dir/multica-bridge.cjs"
 restart_lines() { if [[ -f "$fake_state/restarts.log" ]]; then wc -l < "$fake_state/restarts.log"; else printf '0\n'; fi; }
 restarts_before="$(restart_lines)"
-if BELT_DEPLOY_TEST_SNAPSHOT='leases=1 children=1 callbacks=1 cicd=1' \
+if BELT_DEPLOY_TEST_SNAPSHOT="${drained_snapshot//=0/=1}" \
    BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=1 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
    "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$tmp_dir/drain-timeout.log" 2>&1; then
   echo 'expected busy drain to abort deployment' >&2
@@ -178,6 +190,25 @@ grep -q 'deployment aborted without restart' "$tmp_dir/drain-timeout.log"
 [[ "$restarts_before" == "$(restart_lines)" ]]
 grep -q 'stale-runtime' "$bridge_dir/multica-bridge.cjs"
 cp -- "$root_dir/multica-bridge.cjs" "$bridge_dir/multica-bridge.cjs"
+
+# The complementary half of the busy case. Without it a fixture that can never
+# drain aborts every later exercise silently instead of failing on its own line.
+printf '\nstale-runtime-drained\n' >> "$bridge_dir/multica-bridge.cjs"
+restarts_before="$(restart_lines)"
+BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=1 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
+  "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$tmp_dir/drain-clear.log" 2>&1
+if grep -q 'deployment aborted without restart' "$tmp_dir/drain-clear.log"; then
+  echo 'expected a drained deploy to proceed' >&2
+  exit 1
+fi
+if [[ "$restarts_before" == "$(restart_lines)" ]]; then
+  echo 'expected a drained deploy to restart the unit' >&2
+  exit 1
+fi
+if grep -q 'stale-runtime-drained' "$bridge_dir/multica-bridge.cjs"; then
+  echo 'expected a drained deploy to replace the runtime file' >&2
+  exit 1
+fi
 
 # A partial rollout can leave the wrapper absent. It is a named parity target and
 # must be recreated by a selective deployment.
