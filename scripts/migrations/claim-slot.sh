@@ -6,8 +6,12 @@ mkdir -p "$(dirname "$reserved")"; exec 9>"$lock"
 for _ in 1 2 3 4 5; do flock -n 9 && break; sleep .2; done
 flock -n 9 || { echo 'reservation lock busy after bounded retries' >&2; exit 75; }
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
-git -C "$root" ls-tree -r --name-only origin/main 2>/dev/null | sed -nE 's#^.*/([0-9]+)_[^/]+\.sql$#\1#p' >"$tmp" || true
-[[ -f ${PRODUCTION_MIGRATIONS_FILE:-} ]] && cat "$PRODUCTION_MIGRATIONS_FILE" >>"$tmp" || true
+main_ref=origin/main; git -C "$root" rev-parse --verify "$main_ref" >/dev/null 2>&1 || main_ref=HEAD
+git -C "$root" ls-tree -r --name-only "$main_ref" 2>/dev/null | sed -nE 's#^.*/([0-9]+)_[^/]+\.sql$#\1#p' >"$tmp" || true
+if [[ -f ${PRODUCTION_MIGRATIONS_FILE:-} ]]; then
+  # Accept schema_migrations rows (slot, timestamp) as well as filenames.
+  sed -nE 's#^([0-9]+)([|[:space:]].*)?$#\1#p; s#^.*/([0-9]+)_[^/]+\.sql$#\1#p' "$PRODUCTION_MIGRATIONS_FILE" >>"$tmp"
+fi
 [[ -f ${OPEN_PR_MIGRATIONS_FILE:-} ]] && sed -nE 's#^.*/([0-9]+)_[^/]+\.sql$#\1#p' "$OPEN_PR_MIGRATIONS_FILE" >>"$tmp" || true
 if [[ -f $reserved ]] && grep -q "ticket=$ticket " "$reserved"; then grep "ticket=$ticket " "$reserved" | head -1 | sed -nE 's/.*slot=([0-9]+).*/\1/p'; exit 0; fi
 slot=1; while grep -qx "$slot" "$tmp" || { [[ -f $reserved ]] && grep -q "slot=$slot " "$reserved"; }; do slot=$((slot+1)); done
