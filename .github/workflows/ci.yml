@@ -256,12 +256,40 @@ jobs:
     # independent of the backend services so every push and pull request
     # validates the restart-critical wrapper and guard directly.
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_DB: multica
+          POSTGRES_USER: multica
+          POSTGRES_PASSWORD: multica
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U multica -d multica"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgres://multica:multica@localhost:5432/multica?sslmode=disable
     steps:
       - name: Checkout
         uses: actions/checkout@v6
         with:
           # deploy.test.sh replays the previous bridge revision from history.
           fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
 
       - name: Test daemon wrapper launch contract
         run: bash ops/belt/wrapper.test.sh
@@ -280,6 +308,12 @@ jobs:
 
       - name: Test parked diagnosis backfill
         run: node --test ops/belt/backfill-parked-diagnosis.test.cjs
+
+      - name: Verify bridge integration uses the service database
+        run: test "$DATABASE_URL" != "postgres://test"
+
+      - name: Test Multica bridge integration
+        run: node --test ops/belt/multica-bridge.test.cjs
 
   backend:
     runs-on: ubuntu-latest

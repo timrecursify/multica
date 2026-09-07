@@ -66,6 +66,7 @@ const {
   retryEscalationSourceTask,
   capEscalationVerified,
   retryEscalationLoop,
+  consumesRetryEscalation,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
   diagnosisRerunErrorStatus,
@@ -321,6 +322,13 @@ test('a second retry escalation for one stage is parked', () => {
     trigger_stage: 'Spec' } } }, 'Spec'), true);
   assert.equal(retryEscalationLoop({ metadata: { retry_escalation: {
     trigger_stage: 'Queue' } } }, 'Spec'), false);
+});
+
+test('successful departure consumes active retry escalation metadata', () => {
+  const issue = { status: 'Queue', metadata: { retry_escalation: { trigger_stage: 'Queue' } } };
+  assert.equal(consumesRetryEscalation(issue, 'In Progress'), true);
+  assert.equal(consumesRetryEscalation(issue, 'Queue'), false);
+  assert.equal(consumesRetryEscalation({ status: 'Queue', metadata: {} }, 'In Progress'), false);
 });
 
 test('completion escalation is bound to one exact completed failed task', async () => {

@@ -676,6 +676,11 @@ function retryEscalationLoop(issue, stage) {
   return issue.metadata?.retry_escalation?.trigger_stage === stage;
 }
 
+function consumesRetryEscalation(issue, toStage) {
+  return issue.metadata?.retry_escalation?.trigger_stage === issue.status &&
+    toStage !== issue.status;
+}
+
 async function verifiedRetryEscalation(client, issue, body) {
   const trigger = retryEscalationReason(body.reason);
   const taskId = body.retry_escalation_task_id;
@@ -2417,13 +2422,15 @@ async function relayAdvance(req, res, body) {
              WHEN $4 THEN COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
                'human_review_release_at', $5::timestamptz,
                'human_review_release_reason', $6::text)
+             WHEN $7 THEN COALESCE(metadata, '{}'::jsonb) - 'retry_escalation'
              ELSE metadata END,
            updated_at = NOW()
        WHERE id = $2
        RETURNING id, status`,
       [to_stage, issue_id, parkedRelease || parkedEvidenceQcRelease,
         explicitHumanReviewRelease, issue.metadata?.human_review_release_at || null,
-        explicitHumanReviewRelease ? reason.trim() : null]
+        explicitHumanReviewRelease ? reason.trim() : null,
+        consumesRetryEscalation(issue, to_stage)]
     );
     if (parkedRelease || parkedEvidenceQcRelease) {
       console.warn(JSON.stringify({ event: "parked_release_consumed",
@@ -2829,6 +2836,7 @@ module.exports = {
   retryEscalationSourceTask,
   capEscalationVerified,
   retryEscalationLoop,
+  consumesRetryEscalation,
   authorizeRelayStatusWrites,
   rerunParkedDiagnosis,
   relayDiagnosisRerun,
