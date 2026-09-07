@@ -35,7 +35,11 @@ test("stage input hash includes current PR check-suite conclusions", () => {
 
 function fakeClient(responses) {
   const calls = [];
-  return { calls, query: async (sql, params) => { calls.push({ sql, params }); return { rows: responses.shift() || [] }; } };
+  return { calls, query: async (sql, params) => {
+    calls.push({ sql, params });
+    if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
+    return { rows: responses.shift() || [] };
+  } };
 }
 
 test("stageEligibility: no outcome -> eligible; same hash -> not; changed hash -> eligible", async () => {
@@ -121,7 +125,8 @@ test("recordStageOutcomes rejects an In Progress ADVANCED result without PR evid
     [{ input_hash: "h1" }], []
   ]);
   await so.recordStageOutcomes(c, { logger: { log: (line) => logs.push(line) } });
-  assert.equal(c.calls[3].params[2], "FAILED");
+  const write = c.calls.find((call) => call.sql.includes("INSERT INTO issue_stage_outcome"));
+  assert.equal(write.params[2], "FAILED");
   assert.match(logs[0], /missing review evidence/);
 });
 
@@ -133,8 +138,11 @@ test("recordStageOutcomes never promotes a PR mentioned only in comment prose", 
       if (sql.includes("FROM agent_task_queue")) {
         return { rows: [{ id: "t4", issue_id: "i4", stage: "In Progress", output: "OUTCOME: ADVANCED" }] };
       }
+      if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
       if (sql.includes("has_review_evidence")) return { rows: [{ has_review_evidence: false }] };
       if (sql.includes("md5")) return { rows: [{ input_hash: "h4" }] };
+      if (sql.includes("SELECT id FROM issue") || sql.includes("FROM issue_work_product") ||
+          sql.includes("FROM issue_pull_request")) return { rows: [] };
       if (sql.includes("INSERT INTO issue_stage_outcome")) { writes.push(params); return { rows: [] }; }
       throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
     }
