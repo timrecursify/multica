@@ -1139,7 +1139,14 @@ test('configured stage pool fails closed when its members are incompatible', asy
   const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
     ? { rows: [] } : { rows: [scoper({ instructions: 'Own Queue tickets only.' })] } };
   await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
-    /No eligible stage owner in pool/);
+    /No eligible stage owner in pool: workspace-1\/Spec \(archived=0,status=0,runtime=0,instructions=1\)/);
+});
+
+test('configured stage pool reports an offline runtime as the eligibility defect', async () => {
+  const client = { query: async (sql) => /pg_advisory_xact_lock/.test(sql)
+    ? { rows: [] } : { rows: [scoper({ selected_runtime_id: null })] } };
+  await assert.rejects(() => selectStageOwner(client, 'workspace-1', 'Registered', 'Spec'),
+    /runtime=1/);
 });
 
 test('configured stage pool queues on the least-loaded member when every member is at capacity', async () => {

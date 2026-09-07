@@ -1327,6 +1327,17 @@ async function canonicalStageOwner(client, workspaceId, ownerStage) {
   return result.rows[0] || null;
 }
 
+function poolIneligibilitySummary(rows, toStage) {
+  const counts = { archived: 0, status: 0, runtime: 0, instructions: 0 };
+  for (const row of rows) {
+    if (row.archived_at !== null) counts.archived += 1;
+    if (!["idle", "working"].includes(row.agent_status)) counts.status += 1;
+    if (!row.selected_runtime_id) counts.runtime += 1;
+    if (!instructionCompatibility(row.instructions, toStage).ok) counts.instructions += 1;
+  }
+  return Object.entries(counts).map(([reason, count]) => `${reason}=${count}`).join(",");
+}
+
 async function selectPoolOwner(client, workspaceId, ownerStage, toStage, options = {}) {
   // Selection and the rotation update share the relay transaction. The advisory
   // lock makes equal-load choices stable under concurrent advances into this pool.
@@ -1362,7 +1373,10 @@ async function selectPoolOwner(client, workspaceId, ownerStage, toStage, options
   const identityEligible = result.rows.filter((row) => row.archived_at === null &&
     ["idle", "working"].includes(row.agent_status) && row.selected_runtime_id &&
     instructionCompatibility(row.instructions, toStage).ok);
-  if (identityEligible.length === 0) throw new Error(`No eligible stage owner in pool: ${workspaceId}/${toStage}`);
+  if (identityEligible.length === 0) {
+    const reasons = poolIneligibilitySummary(result.rows, toStage);
+    throw new Error(`No eligible stage owner in pool: ${workspaceId}/${toStage} (${reasons})`);
+  }
   const ts = (value) => (value === null || value === undefined) ? -Infinity : new Date(value).getTime();
   identityEligible.sort((left, right) => Number(left.active_task_count) - Number(right.active_task_count) ||
     ts(left.last_selected_at) - ts(right.last_selected_at) ||
