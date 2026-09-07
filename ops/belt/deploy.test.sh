@@ -152,20 +152,13 @@ selective_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --o
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$selective_receipt" --only multica-cicd-worker >/dev/null
 
 # A missing nested directory below an existing canonical service root is
-# created by selective deployment, while a missing service root remains a
-# fail-closed configuration error.
+# created by selective deployment.
 rm -rf -- "$relay_dir/parity"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-relay-advance-daemon >"$tmp_dir/parity-create.log"
 cmp -s -- "$root_dir/parity/multica-relay-advance-daemon.cjs" "$relay_dir/parity/multica-relay-advance-daemon.cjs"
 grep -q "Created target directory $relay_dir/parity" "$tmp_dir/parity-create.log"
 grep -q 'Backed up absence of new target' "$tmp_dir/parity-create.log"
 grep -q 'No processes were restarted.' "$tmp_dir/parity-create.log"
-rm -rf -- "$tmp_dir/multica-relay-advance"
-if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-relay-advance-daemon >"$tmp_dir/missing-service.log" 2>&1; then
-  echo 'expected missing canonical service root rejection' >&2
-  exit 1
-fi
-grep -q 'Missing runtime file:' "$tmp_dir/missing-service.log"
 
 # A selected wrapper is repaired even when runtime drifted; omitting it keeps
 # the fail-closed parity guard.
@@ -181,4 +174,13 @@ if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only mult
   exit 1
 fi
 grep -q 'Wrapper preflight: source/runtime parity mismatch (wrapper not selected)' "$tmp_dir/wrapper-selective.log"
+
+# Keep the absent-service-root check last because it deliberately removes the
+# relay fixture that later full-manifest tests require.
+rm -rf -- "$tmp_dir/multica-relay-advance"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-relay-advance-daemon >"$tmp_dir/missing-service.log" 2>&1; then
+  echo 'expected missing canonical service root rejection' >&2
+  exit 1
+fi
+grep -q 'Missing runtime file:' "$tmp_dir/missing-service.log"
 echo 'deploy rollback test passed'
