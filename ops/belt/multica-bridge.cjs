@@ -21,6 +21,7 @@ const { isQcLane, isSpecLane, qcEscalationModels, QC_ESCALATION_BOUNCES, qcLaneM
 const { recordParkAndQueueDiagnosis, isBuilderDispatchAllowed, parseRuntimeEvidenceReference } = require("./parked-diagnosis.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
+const { buildTaskAdmission } = require("./build-admission.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -1042,6 +1043,10 @@ async function replaceStageTask(client, task) {
   if (!isBuilderDispatchAllowed(context)) {
     throw new Error('builder dispatcher rejected a no_builder diagnosis task');
   }
+  const admission = await buildTaskAdmission(client, { issueId: task.issueId, toStage: task.toStage });
+  if (!admission.admit) return { taskId: admission.reuseTaskId, relayLogId: null, reused: true };
+  if (admission.qcAttemptId) context.qc_attempt_id = admission.qcAttemptId;
+  task.context = JSON.stringify(context);
   // The issue row is locked by relayAdvance. Cancel only unstarted relay work
   // for another execution stage before making the successor visible. Running
   // paid work and manual/disposition tasks are deliberately preserved.
@@ -1064,10 +1069,10 @@ async function replaceStageTask(client, task) {
     `INSERT INTO agent_task_queue (
        agent_id, issue_id, workspace_id, status, priority, runtime_id, context,
        trigger_summary, force_fresh_session, originator_source,
-       trigger_evidence_kind
+       trigger_evidence_kind, retry_of_task_id
      )
      SELECT $1, $2, $3, 'queued', $4, $5, $6::jsonb, $7, TRUE,
-            'unattributed', 'relay_stage_transition'
+            'unattributed', 'relay_stage_transition', $10::uuid
       WHERE NOT EXISTS (
         SELECT 1 FROM agent_task_queue active
          WHERE active.issue_id = $2
@@ -1077,7 +1082,7 @@ async function replaceStageTask(client, task) {
        ON CONFLICT DO NOTHING
        RETURNING id`,
     [task.agentId, task.issueId, task.workspaceId, task.priority, task.runtimeId, task.context,
-      task.triggerSummary, LIVE_TASK_STATUSES, task.toStage]
+      task.triggerSummary, LIVE_TASK_STATUSES, task.toStage, admission.retryOfTaskId || null]
   );
 
   const taskId = inserted.rows[0]?.id || await existingStageTask(
