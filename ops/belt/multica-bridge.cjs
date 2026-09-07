@@ -2051,7 +2051,13 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
-    const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
+    const parkedTransitionResult = await client.query(
+      `SELECT next_stage, alt_next_stages FROM relay_stage_config
+       WHERE workspace_id = $1 AND stage_name = $2`,
+      [issue.workspace_id, issue.status]);
+    const parkedAllowedStages = [parkedTransitionResult.rows[0]?.next_stage]
+      .concat(parkedTransitionResult.rows[0]?.alt_next_stages || []).filter(Boolean);
+    const parkedRelease = issue.status === "Parked" && parkedAllowedStages.includes(to_stage) &&
       issue.metadata?.parked_release_once === true;
     // Release admission is explicit and one-use: reason: "parked_release_required".
     // created_at >= $3; created_at >= $2; parked_release_once === true.
@@ -2062,7 +2068,8 @@ async function relayAdvance(req, res, body) {
     const parkedDiagnosisDone = issue.status === "Parked" && to_stage === "Done";
     // No reconciler/retry/outcome path may leave Parked. Only explicit
     // operator release or diagnosis admissions are exceptions.
-    const parkedOperatorRelease = issue.status === 'Parked' && explicitOperatorRelease;
+    const parkedOperatorRelease = issue.status === 'Parked' && explicitOperatorRelease &&
+      parkedAllowedStages.includes(to_stage);
     const parkedSystemExit = issue.status === 'Parked' &&
       (parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone);
     if (issue.status === 'Parked' && to_stage !== 'Parked' &&
