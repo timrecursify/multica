@@ -1815,8 +1815,7 @@ async function relayAdvance(req, res, body) {
       }));
       return;
     }
-    const parkedRelease = issue.status === "Parked" && ["Queue", "Spec"].includes(to_stage) &&
-      issue.metadata?.parked_release_once === true;
+    let parkedRelease = false;
     const parkedEvidenceQcRelease = await verifiedParkedEvidenceRelease(client, issue, to_stage, reason);
     // Parked -> Done is reserved for the relay's already-fixed diagnosis
     // outcome. It still reaches the current PASS + work-product-hash gate
@@ -1911,6 +1910,12 @@ async function relayAdvance(req, res, body) {
     const expectedStage = transitionResult.rows[0]?.next_stage;
     const altStages = transitionResult.rows[0]?.alt_next_stages || [];
     const allowedStages = [expectedStage].concat(altStages).filter(Boolean);
+    // An authenticated operator release may leave Parked only for a
+    // workspace-configured successor. Keep the one-time marker requirement,
+    // but do not hard-code Queue/Spec: some lanes legitimately release to
+    // In Review or another configured alternate.
+    parkedRelease = issue.status === "Parked" && allowedStages.includes(to_stage) &&
+      issue.metadata?.parked_release_once === true;
     if (issue.status === "In Review" && to_stage === "Spec" && !noArtifactRescope) {
       const decision = qcBounceDecision(await latestQcVerdict(client, issue_id), expectedStage);
       if (decision.action === "hold") {
