@@ -64,7 +64,54 @@ def child_block(c):
     if n:
         out.append('_Source thread: #%s (%d comment%s), preserved on the archived ticket._'
                    % (c['number'], n, '' if n == 1 else 's'))
+    # A child's open pull requests are the single most expensive thing to lose:
+    # archiving the child hides the only link between the requirement and the
+    # branch that already implements it, so the next builder reimplements work
+    # that is sitting in review. Description text alone does not carry this --
+    # the link lives in issue_pull_request, not in the body -- so it is copied
+    # here explicitly and, like every other section, the archive is conditional
+    # on it being readable back out of the MEGA.
+    out += pr_lines(c)
     return '\n\n'.join(out)
+
+
+def pr_lines(c):
+    """Markdown for the child's linked pull requests, newest first. Empty when it has none."""
+    prs = c.get('prs') or []
+    if not prs:
+        return []
+    rows = ['**Pull requests already open against this requirement** '
+            '(reconcile before writing new code)']
+    for p in sorted(prs, key=lambda x: (x.get('pr_created_at') or ''), reverse=True):
+        # 'merged' is not 'accepted': a QC FAIL recorded after the merge means
+        # the requirement is still open, so the verdict is printed beside the
+        # state rather than being collapsed into it.
+        state = 'merged' if p.get('merged_at') else (p.get('state') or 'unknown')
+        bits = ['`%s/%s#%s`' % (p.get('repo_owner'), p.get('repo_name'), p.get('pr_number')),
+                'state: **%s**' % state]
+        if p.get('merged_at'):
+            bits.append('merged %s' % str(p['merged_at'])[:16] + 'Z')
+        # qc_verdict, never qc_attempt: a PASS and its post-gate FAIL share an
+        # idem_key and the FAIL is dropped by ON CONFLICT DO NOTHING, so
+        # qc_attempt reports a pass for work that was later rejected.
+        if p.get('verdict'):
+            bits.append('QC %s (%s)' % (p['verdict'], str(p.get('verdict_at'))[:16] + 'Z'))
+        else:
+            bits.append('QC verdict: none recorded')
+        bits.append(p.get('html_url') or '')
+        rows.append('- ' + ' — '.join(b for b in bits if b))
+    return ['\n'.join(rows)]
+
+
+def mega_body(base, kids):
+    """The MEGA description as written to the database.
+
+    Composition is a named function so the regression suite can assert what the
+    MEGA actually ends up holding -- notably that a child carrying an
+    issue_pull_request row cannot produce a body without that PR reference.
+    """
+    return (base + '\n\n' + MARK + '\n' + PREAMBLE + '\n'
+            + '\n\n'.join(child_block(c) for c in kids) + '\n')
 
 
 def fetch(mega_filter):
@@ -77,7 +124,32 @@ SELECT coalesce(json_agg(m),'[]') FROM (
                'descr', c.description, 'ac', c.acceptance_criteria,
                'meta', c.metadata,
                'comments', (SELECT json_agg(cm.content ORDER BY cm.created_at)
-                              FROM comment cm WHERE cm.issue_id = c.id)) AS k
+                              FROM comment cm WHERE cm.issue_id = c.id),
+               -- The child's PR trail. Both link tables are read: GitHub is the
+               -- live provider, vcs_pull_request is the self-hosted one, and a
+               -- board can hold either.
+               'prs', (SELECT json_agg(pj) FROM (
+                   SELECT g.repo_owner, g.repo_name, g.pr_number, g.state,
+                          g.html_url, g.merged_at, g.pr_created_at,
+                          v.verdict, v.created_at AS verdict_at
+                     FROM issue_pull_request ipr
+                     JOIN github_pull_request g ON g.id = ipr.pull_request_id
+                     LEFT JOIN LATERAL (SELECT qv.verdict, qv.created_at
+                                          FROM qc_verdict qv
+                                         WHERE qv.issue_id = c.id
+                                      ORDER BY qv.created_at DESC LIMIT 1) v ON true
+                    WHERE ipr.issue_id = c.id
+                   UNION ALL
+                   SELECT x.repo_owner, x.repo_name, x.pr_number, x.state,
+                          x.html_url, x.merged_at, x.pr_created_at,
+                          v.verdict, v.created_at AS verdict_at
+                     FROM issue_vcs_pull_request ivpr
+                     JOIN vcs_pull_request x ON x.id = ivpr.pull_request_id
+                     LEFT JOIN LATERAL (SELECT qv.verdict, qv.created_at
+                                          FROM qc_verdict qv
+                                         WHERE qv.issue_id = c.id
+                                      ORDER BY qv.created_at DESC LIMIT 1) v ON true
+                    WHERE ivpr.issue_id = c.id) pj)) AS k
                FROM issue c
               WHERE c.parent_issue_id = p.id
                 AND c.title NOT LIKE 'MEGA%%'
@@ -139,8 +211,7 @@ def main():
 
         # Re-fold every live child, not only the new ones: the description is
         # rebuilt from base each run, so a partial list would drop the rest.
-        allblocks = [child_block(c) for c in m['kids']]
-        newd = base + '\n\n' + MARK + '\n' + PREAMBLE + '\n' + '\n\n'.join(allblocks) + '\n'
+        newd = mega_body(base, m['kids'])
         if not a.apply:
             print('DRY mega #%s children=%d bytes=%d' % (m['mega_number'], len(m['kids']), len(newd)))
             continue
