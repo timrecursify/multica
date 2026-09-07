@@ -22,9 +22,11 @@ test('an escalation failure is isolated so later tickets are still processed', a
   const logs = [];
   const pool = { query: async (sql, params) => {
     if (sql.includes("FROM issue WHERE")) return { rows: issues };
-    if (sql.includes('FROM comment')) {
+    if (sql.includes('FROM issue_work_product')) {
       const issue = issues.find(candidate => candidate.id === params[0]);
-      return { rows: [{ content: `PR: https://github.com/acme/repo/pull/${issue.number}` }] };
+      return { rows: [{ scope_revision: 1, kind: 'implementation', repository: 'acme/repo',
+        branch: `fix/${issue.number}`, pr_number: issue.number, head_sha: 'a'.repeat(40),
+        acceptance_evidence: { verified: true }, dependency_issue_ids: [] }] };
     }
     if (sql.includes('FROM qc_verdict')) return { rows: [] };
     return { rows: [] };

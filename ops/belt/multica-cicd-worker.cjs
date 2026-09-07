@@ -675,29 +675,6 @@ function countCiFailure(issue, pr, sha, ci) {
   return count;
 }
 
-// A flight can cite more than one pull request, and taking the first match
-// closes it against whichever happened to be mentioned most recently. gsp#83
-// cites sk-cli#316 (merged) and sk-cli#498 (open): the single-match read shipped
-// it to Done on #316 every poll while belt-config-guard.sh returned it for #498,
-// so the two flapped once every five minutes. A flight is finished only when
-// EVERY pull request it references is finished.
-function findAllPRs(work) {
-  const out = [];
-  const seen = new Set();
-  const re = /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/gi;
-  let m;
-  while ((m = re.exec(work || '')) !== null) {
-    const pr = { repo: `${m[1]}/${m[2]}`, num: m[3] };
-    const k = `${pr.repo}#${pr.num}`;
-    if (!seen.has(k)) { seen.add(k); out.push(pr); }
-  }
-  return out;
-}
-
-function hasBarePRReference(work) {
-  return /\bPR\s*#\d+/i.test(work || '');
-}
-
 // Green means every completed run on THIS head SHA succeeded. A run list
 // filtered by status alone can return a success from an older SHA of the same
 // branch, which is how a red PR reads as green.
@@ -743,98 +720,80 @@ async function sweep() {
     issue.cicd_task_id = task.rows[0]?.id || null;
     try {
       watchdog.observe(issue.id);
-      // Read the thread, not just its last line. The pull request is announced by
-      // whichever comment the builder wrote, and a later note pushes it out of a
-      // one-row lookup. Reading one comment closed flights whose pull request was
-      // still open, which is the exact failure this stage exists to prevent.
-      // Read every comment, including QC ones. A QC verdict frequently carries the
-      // pull request it reviewed, and skipping those comments made this stage fall
-      // back to an older link: #78 was closed against ppp#8881 while its real pull
-      // request, ppp#10474, was open and mergeable in a comment the filter dropped.
-      const w = await pool.query(
-        `SELECT content FROM comment WHERE issue_id=$1
-         ORDER BY created_at DESC LIMIT 40`, [issue.id]);
-      const seenPR = new Set();
-      const prs = [];
-      let hasBarePR = false;
-      for (const row of w.rows) {
-        const content = row.content || '';
-        hasBarePR ||= hasBarePRReference(content);
-        for (const cand of findAllPRs(content)) {
-          const k = `${cand.repo}#${cand.num}`;
-          if (!seenPR.has(k)) { seenPR.add(k); prs.push(cand); }
-        }
-      }
-      if (!prs.length) {
-        await returnIssueToBuild(issue, hasBarePR ? 'ambiguous PR reference, no repository' : 'no PR referenced');
+      const products = await pool.query(
+        `SELECT scope_revision, kind, repository, branch, pr_number, head_sha,
+                acceptance_evidence, replaces_scope_revision, dependency_issue_ids
+           FROM issue_work_product
+          WHERE issue_id=$1::uuid AND status='active'
+            AND consuming_stage='CI/CD & Deploy'
+          ORDER BY scope_revision DESC LIMIT 2`, [issue.id]);
+      if (!products.rows.length) {
+        await returnIssueToBuild(issue, 'no active canonical work product for CI/CD & Deploy');
         watchdog.clear(issue.id);
         continue;
       }
-
-      // Resolve every referenced PR first, then decide once.
-      const states = [];
-      for (const cand of prs) {
-        const key = `${cand.repo}#${cand.num}`;
-        let info = prCache.get(key);
-        if (!info) {
-          info = JSON.parse(gh(['pr', 'view', cand.num, '-R', cand.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit']));
-          prCache.set(key, info);
-        }
-        states.push({ pr: cand, info });
-      }
-      // A closed, unmerged pull request is a dead end only when nothing
-      // replaced it. gsp#1577 cited sk-cli#986 (closed) and its replacement
-      // #1123 (open, mergeable): returning on #986 sent the builder to rebase
-      // #1123 four times in 30 minutes (2026-09-03 06:05Z). A superseded PR is
-      // ignored; the ticket returns only when every cited PR is closed.
-      const closed = states.filter(s2 => s2.info.state === 'CLOSED');
-      const alive = states.filter(s2 => s2.info.state !== 'CLOSED');
-      if (closed.length && !alive.length) {
-        await returnIssueToBuild(issue, closed.map(s2 => `${s2.pr.repo}#${s2.pr.num} closed without merge`).join(', '));
+      if (products.rows.length !== 1) {
+        await retryEscalation(issue, 'Parked',
+          `work_product_identity_conflict issue=${issue.id} active_products=${products.rows.length}`);
         continue;
       }
-      if (closed.length) {
-        log(`SUPERSEDED #${issue.number} ignoring ${closed.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', ')} (closed; ${alive.length} live PR(s) remain)`);
+      const product = products.rows[0];
+      if (product.kind !== 'implementation') {
+        await retryEscalation(issue, 'Parked',
+          `non_code_product_misrouted issue=${issue.id} kind=${product.kind} scope_revision=${product.scope_revision}`);
+        continue;
       }
-      const openStates = alive.filter(s2 => s2.info.state !== 'MERGED');
-      if (!openStates.length) {
-        // Several merged PRs finish a ticket when the newest of them is
-        // deployed (gsp#1058: four merged sk-cli PRs, returned every poll).
-        const merged = alive.filter(s2 => /^[0-9a-f]{40}$/.test(s2.info.mergeCommit?.oid || ''))
-          .sort((a, b) => String(b.info.mergedAt || '').localeCompare(String(a.info.mergedAt || '')));
-        if (!merged.length) {
-          await returnIssueToBuild(issue, 'exactly one merged PR with a full merge SHA is required');
+      const evidence = product.acceptance_evidence;
+      if (!product.repository || !product.branch || !product.pr_number ||
+          !/^[0-9a-f]{40}$/.test(product.head_sha || '') || !evidence ||
+          typeof evidence !== 'object' || !Object.keys(evidence).length) {
+        await returnIssueToBuild(issue, `canonical work product scope_revision=${product.scope_revision} is incomplete`);
+        continue;
+      }
+
+      const pr = { repo: product.repository, num: String(product.pr_number) };
+      const key = `${pr.repo}#${pr.num}`;
+      let info = prCache.get(key);
+      if (!info) {
+        info = JSON.parse(gh(['pr', 'view', pr.num, '-R', pr.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit']));
+        prCache.set(key, info);
+      }
+      if (info.headRefOid !== product.head_sha) {
+        await returnToBuild(issue, pr,
+          `head SHA changed from canonical ${product.head_sha} to ${info.headRefOid || 'missing'}; update the existing branch ${product.branch} and work product`);
+        continue;
+      }
+      if (info.state === 'CLOSED') {
+        await returnToBuild(issue, pr, 'canonical PR closed without merge; replacement requires a new scope revision');
+        continue;
+      }
+      if (info.state === 'MERGED') {
+        const mergedSha = info.mergeCommit?.oid || '';
+        if (!/^[0-9a-f]{40}$/.test(mergedSha)) {
+          await returnIssueToBuild(issue, 'canonical merged PR has no full merge SHA');
           continue;
         }
-        const last = merged[0];
-        const result = await routeFinishedPR(issue, merged.length === 1 ? 'merged PR' : `latest of ${merged.length} merged PRs`, last.info.mergeCommit.oid, {
-          repo: last.pr.repo, num: last.pr.num, headSha: last.info.headRefOid, createdAt: last.info.createdAt,
-          mergedAt: last.info.mergedAt
+        const result = await routeFinishedPR(issue, 'canonical merged PR', mergedSha, {
+          repo: pr.repo, num: pr.num, headSha: product.head_sha,
+          createdAt: info.createdAt, mergedAt: info.mergedAt
         });
-        if (result?.status === 'pending') await closureWatchdog(issue, result, last.info.mergeCommit.oid);
+        if (result?.status === 'pending') await closureWatchdog(issue, result, mergedSha);
         else if (result?.status === 'done' || result?.status === 'returned') watchdog.clear(issue.id);
         continue;
       }
-      if (openStates.length > 1) {
-        const list = openStates.map(s2 => `${s2.pr.repo}#${s2.pr.num}`).join(', ');
-        await returnToBuild(issue, openStates[0].pr,
-          `${openStates.length} open PRs (${list}); keep exactly one: close the superseded PRs with gh pr close, then rebase the survivor`);
-        continue;
-      }
-      const pr = openStates[0].pr;
-      const info = openStates[0].info;
 
       if (info.mergeable === 'CONFLICTING') {
-        await returnToBuild(issue, pr, 'merge conflict; verify master..merge diff after rebase');
+        await returnToBuild(issue, pr,
+          `merge conflict; rework the existing branch ${product.branch} and update this work product`);
         continue;
       }
 
-      const ci = ciState(pr.repo, info.headRefOid, info.createdAt);
+      const ci = ciState(pr.repo, product.head_sha, info.createdAt);
       if (ci === 'absent') {
         await returnToBuild(issue, pr, `no CI runs after ${CI_ABSENT_MINUTES} minutes`);
         continue;
       }
-      const failures = countCiFailure(issue, pr, info.headRefOid, ci);
+      const failures = countCiFailure(issue, pr, product.head_sha, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
       if (ci !== 'green') {
         const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && info.mergeable !== 'CONFLICTING' ? retroactiveEligible(pr.repo, pr.num) : null;
@@ -865,7 +824,8 @@ async function sweep() {
         // and the merge call then answers 405 "merge conflicts". That is the
         // same fact as CONFLICTING: return it now instead of retrying every poll.
         if (/merge conflicts/i.test(String(e.message))) {
-          await returnToBuild(issue, pr, 'merge conflict; verify master..merge diff after rebase');
+          await returnToBuild(issue, pr,
+            `merge conflict; rework the existing branch ${product.branch} and update this work product`);
           continue;
         }
         log(`MERGE-FAIL #${issue.number} ${pr.repo}#${pr.num}: ${String(e.message).split('\n')[0].slice(0, 160)}`);

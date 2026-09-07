@@ -49,34 +49,35 @@ function legacyOutcome(text) {
   return { outcome: "FAILED", blockedOn: null };
 }
 
-// Inputs the agent could have acted on: PR head sha, CI rollup, operator comment
-// content, dependency states, spec/description body. Any change re-opens the stage.
-//
-// Comments contribute the md5 set of DISTINCT operator comment bodies
-// (source_task_id IS NULL), never a comment id. Hashing the newest id let a
-// builder's own blocker comment mutate the hash and re-dispatch the stage that
-// had just reported BLOCKED, so a permanently blocked ticket rebuilt every
-// cooldown window. Content excludes belt output; the DISTINCT set also makes a
-// repeated identical operator note (the CI/CD worker re-posts one each poll) a
-// no-op, while genuinely new operator text still re-opens the stage.
+// The active work product is the only ownership/input record. Comment prose and
+// historical issue-to-PR links are presentation data and cannot re-open a stage.
 function stageInputHashSql() {
   return `
-    WITH pr AS (
-      SELECT p.id, p.head_sha, p.checks_rollup_state
-      FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
-      WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1)
-    SELECT md5(concat_ws('|',
-      (SELECT head_sha FROM pr), (SELECT checks_rollup_state FROM pr),
+    WITH product AS (
+      SELECT wp.* FROM issue_work_product wp
+      WHERE wp.issue_id = $1::uuid AND wp.status = 'active'
+    ), pr AS (
+      SELECT gh.id, gh.head_sha, gh.checks_rollup_state
+      FROM product wp JOIN issue i ON i.id = wp.issue_id
+      JOIN github_pull_request gh ON gh.workspace_id = i.workspace_id
+       AND gh.repo_owner || '/' || gh.repo_name = wp.repository
+       AND gh.pr_number = wp.pr_number AND gh.head_sha = wp.head_sha
+      WHERE wp.kind = 'implementation' LIMIT 1)
+    SELECT CASE WHEN wp.issue_id IS NULL THEN NULL ELSE md5(concat_ws('|',
+      wp.scope_revision::text, wp.kind, wp.repository, wp.branch,
+      wp.pr_number::text, wp.head_sha, wp.consuming_stage,
+      md5(wp.acceptance_evidence::text),
+      (SELECT checks_rollup_state FROM pr),
       (SELECT string_agg(s.suite_id::text || ':' || s.status || ':' || coalesce(s.conclusion, ''), ',' ORDER BY s.suite_id)
          FROM github_pull_request_check_suite s
         WHERE s.pr_id = (SELECT id FROM pr) AND s.head_sha = (SELECT head_sha FROM pr)),
-      (SELECT md5(string_agg(DISTINCT md5(c.content), ',' ORDER BY md5(c.content)))
-         FROM comment c WHERE c.issue_id = i.id AND c.source_task_id IS NULL),
-      (SELECT string_agg(d.depends_on_issue_id::text || ':' || di.status, ',' ORDER BY d.depends_on_issue_id)
-         FROM issue_dependency d JOIN issue di ON di.id = d.depends_on_issue_id WHERE d.issue_id = i.id),
-      md5(coalesce(i.description, '')))) AS input_hash,
+      (SELECT string_agg(dep.id::text || ':' || dep.status, ',' ORDER BY dep.id)
+         FROM unnest(wp.dependency_issue_ids) dependency(dependency_id)
+         JOIN issue dep ON dep.id = dependency.dependency_id)
+    )) END AS input_hash,
     i.status AS issue_status
-    FROM issue i WHERE i.id = $1::uuid`;
+    FROM issue i LEFT JOIN product wp ON wp.issue_id = i.id
+    WHERE i.id = $1::uuid`;
 }
 
 function outcomeForStageSql() {
@@ -124,13 +125,13 @@ function unrecordedCompletionsSql() {
 // as long as it stayed in the window. Each row is therefore isolated, and a write
 // the database refuses is retried once without blocked_on so the outcome kind
 // still lands.
-async function recordStageOutcomes(client, { windowMinutes = 180, logger = console, githubCommand } = {}) {
+async function recordStageOutcomes(client, { windowMinutes = 180, logger = console } = {}) {
   const rows = (await client.query(unrecordedCompletionsSql(), [windowMinutes])).rows;
   let recorded = 0;
   let failed = 0;
   for (const row of rows) {
     try {
-      recorded += await recordOneOutcome(client, row, logger, { githubCommand });
+      recorded += await recordOneOutcome(client, row, logger);
     } catch (error) {
       failed += 1;
       logger.log(`[stage-outcome] record failed task=${row.id} stage=${row.stage}: ${error?.message || error}`);
@@ -139,33 +140,25 @@ async function recordStageOutcomes(client, { windowMinutes = 180, logger = conso
   return { scanned: rows.length, recorded, failed };
 }
 
-async function recordOneOutcome(client, row, logger, { githubCommand } = {}) {
+async function recordOneOutcome(client, row, logger) {
   const parsed = parseOutcome(row.output);
-  // An In Progress completion is the implementation handoff. It cannot be
-  // advanced without a linked PR and bound head SHA, so do not persist a
-  // misleading terminal ADVANCED outcome when that evidence is absent.
+  // Every implementation, no-change, and operational handoff has one explicit
+  // active product with verified evidence. Free text cannot supply ownership.
   if (parsed.outcome === "ADVANCED" && row.stage === "In Progress") {
     const evidence = (await client.query(
       `SELECT EXISTS (
-         SELECT 1 FROM issue_pull_request ipr
-         JOIN github_pull_request p ON p.id = ipr.pull_request_id
-         WHERE ipr.issue_id = $1::uuid AND NULLIF(p.head_sha, '') IS NOT NULL
+         SELECT 1 FROM issue_work_product wp
+         WHERE wp.issue_id = $1::uuid AND wp.status = 'active'
+           AND wp.consuming_stage = 'In Review'
+           AND wp.acceptance_evidence <> '{}'::jsonb
+           AND (
+             (wp.kind = 'implementation' AND wp.repository IS NOT NULL
+               AND wp.branch IS NOT NULL AND wp.pr_number IS NOT NULL
+               AND wp.head_sha ~ '^[0-9a-f]{40}$')
+             OR (wp.kind IN ('no_change', 'operational')
+               AND wp.acceptance_evidence->>'verified' = 'true')
+           )
        ) AS has_review_evidence`, [row.issue_id])).rows[0];
-    if (!evidence?.has_review_evidence && githubCommand) {
-      const issue = (await client.query(
-        `SELECT id, workspace_id, status FROM issue WHERE id = $1::uuid`, [row.issue_id])).rows[0];
-      if (issue) {
-        const { linkObservedPullRequest } = require('./reconciler.cjs');
-        await linkObservedPullRequest(client, issue, { githubCommand });
-      }
-      const retriedEvidence = (await client.query(
-        `SELECT EXISTS (
-           SELECT 1 FROM issue_pull_request ipr
-           JOIN github_pull_request p ON p.id = ipr.pull_request_id
-           WHERE ipr.issue_id = $1::uuid AND NULLIF(p.head_sha, '') IS NOT NULL
-         ) AS has_review_evidence`, [row.issue_id])).rows[0];
-      if (retriedEvidence?.has_review_evidence) return persistOutcome(client, row, parsed, logger);
-    }
     if (!evidence?.has_review_evidence) {
       parsed.outcome = "FAILED";
       parsed.blockedOn = null;

@@ -125,64 +125,35 @@ test("recordStageOutcomes rejects an In Progress ADVANCED result without PR evid
   assert.match(logs[0], /missing review evidence/);
 });
 
-test("recordStageOutcomes links the observed PR and keeps In Progress ADVANCED", async () => {
-  // The real reconciler.linkObservedPullRequest runs here: the comment row is the
-  // only PR pointer, `gh pr view` supplies headRefOid, and the link row it writes
-  // is what turns the missing evidence into a supported ADVANCED outcome.
-  const writes = { pr: null, link: null, outcome: null };
+test("recordStageOutcomes never promotes a PR mentioned only in comment prose", async () => {
+  const writes = [];
   const ghCalls = [];
-  let linked = false;
   const client = {
     query: async (sql, params) => {
       if (sql.includes("FROM agent_task_queue")) {
         return { rows: [{ id: "t4", issue_id: "i4", stage: "In Progress", output: "OUTCOME: ADVANCED" }] };
       }
-      if (sql.includes("has_review_evidence")) return { rows: [{ has_review_evidence: linked }] };
+      if (sql.includes("has_review_evidence")) return { rows: [{ has_review_evidence: false }] };
       if (sql.includes("md5")) return { rows: [{ input_hash: "h4" }] };
-      if (sql.includes("FROM issue WHERE id")) return { rows: [{ id: "i4", workspace_id: "w1", status: "In Progress" }] };
-      if (sql.includes("FROM comment WHERE issue_id")) {
-        return { rows: [{ content: "opened https://github.com/acme/widget/pull/42 for review" }] };
-      }
-      if (sql.includes("INSERT INTO github_pull_request")) { writes.pr = params; return { rows: [{ id: "pr-1" }] }; }
-      if (sql.includes("INSERT INTO issue_pull_request")) { writes.link = params; linked = true; return { rows: [] }; }
-      if (sql.includes("INSERT INTO issue_stage_outcome")) { writes.outcome = params; return { rows: [] }; }
+      if (sql.includes("INSERT INTO issue_stage_outcome")) { writes.push(params); return { rows: [] }; }
       throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
     }
   };
-  const view = {
-    number: 42, title: "Fix widget", state: "OPEN", url: "https://github.com/acme/widget/pull/42",
-    headRefOid: "abc123def4567890", headRefName: "fix/widget", author: { login: "dev" },
-    createdAt: "2026-09-06T00:00:00Z", updatedAt: "2026-09-06T01:00:00Z",
-    additions: 3, deletions: 1, changedFiles: 1, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
-    statusCheckRollup: [{ conclusion: "SUCCESS" }]
-  };
-  const logs = [];
   const result = await so.recordStageOutcomes(client, {
-    logger: { log: (line) => logs.push(line) },
-    githubCommand: (args) => { ghCalls.push(args); return JSON.stringify(view); }
+    logger: { log: () => {} },
+    githubCommand: (...args) => { ghCalls.push(args); }
   });
 
   assert.deepEqual(result, { scanned: 1, recorded: 1, failed: 0 });
-  // The PR the comment pointed at is the PR that was read.
-  assert.deepEqual(ghCalls.length, 1);
-  assert.deepEqual(ghCalls[0].slice(0, 3), ["pr", "view", "https://github.com/acme/widget/pull/42"]);
-  assert.match(ghCalls[0][4], /headRefOid/);
-  // github_pull_request carries the observed head sha; without it the evidence
-  // query (NULLIF(p.head_sha, '')) would still see nothing.
-  assert.deepEqual(writes.pr.slice(0, 4), ["w1", "acme", "widget", 42]);
-  assert.equal(writes.pr[13], "abc123def4567890");
-  // The link row is the reconciliation this stage depends on.
-  assert.deepEqual(writes.link, ["i4", "pr-1"]);
-  assert.deepEqual(writes.outcome, ["i4", "In Progress", "ADVANCED", null, "t4", "h4"]);
-  assert.equal(logs.filter((line) => /missing review evidence/.test(line)).length, 0);
+  assert.equal(ghCalls.length, 0);
+  assert.deepEqual(writes[0], ["i4", "In Progress", "FAILED", null, "t4", "h4"]);
 });
-test("input hash ignores belt output and keys operator comments by content", () => {
+test("input hash uses the active product and declared dependency state", () => {
   const sql = so.stageInputHashSql();
-  // A builder's own comment must never re-open the stage it just reported on.
-  assert.match(sql, /c\.source_task_id IS NULL/);
-  assert.doesNotMatch(sql, /c\.id::text/);
-  // Content, not identity, so an identical repeated operator note is not new input.
-  assert.match(sql, /md5\(string_agg\(DISTINCT md5\(c\.content\)/);
+  assert.match(sql, /FROM issue_work_product/);
+  assert.match(sql, /wp\.status = 'active'/);
+  assert.match(sql, /unnest\(wp\.dependency_issue_ids\)/);
+  assert.doesNotMatch(sql, /FROM comment|issue_pull_request/);
 });
 
 test("typed line accepts a bare blocked_on token as well as blocked_on=", () => {
