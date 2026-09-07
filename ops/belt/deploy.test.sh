@@ -112,12 +112,15 @@ bridge_dir="$tmp_dir/gsp-multica-bridge"
 relay_dir="$tmp_dir/multica-relay-advance/app"
 worker_dir="$tmp_dir/gsp-multica-worker"
 cicd_dir="$tmp_dir/multica-cicd-worker"
+doctrine_dir="$tmp_dir/multica-doctrine"
 
 dry_log="$tmp_dir/dry-run.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run >"$dry_log"
 grep -q "Would copy .*/parked-diagnosis.cjs to $bridge_dir/parked-diagnosis.cjs" "$dry_log"
 grep -q "Would copy .*/parked-diagnosis.cjs to $relay_dir/parked-diagnosis.cjs" "$dry_log"
 grep -q "Would copy .*/parity/relay-dead-rows.cjs to .*/parity/relay-dead-rows.cjs" "$dry_log"
+grep -q "Would copy .*/multica-bundle.py to $doctrine_dir/multica-bundle.py" "$dry_log"
+grep -q "Would copy .*/RUNBOOK_SPEC_WORKER.md to $doctrine_dir/RUNBOOK_SPEC_WORKER.md" "$dry_log"
 # transition-policy.cjs ships to three service directories from one source row.
 [[ "$(grep -c 'Would copy .*/transition-policy.cjs' "$dry_log")" -eq 3 ]]
 grep -q '^Would restart gsp-multica-bridge$' "$dry_log"
@@ -175,6 +178,8 @@ apply_log="$tmp_dir/apply.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --all >"$apply_log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" "$(git -C "$root_dir/../.." rev-parse HEAD)" >"$tmp_dir/verify.log"
 grep -q "Match: $cicd_dir/multica-cicd-worker.cjs" "$tmp_dir/verify.log"
+[[ "$(stat -c '%a:%g' "$doctrine_dir/multica-bundle.py")" == "750:$(stat -c '%g' "$doctrine_dir")" ]]
+[[ "$(stat -c '%a:%g' "$doctrine_dir/RUNBOOK_SPEC_WORKER.md")" == "640:$(stat -c '%g' "$doctrine_dir")" ]]
 receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$apply_log")"
 [[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" >/dev/null

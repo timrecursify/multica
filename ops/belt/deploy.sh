@@ -202,15 +202,19 @@ done
 
 for index in "${!sources[@]}"; do
   selected "$index" || continue
-  # A missing target is allowed only when its canonical service root already
-  # exists. That is the real guard: it catches a wrong runtime root -- the
+  # A missing target is allowed only when its canonical runtime or doctrine
+  # root already exists. That is the real guard: it catches a wrong root -- the
   # failure that shipped a manifest pointing at /var/lib/gsp/gsp-multica, a
   # tree absent on gsp -- while letting a genuinely new file be created. The
   # per-file allowlist this replaces had to be edited for every added file and
   # silently encoded the old layout.
   new_targets[$index]=0
-  relative_target="${targets[$index]#"$runtime_root"/}"
-  service_root="$runtime_root/${relative_target%%/*}"
+  if [[ "${targets[$index]}" == "$doctrine_root/"* ]]; then
+    service_root="$doctrine_root"
+  else
+    relative_target="${targets[$index]#"$runtime_root"/}"
+    service_root="$runtime_root/${relative_target%%/*}"
+  fi
   [[ -d "$service_root" ]] && new_targets[$index]=1
   if [[ ! -f "${sources[$index]}" ]]; then
     printf 'Missing repository file: %s\n' "${sources[$index]}" >&2
@@ -331,6 +335,13 @@ for index in "${!sources[@]}"; do
     false
   fi
   cp --preserve=mode -- "$source_file" "$target_file"
+  if [[ "$target_file" == "$doctrine_root/"* ]]; then
+    chgrp --reference="$doctrine_root" -- "$target_file"
+    case "$target_file" in
+      *.py) chmod 0750 -- "$target_file" ;;
+      *) chmod 0640 -- "$target_file" ;;
+    esac
+  fi
   printf 'Copied %s to %s\n' "$source_file" "$target_file"
 done
 

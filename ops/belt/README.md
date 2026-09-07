@@ -40,8 +40,8 @@ To intentionally hold the AI worker during spend investigations or guarded
 deploys, create `/var/lib/gsp/.local/state/multica-ai-hold`. The guard then
 skips only `gsp-multica-worker`; bridge, CI/CD, archiver, and relay liveness
 checks continue. Remove the marker only after the worker may safely resume.
-| `multica-bundle.py` | `ops/belt/multica-bundle.py` | Run from the checkout; no persistent service |
-| `RUNBOOK_SPEC_WORKER.md` | `/var/lib/gsp/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | No process; this is the operational runbook |
+| `multica-bundle.py` | `/opt/gsp/multica-doctrine/multica-bundle.py` | Spec helper |
+| `RUNBOOK_SPEC_WORKER.md` | `/opt/gsp/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | Spec doctrine |
 
 ## Guard parity repair
 
