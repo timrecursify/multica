@@ -13,6 +13,7 @@ const { evaluate } = require('./transition-policy.cjs');
 const { createWatchdog, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
 const { mintGithubToken, repoFromGhArgs } = require('./github-token.cjs');
 const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multica-runtime/receipts';
+const SK_COMMAND = process.env.SK_COMMAND || '/home/newadmin/.local/bin/sk';
 let pool;
 let relayToken;
 let readReceipt = (sha) => JSON.parse(fs.readFileSync(`${RECEIPT_ROOT}/belt-${sha}.json`, 'utf8'));
@@ -560,7 +561,7 @@ function noteReturn(issue, reason) {
     '2. Push the rebased branch; confirm GitHub reports the PR mergeable and CI runs on the new head.',
     '3. Report the new head SHA. Reporting ADVANCED with the PR still conflicting or without a fresh CI run returns it here again.'].join('\n');
   try {
-    execFileSync('sk', ['multica', 'comment', '--board', board, '--number', String(issue.number), '--body', body],
+    execFileSync(SK_COMMAND, ['multica', 'comment', '--board', board, '--number', String(issue.number), '--body', body],
       { encoding: 'utf8', timeout: 60000, stdio: ['ignore', 'pipe', 'pipe'] });
   } catch (e) {
     log(`NOTE-FAIL #${issue.number} ${String(e.message).split('\n')[0].slice(0, 160)}`);
