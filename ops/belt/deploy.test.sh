@@ -177,6 +177,7 @@ grep -q 'Wrapper preflight: source/runtime parity mismatch (wrapper not selected
 
 # Keep the absent-service-root check last because it deliberately removes the
 # relay fixture that later full-manifest tests require.
+cp -- "$root_dir/multica-daemon-wrapper.sh" "$worker_dir/multica-daemon-wrapper.sh"
 rm -rf -- "$tmp_dir/multica-relay-advance"
 if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-relay-advance-daemon >"$tmp_dir/missing-service.log" 2>&1; then
   echo 'expected missing canonical service root rejection' >&2
