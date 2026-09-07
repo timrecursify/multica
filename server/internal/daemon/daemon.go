@@ -154,7 +154,7 @@ func taskMulticaEnvironment(task Task, agentName, token, configRoot, workspacesR
 		// node_modules remain task-local; only the pnpm content-addressed store is shared.
 		"MULTICA_CODE_REVIEW_GRAPH_VENV": filepath.Join(sharedCache, "code-review-graph", "2.3.8"),
 		"PNPM_HOME":                       filepath.Join(sharedCache, "pnpm"),
-		"PNPM_STORE_DIR":                  filepath.Join(sharedCache, "pnpm", "store"),
+		"npm_config_store_dir":            filepath.Join(sharedCache, "pnpm", "store"),
 		"npm_config_cache":                filepath.Join(sharedCache, "npm"),
 	}
 }

@@ -578,7 +578,7 @@ func TestTaskMulticaEnvironmentIncludesPrivateConfigRoot(t *testing.T) {
 		"TEMP":                         "/task/tmp",
 		"MULTICA_CODE_REVIEW_GRAPH_VENV": "/daemon/cache/code-review-graph/2.3.8",
 		"PNPM_HOME":                       "/daemon/cache/pnpm",
-		"PNPM_STORE_DIR":                  "/daemon/cache/pnpm/store",
+		"npm_config_store_dir":            "/daemon/cache/pnpm/store",
 		"npm_config_cache":                "/daemon/cache/npm",
 	}
 	if !maps.Equal(env, want) {

@@ -2,4 +2,6 @@
 Description=Garbage-collect idle belt task workspaces
 [Service]
 Type=oneshot
+Nice=10
+IOSchedulingClass=idle
 ExecStart=/opt/gsp/multica-workers/gsp-multica-worker/workspace-gc.sh --apply
