@@ -47,23 +47,28 @@ function runHelper(helper, repo, home) {
 
 function mintGithubToken(repo) {
   const helper = process.env.GSP_BELT_GIT_CREDENTIAL || DEFAULT_HELPER;
-  const fallback = writableCacheHome();
-  const homes = pinnedHome ? [pinnedHome] : ['', ...(fallback ? [fallback] : [])];
-  let detail = 'returned no token';
-  for (const home of homes) {
+  const attempt = (home) => {
     try {
       const token = runHelper(helper, repo, home);
-      if (token) {
-        if (home) pinnedHome = home;
-        failureLogged = false;
-        return token;
-      }
+      if (!token) return { detail: 'returned no token' };
+      if (home) pinnedHome = home;
+      failureLogged = false;
+      return { token };
     } catch (error) {
-      detail = error && error.message ? error.message : error;
+      return { detail: error && error.message ? error.message : error };
     }
+  };
+
+  let result = attempt(pinnedHome);
+  if (!result.token && !pinnedHome) {
+    // Look for a writable cache home only once the unit's own $HOME has failed,
+    // so a healthy $HOME never gets a spare cache directory created beside it.
+    const fallback = writableCacheHome();
+    if (fallback) result = attempt(fallback);
   }
+  if (result.token) return result.token;
   if (!failureLogged) {
-    console.error(`[github-token] ${helper} mint failed for ${repo}: ${String(detail).slice(0, 200)}`);
+    console.error(`[github-token] ${helper} mint failed for ${repo}: ${String(result.detail).slice(0, 200)}`);
     failureLogged = true;
   }
   return '';
