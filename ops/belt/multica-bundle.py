@@ -19,10 +19,9 @@ metadata.bundled_into so the move is reversible.
 Idempotent: a child already folded in with an unchanged content hash is skipped,
 so a crashed or re-run scoper never doubles a MEGA description.
 """
-import hashlib, json, subprocess, sys, argparse
+import hashlib, json, os, shutil, subprocess, sys, argparse
 
-DSN = ['docker', 'exec', '-i', 'gsp-multica-v2-postgres-1',
-       'psql', '-U', 'gsp_multica', '-d', 'gsp_multica']
+DSN = ['psql', '-h', '127.0.0.1', '-p', '25432']
 MARK = '## Bundled work (this MEGA is the only unit of work)'
 PREAMBLE = (
     'Each section below is a ticket folded into this MEGA. Those tickets are\n'
@@ -33,8 +32,18 @@ PREAMBLE = (
 def q(sql, rows=True):
     # SQL goes in on stdin, never as argv: a folded MEGA description reaches
     # six figures of bytes and `-c` died with E2BIG (Argument list too long).
-    r = subprocess.run(DSN + (['-At', '-f', '-'] if rows else ['-q', '-f', '-']),
-                       input=sql, capture_output=True, text=True)
+    missing = [name for name in ('MULTICA_POSTGRES_USER',
+                                 'MULTICA_POSTGRES_PASSWORD',
+                                 'MULTICA_POSTGRES_DB') if not os.environ.get(name)]
+    if missing:
+        sys.exit('missing required environment variable: ' + ', '.join(missing))
+    if shutil.which('psql') is None:
+        sys.exit('psql is not on PATH for the account running multica-bundle.py')
+    env = os.environ.copy()
+    env['PGPASSWORD'] = env['MULTICA_POSTGRES_PASSWORD']
+    dsn = DSN + ['-U', env['MULTICA_POSTGRES_USER'], '-d', env['MULTICA_POSTGRES_DB']]
+    r = subprocess.run(dsn + (['-At', '-f', '-'] if rows else ['-q', '-f', '-']),
+                       input=sql, capture_output=True, text=True, env=env)
     if r.returncode:
         sys.exit('psql failed: ' + r.stderr.strip()[:400])
     return r.stdout
