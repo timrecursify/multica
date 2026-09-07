@@ -228,6 +228,7 @@ func createDispatchedClaimFixtureTask(t *testing.T, ctx context.Context, agentID
 	t.Helper()
 
 	var taskID string
+	var activeTaskID string
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (
 			agent_id, runtime_id, issue_id, status, priority, dispatched_at, started_at
@@ -4214,16 +4215,31 @@ func TestGetTaskGCCheck(t *testing.T) {
 	})
 
 	var taskID string
+	workDir := "/workspaces/" + testWorkspaceID + "/quick-create-gc"
+	result, _ := json.Marshal(map[string]string{
+		"pr_url":      "https://github.com/example/repo/pull/42",
+		"branch_name": "agent/quick-create-gc",
+	})
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO agent_task_queue (
-			agent_id, runtime_id, status, priority, context, completed_at
+			agent_id, runtime_id, status, priority, context, completed_at, work_dir, result
 		)
-		VALUES ($1, $2, 'completed', 0, $3, NOW())
+		VALUES ($1, $2, 'completed', 0, $3, NOW(), $4, $5)
 		RETURNING id
-	`, agentID, runtimeID, quickContext).Scan(&taskID); err != nil {
+	`, agentID, runtimeID, quickContext, workDir, result).Scan(&taskID); err != nil {
 		t.Fatalf("setup: create quick-create task: %v", err)
 	}
-	defer testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id = $1`, taskID)
+	defer testPool.Exec(ctx, `DELETE FROM agent_task_queue WHERE id IN ($1, $2)`, taskID, activeTaskID)
+
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO agent_task_queue (
+			agent_id, runtime_id, status, priority, context, work_dir
+		)
+		VALUES ($1, $2, 'running', 0, $3, $4)
+		RETURNING id
+	`, agentID, runtimeID, quickContext, workDir).Scan(&activeTaskID); err != nil {
+		t.Fatalf("setup: create active workdir reference: %v", err)
+	}
 
 	// Cross-workspace probe.
 	w := httptest.NewRecorder()
@@ -4245,8 +4261,12 @@ func TestGetTaskGCCheck(t *testing.T) {
 		t.Fatalf("same-workspace token: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 	var resp struct {
-		Status      string `json:"status"`
-		CompletedAt string `json:"completed_at"`
+		Status           string `json:"status"`
+		CompletedAt      string `json:"completed_at"`
+		WorkDir          string `json:"work_dir"`
+		PRURL            string `json:"pr_url"`
+		BranchName       string `json:"branch_name"`
+		ActiveReferences int64  `json:"active_references"`
 	}
 	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode: %v", err)
@@ -4256,6 +4276,18 @@ func TestGetTaskGCCheck(t *testing.T) {
 	}
 	if resp.CompletedAt == "" {
 		t.Fatal("expected completed_at to be set for completed task")
+	}
+	if resp.WorkDir != workDir {
+		t.Fatalf("expected work_dir %q, got %q", workDir, resp.WorkDir)
+	}
+	if resp.PRURL != "https://github.com/example/repo/pull/42" {
+		t.Fatalf("expected pr_url from task result, got %q", resp.PRURL)
+	}
+	if resp.BranchName != "agent/quick-create-gc" {
+		t.Fatalf("expected branch_name from task result, got %q", resp.BranchName)
+	}
+	if resp.ActiveReferences != 1 {
+		t.Fatalf("expected one active workdir reference, got %d", resp.ActiveReferences)
 	}
 }
 
