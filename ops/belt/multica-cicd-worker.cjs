@@ -208,28 +208,48 @@ async function retryEscalation(issue, toStage, reason, evidence = {}) {
   await relay(issue.id, toStage, null, reason, null, retryEvidence, issue.cicd_task_id || issue.metadata?.cicd_task_id);
 }
 
+// `gh` exits with "To get started with GitHub CLI, please run: gh auth login"
+// when no token reached it, and with 401/Bad credentials when the token was
+// refused. Neither clears by waiting, so the retry budget -- six attempts over
+// roughly four minutes -- was spent re-asking a question already answered, and
+// the ticket returned to Spec long after its cause was known. Escalate on the
+// first such failure with a cause that names the credential, not the clock.
+const UNAUTHENTICATED_GH = /gh auth login|HTTP 401|Bad credentials|requires authentication|authentication required/i;
+function unauthenticatedGh(error) {
+  return UNAUTHENTICATED_GH.test(String(error && error.message ? error.message : error));
+}
+
+async function escalateToSpec(issue, detail, sha) {
+  const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
+  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
+  if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
+  await relay(issue.id, 'Spec', null, detail, null, evidence);
+  log(`ESCALATE #${issue.number} — ${detail}`);
+}
+
 async function watchdogFailure(issue, error, sha = '') {
   const row = watchdog.observe(issue.id, { sha, outcome: 'retrying', error });
+  const elapsed = () => Date.now() - Date.parse(row.first_seen_at);
+  const cause = `stage=${row.stage} attempts=${row.attempts} elapsed_ms=${elapsed()} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
   // The sentinel is a wall-clock bound independent of poll count. Sparse or
   // failed polls must still produce an auditable human-review hold on time.
   if (watchdog.stalled(row)) {
     const stalled = watchdog.markAlerted(row);
-    const detail = `deploy_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
-    const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
-    const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
-    if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
-    await relay(issue.id, 'Spec', null, detail, null, evidence);
-    log(`ESCALATE #${issue.number} — ${detail}`);
+    const detail = `deploy_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed()} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
+    await escalateToSpec(issue, detail, sha);
     return { stalled: true, audit: stalled };
   }
+  if (unauthenticatedGh(error)) {
+    const detail = `deploy_unauthenticated issue=${issue.id} ${cause}`;
+    log(`TERMINAL #${issue.number} github credential unavailable; retrying cannot mint one correlation_key=${row.correlation_key}`);
+    const audit = watchdog.markAlerted(row, 'deploy_unauthenticated');
+    await escalateToSpec(issue, detail, sha);
+    return { stalled: true, audit };
+  }
   if (!watchdog.retryAllowed(row)) {
-    const detail = `deploy_retry_exhausted issue=${issue.id} stage=${row.stage} attempts=${row.attempts} elapsed_ms=${Date.now() - Date.parse(row.first_seen_at)} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
+    const detail = `deploy_retry_exhausted issue=${issue.id} ${cause}`;
     log(`TERMINAL #${issue.number} retry limit exhausted before sentinel; escalating correlation_key=${row.correlation_key}`);
-    const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
-    const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
-    if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
-    await relay(issue.id, 'Spec', null, detail, null, evidence);
-    log(`ESCALATE #${issue.number} — ${detail}`);
+    await escalateToSpec(issue, detail, sha);
     return { stalled: true, audit: row };
   }
   log(`RETRY #${issue.number} attempt=${row.attempts}/${RETRY_LIMIT} backoff_ms=${watchdog.backoffMs(row)} correlation_key=${row.correlation_key}`);
