@@ -52,6 +52,19 @@ if ! env MULTICA_OPERATOR_RELEASE_FILE="$release_fixture/release" MULTICA_SUPERV
   echo 'worker release gate behavior unexpected'; exit 1
 fi
 rm -rf "$release_fixture"
+
+# Exercise the worker safety gate and prove held remediation performs no PM2 action.
+guard_fixture="$(mktemp -d)"
+cat >"$guard_fixture/pm2" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$PM2_CALLS"
+[[ "$1" == jlist ]] && printf '%s\n' '[{"name":"gsp-multica-worker","pm2_env":{"status":"stopped","max_restarts":10}}]'
+EOF
+chmod +x "$guard_fixture/pm2"
+held_result=$(PM2_CALLS="$guard_fixture/calls" BELT_PM2="$guard_fixture/pm2" MULTICA_AI_HOLD_FILE="$guard_fixture/hold" MULTICA_OPERATOR_RELEASE_FILE="$guard_fixture/release" MULTICA_SUPERVISOR_APPROVAL_FILE="$guard_fixture/approval" bash -c 'source "$1"; touch "$MULTICA_AI_HOLD_FILE"; fixed=(); unfixable=(); guard_tower_process; printf "%s|%s" "${#fixed[@]}" "${#unfixable[@]}"' _ "$root_dir/belt-config-guard.sh")
+assert_eq '0|1' "$held_result" 'held worker reports human-review diagnostic'
+[[ ! -s "$guard_fixture/calls" ]] || { echo 'held worker was restarted' >&2; exit 1; }
+rm -rf "$guard_fixture"
 for expected in "${RELAY_CAP_EXPECTATIONS[@]}"; do
   IFS='|' read -r app expected_stage expected_lifetime <<<"$expected"
   if ! relay_caps_match "$expected_stage" "$expected_lifetime" "$expected_stage" "$expected_lifetime"; then
