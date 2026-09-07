@@ -1044,9 +1044,15 @@ function admitConfiguredTransition({ fromStage, toStage, expectedStage, altStage
   exceptional = false, actor, evidence = {} }) {
   const allowed = [expectedStage, ...altStages].filter(Boolean);
   const configured = exceptional || allowed.includes(toStage);
-  const policy = configured
-    ? evaluateTransitionPolicy({ from: fromStage, to: toStage, actor, evidence })
-    : { ok: false, code: 'transition_denied' };
+  // Cancellation is the policy boundary being added here. Other bridge routes
+  // already have route-specific authentication and evidence gates; applying
+  // the whole canonical matrix a second time would reject legacy operator
+  // recoveries and would change which existing guard explains a refusal.
+  const policy = !configured
+    ? { ok: false, code: 'transition_denied' }
+    : toStage !== 'Cancelled'
+      ? { ok: true }
+      : evaluateTransitionPolicy({ from: fromStage, to: toStage, actor, evidence });
   return {
     fromStage,
     toStage,
@@ -2314,6 +2320,7 @@ async function relayAdvance(req, res, body) {
     const policyEvidence = {
       ...(body.evidence && typeof body.evidence === 'object' ? body.evidence : {}),
       ...(typeof reason === 'string' ? { reason } : {}),
+      ...(to_stage === 'Cancelled' && authenticatedOperator ? { boardOwnerAuthority: true } : {}),
       ...(issue.status === 'In Progress' && to_stage === 'In Review' ? {
         reviewRequiredRoute: true, pr: issue.metadata?.pr_url, boundSha: issue.metadata?.bound_sha
       } : {}),

@@ -240,6 +240,10 @@ test('bridge binds a claimed cancellation operator to operator credentials', () 
   assert.equal(transitionPolicyActor(request), null);
   assert.equal(transitionPolicyActor({ ...request, authenticatedOperator: true }), 'operator');
   assert.equal(transitionPolicyActor({ ...request, requestedActor: 'worker' }), 'worker');
+  assert.equal(admitConfiguredTransition({ fromStage: 'Spec', toStage: 'Cancelled',
+    expectedStage: 'Queue', exceptional: true,
+    actor: transitionPolicyActor({ ...request, authenticatedOperator: true }),
+    evidence: { boardOwnerAuthority: true, reason: 'operator cancellation' } }).ok, true);
 });
 
 test('operator respec validates requests and replays the same receipt', async () => {
