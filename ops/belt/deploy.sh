@@ -38,6 +38,12 @@ if [[ "$mode" == rollback && ! "$rollback_timestamp" =~ ^[0-9]{8}T[0-9]{6}Z$ ]];
   exit 2
 fi
 
+if [[ "$only_target" == belt-unit-guard ]]; then
+  [[ "$mode" != rollback ]] || { printf 'belt-unit-guard rollback is not supported\n' >&2; exit 2; }
+  "$root_dir/../gsp-belt/scripts/deploy-belt-unit-guard.sh" "$mode" "$source_commit"
+  exit
+fi
+
 # A bare --apply would rewrite every managed target at once. Runtime and tracked
 # tree have drifted independently, so an unscoped apply must be asked for by name.
 if [[ "$mode" == apply && -z "$only_target" && $allow_full -eq 0 ]]; then

@@ -1,0 +1,5 @@
+[Unit]
+Description=Self-heal enabled Multica belt units
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/belt-unit-guard
