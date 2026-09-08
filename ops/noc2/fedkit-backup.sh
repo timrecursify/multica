@@ -19,16 +19,20 @@ awk -F= 'NF==2 && $1 !~ /^#/ {print $2}' "$MANIFEST" >"$files_from"
 printf '%s\n' "$STAGING/pg_dumpall.sql" "$STAGING/redis.rdb" >>"$files_from"
 args=(-r "$REPO" backup --files-from "$files_from" --tag huawei-fedkit-$(hostname -s))
 if (( DRY_RUN )); then printf 'restic'; printf ' %q' "${args[@]}"; echo; exit 0; fi
+[[ -n "$PASSWORD_FILE" && -r "$PASSWORD_FILE" ]] || { log 'protected RESTIC password file required' >&2; exit 4; }
+perm=$(stat -c %a "$PASSWORD_FILE" 2>/dev/null || echo 999); (( 10#$perm <= 640 )) || { log 'password file permissions are too broad' >&2; exit 4; }
 mkdir -p "$STAGING"
-if command -v pg_dumpall >/dev/null; then pg_dumpall >"$STAGING/pg_dumpall.sql"; else : >"$STAGING/pg_dumpall.sql"; fi
-if command -v redis-cli >/dev/null; then redis-cli --rdb "$STAGING/redis.rdb"; else : >"$STAGING/redis.rdb"; fi
+command -v pg_dumpall >/dev/null || { log 'pg_dumpall required' >&2; exit 5; }; pg_dumpall >"$STAGING/pg_dumpall.sql" || exit 5
+command -v redis-cli >/dev/null || { log 'redis-cli required' >&2; exit 5; }; redis-cli --rdb "$STAGING/redis.rdb" || exit 5
+[[ -s "$STAGING/pg_dumpall.sql" && -s "$STAGING/redis.rdb" ]] || { log 'required capture empty' >&2; exit 5; }
 if ! restic -r "$REPO" snapshots >/dev/null 2>&1; then
   restic -r "$REPO" init
 fi
-restic "${args[@]}"
-restic -r "$REPO" snapshots >/dev/null
+RESTIC_PASSWORD_FILE="$PASSWORD_FILE" restic "${args[@]}"
+snapshot_id=$(RESTIC_PASSWORD_FILE="$PASSWORD_FILE" restic -r "$REPO" snapshots --json | sed -n 's/.*"id":"\([^"]*\)".*/\1/p' | tail -1)
+[[ -n "$snapshot_id" ]] || { log 'snapshot id unavailable' >&2; exit 6; }
 for ((attempt=1; attempt<=MIRROR_RETRIES; attempt++)); do
-  RESTIC_REPOSITORY="$PI_REPO" restic copy --from-repository "$REPO" && exit 0
+  RESTIC_PASSWORD_FILE="$PASSWORD_FILE" RESTIC_REPOSITORY="$PI_REPO" restic copy --from-repository "$REPO" && RESTIC_PASSWORD_FILE="$PASSWORD_FILE" RESTIC_REPOSITORY="$PI_REPO" restic dump "$snapshot_id" fedkit-allowlist.conf >/dev/null 2>&1 && exit 0
   sleep "$attempt"
 done
 log 'Pi mirror failed after retries' >&2; exit 7
