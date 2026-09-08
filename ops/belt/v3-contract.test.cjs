@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { execFileSync } = require('node:child_process');
+const { readFileSync } = require('node:fs');
 const test = require('node:test');
 const { ADVISORY_LOCK_SQL } = require('./reconciler.cjs');
 
@@ -35,7 +36,11 @@ test('records every legacy executable queue-insert writer for retirement discove
 });
 
 test('pins the reconciler advisory lock namespace', () => {
-  assert.equal(ADVISORY_LOCK_SQL, "SELECT pg_advisory_xact_lock(hashtext('v3-reconciler:' || $1::text))");
+  const expected = "SELECT pg_advisory_xact_lock(hashtext($1), hashtext('build'))";
+  const buildAdmissionSource = readFileSync('ops/belt/build-admission.cjs', 'utf8');
+  const buildAdmissionLock = buildAdmissionSource.match(/"(SELECT pg_advisory_xact_lock\(hashtext\(\$1\), hashtext\('[^']+'\)\))"/);
+  assert.equal(ADVISORY_LOCK_SQL, expected);
+  assert.equal(buildAdmissionLock?.[1], ADVISORY_LOCK_SQL);
 });
 
 module.exports = { DISPATCHABLE_STATUSES, FROZEN_SHA, LEGACY_QUEUE_WRITERS, LIVE_STATUSES, liveTaskCount };

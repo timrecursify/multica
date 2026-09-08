@@ -350,7 +350,15 @@ jobs:
             ops/belt/relay-completion-admission.test.cjs \
             ops/belt/runs-per-ticket.test.cjs \
             ops/belt/stage-capacity.test.cjs \
-            ops/belt/transition-policy.test.cjs
+            ops/belt/transition-policy.test.cjs \
+            ops/belt/v3-contract.test.cjs
+
+      - name: Test belt dependency-backed contracts
+        run: |
+          node --test \
+            ops/belt/qc-escalation-lane.test.cjs \
+            ops/belt/respec-owner-lane.test.cjs \
+            ops/belt/runs-per-ticket-sentinel.test.cjs
 
       - name: Test belt shell contracts
         run: |
