@@ -4,7 +4,7 @@ const test = require('node:test');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { createWatchdog, correlationKey, SENTINEL_MS } = require('./cicd-watchdog.cjs');
+const { createWatchdog, correlationKey, SENTINEL_MS, RETRY_LIMIT } = require('./cicd-watchdog.cjs');
 
 test('default sentinel threshold matches the 20-minute alert contract', () => {
   assert.equal(SENTINEL_MS, 20 * 60 * 1000);
@@ -67,8 +67,35 @@ test('retry and sentinel predicates classify every state', () => {
       const row = { first_seen_at: new Date(0).toISOString(), attempts, alerted };
       now = elapsed;
       const retry = w.retryAllowed(row); const escalate = w.stalled(row);
-      assert.ok(retry || escalate || attempts > 5 || alerted,
+      assert.ok(retry || escalate || attempts >= RETRY_LIMIT || alerted,
         `unclassified state attempts=${attempts} elapsed=${elapsed} alerted=${alerted}`);
     }
   }
+});
+
+test('retry budget is exhausted at the limit and remains exhausted', () => {
+  const w = createWatchdog({ now: () => 0 });
+  let row;
+  for (let attempt = 1; attempt <= RETRY_LIMIT; attempt += 1) {
+    row = w.observe('issue-retry-limit', { error: 'failed' });
+    assert.equal(row.attempts, attempt);
+    assert.equal(w.retryAllowed(row), attempt < RETRY_LIMIT);
+  }
+
+  for (let extra = 0; extra < 3; extra += 1) {
+    row = w.observe('issue-retry-limit', { error: 'still failed' });
+    assert.equal(row.attempts, RETRY_LIMIT);
+    assert.equal(w.retryAllowed(row), false);
+  }
+});
+
+test('missing and NaN attempt counters recover to a finite value', () => {
+  const w = createWatchdog({ now: () => 0 });
+  const row = w.observe('issue-invalid-attempts', { countAttempt: false });
+
+  delete row.attempts;
+  assert.equal(w.observe('issue-invalid-attempts', { error: 'failed' }).attempts, 1);
+  row.attempts = Number.NaN;
+  assert.equal(w.observe('issue-invalid-attempts', { error: 'failed again' }).attempts, 1);
+  assert.equal(Number.isFinite(w.backoffMs(row)), true);
 });
