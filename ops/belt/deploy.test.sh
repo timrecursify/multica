@@ -106,9 +106,12 @@ done
 
 # Expectations come from the canonical manifest, never a second copy of it.
 runtime_root="$tmp_dir"
+export BELT_DEPLOY_GLOBAL_BIN_ROOT="$tmp_dir/usr-local-bin"
+export BELT_DEPLOY_SKIP_OWNERSHIP=1
 . "$root_dir/belt-manifest.sh"
 [[ "${#sources[@]}" -eq "${#targets[@]}" ]] || { echo 'manifest arrays are not index-aligned' >&2; exit 1; }
 "$root_dir/manifest-require-graph.test.sh"
+BELT_DEPLOY_GLOBAL_BIN_ROOT="$tmp_dir/usr-local-bin" "$root_dir/manifest-closure.test.sh"
 
 # The wrapper sources helper scripts by absolute path, so a runtime missing one
 # cannot start -- belt-concurrency.sh was absent from a live worker for exactly

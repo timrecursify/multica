@@ -347,6 +347,7 @@ type Daemon struct {
 	// command resolves; read by runTask to launch the custom command for a
 	// claimed task. Guarded by mu.
 	profileLaunchSpecs map[string]profileLaunchSpec
+	ioPressureHeld atomic.Bool
 	reloading          sync.Mutex // prevents concurrent workspace syncs
 	authIncidentMu     sync.Mutex
 	authIncidentActive bool               // one durable authentication incident per outage
@@ -4528,6 +4529,14 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			continue
 		}
 		slots := append([]int{slot}, drainAvailableSlots(sem, d.cfg.MaxConcurrentTasks-1)...)
+		if d.cfg.IOPressureHoldThreshold > 0 {
+			pressure, err := readIOPSI()
+			if err == nil {
+				held := d.ioPressureHeld.Load()
+				if (!held && pressure >= d.cfg.IOPressureHoldThreshold) || (held && pressure > d.cfg.IOPressureResumeThreshold) { d.ioPressureHeld.Store(true); releaseSlots(slots); d.logger.Warn("poll tick blocked", "reason", "io pressure", "resource", "io_psi", "full_avg10", pressure, "hold_threshold", d.cfg.IOPressureHoldThreshold, "resume_threshold", d.cfg.IOPressureResumeThreshold); if err := sleepWithContextOrWakeup(pollerCtx, capacityBackoff(d.cfg.PollInterval), wakeup); err != nil { return }; continue }
+				d.ioPressureHeld.Store(false)
+			}
+		}
 
 		// Auto-update barrier: refuse to claim while an update prepares to roll
 		// the process (paired with the re-check in tryAutoUpdate).

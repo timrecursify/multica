@@ -28,7 +28,7 @@ descriptor_stream() {
     limit_eligible <"$WORKSPACE_GC_DESCRIPTOR_FILE"
     return
   fi
-  local task_dir meta task_id values_sql='' separator='' missing_meta=0 sql_root
+  local task_dir meta task_id values_sql='' separator='' missing_meta=0 sql_root workspace_dir task_prefix
   declare -A seen_ids=()
   for task_dir in "$root"/*/????????; do
     [[ -d "$task_dir" && ! -L "$task_dir" ]] || continue
@@ -39,6 +39,13 @@ descriptor_stream() {
     fi
     task_id="$(jq -r '.task_id // empty' "$meta")"
     [[ "$task_id" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] || continue
+    # Metadata is trusted only when it belongs to the directory being scanned.
+    # This prevents a copied/stale .gc_meta.json from injecting another task
+    # UUID into the single SQL lookup below.
+    workspace_dir="$(basename -- "$(dirname -- "$task_dir")")"
+    task_prefix="$(basename -- "$task_dir")"
+    [[ "${task_id,,}" == "${task_prefix,,}"* && "$task_prefix" == "${task_id:0:8}" ]] || continue
+    [[ "$workspace_dir" =~ ^[0-9a-fA-F-]{36}$ ]] || continue
     [[ -z "${seen_ids["$task_id"]+x}" ]] || continue
     seen_ids["$task_id"]=1
     values_sql+="$separator('$task_id'::uuid)"

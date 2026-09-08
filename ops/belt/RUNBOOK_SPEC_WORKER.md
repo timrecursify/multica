@@ -131,6 +131,12 @@ children are no longer visible.
    python3 /opt/gsp/multica-doctrine/multica-bundle.py --mega <mega-number> --apply
    ```
 
+   The canonical helper self-routes when invoked directly: if the three
+   `MULTICA_POSTGRES_*` variables are not already present, it sources
+   `/etc/gsp/multica/gsp-multica-bridge.env` through the sanctioned `sudo -n
+   bash -c` path and re-execs as `gsp-multica`. Do not copy credentials onto
+   the command line.
+
    This copies each child's title, description and acceptance criteria into a
    `## Bundled work` section on the mega, reads the mega back to confirm the
    content is actually there, and only then sets the child to `Archived` with
@@ -162,6 +168,17 @@ the folded content itself:
   python3 /opt/gsp/multica-doctrine/multica-bundle.py --unbundle <ticket-number> --apply
   python3 /opt/gsp/multica-doctrine/multica-bundle.py --mega <new-mega-number> --apply
   ```
+
+For older administrative bundles whose source is Cancelled and has no
+`bundled_by` metadata, recovery is intentionally explicit: add
+`--from-mega <active-mega-number>`. The helper verifies the source is detached,
+Cancelled, and named by an exact `gsp:<ticket-number>` token in that MEGA before
+previewing or applying the Registered transition; ambiguous or inactive MEGAs
+are rejected.
+
+Status transitions use the same transaction-local `multica.relay_authorized`
+capability as the canonical bridge/reconciler (migration 297); description-only
+writes do not set it.
 
   `--unbundle` returns one folded ticket to `Registered` and detaches it, so
   regrouping never has to be done by hand against an archived row.

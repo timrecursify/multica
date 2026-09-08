@@ -1073,9 +1073,9 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 	// the browsers above; the other four composio endpoints stay session-gated.
 	r.Get("/api/integrations/composio/callback", h.ComposioCallback)
 
-	// Daemon API routes (require daemon token or valid user token)
+	// Daemon API routes require an mdt_ daemon token.
 	r.Route("/api/daemon", func(r chi.Router) {
-		r.Use(middleware.DaemonAuth(queries, patCache, daemonTokenCache, cloudPATVerifier))
+		r.Use(middleware.DaemonAuth(queries, daemonTokenCache))
 
 		r.Post("/register", h.DaemonRegister)
 		r.Post("/deregister", h.DaemonDeregister)
