@@ -81,7 +81,10 @@ printf '%s\n' \
   'set -Eeuo pipefail' \
   'input="$(cat)"' \
   'if [[ "$input" == *"concat_ws"* ]]; then printf "%s\n" "${BELT_DEPLOY_TEST_SNAPSHOT:?}"; fi' \
-  'printf "%s|%s\n" "$$" "$*" >> "${BELT_DEPLOY_TEST_PSQL_LOG:?}"' > "$fake_bin/psql"
+  'kind=other' \
+  '[[ "$input" == *"admission_held = true"* ]] && kind=close' \
+  '[[ "$input" == *"admission_held = false"* ]] && kind=open' \
+  'printf "%s|%s|%s\n" "$$" "$kind" "$*" >> "${BELT_DEPLOY_TEST_PSQL_LOG:?}"' > "$fake_bin/psql"
 chmod +x -- "$fake_bin/psql"
 export PATH="$fake_bin:$PATH"
 export BELT_DEPLOY_SYSTEMCTL_STATE="$fake_state"
@@ -90,6 +93,7 @@ export BELT_DEPLOY_STATE_ROOT="$tmp_dir/deploy-state"
 export BELT_DEPLOY_DATABASE_URL="postgres://fixture"
 export BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=2
 export BELT_DEPLOY_TEST_PSQL_LOG="$tmp_dir/psql.log"
+: > "$BELT_DEPLOY_TEST_PSQL_LOG"
 receipt_root="$tmp_dir/receipts"
 source_sha="$(git -C "$root_dir/../.." rev-parse HEAD)"
 export MULTICA_RECEIPT_ROOT="$receipt_root"
@@ -181,6 +185,7 @@ grep -q 'Refusing an unscoped --apply' "$tmp_dir/unscoped.log"
 printf '\nstale-runtime\n' >> "$bridge_dir/multica-bridge.cjs"
 restart_lines() { if [[ -f "$fake_state/restarts.log" ]]; then wc -l < "$fake_state/restarts.log"; else printf '0\n'; fi; }
 restarts_before="$(restart_lines)"
+psql_line_before="$(wc -l < "$BELT_DEPLOY_TEST_PSQL_LOG" 2>/dev/null || printf 0)"
 if BELT_DEPLOY_TEST_SNAPSHOT="${drained_snapshot//=0/=1}" \
    BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=1 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
    "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$tmp_dir/drain-timeout.log" 2>&1; then
@@ -188,9 +193,41 @@ if BELT_DEPLOY_TEST_SNAPSHOT="${drained_snapshot//=0/=1}" \
   exit 1
 fi
 grep -q 'deployment aborted without restart' "$tmp_dir/drain-timeout.log"
+tail -n "+$((psql_line_before + 1))" "$BELT_DEPLOY_TEST_PSQL_LOG" > "$tmp_dir/drain-timeout-psql.log"
+grep -q '|close|' "$tmp_dir/drain-timeout-psql.log"
+if grep -q '|open|' "$tmp_dir/drain-timeout-psql.log"; then
+  echo 'genuine drain timeout unexpectedly opened its fence' >&2; exit 1
+fi
 [[ "$restarts_before" == "$(restart_lines)" ]]
 grep -q 'stale-runtime' "$bridge_dir/multica-bridge.cjs"
 cp -- "$root_dir/multica-bridge.cjs" "$bridge_dir/multica-bridge.cjs"
+
+# Validation can abort after fencing but before the first drain snapshot. The
+# EXIT/ERR cleanup must reopen that fence; no timeout is inferred.
+psql_line_before="$(wc -l < "$BELT_DEPLOY_TEST_PSQL_LOG")"
+if env -u BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
+  "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$tmp_dir/drain-unset.log" 2>&1; then
+  echo 'expected unset drain timeout to abort deployment' >&2; exit 1
+fi
+tail -n "+$((psql_line_before + 1))" "$BELT_DEPLOY_TEST_PSQL_LOG" > "$tmp_dir/drain-unset-psql.log"
+grep -q 'must be set to a positive integer' "$tmp_dir/drain-unset.log"
+grep -q '|close|' "$tmp_dir/drain-unset-psql.log"
+grep -q '|open|' "$tmp_dir/drain-unset-psql.log"
+
+# INT and TERM use the same idempotent cleanup while blocked in a real drain.
+for signal in INT TERM; do
+  psql_line_before="$(wc -l < "$BELT_DEPLOY_TEST_PSQL_LOG")"
+  timeout --foreground --signal="$signal" --kill-after=2 1.2 env \
+    BELT_DEPLOY_TEST_SNAPSHOT="${drained_snapshot//=0/=1}" \
+    BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=30 BELT_DEPLOY_DRAIN_POLL_SECONDS=1 \
+    BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" \
+    "$root_dir/deploy.sh" --apply --only multica-bridge.cjs >"$tmp_dir/signal-$signal.log" 2>&1 || true
+  tail -n "+$((psql_line_before + 1))" "$BELT_DEPLOY_TEST_PSQL_LOG" > "$tmp_dir/signal-$signal-psql.log"
+  grep -q '|close|' "$tmp_dir/signal-$signal-psql.log"
+  [[ "$(grep -c '|open|' "$tmp_dir/signal-$signal-psql.log")" -eq 1 ]] || {
+    echo "$signal cleanup did not open its fence exactly once" >&2; exit 1;
+  }
+done
 
 # The complementary half of the busy case. Without it a fixture that can never
 # drain aborts every later exercise silently instead of failing on its own line.
@@ -281,7 +318,7 @@ fi
 selective_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-cicd-worker$/\1/p' "$tmp_dir/selective.log")"
 [[ "$selective_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
 activation_receipt="$receipt_root/timrecursify/multica/gsp-belt/$source_sha.json"
-node -e 'const r=require(process.argv[1]),s=process.argv[2],a=Date.parse(r.activation?.activated_at),h=Date.parse(r.health?.checked_at);if(r.schema_version!==1||r.repository!=="timrecursify/multica"||r.target!=="gsp-belt"||r.deployment_owner!=="ops/belt/deploy.sh"||r.source_sha!==s||r.activation?.status!=="activated"||r.activation?.process_sha!==s||r.activation?.release!==`git:timrecursify/multica@${s}`||!Number.isFinite(a)||!Number.isFinite(h)||h<a||r.health?.status!=="ok"||r.health?.probe!=="systemd-active-mainpid-runtime-parity-v1")process.exit(1)' \
+node -e 'const r=require(process.argv[1]),s=process.argv[2],a=Date.parse(r.activation?.activated_at),h=Date.parse(r.health?.checked_at);if(r.schema_version!==1||r.repository!=="timrecursify/multica"||r.target!=="gsp-belt"||r.deployment_owner!=="ops/belt/deploy.sh"||r.source_sha!==s||r.activation?.status!=="activated"||r.activation?.process_sha!==s||r.activation?.release!==`git:timrecursify/multica@${s}`||!Number.isFinite(a)||!Number.isFinite(h)||h<a||r.health?.status!=="ok"||r.health?.probe!=="systemd-active-mainpid-runtime-parity-v1"||r.stale_fence_alarm?.status!=="not_required")process.exit(1)' \
   "$activation_receipt" "$source_sha"
 grep -q "^Receipt: $activation_receipt$" "$tmp_dir/selective.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$selective_receipt" --only multica-cicd-worker >/dev/null

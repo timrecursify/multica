@@ -57,11 +57,43 @@ receipt_target="gsp-belt"
 receipt_owner="ops/belt/deploy.sh"
 receipt_probe="systemd-active-mainpid-runtime-parity-v1"
 deployment_fence_closed=0
+deployment_drain_timed_out=0
+deployment_cleanup_running=0
+deployment_fence_alarm_status=not_required
 
 . "$root_dir/deployment-drain.sh"
 
 # Manifest lives in one place; see belt-manifest.sh.
 . "$root_dir/belt-manifest.sh"
+
+declare -a backups=()
+declare -a touched=()
+declare -a absence_markers=()
+restore_on_failure() {
+  local rc="${1:-$?}" index
+  (( deployment_cleanup_running == 0 )) || return "$rc"
+  deployment_cleanup_running=1
+  trap - ERR EXIT INT TERM
+  if (( rc != 0 )) && [[ "$mode" == apply && ${#touched[@]} -gt 0 ]]; then
+    for index in "${touched[@]}"; do
+      if [[ -f "${absence_markers[$index]}" ]]; then
+        rm -f -- "${targets[$index]}"
+      else
+        cp --preserve=mode -- "${backups[$index]}" "${targets[$index]}" ||
+          printf 'ROLLBACK FAILED: %s\n' "${targets[$index]}" >&2
+      fi
+    done
+    printf 'Deployment failed; restored %s target(s). Rollback receipt: %s --rollback %s\n' \
+      "${#touched[@]}" "$0" "$timestamp" >&2
+  fi
+  if (( deployment_fence_closed == 1 && deployment_drain_timed_out == 0 )); then
+    deployment_fence_open || printf 'CRITICAL: failed to reopen admission fence during cleanup\n' >&2
+  fi
+  exit "$rc"
+}
+trap 'restore_on_failure $?' ERR EXIT
+trap 'restore_on_failure 130' INT
+trap 'restore_on_failure 143' TERM
 
 if [[ "$only_target" == belt-unit-guard ]]; then
   [[ "$mode" != rollback ]] || { printf 'belt-unit-guard rollback is not supported\n' >&2; exit 2; }
@@ -217,8 +249,8 @@ write_activation_receipt() {
   release="git:$receipt_repository@$source_sha"
   mkdir -p -- "$receipt_dir"
   temporary="$(mktemp "$receipt_dir/.$source_sha.XXXXXX")"
-  printf '{"schema_version":1,"repository":"%s","target":"%s","deployment_owner":"%s","source_sha":"%s","activation":{"status":"activated","activated_at":"%s","process_sha":"%s","release":"%s"},"health":{"status":"ok","checked_at":"%s","probe":"%s"}}\n' \
-    "$receipt_repository" "$receipt_target" "$receipt_owner" "$source_sha" "$activated_at" "$source_sha" "$release" "$checked_at" "$receipt_probe" > "$temporary"
+  printf '{"schema_version":1,"repository":"%s","target":"%s","deployment_owner":"%s","source_sha":"%s","activation":{"status":"activated","activated_at":"%s","process_sha":"%s","release":"%s"},"health":{"status":"ok","checked_at":"%s","probe":"%s"},"stale_fence_alarm":{"status":"%s"}}\n' \
+    "$receipt_repository" "$receipt_target" "$receipt_owner" "$source_sha" "$activated_at" "$source_sha" "$release" "$checked_at" "$receipt_probe" "$deployment_fence_alarm_status" > "$temporary"
   chmod 0644 -- "$temporary"
   mv -f -- "$temporary" "$receipt"
   printf 'Receipt: %s\n' "$receipt"
@@ -390,27 +422,6 @@ if [[ "$mode" == apply ]]; then
   deployment_wait_for_drain
 fi
 
-declare -a backups=()
-declare -a touched=()
-declare -a absence_markers=()
-restore_on_failure() {
-  local rc=$? index
-  if [[ "$mode" == apply && ${#touched[@]} -gt 0 ]]; then
-    for index in "${touched[@]}"; do
-      if [[ -f "${absence_markers[$index]}" ]]; then
-        rm -f -- "${targets[$index]}"
-      else
-        cp --preserve=mode -- "${backups[$index]}" "${targets[$index]}" ||
-          printf 'ROLLBACK FAILED: %s\n' "${targets[$index]}" >&2
-      fi
-    done
-    printf 'Deployment failed; restored %s target(s). Rollback receipt: %s --rollback %s\n' \
-      "${#touched[@]}" "$0" "$timestamp" >&2
-  fi
-  exit "$rc"
-}
-trap restore_on_failure ERR
-
 # Create every backup before the first target is modified. A partial backup set
 # cannot produce a misleading rollback claim.
 for index in "${!targets[@]}"; do
@@ -477,7 +488,6 @@ if [[ "$mode" == apply ]]; then
   done
 fi
 
-trap - ERR
 if [[ "$mode" == dry-run ]]; then
   if (( ! restart_enabled )) && (( ${#restart_units[@]} > 0 )); then
     printf 'Restarts disabled (--no-restart).\n'

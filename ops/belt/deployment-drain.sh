@@ -22,15 +22,101 @@ deployment_psql() {
   psql "$database_url" -X -v ON_ERROR_STOP=1 "$@"
 }
 
+deployment_process_identity() {
+  local pid="$1" proc_root="${BELT_DEPLOY_CONTROLLER_PROC_ROOT:-/proc}" stat_line stat_tail boot_id start_ticks restore_glob=1
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  [[ -r "$proc_root/$pid/stat" && -r "$proc_root/sys/kernel/random/boot_id" ]] || return 1
+  IFS= read -r stat_line < "$proc_root/$pid/stat" || return 1
+  stat_tail="${stat_line##*) }"
+  # starttime is field 22 of /proc/PID/stat, or field 20 after pid and comm.
+  [[ $- == *f* ]] && restore_glob=0
+  set -f
+  set -- $stat_tail
+  (( restore_glob == 0 )) || set +f
+  start_ticks="${20:-}"
+  IFS= read -r boot_id < "$proc_root/sys/kernel/random/boot_id" || return 1
+  [[ "$start_ticks" =~ ^[0-9]+$ && -n "$boot_id" ]] || return 1
+  printf '%s|%s\n' "$start_ticks" "$boot_id"
+}
+
+deployment_controller_alive() {
+  local pid="$1" expected_start="$2" expected_boot="$3" identity
+  [[ -n "$expected_start" && -n "$expected_boot" ]] || return 1
+  identity="$(deployment_process_identity "$pid")" || return 1
+  [[ "$identity" == "$expected_start|$expected_boot" ]]
+}
+
+deployment_fence_alarm() {
+  local stale_invocation="$1" stale_pid="$2" sk="${BELT_DEPLOY_SK:-}" out
+  if [[ -z "$sk" ]]; then
+    sk="$(command -v sk 2>/dev/null || true)"
+    [[ -n "$sk" ]] || sk=/home/newadmin/.local/bin/sk
+  fi
+  if [[ ! -x "$sk" ]]; then
+    deployment_fence_alarm_status=failed
+    printf 'CRITICAL: unable to file stale-fence P0: sk executable unavailable (resolved path: %s)\n' "${sk:-none}" >&2
+    return 1
+  fi
+  if out=$("$sk" multica create --board gsp \
+    --title 'P0: belt admission fence has a dead controller' \
+    --desc - 2>&1 <<EOF
+Automated by ops/belt/deploy.sh on $(hostname) at $(date -Is).
+
+The durable admission fence was held by dead controller invocation ${stale_invocation:-unknown}, pid ${stale_pid:-unknown}. A new serialized controller is taking over the hold.
+EOF
+  ); then
+    deployment_fence_alarm_status=filed
+    printf 'STALE-FENCE P0 FILED: %s\n' "$out" >&2
+    return 0
+  fi
+  if [[ "$out" =~ (^|$'\n')[[:space:]]*code:[[:space:]]active_duplicate_issue($|$'\n') ]]; then
+    deployment_fence_alarm_status=duplicate_suppressed
+    printf 'STALE-FENCE P0 ALREADY ACTIVE; duplicate suppressed:\n%s\n' "$out" >&2
+    return 0
+  fi
+  deployment_fence_alarm_status=failed
+  printf 'CRITICAL: unable to file stale-fence P0 ticket:\n%s\n' "$out" >&2
+  return 1
+}
+
 deployment_fence_close() {
+  local current_identity current_start current_boot row held stale_invocation stale_pid stale_start stale_boot
+  current_identity="$(deployment_process_identity "$$")" || {
+    printf 'Unable to establish deployment controller process identity\n' >&2
+    return 2
+  }
+  IFS='|' read -r current_start current_boot <<< "$current_identity"
   deployment_psql -f "$root_dir/deployment-lock.sql" >/dev/null
-  deployment_psql -v invocation="$BELT_DEPLOY_INVOCATION_ID" -v pid="$$" <<'SQL' >/dev/null
+  row="$(deployment_psql -At <<'SQL'
+SELECT admission_held::int, coalesce(invocation_id, ''), coalesce(controller_pid::text, ''),
+       coalesce(controller_start_ticks::text, ''), coalesce(controller_boot_id, '')
+FROM belt_deployment_control WHERE singleton;
+SQL
+  )"
+  IFS='|' read -r held stale_invocation stale_pid stale_start stale_boot <<< "$row"
+  if [[ "$held" == 1 ]]; then
+    if deployment_controller_alive "$stale_pid" "$stale_start" "$stale_boot"; then
+      printf 'Admission fence is held by live controller: invocation=%s controller_pid=%s\n' "$stale_invocation" "$stale_pid" >&2
+      return 1
+    fi
+    if ! deployment_fence_alarm "$stale_invocation" "$stale_pid"; then
+      printf 'CRITICAL: stale-fence takeover is continuing without a filed P0 alarm; receipt will record the alarm failure\n' >&2
+    fi
+    printf 'Taking over stale admission fence: prior_invocation=%s prior_controller_pid=%s\n' "$stale_invocation" "$stale_pid"
+  fi
+  deployment_psql -v invocation="$BELT_DEPLOY_INVOCATION_ID" -v pid="$$" \
+    -v start_ticks="$current_start" -v boot_id="$current_boot" \
+    -v takeover_invocation="${stale_invocation:-}" -v taking_over="$([[ "$held" == 1 ]] && printf true || printf false)" <<'SQL' >/dev/null
 UPDATE belt_deployment_control
 SET admission_held = true,
     invocation_id = :'invocation',
     controller_pid = :'pid'::bigint,
+    controller_start_ticks = :'start_ticks'::bigint,
+    controller_boot_id = :'boot_id',
     held_at = clock_timestamp(),
-    released_at = NULL
+    released_at = NULL,
+    takeover_of_invocation_id = CASE WHEN :'taking_over'::boolean THEN nullif(:'takeover_invocation', '') ELSE NULL END,
+    takeover_at = CASE WHEN :'taking_over'::boolean THEN clock_timestamp() ELSE NULL END
 WHERE singleton;
 SQL
   local temporary
@@ -113,6 +199,7 @@ deployment_wait_for_drain() {
     fi
     now="$(date +%s)"
     if (( now - start >= timeout_seconds )); then
+      deployment_drain_timed_out=1
       printf 'Drain timed out after %ss; deployment aborted without restart; admission fence remains closed\n' "$timeout_seconds" >&2
       return 1
     fi
