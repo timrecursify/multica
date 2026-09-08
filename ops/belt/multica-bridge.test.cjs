@@ -151,19 +151,21 @@ test('work product handoff advances to CI/CD without creating a second active ro
   assert.equal(products.filter((row) => row.status === 'active').length, 1);
 });
 
-test('CI/CD return hands the existing active work product back to In Review', async () => {
-  const product = { issue_id: '123e4567-e89b-42d3-a456-426614174000',
-    status: 'active', consuming_stage: 'CI/CD & Deploy' };
-  const client = { async query(sql, values) {
-    assert.match(sql, /UPDATE issue_work_product/);
-    assert.equal(values[0], product.issue_id);
-    product.consuming_stage = values[1];
-    return { rowCount: 1, rows: [product] };
-  } };
+for (const destination of ['In Progress', 'Spec', 'Parked']) {
+  test(`CI/CD exit to ${destination} hands the existing active work product back to In Review`, async () => {
+    const product = { issue_id: '123e4567-e89b-42d3-a456-426614174000',
+      status: 'active', consuming_stage: 'CI/CD & Deploy' };
+    const client = { async query(sql, values) {
+      assert.match(sql, /UPDATE issue_work_product/);
+      assert.equal(values[0], product.issue_id);
+      product.consuming_stage = values[1];
+      return { rowCount: 1, rows: [product] };
+    } };
 
-  await handoffActiveWorkProduct(client, product.issue_id, 'CI/CD & Deploy', 'In Progress');
-  assert.equal(product.consuming_stage, 'In Review');
-});
+    await handoffActiveWorkProduct(client, product.issue_id, 'CI/CD & Deploy', destination);
+    assert.equal(product.consuming_stage, 'In Review');
+  });
+}
 
 test('work product handoff is a no-op when there is no active row', async () => {
   const calls = [];
@@ -2133,6 +2135,15 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       originator_source text, trigger_evidence_kind text, result jsonb, error text, started_at timestamptz, completed_at timestamptz,
       prepare_lease_expires_at timestamptz, failure_reason text, trigger_comment_id uuid,
       created_at timestamptz NOT NULL DEFAULT now());
+      CREATE TABLE "${schema}".issue_work_product (
+        issue_id uuid NOT NULL, scope_revision bigint NOT NULL, kind text NOT NULL,
+        repository text, branch text, pr_number integer, head_sha text,
+        acceptance_evidence jsonb NOT NULL, replaces_scope_revision bigint,
+        consuming_stage text NOT NULL, dependency_issue_ids uuid[] NOT NULL DEFAULT '{}',
+        status text NOT NULL, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+      CREATE TABLE "${schema}".qc_effective_verdict (
+        id bigserial PRIMARY KEY, issue_id uuid NOT NULL, verdict text NOT NULL,
+        failure_class text, qualifying boolean, created_at timestamptz NOT NULL);
       CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".issue_stage_outcome (issue_id uuid NOT NULL, stage text NOT NULL,
@@ -2164,6 +2175,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
         VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'),
                ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
+      // No issue_work_product row: this case asserts that an operator release
+      // enqueues a build. A satisfying work product would make build admission
+      // correctly refuse, which is the opposite of what this test exercises.
       await admin.query(`INSERT INTO "${schema}".issue_stage_outcome
         (issue_id, stage, outcome, blocked_on, outcome_at)
         VALUES ($1, 'In Progress', 'BLOCKED', 'human', now() - interval '1 hour')`, [issueId]);

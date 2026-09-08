@@ -1,18 +1,35 @@
-const BUILD_STAGES = new Set(["Queue", "In Progress"]);
+const BUILD_ADMISSION_STAGES = new Set(["Queue", "In Progress"]);
+const BUILD_PRODUCT_STAGES = new Set(["In Progress"]);
 
 async function buildTaskAdmission(client, { issueId, toStage, locked = false }) {
-  if (!BUILD_STAGES.has(toStage)) return { admit: true };
+  if (!BUILD_ADMISSION_STAGES.has(toStage)) return { admit: true };
+  // Queue work scopes the implementation; it never produces the artifact that
+  // can satisfy review evidence. Keep dispatch admission separate from the
+  // stages whose completed tasks may own a canonical work product.
+  if (!BUILD_PRODUCT_STAGES.has(toStage)) return { admit: true };
   if (!locked) {
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext('build'))", [issueId]);
   }
   const prior = (await client.query(
-    `SELECT task.id, task.completed_at FROM agent_task_queue task
-      WHERE task.issue_id=$1::uuid AND task.status='completed'
+    `SELECT task.id, task.completed_at
+       FROM issue_work_product product
+       JOIN agent_task_queue task
+         ON task.id::text = product.acceptance_evidence->>'task_id'
+        AND task.issue_id = product.issue_id
+      WHERE product.issue_id=$1::uuid AND product.status='active'
+        AND product.consuming_stage='In Review'
+        AND product.acceptance_evidence <> '{}'::jsonb
+        AND task.status='completed'
         AND task.context->>'to_stage'=ANY($2::text[])
-        AND COALESCE(to_jsonb(task)->>'result', '')
-          ~* '(https?://[^[:space:]]+/pull/[0-9]+|bound[ _-]?sha|[a-f0-9]{40})'
+        AND (
+          (product.kind='implementation' AND product.repository IS NOT NULL
+            AND product.branch IS NOT NULL AND product.pr_number IS NOT NULL
+            AND product.head_sha ~ '^[0-9a-f]{40}$')
+          OR (product.kind IN ('no_change', 'operational')
+            AND product.acceptance_evidence->>'verified'='true')
+        )
       ORDER BY task.completed_at DESC NULLS LAST, task.created_at DESC, task.id DESC LIMIT 1`,
-    [issueId, [...BUILD_STAGES]])).rows[0];
+    [issueId, [...BUILD_PRODUCT_STAGES]])).rows[0];
   if (!prior) return { admit: true };
   const failure = (await client.query(
     `SELECT id FROM qc_effective_verdict WHERE issue_id=$1::uuid AND verdict='FAIL'
@@ -41,4 +58,4 @@ async function buildTaskAdmission(client, { issueId, toStage, locked = false }) 
   return { admit: true, retryOfTaskId: prior.id, qcAttemptId: String(failure.id) };
 }
 
-module.exports = { BUILD_STAGES, buildTaskAdmission };
+module.exports = { BUILD_ADMISSION_STAGES, BUILD_PRODUCT_STAGES, buildTaskAdmission };

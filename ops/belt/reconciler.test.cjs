@@ -165,7 +165,7 @@ test("completed build handoff statement runs against the production relay_run_lo
     await client.query(`CREATE TABLE relay_run_log (
       id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text NOT NULL,
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL DEFAULT 'pending',
-      parked_audit jsonb
+      parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT NOW()
     )`);
     await client.query(`CREATE TABLE issue_stage_outcome (
       issue_id uuid NOT NULL, stage text NOT NULL, task_id uuid
@@ -200,6 +200,43 @@ test("completed build handoff statement runs against the production relay_run_lo
     await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     await client.end();
   }
+});
+
+test("stale pending completed-build handoff is detected instead of silently reused", async () => {
+  const calls = [];
+  const client = { async query(sql, values) {
+    calls.push({ sql, values });
+    if (sql.includes("SELECT task_id FROM relay_run_log")) return { rows: [{ task_id: "stale-task" }] };
+    return { rows: [], rowCount: 0 };
+  }};
+  const result = await armCompletedBuildWorkProduct(client, "issue", "In Progress", "stale-task", 30);
+  assert.equal(result.stalled, true);
+  const detection = calls.find(({ sql }) => sql.includes("SELECT task_id FROM relay_run_log"));
+  assert.match(detection.sql, /status = 'pending'/);
+  assert.match(detection.sql, /created_at <= NOW\(\) -/);
+  assert.equal(detection.values[3], 30);
+});
+
+test("stale pending completed-build handoff routes the issue to Human Review", async () => {
+  const completed = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) {
+      return { rows: [{ ...issue, status: "In Progress" }] };
+    }
+    if (sql.includes("SELECT task.id, task.completed_at")) {
+      return { rows: [{ id: completed, completed_at: "2026-09-06T00:00:00Z" }] };
+    }
+    if (sql.includes("FROM qc_effective_verdict")) return { rows: [] };
+    if (sql.includes("SELECT task_id FROM relay_run_log")) return { rows: [{ task_id: completed }] };
+    return original(sql, values);
+  };
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "human_review", reason: "completed_build_work_product_handoff_stalled"
+  });
+  assert.ok(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Human Review'")));
+  assert.equal(db.calls.some(({ sql }) => sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
 test("completed same-stage handoff is rearmed when the outcome cites an older task", async () => {
@@ -243,6 +280,22 @@ test("own-stage FAILED build with no QC verdict is admitted as a bounded retry i
       issue_id uuid NOT NULL, stage text NOT NULL, outcome text NOT NULL,
       blocked_on text, task_id uuid, outcome_at timestamptz NOT NULL
     )`);
+    await client.query(`CREATE TABLE issue_work_product (
+      issue_id uuid NOT NULL, scope_revision bigint NOT NULL, kind text NOT NULL,
+      repository text, branch text, pr_number integer, head_sha text,
+      acceptance_evidence jsonb NOT NULL, replaces_scope_revision bigint,
+      consuming_stage text NOT NULL, dependency_issue_ids uuid[] NOT NULL DEFAULT '{}',
+      status text NOT NULL, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
+    )`);
+    await client.query(
+      `INSERT INTO issue_work_product
+         (issue_id, scope_revision, kind, repository, branch, pr_number, head_sha,
+          acceptance_evidence, consuming_stage, status, created_at, updated_at)
+       VALUES ($1, 1, 'implementation', 'acme/widget', 'fix/belt', 7, $2,
+         '{"task_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}',
+         'In Review', 'active', '2026-09-07T20:00:00Z', '2026-09-07T20:00:00Z')`,
+      [issueId, "a".repeat(40)]
+    );
     await client.query(
       `INSERT INTO agent_task_queue
          (id, issue_id, status, context, result, completed_at, created_at)
@@ -284,6 +337,9 @@ test("existing implementation retry remains reused without a relay handoff", asy
   const db = harness();
   const original = db.query;
   db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) {
+      return { rows: [{ ...issue, status: "In Progress" }] };
+    }
     if (sql.includes("SELECT task.id, task.completed_at")) {
       return { rows: [{ id: prior, completed_at: "2026-09-06T00:00:00Z" }] };
     }

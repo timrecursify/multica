@@ -57,6 +57,16 @@ out="$(PATH="$tmp:$PATH" bash "$helper" token sk-cli)"
 repos="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["repositories"]))' "$MINT_BODY")"
 [[ "$repos" == sk-cli ]] || fail "token was not narrowed to the requested repository: $repos"
 
+# --- every accepted spelling is normalized to the bare repository name -----
+for requested in multica timrecursify/multica timrecursify/multica.git https://github.com/timrecursify/multica.git; do
+  rm -rf -- "$HOME/.cache"
+  rm -f -- "$MINT_BODY"
+  out="$(PATH="$tmp:$PATH" bash "$helper" token "$requested")"
+  [[ "$out" == ghs_stubtoken ]] || fail "token mode rejected accepted repository spelling: $requested"
+  repos="$(python3 -c 'import json,sys; print(",".join(json.load(open(sys.argv[1]))["repositories"]))' "$MINT_BODY")"
+  [[ "$repos" == multica ]] || fail "repository '$requested' normalized to '$repos', not 'multica'"
+done
+
 for path in "${!REQUIRED[@]}"; do
   perm="${REQUIRED[$path]}"
   have="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["permissions"].get(sys.argv[2], ""))' "$MINT_BODY" "$perm")"
@@ -85,6 +95,8 @@ if PATH="$tmp:$PATH" bash "$helper" token not-a-belt-repo >/dev/null 2>&1; then
 fi
 
 # --- the cache is reused while it has more than five minutes left -----------
+out="$(PATH="$tmp:$PATH" bash "$helper" token sk-cli)"
+[[ "$out" == ghs_stubtoken ]] || fail "token mode did not warm the cache: $out"
 rm -f "$MINT_BODY"
 cached="$(PATH="$tmp:$PATH" bash "$helper" token sk-cli)"
 [[ "$cached" == ghs_stubtoken ]] || fail "cached read did not return the token: $cached"
