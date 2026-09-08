@@ -59,6 +59,7 @@ receipt_probe="systemd-active-mainpid-runtime-parity-v1"
 deployment_fence_closed=0
 deployment_drain_timed_out=0
 deployment_cleanup_running=0
+deployment_fence_alarm_status=not_required
 
 . "$root_dir/deployment-drain.sh"
 
@@ -248,8 +249,8 @@ write_activation_receipt() {
   release="git:$receipt_repository@$source_sha"
   mkdir -p -- "$receipt_dir"
   temporary="$(mktemp "$receipt_dir/.$source_sha.XXXXXX")"
-  printf '{"schema_version":1,"repository":"%s","target":"%s","deployment_owner":"%s","source_sha":"%s","activation":{"status":"activated","activated_at":"%s","process_sha":"%s","release":"%s"},"health":{"status":"ok","checked_at":"%s","probe":"%s"}}\n' \
-    "$receipt_repository" "$receipt_target" "$receipt_owner" "$source_sha" "$activated_at" "$source_sha" "$release" "$checked_at" "$receipt_probe" > "$temporary"
+  printf '{"schema_version":1,"repository":"%s","target":"%s","deployment_owner":"%s","source_sha":"%s","activation":{"status":"activated","activated_at":"%s","process_sha":"%s","release":"%s"},"health":{"status":"ok","checked_at":"%s","probe":"%s"},"stale_fence_alarm":{"status":"%s"}}\n' \
+    "$receipt_repository" "$receipt_target" "$receipt_owner" "$source_sha" "$activated_at" "$source_sha" "$release" "$checked_at" "$receipt_probe" "$deployment_fence_alarm_status" > "$temporary"
   chmod 0644 -- "$temporary"
   mv -f -- "$temporary" "$receipt"
   printf 'Receipt: %s\n' "$receipt"
