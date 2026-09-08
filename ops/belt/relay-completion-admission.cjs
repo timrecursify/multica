@@ -1,5 +1,7 @@
 'use strict';
 
+const { parseOutcome } = require('./stage-outcome.cjs');
+
 // A native task may exit with status=completed after the agent has reported a
 // blocker.  This gate consumes only the bounded result envelope emitted by the
 // daemon and the explicit outcome markers required by the worker runbooks.  It
@@ -65,8 +67,9 @@ function textFields(envelope) {
 }
 
 function completionAdmission(result) {
-  const rejected = (reason) => ({
-    ok: false, reason, disposition: 'Spec', escalation: 'sol_low_respec'
+  const rejected = (reason, blockedOn) => ({
+    ok: false, reason, disposition: 'Spec', escalation: 'sol_low_respec',
+    ...(blockedOn ? { blockedOn } : {})
   });
   const envelope = asEnvelope(result);
   if (!envelope) return rejected('missing_result');
@@ -78,6 +81,13 @@ function completionAdmission(result) {
 
   const texts = textFields(envelope);
   if (texts.length === 0) return rejected('missing_result');
+
+  for (const text of texts) {
+    const declared = parseOutcome(text);
+    if (declared.typed && declared.outcome === 'BLOCKED' && declared.blockedOn) {
+      return rejected('completion_blocked', declared.blockedOn);
+    }
+  }
 
   for (const field of ['status', 'verdict', 'outcome']) {
     const reason = normalizedOutcome(envelope[field]);

@@ -21,6 +21,14 @@ test('holds explicit blocked completion evidence', () => {
     { ok: false, reason: 'completion_blocked', disposition: 'Spec', escalation: 'sol_low_respec' });
 });
 
+test('preserves an explicit machine-resolvable blocker', () => {
+  for (const blockedOn of ['ci', 'sha', 'dependency', 'quota']) {
+    assert.deepEqual(completionAdmission({ output: `work complete\nOUTCOME: BLOCKED blocked_on=${blockedOn}` }),
+      { ok: false, reason: 'completion_blocked', disposition: 'Spec',
+        escalation: 'sol_low_respec', blockedOn });
+  }
+});
+
 test('holds QC-BLOCKED completion evidence', () => {
   for (const output of ['QC-BLOCKED: checkout unavailable', 'QC-BLOCKED']) {
     assert.deepEqual(completionAdmission({ output }),
