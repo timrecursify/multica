@@ -31,12 +31,12 @@ test("merged PR check awaits an async GitHub command", async () => {
 function harness({ live = [], isLeaf = true, owner = {
   agent_id: "33333333-3333-4333-8333-333333333333",
   selected_runtime_id: "44444444-4444-4444-8444-444444444444"
-} } = {}) {
+}, status = issue.status } = {}) {
   const calls = []; let inserted = 0;
   return { calls, query: async (sql, values = []) => {
     calls.push({ sql, values });
     if (sql.includes("AS is_leaf")) return { rows: [{ is_leaf: isLeaf }] };
-    if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [issue] };
+    if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [{ ...issue, status }] };
     if (sql.includes("FROM agent_task_queue") && sql.includes("FOR UPDATE")) return { rows: live };
     if (sql.includes("FROM relay_stage_agent_pool")) return { rows: owner ? [owner] : [] };
     if (sql.includes("INSERT INTO agent_task_queue")) return { rows: [{ id: `task-${++inserted}` }] };
@@ -281,7 +281,7 @@ test("completed build without a work product remains admitted", async () => {
 test("existing implementation retry remains reused without a relay handoff", async () => {
   const prior = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const retry = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-  const db = harness();
+  const db = harness({ status: "In Progress" });
   const original = db.query;
   db.query = async (sql, values = []) => {
     if (sql.includes("SELECT task.id, task.completed_at")) {

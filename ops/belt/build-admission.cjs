@@ -12,7 +12,7 @@ async function buildTaskAdmission(client, { issueId, toStage, locked = false }) 
     `SELECT task.id, task.completed_at
        FROM issue_work_product wp
        JOIN agent_task_queue task
-         ON task.id = NULLIF(wp.acceptance_evidence->>'source_task_id', '')::uuid
+       ON task.id::text = wp.acceptance_evidence->>'source_task_id'
         AND task.issue_id = wp.issue_id
       WHERE wp.issue_id=$1::uuid AND wp.status='active'
         AND wp.kind='implementation' AND wp.consuming_stage='In Review'
