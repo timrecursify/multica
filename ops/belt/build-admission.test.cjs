@@ -14,14 +14,27 @@ function db({ prior, failure, unreviewedFailure, successor } = {}) {
   }};
 }
 
+test("completed Queue task with a 40-hex result does not satisfy In Progress admission", async () => {
+  const client = db();
+  assert.deepEqual(await buildTaskAdmission(client, { issueId: "issue", toStage: "In Progress" }),
+    { admit: true });
+  const productRead = client.calls.find(({ sql }) => sql.includes("FROM issue_work_product"));
+  assert.ok(productRead);
+  assert.deepEqual(productRead.values[1], ["In Progress"]);
+  assert.doesNotMatch(productRead.sql, /to_jsonb\(task\)|bound\[ _-\]|\[a-f0-9\]\{40\}/);
+});
+
 test("first build is admitted", async () => {
   assert.deepEqual(await buildTaskAdmission(db(), { issueId: "issue", toStage: "Queue" }), { admit: true });
 });
 
-test("GSP-2406 replay reuses completed PR-bearing build", async () => {
+test("completed In Progress task with a real work-product row is reused", async () => {
   const client = db({ prior: { id: "1429d9c4", completed_at: "2026-09-07T00:00:00Z" } });
   assert.deepEqual(await buildTaskAdmission(client, { issueId: "gsp-2406", toStage: "In Progress" }),
     { admit: false, reuseTaskId: "1429d9c4", reason: "completed_build_work_product" });
+  const productRead = client.calls.find(({ sql }) => sql.includes("FROM issue_work_product"));
+  assert.match(productRead.sql, /product\.consuming_stage='In Review'/);
+  assert.match(productRead.sql, /product\.acceptance_evidence->>'task_id'/);
 });
 
 test("GSP-2403 qualifying implementation failure admits exactly one linked retry", async () => {
