@@ -444,15 +444,15 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
       reason: 'completion_blocked_on_human',
       evidence: `blocked_on=human ${resultPointer(row)}` };
   }
-  if (declared && declared.outcome === 'NO_OP' && row.to_stage === 'In Progress') {
-    return { kind: 'no_pr', noopDelivered: true, toStage: 'Done',
-      reason: 'completed_noop_already_delivered' };
-  }
   const commentPr = linked.rows[0] ? null : await client.query(
     `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`, [row.issue_id]);
   const commentMatch = commentPr?.rows
     .map(({ content }) => String(content || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i))
     .find(Boolean);
+  if (declared && declared.outcome === 'NO_OP' && row.to_stage === 'In Progress' && !commentMatch) {
+    return { kind: 'no_pr', noopDelivered: true, toStage: 'Done',
+      reason: 'completed_noop_already_delivered' };
+  }
   // A completed NO_OP has no deployable artifact. Park it instead of asking
   // the bridge to admit an independently checked NO-SHA Done transition.
   if (!linked.rows[0] && !commentMatch) {
