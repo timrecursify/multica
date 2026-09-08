@@ -297,6 +297,7 @@ async function routeTerminalBlocker(client, issue, prior, options) {
   if (!reason) return null;
   try {
     const result = await moveToHumanReview(client, issue, reason, options);
+    if (!result) return null;
     options.budget.humanReview += 1;
     console.log(`[reconcile] ${issue.id} ${issue.status} -> Human Review (${reason})`);
     return result;
@@ -453,9 +454,11 @@ async function reconcileIssue(client, issueId, options = {}) {
           if (options.humanReviewRouting && HUMAN_REVIEW_FROM.has(issue.status) &&
               options.budget.humanReview < options.maxHumanReviewPerCycle) {
             const routed = await moveToHumanReview(client, issue, reason, options);
-            options.budget.humanReview += 1;
-            await client.query("COMMIT");
-            return routed;
+            if (routed) {
+              options.budget.humanReview += 1;
+              await client.query("COMMIT");
+              return routed;
+            }
           }
           await client.query("COMMIT");
           return { action: "skipped", reason, taskId: admission.reuseTaskId };

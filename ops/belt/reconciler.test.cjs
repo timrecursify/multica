@@ -239,7 +239,9 @@ test("stale pending completed-build handoff stays technical", async () => {
     if (sql.includes("SELECT task_id FROM relay_run_log")) return { rows: [{ task_id: completed }] };
     return original(sql, values);
   };
-  assert.equal(await reconcileIssue(db, issue.id, { evaluate: ok }), null);
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "skipped", reason: "completed_build_work_product_handoff_stalled", taskId: completed
+  });
   assert.equal(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Human Review'")), false);
   assert.equal(db.calls.some(({ sql }) => sql.includes("INSERT INTO agent_task_queue")), false);
 });
@@ -643,11 +645,7 @@ test("moveToHumanReview asks as system for a reserved decision", async () => {
 });
 
 test("a capped Spec ticket remains on the technical skipped path", async () => {
-  // Spec was excluded from HUMAN_REVIEW_FROM on the belief that RULES barred
-  // the transition. It does not: transition-policy lists Spec -> Human Review
-  // for the operator actor. With Spec excluded, a Spec ticket that had spent
-  // its lifetime task budget could neither be re-dispatched nor routed, so it
-  // was re-evaluated every cycle forever. Assert against the real policy.
+  // Lifetime exhaustion is technical work and must stay on the skipped path.
   const { evaluate } = require("./transition-policy.cjs");
   const verdict = evaluate({
     from: "Spec", to: "Human Review", actor: "operator",
