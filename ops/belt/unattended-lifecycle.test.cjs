@@ -330,12 +330,15 @@ test('GitHub API outage and non-shipping terminal states stay out of shipped met
   runToImplementation(outage);
   arriveAtDeploy(outage);
   waitOn(outage, 'github-api');
+  assert.equal(evaluate({ from: outage.stage, to: 'Human Review', actor: 'system',
+    evidence: { blocker: 'github_api_outage' } }).code, 'human_review_blocker_not_reserved');
+  assert.notEqual(outage.stage, 'Human Review');
   const cancelled = createHarness('cancelled');
   advance(cancelled, 'Cancelled', 'operator', { boardOwnerAuthority: true, reason: 'withdrawn' });
   cancelled.outcomes.push('CANCELLED');
   const approval = createHarness('approval-wait');
   advance(approval, 'Spec', 'system', { registeredIssue: approval.id, selectedWorkspace: 'gsp' });
-  advance(approval, 'Human Review', 'operator', { blocker: 'release approval', namedBlocker: true });
+  advance(approval, 'Human Review', 'operator', { blocker: 'client_charge', namedBlocker: true });
   waitOn(approval, 'human');
   approval.outcomes.push('WAITING_APPROVAL');
   assert.equal([outage, cancelled, approval].filter(({ shipped }) => shipped).length, 0);
