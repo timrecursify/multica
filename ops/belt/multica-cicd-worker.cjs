@@ -292,6 +292,18 @@ function unauthenticatedGh(error) {
 }
 
 async function escalateToSpec(issue, detail, sha) {
+  // A retry exhaustion/stall leaves the deploy consumer without a chance to
+  // run normal cleanup. Return the active implementation product to In Review
+  // before escalating so the bridge evidence gate cannot strand the ticket in
+  // CI/CD & Deploy after the relay moves it to Spec.
+  try {
+    await pool.query(
+      `UPDATE issue_work_product SET consuming_stage='In Review'
+         WHERE issue_id=$1::uuid AND status='active' AND consuming_stage='CI/CD & Deploy'`,
+      [issue.id]);
+  } catch (error) {
+    log(`WORK_PRODUCT-RETURN-FAIL #${issue.number}: ${String(error?.message || error).split('\n')[0].slice(0, 160)}`);
+  }
   const evidence = { retry_escalation: true, source_sha: sha || null, blocker: detail };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Spec', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Spec: ${verdict.code}`);
