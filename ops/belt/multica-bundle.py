@@ -10,7 +10,7 @@ acceptable, so the content moves first and the archive is conditional on proof
 that it moved.
 
 The proof is a substring check per child against the MEGA description that was
-actually read back from the database after the write. A child is archived only
+actually read back from the API after the write. A child is archived only
 when its own content is demonstrably present in its parent. Nothing is deleted:
 the child keeps its row, its thread and its number, takes the terminal
 'Archived' status the archiver already uses, and records where it went in
@@ -19,9 +19,8 @@ metadata.bundled_into so the move is reversible.
 Idempotent: a child already folded in with an unchanged content hash is skipped,
 so a crashed or re-run scoper never doubles a MEGA description.
 """
-import hashlib, json, os, shutil, subprocess, sys, argparse
+import argparse, hashlib, json, os, sys, urllib.error, urllib.parse, urllib.request
 
-DSN = ['psql', '-h', '127.0.0.1', '-p', '25432']
 MARK = '## Bundled work (this MEGA is the only unit of work)'
 PREAMBLE = (
     'Each section below is a ticket folded into this MEGA. Those tickets are\n'
@@ -29,28 +28,49 @@ PREAMBLE = (
     'Deliver every section as one change set against one shared root cause.\n')
 
 
-def q(sql, rows=True):
-    # SQL goes in on stdin, never as argv: a folded MEGA description reaches
-    # six figures of bytes and `-c` died with E2BIG (Argument list too long).
-    missing = [name for name in ('MULTICA_POSTGRES_USER',
-                                 'MULTICA_POSTGRES_PASSWORD',
-                                 'MULTICA_POSTGRES_DB') if not os.environ.get(name)]
-    if missing:
-        sys.exit('missing required environment variable: ' + ', '.join(missing))
-    if shutil.which('psql') is None:
-        sys.exit('psql is not on PATH for the account running multica-bundle.py')
-    env = os.environ.copy()
-    env['PGPASSWORD'] = env['MULTICA_POSTGRES_PASSWORD']
-    dsn = DSN + ['-U', env['MULTICA_POSTGRES_USER'], '-d', env['MULTICA_POSTGRES_DB']]
-    r = subprocess.run(dsn + (['-At', '-f', '-'] if rows else ['-q', '-f', '-']),
-                       input=sql, capture_output=True, text=True, env=env)
-    if r.returncode:
-        sys.exit('psql failed: ' + r.stderr.strip()[:400])
-    return r.stdout
+class API:
+    def __init__(self):
+        missing = [n for n in ('MULTICA_SERVER_URL', 'MULTICA_TOKEN') if not os.environ.get(n)]
+        if missing:
+            sys.exit('missing required environment variable: ' + ', '.join(missing))
+        base = os.environ['MULTICA_SERVER_URL'].rstrip('/')
+        if base.startswith('ws://'):
+            base = 'http://' + base[5:]
+        elif base.startswith('wss://'):
+            base = 'https://' + base[6:]
+        self.base = base[:-3] if base.endswith('/ws') else base
+        self.token = os.environ['MULTICA_TOKEN']
+
+    def request(self, method, path, body=None):
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.base + path, data=data, method=method,
+            headers={'Authorization': 'Bearer ' + self.token, 'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req) as response:
+                raw = response.read()
+                return json.loads(raw) if raw else None
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors='replace').strip()
+            sys.exit('Multica API %s %s failed: HTTP %d: %s' %
+                     (method, path, exc.code, detail[:400]))
+        except urllib.error.URLError as exc:
+            sys.exit('Multica API %s %s failed: %s' % (method, path, exc.reason))
+
+    def get(self, path): return self.request('GET', path)
+    def put(self, path, body): return self.request('PUT', path, body)
+    def delete(self, path): return self.request('DELETE', path)
 
 
-def lit(s):
-    return '$mbq$' + (s or '') + '$mbq$'
+def issue_path(issue_id, suffix=''):
+    return '/api/issues/' + urllib.parse.quote(str(issue_id), safe='') + suffix
+
+
+def resolve_number(api, number):
+    response = api.get('/api/issues/?number=' + urllib.parse.quote(str(number), safe=''))
+    issues = response.get('issues', [])
+    if len(issues) != 1:
+        sys.exit('#%s was not found in the task token workspace' % number)
+    return issues[0]['id']
 
 
 def child_block(c):
@@ -123,50 +143,46 @@ def mega_body(base, kids):
             + '\n\n'.join(child_block(c) for c in kids) + '\n')
 
 
-def fetch(mega_filter):
-    return json.loads(q("""
-SELECT coalesce(json_agg(m),'[]') FROM (
-  SELECT p.id AS mega_id, p.number AS mega_number, p.description AS mega_descr,
-    (SELECT json_agg(k ORDER BY k->>'number')
-       FROM (SELECT json_build_object(
-               'id', c.id, 'number', c.number, 'title', c.title,
-               'descr', c.description, 'ac', c.acceptance_criteria,
-               'meta', c.metadata,
-               'comments', (SELECT json_agg(cm.content ORDER BY cm.created_at)
-                              FROM comment cm WHERE cm.issue_id = c.id),
-               -- The child's PR trail. Both link tables are read: GitHub is the
-               -- live provider, vcs_pull_request is the self-hosted one, and a
-               -- board can hold either.
-               'prs', (SELECT json_agg(pj) FROM (
-                   SELECT g.repo_owner, g.repo_name, g.pr_number, g.state,
-                          g.html_url, g.merged_at, g.pr_created_at,
-                          v.verdict, v.created_at AS verdict_at
-                     FROM issue_pull_request ipr
-                     JOIN github_pull_request g ON g.id = ipr.pull_request_id
-                     LEFT JOIN LATERAL (SELECT qv.verdict, qv.created_at
-                                          FROM qc_verdict qv
-                                         WHERE qv.issue_id = c.id
-                                      ORDER BY qv.created_at DESC LIMIT 1) v ON true
-                    WHERE ipr.issue_id = c.id
-                   UNION ALL
-                   SELECT x.repo_owner, x.repo_name, x.pr_number, x.state,
-                          x.html_url, x.merged_at, x.pr_created_at,
-                          v.verdict, v.created_at AS verdict_at
-                     FROM issue_vcs_pull_request ivpr
-                     JOIN vcs_pull_request x ON x.id = ivpr.pull_request_id
-                     LEFT JOIN LATERAL (SELECT qv.verdict, qv.created_at
-                                          FROM qc_verdict qv
-                                         WHERE qv.issue_id = c.id
-                                      ORDER BY qv.created_at DESC LIMIT 1) v ON true
-                    WHERE ivpr.issue_id = c.id) pj)) AS k
-               FROM issue c
-              WHERE c.parent_issue_id = p.id
-                AND c.title NOT LIKE 'MEGA%%'
-                AND c.status NOT IN ('Archived','Cancelled')) s) AS kids
-  FROM issue p
-  WHERE p.title LIKE 'MEGA%%' AND p.status NOT IN ('Done','Cancelled','Archived')
-    %s
-) m WHERE m.kids IS NOT NULL;""" % mega_filter).strip())
+def load_child(api, issue):
+    iid = issue['id']
+    prs = []
+    for source in api.get(issue_path(iid, '/pull-requests')).get('pull_requests', []):
+        p = dict(source)
+        p.update(pr_number=p.get('number'), verdict=p.get('qc_verdict'),
+                 verdict_at=p.get('qc_verdict_created_at'))
+        prs.append(p)
+    return {'id': iid, 'number': issue['number'], 'title': issue.get('title'),
+            'descr': issue.get('description'), 'ac': issue.get('acceptance_criteria') or [],
+            'meta': issue.get('metadata') or {},
+            'comments': api.get(issue_path(iid, '/comments')) or [], 'prs': prs}
+
+
+def fetch(api, mega_number):
+    if mega_number is None:
+        response = api.get('/api/issues/?open_only=true')
+        candidates = [row['id'] for row in response.get('issues', [])
+                      if (row.get('title') or '').startswith('MEGA')]
+    else:
+        candidates = [resolve_number(api, mega_number)]
+    megas = []
+    for mega_id in candidates:
+        mega = api.get(issue_path(mega_id))
+        if mega.get('status') in ('Done', 'Cancelled', 'Archived'):
+            continue
+        children = api.get(issue_path(mega['id'], '/children')).get('issues', [])
+        kids = [load_child(api, c) for c in children
+                if not (c.get('title') or '').startswith('MEGA')
+                and c.get('status') not in ('Archived', 'Cancelled')]
+        if kids:
+            megas.append({'mega_id': mega['id'], 'mega_number': mega['number'],
+                          'mega_descr': mega.get('description'), 'kids': kids})
+    if mega_number is not None and candidates and not (mega.get('title') or '').startswith('MEGA'):
+        sys.exit('#%s is not a MEGA ticket' % mega_number)
+    return megas
+
+
+def set_metadata(api, issue_id, key, value):
+    api.put(issue_path(issue_id, '/metadata/' + urllib.parse.quote(key, safe='')), {'value': value})
 
 
 def main():
@@ -176,26 +192,27 @@ def main():
     ap.add_argument('--unbundle', metavar='CHILD',
                     help='restore one folded ticket to Registered and detach it')
     a = ap.parse_args()
+    api = API()
 
     # Splitting an over-broad mega needs its members back as real tickets. The
     # fold is reversible precisely so a scoper can regroup by root cause instead
     # of being stuck with whatever cluster created the mega.
     if a.unbundle:
-        row = q("SELECT id, metadata->>'bundled_into' FROM issue WHERE number = %d"
-                " AND metadata->>'bundled_by' = 'multica-bundle'" % int(a.unbundle)).strip()
-        if not row:
+        child = api.get(issue_path(resolve_number(api, a.unbundle)))
+        meta = child.get('metadata') or {}
+        if meta.get('bundled_by') != 'multica-bundle' or not meta.get('bundled_into'):
             sys.exit('#%s is not a folded ticket' % a.unbundle)
-        iid, mega = row.split('|')
+        iid, mega = child['id'], meta['bundled_into']
         if not a.apply:
             print('DRY unbundle #%s from MEGA #%s' % (a.unbundle, mega)); return
-        q("UPDATE issue SET status='Registered', parent_issue_id=NULL, "
-          "metadata = (coalesce(metadata,'{}'::jsonb) - 'bundled_into' - 'bundled_into_id' "
-          "- 'content_md5' - 'bundled_by') || '{\"unbundled_from\": \"%s\"}'::jsonb, "
-          "updated_at=now() WHERE id='%s'" % (mega, iid), rows=False)
+        api.put(issue_path(iid), {'status': 'Registered', 'parent_issue_id': None})
+        for key in ('bundled_into', 'bundled_into_id', 'content_md5', 'bundled_by'):
+            api.delete(issue_path(iid, '/metadata/' + key))
+        set_metadata(api, iid, 'unbundled_from', str(mega))
         print('unbundled #%s from MEGA #%s -> Registered' % (a.unbundle, mega))
         return
 
-    megas = fetch("AND p.number = %d" % int(a.mega) if a.mega else "")
+    megas = fetch(api, int(a.mega) if a.mega else None)
 
     folded = archived = skipped = blocked = 0
     for m in megas:
@@ -225,11 +242,10 @@ def main():
             print('DRY mega #%s children=%d bytes=%d' % (m['mega_number'], len(m['kids']), len(newd)))
             continue
 
-        q("UPDATE issue SET description=%s, updated_at=now() WHERE id='%s'"
-          % (lit(newd), m['mega_id']), rows=False)
-        # Read back what the database actually holds. A write that silently
+        api.put(issue_path(m['mega_id']), {'description': newd})
+        # Read back what the API actually holds. A write that silently
         # truncated must not be allowed to authorise an archive.
-        live = q("SELECT description FROM issue WHERE id='%s'" % m['mega_id'])
+        live = api.get(issue_path(m['mega_id'])).get('description') or ''
         folded += 1
 
         for c, h in todo:
@@ -239,12 +255,13 @@ def main():
                       % (c['number'], m['mega_number']))
                 blocked += 1
                 continue
-            prov = json.dumps({'bundled_into': m['mega_number'],
+            for key, value in {'bundled_into': m['mega_number'],
                                'bundled_into_id': m['mega_id'],
-                               'content_md5': h, 'bundled_by': 'multica-bundle'})
-            q("UPDATE issue SET status='Archived', "
-              "metadata = coalesce(metadata,'{}'::jsonb) || %s::jsonb, updated_at=now() "
-              "WHERE id='%s'" % (lit(prov), c['id']), rows=False)
+                               'content_md5': h, 'bundled_by': 'multica-bundle'}.items():
+                set_metadata(api, c['id'], key, value)
+            # Provenance is written first: if archiving fails, the child stays
+            # visible and a rerun safely repeats the idempotent metadata writes.
+            api.put(issue_path(c['id']), {'status': 'Archived'})
             archived += 1
 
     print('megas_folded=%d children_archived=%d skipped_idempotent=%d blocked=%d'
