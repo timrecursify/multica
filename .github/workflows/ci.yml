@@ -352,6 +352,16 @@ jobs:
             ops/belt/stage-capacity.test.cjs \
             ops/belt/transition-policy.test.cjs
 
+      - name: Test belt dependency-backed contracts
+        run: |
+          node --test \
+            ops/belt/merged-pr-evidence.test.cjs \
+            ops/belt/parity/multica-relay-advance-daemon-runtime.test.cjs \
+            ops/belt/parity/multica-relay-advance-daemon.test.cjs \
+            ops/belt/qc-escalation-lane.test.cjs \
+            ops/belt/respec-owner-lane.test.cjs \
+            ops/belt/runs-per-ticket-sentinel.test.cjs
+
       - name: Test belt shell contracts
         run: |
           bash ops/belt/belt-concurrency.test.sh
