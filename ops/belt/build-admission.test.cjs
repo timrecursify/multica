@@ -27,26 +27,29 @@ test("active canonical product reuses correlated build", async () => {
 });
 
 test("GSP-2403 qualifying implementation failure admits exactly one linked retry", async () => {
-  const prior = { id: "7f3916a4", completed_at: "2026-09-07T00:00:00Z" };
-  const first = await buildTaskAdmission(db({ prior, failure: { id: 1772 } }),
+  const prior = { id: "7f3916a4-1111-4111-8111-7f3916a40000", completed_at: "2026-09-07T00:00:00Z" };
+  const product = { kind:"implementation", consuming_stage:"In Review", repository:"timrecursify/multica", branch:"main", pr_number:1, head_sha:"a".repeat(40), producer_task_id:prior.id };
+  const first = await buildTaskAdmission(db({ prior, product, failure: { id: 1772 } }),
     { issueId: "gsp-2403", toStage: "In Progress" });
-  assert.deepEqual(first, { admit: true, retryOfTaskId: "7f3916a4", qcAttemptId: "1772" });
-  const replay = await buildTaskAdmission(db({ prior, failure: { id: 1772 }, successor: { id: "b4277af2" } }),
+  assert.deepEqual(first, { admit: true, retryOfTaskId: prior.id, qcAttemptId: "1772" });
+  const replay = await buildTaskAdmission(db({ prior, product, failure: { id: 1772 }, successor: { id: "b4277af2" } }),
     { issueId: "gsp-2403", toStage: "In Progress" });
   assert.deepEqual(replay, { admit: false, reuseTaskId: "b4277af2", reason: "implementation_retry_exists" });
   assert.equal(replay.admit, false, "the effective failure event admits only one corrective task");
 });
 
 test("correlated FAILED build without any QC verdict admits a retry", async () => {
-  const prior = { id: "failed-build", completed_at: "2026-09-07T00:00:00Z" };
-  assert.deepEqual(await buildTaskAdmission(db({ prior, unreviewedFailure: { task_id: prior.id } }),
+  const prior = { id: "8f3916a4-1111-4111-8111-8f3916a40000", completed_at: "2026-09-07T00:00:00Z" };
+  const product = { kind:"implementation", consuming_stage:"In Review", repository:"timrecursify/multica", branch:"main", pr_number:1, head_sha:"a".repeat(40), producer_task_id:prior.id };
+  assert.deepEqual(await buildTaskAdmission(db({ prior, product, unreviewedFailure: { task_id: prior.id } }),
     { issueId: "stranded", toStage: "In Progress" }),
   { admit: true, retryOfTaskId: prior.id });
 });
 
 test("historical QC verdict does not suppress a current correlated FAILED retry", async () => {
-  const prior = { id: "failed-build", completed_at: "2026-09-07T00:00:00Z" };
-  const client = db({ prior, unreviewedFailure: { task_id: prior.id } });
+  const prior = { id: "9f3916a4-1111-4111-8111-9f3916a40000", completed_at: "2026-09-07T00:00:00Z" };
+  const product = { kind:"implementation", consuming_stage:"In Review", repository:"timrecursify/multica", branch:"main", pr_number:1, head_sha:"a".repeat(40), producer_task_id:prior.id };
+  const client = db({ prior, product, unreviewedFailure: { task_id: prior.id } });
   assert.deepEqual(await buildTaskAdmission(client, { issueId: "stranded", toStage: "In Progress" }),
     { admit: true, retryOfTaskId: prior.id });
   const admissionSql = client.calls.find(({ sql }) => sql.includes("SELECT outcome.task_id")).sql;
