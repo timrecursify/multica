@@ -57,11 +57,28 @@ receipt_target="gsp-belt"
 receipt_owner="ops/belt/deploy.sh"
 receipt_probe="systemd-active-mainpid-runtime-parity-v1"
 deployment_fence_closed=0
+deployment_phase=pre-drain
+declare -a backups=() touched=() absence_markers=()
 
 . "$root_dir/deployment-drain.sh"
 
 # Manifest lives in one place; see belt-manifest.sh.
 . "$root_dir/belt-manifest.sh"
+
+restore_on_failure() {
+  local rc=$? index
+  if [[ "$mode" == apply && "$deployment_fence_closed" == 1 ]]; then
+    if [[ "$deployment_phase" != drained ]]; then
+      deployment_fence_open || true
+    fi
+    for index in "${touched[@]}"; do
+      if [[ -f "${absence_markers[$index]}" ]]; then rm -f -- "${targets[$index]}";
+      else cp --preserve=mode -- "${backups[$index]}" "${targets[$index]}" || true; fi
+    done
+  fi
+  exit "$rc"
+}
+trap restore_on_failure ERR INT TERM
 
 if [[ "$only_target" == belt-unit-guard ]]; then
   [[ "$mode" != rollback ]] || { printf 'belt-unit-guard rollback is not supported\n' >&2; exit 2; }
@@ -388,28 +405,8 @@ if [[ "$mode" == apply ]]; then
   deployment_lock_acquire
   deployment_fence_close
   deployment_wait_for_drain
+  deployment_phase=drained
 fi
-
-declare -a backups=()
-declare -a touched=()
-declare -a absence_markers=()
-restore_on_failure() {
-  local rc=$? index
-  if [[ "$mode" == apply && ${#touched[@]} -gt 0 ]]; then
-    for index in "${touched[@]}"; do
-      if [[ -f "${absence_markers[$index]}" ]]; then
-        rm -f -- "${targets[$index]}"
-      else
-        cp --preserve=mode -- "${backups[$index]}" "${targets[$index]}" ||
-          printf 'ROLLBACK FAILED: %s\n' "${targets[$index]}" >&2
-      fi
-    done
-    printf 'Deployment failed; restored %s target(s). Rollback receipt: %s --rollback %s\n' \
-      "${#touched[@]}" "$0" "$timestamp" >&2
-  fi
-  exit "$rc"
-}
-trap restore_on_failure ERR
 
 # Create every backup before the first target is modified. A partial backup set
 # cannot produce a misleading rollback claim.

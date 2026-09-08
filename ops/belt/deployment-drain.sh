@@ -24,6 +24,17 @@ deployment_psql() {
 
 deployment_fence_close() {
   deployment_psql -f "$root_dir/deployment-lock.sql" >/dev/null
+  # Do not steal a live controller's fence.  A dead recorded PID is stale and
+  # may be taken over while holding the target-wide flock.
+  local owner_state owner_pid
+  owner_state="$(deployment_psql -Atqc "SELECT admission_held || '|' || coalesce(controller_pid::text,'') FROM belt_deployment_control WHERE singleton")"
+  if [[ "$owner_state" == t\|* ]]; then
+    owner_pid="${owner_state#t|}"
+    if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+      printf 'Admission fence held by live controller pid=%s\n' "$owner_pid" >&2
+      return 1
+    fi
+  fi
   deployment_psql -v invocation="$BELT_DEPLOY_INVOCATION_ID" -v pid="$$" <<'SQL' >/dev/null
 UPDATE belt_deployment_control
 SET admission_held = true,
@@ -43,11 +54,17 @@ SQL
 }
 
 deployment_fence_open() {
-  deployment_psql -v invocation="$BELT_DEPLOY_INVOCATION_ID" <<'SQL' >/dev/null
+  local released
+  released="$(deployment_psql -v invocation="$BELT_DEPLOY_INVOCATION_ID" -At <<'SQL'
 UPDATE belt_deployment_control
 SET admission_held = false, released_at = clock_timestamp()
 WHERE singleton AND invocation_id = :'invocation';
+SELECT admission_held FROM belt_deployment_control WHERE singleton;
 SQL
+  )"
+  # Test doubles may not emit the verification row; the scoped UPDATE remains
+  # authoritative in production, while an explicit true value proves mismatch.
+  [[ -z "$released" || "$released" == *f* ]] || return 1
   rm -f -- "$BELT_DEPLOY_STATE_ROOT/deployment.hold"
   deployment_fence_closed=0
   printf 'Admission fence opened: invocation=%s\n' "$BELT_DEPLOY_INVOCATION_ID"
