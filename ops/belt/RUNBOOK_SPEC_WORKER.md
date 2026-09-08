@@ -176,6 +176,10 @@ Cancelled, and named by an exact `gsp:<ticket-number>` token in that MEGA before
 previewing or applying the Registered transition; ambiguous or inactive MEGAs
 are rejected.
 
+Status transitions use the same transaction-local `multica.relay_authorized`
+capability as the canonical bridge/reconciler (migration 297); description-only
+writes do not set it.
+
   `--unbundle` returns one folded ticket to `Registered` and detaches it, so
   regrouping never has to be done by hand against an archived row.
 
