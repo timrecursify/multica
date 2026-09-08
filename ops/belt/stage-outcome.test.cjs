@@ -63,6 +63,8 @@ test("stageEligibility ignores a stale blocker after an operator release", async
   assert.equal(result.eligible, true);
   assert.equal(result.reason, "operator_release_epoch");
   assert.equal(c.calls.length, 1);
+});
+
 test("stageEligibility blocks insertion at the attempt ceiling without a prior outcome", async () => {
   const c = fakeClient([[]]);
   const result = await so.stageEligibility(c, "i-cap", "Queue", { attempt: 3, maxAttempts: 3 });

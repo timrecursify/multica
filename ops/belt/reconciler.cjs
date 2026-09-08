@@ -399,6 +399,7 @@ async function reconcileIssue(client, issueId, options = {}) {
     const stageAttempts = await client.query(stageAttemptsSql(), [issue.id, issue.status, options.defaultMaxAttempts]);
     const attempt = Number(stageAttempts.rows[0]?.attempt || 0);
     const budget = stageAttemptBudget(attempt, Number(stageAttempts.rows[0]?.max_attempts || 0), options.defaultMaxAttempts);
+    const maxAttempts = budget.maxAttempts;
     if (options.typedOutcomes) {
       // GSP-1826: a recorded outcome for this stage with unchanged inputs is final until the inputs change.
       const eligibility = await stageEligibility(client, issue.id, issue.status, {
