@@ -14,6 +14,9 @@ function keyFor(issueId, stage = 'CI/CD & Deploy') { return `${issueId}:${stage}
 function correlationKey(issueId, sha = '') {
   return crypto.createHash('sha256').update(`${issueId}:${sha}`).digest('hex').slice(0, 32);
 }
+function attemptCount(row) {
+  return Number.isFinite(row.attempts) && row.attempts >= 0 ? Math.floor(row.attempts) : 0;
+}
 
 function createWatchdog({ file, now = () => Date.now() } = {}) {
   let state = {};
@@ -44,13 +47,13 @@ function createWatchdog({ file, now = () => Date.now() } = {}) {
       delete row.last_error;
     }
     row.last_seen_at = new Date(t).toISOString();
-    if (countAttempt) { row.last_attempt_at = row.last_seen_at; row.attempts = Math.min(row.attempts + 1, RETRY_LIMIT); }
+    if (countAttempt) { row.last_attempt_at = row.last_seen_at; row.attempts = Math.min(attemptCount(row) + 1, RETRY_LIMIT); }
     if (sha) row.commit_sha = sha; if (outcome) row.outcome = outcome;
     if (error) row.last_error = String(error).slice(0, 500);
     state[key] = row; persist(); return row;
   };
-  const retryAllowed = (row) => row.attempts <= RETRY_LIMIT && now() - Date.parse(row.first_seen_at) < SENTINEL_MS;
-  const backoffMs = (row) => Math.min(RETRY_BASE_MS * (2 ** Math.max(0, row.attempts - 1)), SENTINEL_MS);
+  const retryAllowed = (row) => attemptCount(row) < RETRY_LIMIT && now() - Date.parse(row.first_seen_at) < SENTINEL_MS;
+  const backoffMs = (row) => Math.min(RETRY_BASE_MS * (2 ** Math.max(0, attemptCount(row) - 1)), SENTINEL_MS);
   const stalled = (row) => !row.alerted && now() - Date.parse(row.first_seen_at) >= SENTINEL_MS;
   const markAlerted = (row, outcome = 'deploy_stalled') => { row.alerted = true; row.outcome = outcome; row.alerted_at = new Date(now()).toISOString(); persist(); return row; };
   const clear = (issueId, stage = 'CI/CD & Deploy') => { delete state[keyFor(issueId, stage)]; persist(); };
