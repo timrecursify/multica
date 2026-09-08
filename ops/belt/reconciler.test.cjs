@@ -280,6 +280,22 @@ test("own-stage FAILED build with no QC verdict is admitted as a bounded retry i
       issue_id uuid NOT NULL, stage text NOT NULL, outcome text NOT NULL,
       blocked_on text, task_id uuid, outcome_at timestamptz NOT NULL
     )`);
+    await client.query(`CREATE TABLE issue_work_product (
+      issue_id uuid NOT NULL, scope_revision bigint NOT NULL, kind text NOT NULL,
+      repository text, branch text, pr_number integer, head_sha text,
+      acceptance_evidence jsonb NOT NULL, replaces_scope_revision bigint,
+      consuming_stage text NOT NULL, dependency_issue_ids uuid[] NOT NULL DEFAULT '{}',
+      status text NOT NULL, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL
+    )`);
+    await client.query(
+      `INSERT INTO issue_work_product
+         (issue_id, scope_revision, kind, repository, branch, pr_number, head_sha,
+          acceptance_evidence, consuming_stage, status, created_at, updated_at)
+       VALUES ($1, 1, 'implementation', 'acme/widget', 'fix/belt', 7, $2,
+         '{"task_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}',
+         'In Review', 'active', '2026-09-07T20:00:00Z', '2026-09-07T20:00:00Z')`,
+      [issueId, "a".repeat(40)]
+    );
     await client.query(
       `INSERT INTO agent_task_queue
          (id, issue_id, status, context, result, completed_at, created_at)
