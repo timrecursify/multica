@@ -924,7 +924,11 @@ async function handoffActiveWorkProduct(client, issueId, fromStage, toStage) {
   let consumingStage = null;
   if (fromStage === 'In Review' && toStage === 'CI/CD & Deploy') {
     consumingStage = 'CI/CD & Deploy';
-  } else if (fromStage === 'CI/CD & Deploy' && toStage === 'In Progress') {
+  } else if (fromStage === 'CI/CD & Deploy' &&
+      ['In Progress', 'Spec', 'Parked'].includes(toStage)) {
+    // Every failed CI/CD exit hands the implementation back to the review
+    // boundary. In particular, retry escalation is performed by the bridge
+    // after a worker crash, so this cannot depend on worker-side cleanup.
     consumingStage = 'In Review';
   } else {
     return;
