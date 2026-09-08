@@ -44,16 +44,23 @@ function createWatchdog({ file, now = () => Date.now() } = {}) {
       delete row.last_error;
     }
     row.last_attempt_at = new Date(t).toISOString(); row.last_seen_at = row.last_attempt_at;
-    row.attempts += 1; if (sha) row.commit_sha = sha; if (outcome) row.outcome = outcome;
+    row.attempts = Math.min(RETRY_LIMIT, row.attempts + 1); if (sha) row.commit_sha = sha; if (outcome) row.outcome = outcome;
     if (error) row.last_error = String(error).slice(0, 500);
     state[key] = row; persist(); return row;
+  };
+  const seen = (issueId, { stage = 'CI/CD & Deploy', sha = '' } = {}) => {
+    const key = keyFor(issueId, stage); const t = now();
+    const row = state[key] || { issue_id: issueId, stage, first_seen_at: new Date(t).toISOString(), attempts: 0,
+      correlation_key: correlationKey(issueId, sha), alerted: false };
+    if (sha && row.commit_sha && row.commit_sha !== sha) { row.first_seen_at = new Date(t).toISOString(); row.attempts = 0; row.alerted = false; row.correlation_key = correlationKey(issueId, sha); delete row.alerted_at; }
+    row.last_seen_at = new Date(t).toISOString(); if (sha) row.commit_sha = sha; state[key] = row; persist(); return row;
   };
   const retryAllowed = (row) => row.attempts <= RETRY_LIMIT && now() - Date.parse(row.first_seen_at) < SENTINEL_MS;
   const backoffMs = (row) => Math.min(RETRY_BASE_MS * (2 ** Math.max(0, row.attempts - 1)), SENTINEL_MS);
   const stalled = (row) => !row.alerted && now() - Date.parse(row.first_seen_at) >= SENTINEL_MS;
   const markAlerted = (row, outcome = 'deploy_stalled') => { row.alerted = true; row.outcome = outcome; row.alerted_at = new Date(now()).toISOString(); persist(); return row; };
   const clear = (issueId, stage = 'CI/CD & Deploy') => { delete state[keyFor(issueId, stage)]; persist(); };
-  return { observe, retryAllowed, backoffMs, stalled, markAlerted, clear, snapshot: () => ({ ...state }) };
+  return { observe, seen, retryAllowed, backoffMs, stalled, markAlerted, clear, snapshot: () => ({ ...state }) };
 }
 
 module.exports = { SENTINEL_MS, RETRY_LIMIT, RETRY_BASE_MS, keyFor, correlationKey, createWatchdog };
