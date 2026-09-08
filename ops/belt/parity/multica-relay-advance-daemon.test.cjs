@@ -460,9 +460,6 @@ test('requeue candidate SQL binds the stage array with a real PostgreSQL client'
       t.skip('test DB schema lacks public.relay_run_log; live-schema validation remains required');
       return;
     }
-    await client.query(`CREATE TEMP TABLE qc_verdict (
-      issue_id uuid NOT NULL, checker_id uuid, created_at timestamptz NOT NULL
-    ) ON COMMIT DROP`);
     const result = await client.query(sql, params);
     assert.ok(Array.isArray(result.rows));
   } finally {
