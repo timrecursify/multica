@@ -116,6 +116,10 @@ selected() {
 # root is shared by the GSP and PPP worker units; all other roots are one-to-one.
 service_units_for_target() {
   local target="$1" relative service_root
+  if [[ "$target" == "$global_bin_root/gsp-belt-git-credential" ]]; then
+    printf '%s\n' multica-cicd-worker multica-relay-advance
+    return
+  fi
   if [[ "$target" == "$doctrine_root/"* ]]; then
     printf '%s\n' gsp-multica-worker gsp-multica-worker-ppp
     return
@@ -337,7 +341,9 @@ for index in "${!sources[@]}"; do
   # per-file allowlist this replaces had to be edited for every added file and
   # silently encoded the old layout.
   new_targets[$index]=0
-  if [[ "${targets[$index]}" == "$doctrine_root/"* ]]; then
+  if [[ "${targets[$index]}" == "$global_bin_root/gsp-belt-git-credential" ]]; then
+    service_root="$(dirname -- "${targets[$index]}")"
+  elif [[ "${targets[$index]}" == "$doctrine_root/"* ]]; then
     service_root="$doctrine_root"
   else
     relative_target="${targets[$index]#"$runtime_root"/}"
@@ -466,7 +472,12 @@ for index in "${!sources[@]}"; do
     false
   fi
   cp --preserve=mode -- "$source_file" "$target_file"
-  if [[ "$target_file" == "$doctrine_root/"* ]]; then
+  if [[ "$target_file" == "$global_bin_root/gsp-belt-git-credential" ]]; then
+    chmod 0755 -- "$target_file"
+    if [[ "${BELT_DEPLOY_SKIP_OWNERSHIP:-0}" != 1 ]]; then
+      chown root:root -- "$target_file"
+    fi
+  elif [[ "$target_file" == "$doctrine_root/"* ]]; then
     chgrp --reference="$doctrine_root" -- "$target_file"
     case "$target_file" in
       *.py) chmod 0750 -- "$target_file" ;;
