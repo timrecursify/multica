@@ -23,16 +23,13 @@ deployment_psql() {
 }
 
 deployment_process_identity() {
-  local pid="$1" proc_root="${BELT_DEPLOY_CONTROLLER_PROC_ROOT:-/proc}" stat_line stat_tail boot_id start_ticks restore_glob=1
+  local pid="$1" proc_root="${BELT_DEPLOY_CONTROLLER_PROC_ROOT:-/proc}" stat_line stat_tail boot_id start_ticks
   [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ -r "$proc_root/$pid/stat" && -r "$proc_root/sys/kernel/random/boot_id" ]] || return 1
   IFS= read -r stat_line < "$proc_root/$pid/stat" || return 1
   stat_tail="${stat_line##*) }"
   # starttime is field 22 of /proc/PID/stat, or field 20 after pid and comm.
-  [[ $- == *f* ]] && restore_glob=0
-  set -f
   set -- $stat_tail
-  (( restore_glob == 0 )) || set +f
   start_ticks="${20:-}"
   IFS= read -r boot_id < "$proc_root/sys/kernel/random/boot_id" || return 1
   [[ "$start_ticks" =~ ^[0-9]+$ && -n "$boot_id" ]] || return 1
@@ -47,42 +44,15 @@ deployment_controller_alive() {
 }
 
 deployment_fence_alarm() {
-  local stale_invocation="$1" stale_pid="$2" sk="${BELT_DEPLOY_SK:-}" out
-  local alarm_user="${BELT_DEPLOY_ALARM_USER:-newadmin}" runuser_bin="${BELT_DEPLOY_RUNUSER:-/usr/sbin/runuser}"
-  local alarm_home="${BELT_DEPLOY_ALARM_HOME:-/home/$alarm_user}" alarm_path="${BELT_DEPLOY_ALARM_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
-  if [[ -z "$sk" ]]; then
-    sk="$(command -v sk 2>/dev/null || true)"
-    [[ -n "$sk" ]] || sk=/home/newadmin/.local/bin/sk
-  fi
-  if [[ ! -x "$sk" ]]; then
-    deployment_fence_alarm_status=failed
-    printf 'CRITICAL: unable to file stale-fence P0: sk executable unavailable (resolved path: %s)\n' "${sk:-none}" >&2
-    return 1
-  fi
-  if [[ ! -x "$runuser_bin" ]]; then
-    deployment_fence_alarm_status=failed
-    printf 'CRITICAL: unable to file stale-fence P0: unprivileged launcher unavailable (resolved path: %s)\n' "$runuser_bin" >&2
-    return 1
-  fi
-  if out=$("$runuser_bin" -u "$alarm_user" -- env -i HOME="$alarm_home" PATH="$alarm_path" BELT_DEPLOY_ALARM_USER="$alarm_user" "$sk" multica create --board gsp \
+  local stale_invocation="$1" stale_pid="$2" sk="${BELT_DEPLOY_SK:-/var/lib/gsp/bin/sk}" out
+  [[ -x "$sk" ]] || { printf 'Unable to file stale-fence P0: sk unavailable\n' >&2; return 1; }
+  if out=$("$sk" multica create --board gsp \
     --title 'P0: belt admission fence has a dead controller' \
-    --desc - 2>&1 <<EOF
-Automated by ops/belt/deploy.sh on $(hostname) at $(date -Is).
-
-The durable admission fence was held by dead controller invocation ${stale_invocation:-unknown}, pid ${stale_pid:-unknown}. A new serialized controller is taking over the hold.
-EOF
-  ); then
-    deployment_fence_alarm_status=filed
-    printf 'STALE-FENCE P0 FILED: %s\n' "$out" >&2
+    --desc "Automated by ops/belt/deploy.sh on $(hostname) at $(date -Is).\n\nThe durable admission fence was held by dead controller invocation ${stale_invocation:-unknown}, pid ${stale_pid:-unknown}. A new serialized controller is taking over the hold." 2>&1); then
     return 0
   fi
-  if [[ "$out" =~ (^|$'\n')[[:space:]]*code:[[:space:]]active_duplicate_issue($|$'\n') ]]; then
-    deployment_fence_alarm_status=duplicate_suppressed
-    printf 'STALE-FENCE P0 ALREADY ACTIVE; duplicate suppressed:\n%s\n' "$out" >&2
-    return 0
-  fi
-  deployment_fence_alarm_status=failed
-  printf 'CRITICAL: unable to file stale-fence P0 ticket:\n%s\n' "$out" >&2
+  [[ "$out" =~ active_duplicate_issue|duplicate_issue|already[[:space:]_-]+exists|canonical_duplicate|equivalent[[:space:]_-]+open ]] && return 0
+  printf 'Unable to file stale-fence P0 ticket\n' >&2
   return 1
 }
 
@@ -106,9 +76,7 @@ SQL
       printf 'Admission fence is held by live controller: invocation=%s controller_pid=%s\n' "$stale_invocation" "$stale_pid" >&2
       return 1
     fi
-    if ! deployment_fence_alarm "$stale_invocation" "$stale_pid"; then
-      printf 'CRITICAL: stale-fence takeover is continuing without a filed P0 alarm; receipt will record the alarm failure\n' >&2
-    fi
+    deployment_fence_alarm "$stale_invocation" "$stale_pid" || true
     printf 'Taking over stale admission fence: prior_invocation=%s prior_controller_pid=%s\n' "$stale_invocation" "$stale_pid"
   fi
   deployment_psql -v invocation="$BELT_DEPLOY_INVOCATION_ID" -v pid="$$" \
@@ -162,17 +130,10 @@ SQL
 # record at all -- it writes only retry counters into issue.metadata -- so no
 # query can observe a merge it has in flight. Draining does not cover that
 # worker. Stop its unit before deploying if that matters.
-#
-# Prepare leases use the same live-work principle. An expired prepare lease is
-# not in-flight work and must not hold a drain open: measured live on
-# 2026-09-08, all 9 prepare leases were expired while dispatched/running work
-# was 0. Compare each lease with its own expiry rather than inventing an age
-# threshold. Keep the status term below: genuinely dispatched/running work
-# must still hold the drain open.
 deployment_drain_snapshot() {
   deployment_psql -At <<'SQL'
 SELECT concat_ws(' ',
-  'leases=' || count(*) FILTER (WHERE status IN ('dispatched','running') OR (prepare_lease_expires_at IS NOT NULL AND prepare_lease_expires_at > now())),
+  'leases=' || count(*) FILTER (WHERE status IN ('dispatched','running') OR prepare_lease_expires_at IS NOT NULL),
   'children=' || count(*) FILTER (WHERE parent_task_id IS NOT NULL AND status IN ('dispatched','running')),
   -- callbacks counts only pending rows the advancer can still consume.
   --
