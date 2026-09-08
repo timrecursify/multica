@@ -82,8 +82,9 @@ test("worker doctrine reuses the canonical PR and records evidence without fake 
   assert.match(common, /acceptance evidence/i);
 });
 
-test("build outcome atomically inserts ownership and rework updates its exact identity against PostgreSQL", async () => {
-  assert.ok(process.env.DATABASE_URL, "DATABASE_URL is required for the real PostgreSQL regression test");
+test("build outcome atomically inserts ownership and rework updates its exact identity against PostgreSQL", {
+  skip: !process.env.DATABASE_URL,
+}, async () => {
   const { Client } = require("pg");
   const client = new Client({ connectionString: process.env.DATABASE_URL });
   const schema = `work_product_${process.pid}_${Date.now()}`;
