@@ -925,11 +925,15 @@ async function handoffActiveWorkProduct(client, issueId, fromStage, toStage) {
   if (fromStage === 'In Review' && toStage === 'CI/CD & Deploy') {
     consumingStage = 'CI/CD & Deploy';
   } else if (fromStage === 'CI/CD & Deploy' &&
-      ['In Progress', 'Spec', 'Parked'].includes(toStage)) {
+      ['In Progress', 'Spec', 'Parked', 'Human Review', 'In Review'].includes(toStage)) {
     // Every failed CI/CD exit hands the implementation back to the review
     // boundary. In particular, retry escalation is performed by the bridge
     // after a worker crash, so this cannot depend on worker-side cleanup.
     consumingStage = 'In Review';
+  } else if (fromStage === 'CI/CD & Deploy' && ['Done', 'Cancelled'].includes(toStage)) {
+    // Terminal dispositions are finalized by the existing relay convention;
+    // there is no handback to perform here.
+    return;
   } else {
     return;
   }
