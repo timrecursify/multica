@@ -10,9 +10,19 @@ CREATE TABLE IF NOT EXISTS belt_deployment_control (
   admission_held boolean NOT NULL DEFAULT false,
   invocation_id text,
   controller_pid bigint,
+  controller_start_ticks bigint,
+  controller_boot_id text,
   held_at timestamptz,
-  released_at timestamptz
+  released_at timestamptz,
+  takeover_of_invocation_id text,
+  takeover_at timestamptz
 );
+
+ALTER TABLE belt_deployment_control
+  ADD COLUMN IF NOT EXISTS controller_start_ticks bigint,
+  ADD COLUMN IF NOT EXISTS controller_boot_id text,
+  ADD COLUMN IF NOT EXISTS takeover_of_invocation_id text,
+  ADD COLUMN IF NOT EXISTS takeover_at timestamptz;
 
 INSERT INTO belt_deployment_control (singleton) VALUES (true)
 ON CONFLICT (singleton) DO NOTHING;

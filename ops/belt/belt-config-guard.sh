@@ -445,6 +445,28 @@ worker_remediation_released() {
   ! ai_hold_active && [[ -f "$OPERATOR_RELEASE_FILE" ]] && [[ -f "$SUPERVISOR_APPROVAL_FILE" ]]
 }
 
+deployment_controller_alive() {
+  local pid="$1" expected_start="$2" expected_boot="$3" proc_root="${BELT_DEPLOY_CONTROLLER_PROC_ROOT:-/proc}"
+  local stat_line stat_tail boot_id start_ticks
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -n "$expected_start" && -n "$expected_boot" ]] || return 1
+  [[ -r "$proc_root/$pid/stat" && -r "$proc_root/sys/kernel/random/boot_id" ]] || return 1
+  IFS= read -r stat_line < "$proc_root/$pid/stat" || return 1
+  stat_tail="${stat_line##*) }"
+  set -- $stat_tail
+  start_ticks="${20:-}"
+  IFS= read -r boot_id < "$proc_root/sys/kernel/random/boot_id" || return 1
+  [[ "$start_ticks" == "$expected_start" && "$boot_id" == "$expected_boot" ]]
+}
+
+guard_deployment_fence() {
+  local row held invocation pid start_ticks boot_id
+  row=$("${PSQL[@]}" -c "SELECT admission_held::int, coalesce(invocation_id,''), coalesce(controller_pid::text,''), coalesce(controller_start_ticks::text,''), coalesce(controller_boot_id,'') FROM belt_deployment_control WHERE singleton;" 2>/dev/null) || return 0
+  IFS='|' read -r held invocation pid start_ticks boot_id <<< "$row"
+  [[ "$held" == 1 ]] || return 0
+  deployment_controller_alive "$pid" "$start_ticks" "$boot_id" && return 0
+  unfixable+=("admission fence held by dead controller invocation=${invocation:-unknown} pid=${pid:-unknown}")
+}
+
 file_p0() {
   local title="$1" body="$2" out rc
   out=$("$SK" multica create --board gsp --title "P0: $title" --desc "$body" 2>&1); rc=$?
@@ -1585,6 +1607,7 @@ guard_unshipped_closures() {
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
 # Validate relay authority before any guard can attempt a status mutation.
+guard_deployment_fence
 guard_relay_preflight
 repair_source_runtime_parity
 guard_source_runtime_parity
