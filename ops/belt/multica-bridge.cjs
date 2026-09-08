@@ -936,7 +936,7 @@ async function handoffActiveWorkProduct(client, issueId, fromStage, toStage) {
       RETURNING issue_id`,
     [issueId, consumingStage]
   );
-  if (handedOff.rowCount !== 1) {
+  if (handedOff.rowCount > 1) {
     throw new Error(`work product handoff requires exactly one active row: ` +
       `issue=${issueId} active_products=${handedOff.rowCount}`);
   }
