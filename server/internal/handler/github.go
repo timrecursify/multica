@@ -134,6 +134,8 @@ type GitHubPullRequestResponse struct {
 	Additions    int32 `json:"additions"`
 	Deletions    int32 `json:"deletions"`
 	ChangedFiles int32 `json:"changed_files"`
+	QCVerdict          *string `json:"qc_verdict"`
+	QCVerdictCreatedAt *string `json:"qc_verdict_created_at"`
 }
 
 type GitHubConnectResponse struct {
@@ -970,8 +972,16 @@ func (h *Handler) ListPullRequestsForIssue(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	out := make([]GitHubPullRequestResponse, 0, len(rows))
+	qcVerdict, qcVerdictCreatedAt, err := h.latestQCVerdict(r.Context(), issue.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to list pull requests")
+		return
+	}
 	for _, row := range rows {
-		out = append(out, issuePullRequestRowToResponse(row, h.PRRefresh.Enabled()))
+		resp := issuePullRequestRowToResponse(row, h.PRRefresh.Enabled())
+		resp.QCVerdict = qcVerdict
+		resp.QCVerdictCreatedAt = qcVerdictCreatedAt
+		out = append(out, resp)
 		// Page-visit trigger (MUL-5265): if this card's snapshot is missing or
 		// older than the view TTL, kick an async refresh. Non-blocking — the
 		// current (possibly stale) response is returned immediately and the
@@ -994,12 +1004,42 @@ func (h *Handler) ListPullRequestsForIssue(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	for _, row := range vcsRows {
-		out = append(out, vcsPullRequestRowToResponse(row))
+		resp := vcsPullRequestRowToResponse(row)
+		resp.QCVerdict = qcVerdict
+		resp.QCVerdictCreatedAt = qcVerdictCreatedAt
+		out = append(out, resp)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
 		return out[i].PRCreatedAt > out[j].PRCreatedAt
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"pull_requests": out})
+}
+
+func (h *Handler) latestQCVerdict(ctx context.Context, issueID pgtype.UUID) (*string, *string, error) {
+	var tableExists bool
+	if err := h.DB.QueryRow(ctx, `SELECT to_regclass('public.qc_verdict') IS NOT NULL`).Scan(&tableExists); err != nil {
+		return nil, nil, err
+	}
+	if !tableExists {
+		return nil, nil, nil
+	}
+
+	var verdict pgtype.Text
+	var createdAt pgtype.Timestamptz
+	err := h.DB.QueryRow(ctx, `
+		SELECT verdict, created_at
+		FROM qc_verdict
+		WHERE issue_id = $1
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, issueID).Scan(&verdict, &createdAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	return textToPtr(verdict), timestampToPtr(createdAt), nil
 }
 
 // broadcastPRSnapshotApplied is the ghsnapshot pipeline's onApplied callback:

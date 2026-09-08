@@ -2,16 +2,12 @@
 """Regression suite for multica-bundle.
 
 The bundler folds a source ticket into its MEGA and then archives the source,
-so anything the fold drops becomes invisible. Bundling on 2026-09-07 copied
-title, body and body hash but never read the pull-request tables: 122 sources
-of live MEGAs held an issue_pull_request row and the MEGAs cited almost none of
-them, orphaning ~123 in-flight pull requests behind archived tickets. These
-tests fix that contract: a source carrying a linked pull request must not be
-able to produce a MEGA body that lacks the reference.
+so anything the fold drops becomes invisible. The API rewrite must retain the
+pull-request trail and latest QC verdict that the database implementation added.
 
 Hermetic -- no database, no network. Run: python3 ops/belt/multica-bundle.test.py
 """
-import importlib.util, os, sys, unittest
+import importlib.util, os, sys, unittest, urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location('multica_bundle',
@@ -89,13 +85,52 @@ class PullRequestTrail(unittest.TestCase):
         c = child(prs=[OPEN_PR])
         self.assertIn('sk-cli#1686', mb.child_block(c))
 
-    def test_fetch_query_reads_both_pull_request_link_tables(self):
-        """Guards the SQL itself: the 2026-09-07 bundler had zero references to these tables."""
+    def test_fetch_reads_the_authenticated_pull_request_api(self):
+        """The API combines GitHub and self-hosted PRs and attaches the latest QC verdict."""
         with open(os.path.join(HERE, 'multica-bundle.py')) as fh:
             src = fh.read()
-        for table in ('issue_pull_request', 'github_pull_request',
-                      'issue_vcs_pull_request', 'vcs_pull_request', 'qc_verdict'):
-            self.assertIn(table, src, '%s is never read; the PR trail cannot be copied' % table)
+        self.assertIn("'/pull-requests'", src)
+        self.assertIn("p.get('qc_verdict')", src)
+        self.assertIn("p.get('qc_verdict_created_at')", src)
+
+    def test_api_pull_request_fields_are_mapped_to_the_existing_renderer(self):
+        class FakeAPI:
+            def get(self, path):
+                if path.endswith('/pull-requests'):
+                    return {'pull_requests': [dict(OPEN_PR, number=1686,
+                        qc_verdict='PASS', qc_verdict_created_at='2026-09-07T23:00:00Z')]}
+                if path.endswith('/comments'):
+                    return [{'content': 'preserved'}]
+                self.fail('unexpected path ' + path)
+
+        loaded = mb.load_child(FakeAPI(), child())
+        self.assertEqual(loaded['prs'][0]['pr_number'], 1686)
+        self.assertEqual(loaded['prs'][0]['verdict'], 'PASS')
+        self.assertEqual(len(loaded['comments']), 1)
+
+
+class WorkspaceScopedIssueLookups(unittest.TestCase):
+    def test_every_issue_collection_lookup_carries_worker_workspace(self):
+        class FakeAPI:
+            workspace_id = 'workspace with spaces'
+
+            def __init__(self):
+                self.paths = []
+
+            def get(self, path):
+                self.paths.append(path)
+                if 'number=' in path:
+                    return {'issues': [{'id': 'mega-id'}]}
+                return {'issues': []}
+
+        api = FakeAPI()
+        self.assertEqual(mb.resolve_number(api, 2591), 'mega-id')
+        self.assertEqual(mb.fetch(api, None), [])
+        issue_lookups = [path for path in api.paths if path.startswith('/api/issues/?')]
+        self.assertEqual(len(issue_lookups), 2)
+        for path in issue_lookups:
+            params = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+            self.assertEqual(params.get('workspace_id'), [api.workspace_id], path)
 
 
 if __name__ == '__main__':
