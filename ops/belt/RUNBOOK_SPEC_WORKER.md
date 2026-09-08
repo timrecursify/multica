@@ -167,7 +167,14 @@ the folded content itself:
   ```bash
   python3 /opt/gsp/multica-doctrine/multica-bundle.py --unbundle <ticket-number> --apply
   python3 /opt/gsp/multica-doctrine/multica-bundle.py --mega <new-mega-number> --apply
-  ```
+```
+
+For older administrative bundles whose source is Cancelled and has no
+`bundled_by` metadata, recovery is intentionally explicit: add
+`--from-mega <active-mega-number>`. The helper verifies the source is detached,
+Cancelled, and named by an exact `gsp:<ticket-number>` token in that MEGA before
+previewing or applying the Registered transition; ambiguous or inactive MEGAs
+are rejected.
 
   `--unbundle` returns one folded ticket to `Registered` and detaches it, so
   regrouping never has to be done by hand against an archived row.

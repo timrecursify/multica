@@ -203,6 +203,8 @@ def main():
     ap.add_argument('--apply', action='store_true', help='write and archive')
     ap.add_argument('--unbundle', metavar='CHILD',
                     help='restore one folded ticket to Registered and detach it')
+    ap.add_argument('--from-mega', metavar='MEGA', type=int,
+                    help='required legacy provenance source for --unbundle')
     a = ap.parse_args()
 
     # Splitting an over-broad mega needs its members back as real tickets. The
@@ -212,7 +214,40 @@ def main():
         row = q("SELECT id, metadata->>'bundled_into' FROM issue WHERE number = %d"
                 " AND metadata->>'bundled_by' = 'multica-bundle'" % int(a.unbundle)).strip()
         if not row:
-            sys.exit('#%s is not a folded ticket' % a.unbundle)
+            if a.from_mega is None:
+                sys.exit('#%s is not a folded ticket; legacy recovery requires --from-mega'
+                         % a.unbundle)
+            # Older bundles recorded only a gsp:<child> token in the active
+            # MEGA description. Require every fact to match before recovery:
+            # cancelled source, no current parent, active named MEGA, and an
+            # exact token (not a substring such as gsp:21690).
+            legacy = q("""
+SELECT c.id, m.id, m.number
+  FROM issue c
+  JOIN issue m ON m.number = %d
+ WHERE c.number = %d
+   AND c.status = 'Cancelled'
+   AND c.parent_issue_id IS NULL
+   AND m.title LIKE 'MEGA%%'
+   AND m.status NOT IN ('Done','Cancelled','Archived')
+   AND m.description ~ ('(^|[^[:alnum:]_])gsp:' || c.number::text || '([^[:alnum:]_]|$)')
+""" % (a.from_mega, int(a.unbundle))).strip()
+            if not legacy:
+                sys.exit('#%s is not a verified legacy bundle from MEGA #%s'
+                         % (a.unbundle, a.from_mega))
+            iid, mega_id, mega_number = legacy.split('|')
+            if not a.apply:
+                print('DRY legacy unbundle #%s from MEGA #%s' %
+                      (a.unbundle, mega_number)); return
+            q("UPDATE issue SET status='Registered', parent_issue_id=NULL, "
+              "metadata = coalesce(metadata,'{}'::jsonb) || %s::jsonb, updated_at=now() "
+              "WHERE id='%s'" %
+              (lit(json.dumps({'unbundled_from': mega_number,
+                               'unbundled_from_id': mega_id,
+                               'unbundled_by': 'multica-bundle'})), iid), rows=False)
+            print('unbundled legacy #%s from MEGA #%s -> Registered' %
+                  (a.unbundle, mega_number))
+            return
         iid, mega = row.split('|')
         if not a.apply:
             print('DRY unbundle #%s from MEGA #%s' % (a.unbundle, mega)); return
