@@ -4,6 +4,7 @@ const { execFileSync } = require("child_process");
 const { resolveBuilderRoute } = require("./guardrails.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
+const { isHumanReservedBlocker } = require("./transition-policy.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
@@ -135,12 +136,20 @@ function settingsFor(options = {}) {
   };
 }
 
-// Routes a stuck issue off its stage and onto a human's board. transition-policy
-// lists every `* -> Human Review` row with actors ['operator'], so this asks as
-// the operator the belt is acting for; 'system' was refused as actor_denied.
+// Routes a reserved decision off its stage and onto a human's board.
 async function moveToHumanReview(client, issue, reason, options) {
+  const category = options.humanReviewCategory;
+  if (!isHumanReservedBlocker(category)) {
+    await client.query(`INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+      VALUES ($1::uuid, $2::uuid, 'system', 'human_review_denied_unclassified', $3::jsonb)`,
+      [issue.workspace_id, issue.id, JSON.stringify({ source_stage: issue.status,
+        category: category ?? null, detail: reason ?? null,
+        policy_code: 'human_review_blocker_not_reserved' })]);
+    return null;
+  }
   const verdict = policyFor(options)({
-    from: issue.status, to: "Human Review", actor: "operator", evidence: { blocker: reason }
+    from: issue.status, to: "Human Review", actor: "system",
+    evidence: { human_review_category: category, blocker: reason }
   });
   if (!verdict?.ok) throw new Error(`reconcile policy rejected Human Review: ${reason} (${verdict?.code})`);
   // The UPDATE below performs the advance itself, so the relay row is audit-only
@@ -160,10 +169,7 @@ async function moveToHumanReview(client, issue, reason, options) {
   return { action: "human_review", reason };
 }
 
-// RULES allows Spec -> Human Review for the operator actor, which is the actor
-// moveToHumanReview declares. Spec must stay routable: a Spec ticket that has
-// spent its lifetime task budget can no longer be re-dispatched, and without an
-// exit it is re-evaluated every cycle forever instead of reaching a human.
+// Reserved decisions may originate from any dispatchable stage.
 const HUMAN_REVIEW_FROM = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LINK_TABLE = { ci: "issue_pull_request", sha: "issue_pull_request", dependency: "issue_dependency" };
 
@@ -300,6 +306,7 @@ async function routeTerminalBlocker(client, issue, prior, options) {
   if (!reason) return null;
   try {
     const result = await moveToHumanReview(client, issue, reason, options);
+    if (!result) return null;
     options.budget.humanReview += 1;
     console.log(`[reconcile] ${issue.id} ${issue.status} -> Human Review (${reason})`);
     return result;
@@ -421,7 +428,7 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     // Lifetime cap is per issue and includes every reconciler-created task,
     // regardless of terminal status.  Stop the paid loop before selecting an
-    // owner or inserting another task; route the durable blocker to a human.
+    // owner or inserting another task; technical work remains skipped.
     const lifetime = await client.query(lifetimeTasksSql(), [issue.id, issue.status]);
     const lifetimeCount = Number(lifetime.rows[0]?.count || 0);
     if (lifetimeCount >= options.lifetimeTaskLimit) {
@@ -456,9 +463,11 @@ async function reconcileIssue(client, issueId, options = {}) {
           if (options.humanReviewRouting && HUMAN_REVIEW_FROM.has(issue.status) &&
               options.budget.humanReview < options.maxHumanReviewPerCycle) {
             const routed = await moveToHumanReview(client, issue, reason, options);
-            options.budget.humanReview += 1;
-            await client.query("COMMIT");
-            return routed;
+            if (routed) {
+              options.budget.humanReview += 1;
+              await client.query("COMMIT");
+              return routed;
+            }
           }
           await client.query("COMMIT");
           return { action: "skipped", reason, taskId: admission.reuseTaskId };
@@ -614,4 +623,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, isHumanReservedBlocker, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };

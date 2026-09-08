@@ -44,11 +44,11 @@ const TRANSITIONS = Object.freeze([
   ['CI/CD & Deploy', 'In Progress', ['system'], 'return'],
   ['CI/CD & Deploy', 'Parked', ['system'], 'retryEscalation'],
   ['CI/CD & Deploy', 'Spec', ['system'], 'retryEscalation'],
-  ['Spec', 'Human Review', ['operator'], 'review'],
-  ['Queue', 'Human Review', ['operator'], 'review'],
-  ['In Progress', 'Human Review', ['operator'], 'review'],
-  ['In Review', 'Human Review', ['operator'], 'review'],
-  ['CI/CD & Deploy', 'Human Review', ['operator'], 'review'],
+  ['Spec', 'Human Review', ['operator', 'system'], 'review'],
+  ['Queue', 'Human Review', ['operator', 'system'], 'review'],
+  ['In Progress', 'Human Review', ['operator', 'system'], 'review'],
+  ['In Review', 'Human Review', ['operator', 'system'], 'review'],
+  ['CI/CD & Deploy', 'Human Review', ['operator', 'system'], 'review'],
   ['Human Review', 'Spec', ['operator'], 'decision'],
   ['Human Review', 'Queue', ['operator'], 'decision'],
   ['Human Review', 'In Progress', ['operator'], 'decision'],
@@ -79,6 +79,15 @@ const LEGACY_AUTHORITY_KEYS = new Set([
   'operator_release', 'parked_release_required', 'isOperator', 'isSystem'
 ]);
 
+const HUMAN_REVIEW_CATEGORIES = Object.freeze(new Set([
+  'money_movement', 'client_charge', 'structural_architecture',
+  'structural_security', 'dangerous_production', 'irreversible_production'
+]));
+
+function isHumanReservedBlocker(category) {
+  return typeof category === 'string' && HUMAN_REVIEW_CATEGORIES.has(category.trim());
+}
+
 function hasLegacyAuthority(input) {
   return Object.keys(input).some((key) => LEGACY_AUTHORITY_KEYS.has(key) && input[key] === true);
 }
@@ -90,6 +99,9 @@ function evaluate({ from, to, actor, evidence = {}, ...request } = {}) {
   const transition = TRANSITIONS.find((row) => row.from === from && row.to === to);
   if (!transition) return { ok: false, code: 'transition_denied' };
   if (!transition.actors.includes(actor)) return { ok: false, code: 'actor_denied' };
+  if (to === 'Human Review' && !isHumanReservedBlocker(evidence.human_review_category)) {
+    return { ok: false, code: 'human_review_blocker_not_reserved' };
+  }
   if (to === 'Cancelled' && (typeof evidence.reason !== 'string' || !evidence.reason.trim())) {
     return { ok: false, code: 'evidence_missing' };
   }
@@ -127,4 +139,4 @@ function evaluate({ from, to, actor, evidence = {}, ...request } = {}) {
   return { ok: true, transition: { ...transition, evidence: requiredEvidence } };
 }
 
-module.exports = { EVIDENCE, STAGES, TRANSITIONS, evaluate };
+module.exports = { EVIDENCE, STAGES, TRANSITIONS, HUMAN_REVIEW_CATEGORIES, isHumanReservedBlocker, evaluate };

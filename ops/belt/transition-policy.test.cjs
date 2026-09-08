@@ -5,8 +5,10 @@ const test = require('node:test');
 const { TRANSITIONS, evaluate } = require('./transition-policy.cjs');
 
 function evidenceFor(fields) {
-  return Object.fromEntries(fields.map((field) => [field,
-    field === 'reason' ? 'operator reason' : field === 'workProductEvidence' ? 'NO-SHA: no deployable artifact' : true]));
+  const evidence = Object.fromEntries(fields.map((field) => [field,
+    field === 'reason' ? 'operator reason' : field === 'blocker' ? 'money_movement' : field === 'human_review_category' ? 'money_movement' : field === 'workProductEvidence' ? 'NO-SHA: no deployable artifact' : true]));
+  if (fields.includes('blocker') && !fields.includes('human_review_category')) evidence.human_review_category = 'money_movement';
+  return evidence;
 }
 
 test('accepts every DESIGN transition table row with its required evidence', () => {
@@ -72,13 +74,29 @@ test('allows only system retry escalation from Queue back to Spec', () => {
     'evidence_missing');
 });
 
-test('permits Human Review only when an operator records a blocker', () => {
-  assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system', evidence: {} }).ok, false);
+test('permits Human Review only for reserved blockers', () => {
+  assert.equal(evaluate({ from: 'Queue', to: 'Human Review', actor: 'system', evidence: {} }).code, 'human_review_blocker_not_reserved');
   for (const from of ['Spec', 'Queue', 'In Progress', 'In Review', 'CI/CD & Deploy']) {
-    assert.equal(evaluate({ from, to: 'Human Review', actor: 'system',
-      evidence: { blocker: 'technical_reason' } }).code, 'actor_denied', from);
-    assert.equal(evaluate({ from, to: 'Human Review', actor: 'operator',
-      evidence: { blocker: 'money_or_destructive_decision' } }).ok, true, from);
+    for (const actor of ['system', 'operator']) {
+      assert.equal(evaluate({ from, to: 'Human Review', actor,
+        evidence: { blocker: 'wire $5,000 to vendor' } }).code, 'human_review_blocker_not_reserved', `${from}/${actor}`);
+      for (const blocker of ['money_movement', 'client_charge', 'structural_architecture', 'structural_security', 'dangerous_production', 'irreversible_production']) {
+        assert.equal(evaluate({ from, to: 'Human Review', actor,
+          evidence: { blocker: blocker === 'money_movement' ? 'wire $5,000 to vendor' : 'detail', human_review_category: blocker } }).ok, true, `${from}/${actor}/${blocker}`);
+      }
+    }
+  }
+});
+
+test('production Human Review callers provide admitted reserved categories', () => {
+  const callers = [
+    ['CI/CD closure stall', 'CI/CD & Deploy', { blocker: 'closure stalled', namedBlocker: true, human_review_category: 'dangerous_production' }],
+    ['QC gate exhausted/no owner', 'In Progress', { blocker: 'QC gate exhausted', human_review_category: 'structural_architecture' }],
+    ['QC bounce ceiling', 'In Review', { blocker: 'QC failure', implementationFail: 'QC failure', human_review_category: 'structural_architecture' }],
+    ['completion evidence', 'In Progress', { blocker: 'blocked on human', namedBlocker: true, human_review_category: 'structural_architecture' }]
+  ];
+  for (const [name, from, evidence] of callers) {
+    assert.equal(evaluate({ from, to: 'Human Review', actor: 'operator', evidence }).ok, true, name);
   }
 });
 

@@ -349,6 +349,7 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
     // blockerEvidence alone was rejected as evidence_missing.
     return { blocker: route?.evidence || pointer, namedBlocker: true,
       blockerEvidence: route?.evidence || pointer,
+      human_review_category: 'structural_architecture',
       retryEscalationTaskId: row.task_id };
   }
   if (row.to_stage === 'In Progress' && targetStage === 'Done') {
@@ -1087,7 +1088,9 @@ async function enqueueQcGateRework(client, row, failed, postRelay) {
   const maxAttempts = Number(source.max_attempts || 3);
   if (attempt > maxAttempts || !selected?.agent_id) {
     await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review', agent_token: RELAY_AGENT_SECRET,
-      relay_source_task_id: row.task_id, reason: attempt > maxAttempts ? 'QC-GATE FAIL attempts exhausted' : 'QC-GATE FAIL no In Progress stage owner' });
+      relay_source_task_id: row.task_id, reason: attempt > maxAttempts ? 'QC-GATE FAIL attempts exhausted' : 'QC-GATE FAIL no In Progress stage owner',
+      evidence: { blocker: attempt > maxAttempts ? 'QC-GATE FAIL attempts exhausted' : 'QC-GATE FAIL no In Progress stage owner',
+        human_review_category: 'structural_architecture' } });
     return null;
   }
   const checks = failed.map(c => ({ name: c.name, detail: c.detail }));
@@ -2493,7 +2496,8 @@ async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
         const response = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
           agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
           reason: `QC bounce ceiling reached (${count}/${STAGE_CYCLE_LIMIT}); human review required`,
-          evidence: { implementationFail: cause, qcBounceCeiling: { count, ceiling: STAGE_CYCLE_LIMIT } },
+          evidence: { blocker: cause, implementationFail: cause, qcBounceCeiling: { count, ceiling: STAGE_CYCLE_LIMIT },
+            human_review_category: 'structural_architecture' },
           parked_audit: { reason: 'qc_bounce_ceiling', bounce_count: count, ceiling: STAGE_CYCLE_LIMIT,
             issue_id: row.issue_id, disposition: 'Human Review' } });
         if (response.ok) {
