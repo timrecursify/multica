@@ -193,6 +193,33 @@ test('work product handoff rejects multiple active rows', async () => {
   );
 });
 
+test('work product handoff is a no-op when there is no active row', async () => {
+  const calls = [];
+  const client = { async query(sql, values) {
+    calls.push({ sql, values });
+    return { rowCount: 0, rows: [] };
+  } };
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+
+  await handoffActiveWorkProduct(client, issueId, 'In Review', 'CI/CD & Deploy');
+  await handoffActiveWorkProduct(client, issueId, 'CI/CD & Deploy', 'In Progress');
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(({ values }) => values[1]), ['CI/CD & Deploy', 'In Review']);
+});
+
+test('work product handoff rejects multiple active rows', async () => {
+  const client = { async query() {
+    return { rowCount: 2, rows: [{}, {}] };
+  } };
+
+  await assert.rejects(
+    handoffActiveWorkProduct(client, '123e4567-e89b-42d3-a456-426614174000',
+      'In Review', 'CI/CD & Deploy'),
+    /work product handoff requires exactly one active row: .*active_products=2/
+  );
+});
+
 test('rollup admission with an open child is skipped before a task insert attempt', async () => {
   const calls = [];
   const client = { query: async (sql, values) => {
