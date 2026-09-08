@@ -845,6 +845,18 @@ async function markRelayLogFailedById(client, logId) {
   }
 }
 
+async function holdRelayLogRefusal(client, logId, issueId, reason, escalation) {
+  // Keep the source row pending, but make the refusal durable and ineligible
+  // for the next claim. It can be resumed by an operator after the relay is
+  // repaired without manufacturing another advance attempt.
+  await client.query(`UPDATE relay_run_log
+    SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) || $2::jsonb
+    WHERE id = $1 AND issue_id = $3 AND status = 'pending'`,
+    [logId, JSON.stringify({ completion_admission_refused: true,
+      refusal_reason: reason, refusal_status: escalation?.status || null,
+      advance_retry_at: '2099-01-01T00:00:00.000Z' }), issueId]);
+}
+
 async function failMissingQcVerdict(client, logId) {
   return client.query(
     `UPDATE relay_run_log
@@ -1223,7 +1235,22 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
     if (!completion.ok) {
       const escalation = await requestRetryEscalation(row, completion.reason);
       logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
-      await markRelayLogFailedById(client, row.log_id);
+      if (escalation.ok) {
+        await markRelayLogFailedById(client, row.log_id);
+      } else {
+        const disposition = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
+          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
+          reason: `completion admission refused: ${completion.reason}`,
+          evidence: { completionAdmission: completion.reason, respecRefusalStatus: escalation.status,
+            sourceRelayRow: row.log_id } });
+        if (disposition.ok) {
+          await markRelayLogCompletedById(client, row.log_id);
+          logger.log(`${LOG_PREFIX} [completion-admission] HUMAN REVIEW: issue=${row.issue_id}, relay=${disposition.status}`);
+        } else {
+          await holdRelayLogRefusal(client, row.log_id, row.issue_id, completion.reason, disposition);
+          logger.log(`${LOG_PREFIX} [completion-admission] HELD: issue=${row.issue_id}, respec=${escalation.status}, disposition=${disposition.status}`);
+        }
+      }
       return false;
     }
     const qcAdvance = qcCompletionAdvance(row);
