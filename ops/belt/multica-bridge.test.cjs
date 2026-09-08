@@ -2379,9 +2379,10 @@ test('both daemon accounting paths verify the returned issue stage', () => {
   assert.equal((source.match(/const confirmation = relayAdvanceConfirmation\(response, targetStage\)/g)
     || []).length, 2);
   assert.match(source, /REFUSED:.*requested=.*actual=.*reason=/s);
-  assert.match(source, /response\.status === 200 && !confirmation\.ok/);
   assert.match(source, /recordRefusedAdvance\(client, row\)/);
-  assert.match(source, /SET outcome = 'FAILED', blocked_on = 'human'/);
+  const refusalWriter = source.slice(source.indexOf('async function recordRefusedAdvance'),
+    source.indexOf('async function readvanceRecordedOutcomes'));
+  assert.doesNotMatch(refusalWriter, /issue_stage_outcome/);
 });
 
 test('a no-op disposition reports that no issue transition was applied', async () => {

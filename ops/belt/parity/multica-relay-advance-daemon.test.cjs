@@ -195,7 +195,7 @@ test('typed In Review re-advance supplies strict QC pass evidence', async () => 
   });
 });
 
-test('typed In Review re-advance holds failed QC without a relay denial', async () => {
+test('typed In Review re-advance preserves ADVANCED when QC evidence is incomplete', async () => {
   const calls = [];
   const client = { release() {}, query: async (sql, values) => {
     calls.push({ sql, values });
@@ -207,8 +207,7 @@ test('typed In Review re-advance holds failed QC without a relay denial', async 
     postRelay: async () => { posts += 1; return { ok: true }; },
     logger: { log() {} }, typedOutcomes: true });
   assert.equal(posts, 0);
-  const blocked = calls.find(({ sql }) => sql.startsWith('UPDATE issue_stage_outcome SET blocked_on = $3::text'));
-  assert.deepEqual(blocked.values, ['issue-1', 'In Review', 'human']);
+  assert.equal(calls.some(({ sql }) => /UPDATE issue_stage_outcome SET blocked_on/.test(sql)), false);
   assert.equal(calls.some(({ sql }) => sql.includes('typed_readvance_denials')), false);
 });
 
@@ -1605,7 +1604,7 @@ test('advance claim is one atomic issue-SHA lease without an external transactio
   assert.equal(calls[0].values[1], `issue-1:${'a'.repeat(40)}`);
 });
 
-test('a 409 relay refusal parks the outcome instead of re-posting it every cycle', async () => {
+test('a 409 relay refusal preserves the task-declared ADVANCED outcome', async () => {
   const calls = [];
   const logs = [];
   const client = { release() {}, query: async (sql, values) => {
@@ -1624,9 +1623,7 @@ test('a 409 relay refusal parks the outcome instead of re-posting it every cycle
       body: '{"error":"parked_release_required","message":"a completed Sol-low diagnosis must authorize one deliberate release"}' }; },
     logger: { log: (line) => logs.push(line) }, typedOutcomes: true });
   assert.equal(posts, 1);
-  const parked = calls.find(({ sql }) => sql.includes("SET blocked_on = 'human'"));
-  assert.ok(parked, 'a 409 refusal must park the outcome, or the daemon re-posts it every cycle');
-  assert.deepEqual(parked.values, ['issue-1', 'Parked']);
+  assert.equal(calls.some(({ sql }) => /issue_stage_outcome SET|INSERT INTO issue_stage_outcome/.test(sql)), false);
   assert.match(logs.join('\n'), /a completed Sol-low diagnosis must authorize one deliberate release/);
 });
 
@@ -1644,6 +1641,47 @@ test('a transient relay denial keeps its three-strike allowance', async () => {
     postRelay: async () => ({ ok: false, status: 500, error: 'No eligible stage owner in pool' }),
     logger: { log() {} }, typedOutcomes: true });
   assert.equal(calls.some(({ sql }) => sql.includes("SET blocked_on = 'human'")), false);
+});
+
+test('retry exhaustion preserves a task-declared NO_OP outcome', async () => {
+  const calls = [];
+  const client = { release() {}, query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1',
+      to_stage: 'Spec', outcome: 'NO_OP', task_id: 'task-1', task_status: 'completed',
+      task_result: { output: 'OUTCOME: NO_OP' }, issue_title: 'work', next_stage: 'Queue' }] };
+    if (sql.includes('typed_readvance_denials')) return { rows: [{ denials: 3 }] };
+    return { rows: [] };
+  }};
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => ({ ok: false, status: 500, error: 'temporary owner outage' }),
+    logger: { log() {} }, typedOutcomes: true });
+  assert.equal(calls.some(({ sql }) => /issue_stage_outcome SET|INSERT INTO issue_stage_outcome/.test(sql)), false);
+});
+
+test('a mismatched 200 response preserves the task-declared ADVANCED outcome', async () => {
+  const calls = [];
+  const client = { release() {}, query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1',
+      to_stage: 'Queue', outcome: 'ADVANCED', task_id: 'task-1', task_status: 'completed',
+      task_result: { output: 'OUTCOME: ADVANCED' }, issue_title: 'work', next_stage: 'In Progress' }] };
+    if (sql.includes('typed_readvance_denials')) return { rows: [{ denials: 1 }] };
+    return { rows: [] };
+  }};
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => ({ ok: true, status: 200, issue: { status: 'Queue' } }),
+    logger: { log() {} }, typedOutcomes: true });
+  assert.equal(calls.some(({ sql }) => /issue_stage_outcome SET|INSERT INTO issue_stage_outcome/.test(sql)), false);
+});
+
+test('typed readvance requires task issue and stage ownership', async () => {
+  const queries = [];
+  const client = { release() {}, query: async (sql) => { queries.push(sql); return { rows: [] }; } };
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => { throw new Error('mismatched task must not be posted'); },
+    logger: { log() {} }, typedOutcomes: true });
+  assert.match(queries[0], /t\.issue_id = o\.issue_id AND t\.context->>'to_stage' = o\.stage/);
 });
 
 test('risk-path PR already In Review advances to the configured next stage, not itself', async () => {
