@@ -212,13 +212,13 @@ test('closure stall returns to Spec with system retry-escalation evidence', asyn
   }), relay: async (...args) => calls.push(args) });
 });
 
-test('retryable deploy blocker stays in CI/CD and bypasses closure escalation', async () => {
+test('retryable deploy blocker remains observable to the closure watchdog', async () => {
   const calls = [];
   const observations = [];
   worker.setTestDependencies({
     watchdog: {
       observe: (...args) => observations.push(args),
-      stalled: () => { throw new Error('retryable hold must not enter the stall path'); }
+      stalled: () => false
     },
     relay: async (...args) => calls.push(args)
   });
@@ -313,19 +313,39 @@ test('cancelled workflows cannot substitute for activation evidence', async () =
   assert.equal(calls.length, 0);
 });
 
-test('merged PR whose CI lookup throws is held without returning to build', async () => {
+test('merged PR whose CI lookup throws is held as a typed transport failure', async () => {
   const lines = [];
   const calls = dependencies({ receipt: null, gh: () => { throw new Error('rate limited'); } });
   worker.setTestDependencies({ log: (...a) => lines.push(a.join(' ')) });
   const result = await worker.routeFinishedPR(issue, 'merged', sha, pr);
   assert.equal(result.status, 'pending');
-  assert.equal(result.outcome, 'discovery_unavailable');
-  assert.equal(result.blocker.type, 'ci_discovery_unavailable');
+  assert.equal(result.outcome, 'discovery_transport_failure');
+  assert.equal(result.blocker.type, 'discovery_transport_failure');
   assert.equal(result.retryEligible, true);
   assert.equal(calls.length, 0);
-  assert.ok(lines.some(line => line.includes('HOLD #1 merged') && line.includes('ci=unknown')));
+  assert.ok(lines.some(line => line.includes('HOLD #1 merged') && line.includes('ci=discovery_transport_failure')));
   assert.ok(lines.some(line => line.includes('CI-UNKNOWN') && line.includes('rate limited')));
   worker.setTestDependencies({ log: defaultLog });
+});
+
+test('CI discovery distinguishes authorization from transport failures', async () => {
+  worker.setTestDependencies({ gh: () => { const e = new Error('HTTP 403 Forbidden'); throw e; } });
+  const auth = await worker.ciState('acme/widget', sha, new Date().toISOString());
+  assert.equal(auth.status, 'discovery_auth_failure');
+  worker.setTestDependencies({ gh: () => { throw new Error('socket hang up'); } });
+  const transport = await worker.ciState('acme/widget', sha, new Date().toISOString());
+  assert.equal(transport.status, 'discovery_transport_failure');
+});
+
+test('watchdog acknowledgement is not latched when escalation relay rejects', async () => {
+  let marked = 0;
+  worker.setTestDependencies({
+    watchdog: { observe: () => ({ stage: 'CI/CD & Deploy', first_seen_at: new Date(0).toISOString(), attempts: 1, last_error: 'x', correlation_key: 'c' }),
+      stalled: () => true, markAlerted: () => { marked += 1; } },
+    relay: async () => { throw new Error('relay rejected'); }
+  });
+  await assert.rejects(() => worker.watchdogFailure({ id: 'latch', number: 1 }, new Error('x'), sha));
+  assert.equal(marked, 0);
 });
 
 test('a superseding successful workflow cannot substitute for activation evidence', async () => {
