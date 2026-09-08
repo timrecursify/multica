@@ -27,7 +27,7 @@ function createWatchdog({ file, now = () => Date.now() } = {}) {
     fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
     fs.renameSync(tmp, file);
   };
-  const observe = (issueId, { stage = 'CI/CD & Deploy', sha = '', outcome, error } = {}) => {
+  const observe = (issueId, { stage = 'CI/CD & Deploy', sha = '', outcome, error, increment = true } = {}) => {
     const key = keyFor(issueId, stage); const t = now();
     const row = state[key] || { issue_id: issueId, stage, first_seen_at: new Date(t).toISOString(), attempts: 0,
       correlation_key: correlationKey(issueId, sha), alerted: false };
@@ -43,8 +43,9 @@ function createWatchdog({ file, now = () => Date.now() } = {}) {
       delete row.outcome;
       delete row.last_error;
     }
-    row.last_attempt_at = new Date(t).toISOString(); row.last_seen_at = row.last_attempt_at;
-    row.attempts += 1; if (sha) row.commit_sha = sha; if (outcome) row.outcome = outcome;
+    row.last_seen_at = new Date(t).toISOString();
+    if (increment) { row.last_attempt_at = row.last_seen_at; row.attempts += 1; }
+    if (sha) row.commit_sha = sha; if (outcome) row.outcome = outcome;
     if (error) row.last_error = String(error).slice(0, 500);
     state[key] = row; persist(); return row;
   };
