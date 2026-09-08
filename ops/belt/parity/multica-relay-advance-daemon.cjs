@@ -434,25 +434,24 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
     `SELECT p.html_url, p.repo_owner, p.repo_name
        FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
       WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1`, [row.issue_id]);
-  // A NO_OP or BLOCKED run has no work product of its own. The merged PR it
-  // cites is prior work, and the comment scan below would adopt that PR as
-  // this ticket's product and send it to QC, which opens an empty branch and
-  // returns failure_class=implementation. Decide these before that scan.
+  // A linked PR is authoritative work-product evidence. Otherwise inspect the
+  // completion declaration and comments before choosing a no-deploy route:
+  // typed NO_OP is only no-code when it carries no discoverable PR evidence.
   const declared = linked.rows[0] ? null : await declaredCompletionOutcome(client, row);
-  if (declared && declared.outcome === 'BLOCKED' && declared.blockedOn === 'human') {
-    return { kind: 'blocked_human', toStage: 'Human Review',
-      reason: 'completion_blocked_on_human',
-      evidence: `blocked_on=human ${resultPointer(row)}` };
-  }
-  if (declared && declared.outcome === 'NO_OP' && row.to_stage === 'In Progress') {
-    return { kind: 'no_pr', noopDelivered: true, toStage: 'Done',
-      reason: 'completed_noop_already_delivered' };
-  }
   const commentPr = linked.rows[0] ? null : await client.query(
     `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`, [row.issue_id]);
   const commentMatch = commentPr?.rows
     .map(({ content }) => String(content || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i))
     .find(Boolean);
+  if (declared && declared.outcome === 'BLOCKED' && declared.blockedOn === 'human') {
+    return { kind: 'blocked_human', toStage: 'Human Review',
+      reason: 'completion_blocked_on_human',
+      evidence: `blocked_on=human ${resultPointer(row)}` };
+  }
+  if (declared && declared.outcome === 'NO_OP' && row.to_stage === 'In Progress' && !commentMatch) {
+    return { kind: 'no_pr', noopDelivered: true, toStage: 'Done',
+      reason: 'completed_noop_already_delivered' };
+  }
   // A completed NO_OP has no deployable artifact. Park it instead of asking
   // the bridge to admit an independently checked NO-SHA Done transition.
   if (!linked.rows[0] && !commentMatch) {
