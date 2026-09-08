@@ -2339,14 +2339,6 @@ function relayAdvanceConfirmation(response, targetStage) {
 
 async function recordRefusedAdvance(client, row) {
   await markRelayLogFailedById(client, row.log_id);
-  if (!TYPED_OUTCOMES) return;
-  await client.query(
-    `INSERT INTO issue_stage_outcome
-       (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
-     VALUES ($1::uuid, $2::text, 'FAILED', 'human', $3::uuid, NULL, NOW())
-     ON CONFLICT (issue_id, stage) DO UPDATE SET outcome = 'FAILED', blocked_on = 'human',
-       task_id = EXCLUDED.task_id, input_hash = NULL, outcome_at = NOW()`,
-    [row.issue_id, row.to_stage, row.task_id]);
 }
 
 // Retry recorded successful work without creating another agent task.  A relay
@@ -2430,10 +2422,9 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       // issues whose task did have a run log stopped at exactly three.
       const refused = (response.status >= 400 && response.status < 500) ||
         (response.status === 200 && !confirmation.ok);
-      if (refused || Number(denied.rows[0]?.denials || 0) >= 3) {
-        await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = 'human'
-          WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
-      }
+      // Relay refusal/retry exhaustion is routing state, not a task outcome.
+      // Keep the typed ADVANCED/NO_OP result authoritative; Human Review is
+      // reserved for an explicitly parsed blocker or policy decision.
       logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);
     }
     return advanced;
