@@ -439,12 +439,10 @@ async function reconcileIssue(client, issueId, options = {}) {
     const admission = await buildTaskAdmission(client, { issueId: issue.id, toStage: issue.status, locked: true });
     if (!admission.admit) {
       if (admission.reason === "completed_build_work_product") {
-        // The completed task is the durable build product. Preserve its prior
-        // relay audit row, move the unique task correlation to a new row for
-        // the issue's current stage, and let the normal completion
-        // loop apply configured routing and QC gates without another build.
-        // A pending row, or a completed row already consumed at this stage,
-        // makes the conditional insert a no-op on every later cycle.
+        // The completed task is the durable build product. Arm its relay row
+        // so the normal completion loop records and routes it without another
+        // build. A completed row is re-opened only while the current stage
+        // outcome still points at a different task.
         const armed = await armCompletedBuildWorkProduct(
           client, issue.id, issue.status, admission.reuseTaskId);
         await client.query("COMMIT");
@@ -519,6 +517,26 @@ async function armCompletedBuildWorkProduct(client, issueId, stage, taskId) {
         AND to_stage IS DISTINCT FROM $2::text`,
     [taskId, stage]
   );
+  // A completed relay row normally means this task was already consumed at
+  // this stage. If the stage outcome still cites another task, however, the
+  // completion never became authoritative (for example after the historical
+  // refusal writer overwrote the row). Re-open that exact relay row once so
+  // the normal completion path can record and route the newest task result.
+  const rearmed = await client.query(
+    `UPDATE relay_run_log completed SET status = 'pending',
+        parked_audit = COALESCE(completed.parked_audit, '{}'::jsonb) ||
+          jsonb_build_object('rearmed_reason', 'stage_outcome_task_mismatch')
+      WHERE completed.issue_id = $1::uuid AND completed.task_id = $3::uuid
+        AND completed.to_stage IS NOT DISTINCT FROM $2::text
+        AND completed.status = 'completed'
+        AND NOT EXISTS (
+          SELECT 1 FROM issue_stage_outcome outcome
+           WHERE outcome.issue_id = $1::uuid AND outcome.stage = $2::text
+             AND outcome.task_id = $3::uuid)
+      RETURNING completed.task_id`,
+    [issueId, stage, taskId]
+  );
+  if (rearmed.rows.length) return rearmed;
   return client.query(
     `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
      SELECT $1::uuid, $2::text, $2::text, task.agent_id, task.id, 'pending'
