@@ -2526,6 +2526,45 @@ async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
   }
 }
 
+function requeueCandidateSql() {
+  return `WITH stranded AS (
+    SELECT i.id AS issue_id, i.status AS stage, i.created_at AS issue_created_at,
+           i.metadata, NULL::uuid AS agent_id
+      FROM issue i
+     WHERE i.status = ANY($2::text[])
+  ), budgeted AS (
+    SELECT stranded.*,
+           (SELECT count(*)::int FROM agent_task_queue stage_history
+             WHERE stage_history.issue_id = stranded.issue_id
+               AND stage_history.context->>'to_stage' = stranded.stage
+               ${budgetCountPredicate('stage_history')}) AS stage_task_count,
+           (SELECT count(*)::int FROM agent_task_queue lifetime_history
+             WHERE lifetime_history.issue_id = stranded.issue_id
+               ${budgetCountPredicate('lifetime_history')}) AS lifetime_task_count
+      FROM stranded
+  ), ranked AS (
+    SELECT budgeted.*, ROW_NUMBER() OVER (
+      PARTITION BY agent_id ORDER BY issue_created_at ASC, issue_id ASC
+    ) AS rn
+      FROM budgeted
+     WHERE stage_task_count < $4::int AND lifetime_task_count < $5::int
+  )
+  SELECT * FROM (
+    SELECT ranked.*, NULL::text AS exhaustion_reason
+      FROM ranked
+     WHERE rn <= $1::int
+    UNION ALL
+    SELECT budgeted.*, NULL::bigint AS rn,
+           CASE WHEN stage_task_count >= $4::int
+             THEN 'stage_cycle_limit' ELSE 'lifetime_task_limit' END AS exhaustion_reason
+      FROM budgeted
+     WHERE stage_task_count >= $4::int OR lifetime_task_count >= $5::int
+     ORDER BY issue_created_at ASC, issue_id ASC
+     LIMIT $1::int
+  ) candidates
+  ORDER BY issue_created_at ASC, issue_id ASC`;
+}
+
 function startDaemon() {
   if (!MULTICA_DB || !RELAY_AGENT_SECRET || !WORKSPACE_ID) {
     console.error('[relay-advance-daemon] FATAL: env vars missing');
@@ -2569,4 +2608,4 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup,
   advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency,
-  processAdvanceRow, relayAdvanceConfirmation };
+  processAdvanceRow, relayAdvanceConfirmation, requeueCandidateSql };
