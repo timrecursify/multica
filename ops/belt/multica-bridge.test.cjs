@@ -2141,6 +2141,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
         acceptance_evidence jsonb NOT NULL, replaces_scope_revision bigint,
         consuming_stage text NOT NULL, dependency_issue_ids uuid[] NOT NULL DEFAULT '{}',
         status text NOT NULL, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
+      CREATE TABLE "${schema}".qc_effective_verdict (
+        id bigserial PRIMARY KEY, issue_id uuid NOT NULL, verdict text NOT NULL,
+        failure_class text, qualifying boolean, created_at timestamptz NOT NULL);
       CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".issue_stage_outcome (issue_id uuid NOT NULL, stage text NOT NULL,
