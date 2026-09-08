@@ -4,6 +4,7 @@ const { execFileSync } = require("child_process");
 const { resolveBuilderRoute } = require("./guardrails.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
+const { isHumanReservedBlocker } = require("./transition-policy.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
@@ -135,14 +136,6 @@ function settingsFor(options = {}) {
   };
 }
 
-// Only these decisions belong to a human: money movement/client charges,
-// structural architecture or security, and dangerous/irreversible production
-// actions. All other blockers remain on the reconciler's normal skipped path.
-function isHumanReservedBlocker(blocker) {
-  const value = String(blocker || '').toLowerCase();
-  return /(?:real[_ ]money[_ ]movement|money[_ ]movement|client[_ ]charge|charge[_ ]client|structural[_ ](?:architecture|security)|dangerous.*production|irreversible.*production)/.test(value);
-}
-
 // Routes a reserved decision off its stage and onto a human's board.
 async function moveToHumanReview(client, issue, reason, options) {
   if (!isHumanReservedBlocker(reason)) return { action: "skipped", reason: "technical_blocker" };
@@ -167,10 +160,7 @@ async function moveToHumanReview(client, issue, reason, options) {
   return { action: "human_review", reason };
 }
 
-// RULES allows Spec -> Human Review for the operator actor, which is the actor
-// moveToHumanReview declares. Spec must stay routable: a Spec ticket that has
-// spent its lifetime task budget can no longer be re-dispatched, and without an
-// exit it is re-evaluated every cycle forever instead of reaching a human.
+// Reserved decisions may originate from any dispatchable stage.
 const HUMAN_REVIEW_FROM = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LINK_TABLE = { ci: "issue_pull_request", sha: "issue_pull_request", dependency: "issue_dependency" };
 

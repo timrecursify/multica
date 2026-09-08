@@ -655,7 +655,7 @@ test("a capped Spec ticket remains on the technical skipped path", async () => {
     from: "Spec", to: "Human Review", actor: "operator",
     evidence: { blocker: "lifetime_task_limit:33/6" }
   });
-  assert.equal(verdict.ok, true);
+  assert.equal(verdict.ok, false);
 
   const seen = [];
   const db = { query: async (sql, values) => { seen.push({ sql, values }); return { rows: [] }; } };
@@ -664,6 +664,18 @@ test("a capped Spec ticket remains on the technical skipped path", async () => {
   );
   assert.deepEqual(result, { action: "skipped", reason: "technical_blocker" });
   assert.ok(!seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
+});
+
+test("reconcileIssue lifetime cap does not route Human Review", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.includes("SELECT count(*)::int AS count")) return { rows: [{ count: 6 }] };
+    return original(sql, values);
+  };
+  const result = await reconcileIssue(db, issue.id, { evaluate: ok, lifetimeTaskLimit: 6 });
+  assert.deepEqual(result, { action: "skipped", reason: "lifetime_task_limit", count: 6 });
+  assert.equal(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Human Review'")), false);
 });
 
 test("only Tim's reserved blocker categories may enter Human Review", () => {
