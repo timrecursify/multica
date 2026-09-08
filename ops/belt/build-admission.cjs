@@ -1,18 +1,31 @@
-const BUILD_STAGES = new Set(["Queue", "In Progress"]);
+const BUILD_STAGES = new Set(["In Progress"]);
 
 async function buildTaskAdmission(client, { issueId, toStage, locked = false }) {
   if (!BUILD_STAGES.has(toStage)) return { admit: true };
   if (!locked) {
     await client.query("SELECT pg_advisory_xact_lock(hashtext($1), hashtext('build'))", [issueId]);
   }
+  // The work-product row is the sole evidence of an implementation.  Its
+  // producer is recorded in acceptance evidence and must be a completed,
+  // same-issue In Progress task; free-text task results are never consulted.
   const prior = (await client.query(
-    `SELECT task.id, task.completed_at FROM agent_task_queue task
-      WHERE task.issue_id=$1::uuid AND task.status='completed'
-        AND task.context->>'to_stage'=ANY($2::text[])
-        AND COALESCE(to_jsonb(task)->>'result', '')
-          ~* '(https?://[^[:space:]]+/pull/[0-9]+|bound[ _-]?sha|[a-f0-9]{40})'
-      ORDER BY task.completed_at DESC NULLS LAST, task.created_at DESC, task.id DESC LIMIT 1`,
-    [issueId, [...BUILD_STAGES]])).rows[0];
+    `SELECT task.id, task.completed_at
+       FROM issue_work_product wp
+       JOIN agent_task_queue task
+         ON task.id = NULLIF(wp.acceptance_evidence->>'source_task_id', '')::uuid
+        AND task.issue_id = wp.issue_id
+      WHERE wp.issue_id=$1::uuid AND wp.status='active'
+        AND wp.kind='implementation' AND wp.consuming_stage='In Review'
+        AND wp.repository IS NOT NULL AND wp.branch IS NOT NULL
+        AND wp.pr_number IS NOT NULL AND wp.head_sha ~ '^[0-9a-f]{40}$'
+        AND jsonb_typeof(wp.acceptance_evidence)='object'
+        AND wp.acceptance_evidence->>'source_task_id' ~
+            '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        AND task.status='completed' AND task.context->>'to_stage'='In Progress'
+      GROUP BY task.id, task.completed_at
+      HAVING count(*) = 1
+      ORDER BY task.completed_at DESC NULLS LAST, task.id DESC LIMIT 1`,
+    [issueId])).rows[0];
   if (!prior) return { admit: true };
   const failure = (await client.query(
     `SELECT id FROM qc_effective_verdict WHERE issue_id=$1::uuid AND verdict='FAIL'
