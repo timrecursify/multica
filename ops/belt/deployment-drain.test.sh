@@ -11,8 +11,16 @@ set -Eeuo pipefail
 input="$(cat)"
 if [[ "$input" == *concat_ws* ]]; then
   n=0; [[ -f "$DRAIN_COUNTER" ]] && n="$(<"$DRAIN_COUNTER")"
-  printf '%s\n' "$((n + 1))" > "$DRAIN_COUNTER"
-  if (( n == 0 )); then echo 'leases=1 children=1 callbacks=1'; else echo 'leases=0 children=0 callbacks=0'; fi
+  if [[ -n "${DRAIN_SCENARIO:-}" ]]; then
+    case "$DRAIN_SCENARIO" in
+      expired) echo 'leases=0 children=0 callbacks=0' ;;
+      future|running) echo 'leases=1 children=0 callbacks=0' ;;
+      *) echo "unknown drain scenario: $DRAIN_SCENARIO" >&2; exit 2 ;;
+    esac
+  else
+    printf '%s\n' "$((n + 1))" > "$DRAIN_COUNTER"
+    if (( n == 0 )); then echo 'leases=1 children=1 callbacks=1'; else echo 'leases=0 children=0 callbacks=0'; fi
+  fi
 fi
 if [[ "$input" == *'admission_held = true'* ]]; then : > "$FENCE_FILE"; fi
 if [[ "$input" == *'admission_held = false'* ]]; then rm -f -- "$FENCE_FILE"; fi
@@ -23,6 +31,19 @@ export BELT_DEPLOY_STATE_ROOT="$fixture/state" DRAIN_COUNTER="$fixture/counter" 
 export BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=3 BELT_DEPLOY_DRAIN_POLL_SECONDS=0.01
 timestamp=20260907T120000Z
 . "$root_dir/deployment-drain.sh"
+
+# Lease regression: expired non-running work is drainable, while an unexpired
+# lease and dispatched/running work remain visible to the drain.
+grep -q "prepare_lease_expires_at IS NOT NULL AND prepare_lease_expires_at > now()" "$root_dir/deployment-drain.sh"
+for scenario in expired future running; do
+  export DRAIN_SCENARIO="$scenario"
+  snapshot="$(deployment_drain_snapshot)"
+  case "$scenario" in
+    expired) [[ "$snapshot" == 'leases=0 children=0 callbacks=0' ]] || { echo 'expired prepare lease held drain open' >&2; exit 1; } ;;
+    future|running) [[ "$snapshot" == 'leases=1 children=0 callbacks=0' ]] || { echo "$scenario work was invisible to drain" >&2; exit 1; } ;;
+  esac
+done
+unset DRAIN_SCENARIO
 
 deployment_lock_acquire
 deployment_fence_close
