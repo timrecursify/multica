@@ -546,7 +546,7 @@ async function armCompletedBuildWorkProduct(client, issueId, stage, taskId) {
           SELECT 1 FROM relay_run_log existing
            WHERE existing.task_id = task.id
              AND existing.to_stage IS NOT DISTINCT FROM $2::text
-             AND existing.status IN ('pending', 'completed')
+             AND existing.status IN ('pending', 'completed', 'rejected')
         )
      RETURNING task_id`,
     [issueId, stage, taskId]

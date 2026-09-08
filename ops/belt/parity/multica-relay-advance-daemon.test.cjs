@@ -1461,6 +1461,12 @@ test('retry escalation handles Spec in place without posting a self-transition',
   assert.equal(posted, false);
 });
 
+test('refused escalation branches reject the relay log in both RESPEC paths', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const refusedBranches = source.match(/if \(escalation\.ok\) await markRelayLogFailedById\(client, row\.log_id\);\s*else await rejectRefusedEscalation/g) || [];
+  assert.equal(refusedBranches.length, 2);
+});
+
 // --- GitHub reads run on REST, not GraphQL (relay rate-limit migration) -----
 
 const { github: githubRest, restPrView , reconcileGithubCommand } = require('./multica-relay-advance-daemon.cjs');
