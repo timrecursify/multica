@@ -90,6 +90,22 @@ test("completed task with failed outcome is repaired instead of cooling down the
   assert.equal(repair.values[1], "completion_failed");
 });
 
+test("completed task with a machine blocker remains completed for typed outcome recording", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.includes("SELECT id, status, result, error FROM agent_task_queue")) {
+      return { rows: [{ id: "task-blocked", status: "completed",
+        result: JSON.stringify({ output: "OUTCOME: BLOCKED blocked_on=ci" }), error: null }] };
+    }
+    return original(sql, values);
+  };
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "skipped", reason: "completion_blocked", blockedOn: "ci", taskId: "task-blocked"
+  });
+  assert.equal(db.calls.some((call) => call.sql.includes("SET status = 'failed'")), false);
+});
+
 test("restart is idempotent when the current-stage task is live", async () => {
   const db = harness({ live: [{ id: "task-live", status: "queued", context: taskContext("Queue") }] });
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), { action: "already_live", taskId: "task-live" });

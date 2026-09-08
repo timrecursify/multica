@@ -371,6 +371,11 @@ async function reconcileIssue(client, issueId, options = {}) {
       if (recent.status === "completed") {
         const admission = completionAdmission(recent.result ?? (recent.error ? { error: recent.error } : null));
         if (!admission.ok) {
+          if (["ci", "sha", "dependency", "quota"].includes(admission.blockedOn)) {
+            await client.query("COMMIT");
+            return { action: "skipped", reason: admission.reason,
+              blockedOn: admission.blockedOn, taskId: recent.id };
+          }
           await client.query(
             `UPDATE agent_task_queue
                 SET status = 'failed', completed_at = COALESCE(completed_at, NOW()),
