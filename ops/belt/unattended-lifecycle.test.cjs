@@ -338,7 +338,9 @@ test('GitHub API outage and non-shipping terminal states stay out of shipped met
   cancelled.outcomes.push('CANCELLED');
   const approval = createHarness('approval-wait');
   advance(approval, 'Spec', 'system', { registeredIssue: approval.id, selectedWorkspace: 'gsp' });
-  advance(approval, 'Human Review', 'operator', { blocker: 'client_charge', namedBlocker: true });
+  advance(approval, 'Human Review', 'operator', {
+    human_review_category: 'client_charge', blocker: 'approval required for client charge', namedBlocker: true
+  });
   waitOn(approval, 'human');
   approval.outcomes.push('WAITING_APPROVAL');
   assert.equal([outage, cancelled, approval].filter(({ shipped }) => shipped).length, 0);
