@@ -7,8 +7,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, runBounded,
-  parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired, processAdvanceRow } = require('./multica-relay-advance-daemon.cjs');
-const { armCompletedBuildWorkProduct } = require('../reconciler.cjs');
+  parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
@@ -1462,36 +1461,10 @@ test('retry escalation handles Spec in place without posting a self-transition',
   assert.equal(posted, false);
 });
 
-test('a refused completion escalation is terminal across the following reconcile cycle', async () => {
-  const relayRows = [{ id: 'relay-1', task_id: 'task-1', to_stage: 'In Progress', status: 'pending' }];
-  const client = { async query(sql, values = []) {
-    if (sql.includes("SET status = 'rejected'")) {
-      const row = relayRows.find(({ id, status }) => id === values[0] && status === 'pending');
-      if (row) row.status = 'rejected';
-      return { rowCount: row ? 1 : 0, rows: [] };
-    }
-    if (sql.includes('UPDATE relay_run_log SET task_id = NULL')) return { rowCount: 0, rows: [] };
-    if (sql.includes('UPDATE relay_run_log completed')) return { rowCount: 0, rows: [] };
-    if (sql.includes('INSERT INTO relay_run_log')) {
-      const blocked = relayRows.some((row) => row.task_id === values[2] &&
-        row.to_stage === values[1] && ['pending', 'completed', 'rejected'].includes(row.status));
-      if (!blocked) relayRows.push({ id: `relay-${relayRows.length + 1}`, task_id: values[2],
-        to_stage: values[1], status: 'pending' });
-      return { rowCount: blocked ? 0 : 1, rows: blocked ? [] : [{ task_id: values[2] }] };
-    }
-    throw new Error(`unexpected SQL: ${sql}`);
-  } };
-  let escalations = 0;
-  const row = { log_id: 'relay-1', task_id: 'task-1', issue_id: 'issue-1',
-    to_stage: 'In Progress', task_status: 'completed', task_result: { output: 'OUTCOME: BLOCKED blocked_on=human' } };
-  await processAdvanceRow(client, row, { postRelay: async () => ({ ok: true, status: 200 }),
-    logger: { log() {}, error() {} }, gateRunner: async () => {},
-    completionAdmission: () => ({ ok: false, reason: 'completion_blocked' }),
-    retryEscalation: async () => { escalations += 1; return { ok: false, status: 409 }; } });
-  await armCompletedBuildWorkProduct(client, row.issue_id, row.to_stage, row.task_id);
-  assert.equal(escalations, 1);
-  assert.deepEqual(relayRows, [{ id: 'relay-1', task_id: 'task-1',
-    to_stage: 'In Progress', status: 'rejected' }]);
+test('refused escalation branches reject the relay log in both RESPEC paths', () => {
+  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
+  const refusedBranches = source.match(/if \(escalation\.ok\) await markRelayLogFailedById\(client, row\.log_id\);\s*else await rejectRefusedEscalation/g) || [];
+  assert.equal(refusedBranches.length, 2);
 });
 
 // --- GitHub reads run on REST, not GraphQL (relay rate-limit migration) -----

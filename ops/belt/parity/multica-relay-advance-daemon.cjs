@@ -1222,8 +1222,7 @@ async function runBounded(items, concurrency, operation) {
   await Promise.all(Array.from({ length: count }, () => worker()));
 }
 
-async function processAdvanceRow(client, row, { postRelay, logger, gateRunner,
-  retryEscalation = requestRetryEscalation, completionAdmission = deploymentCompletionAdmission }) {
+async function processAdvanceRow(client, row, { postRelay, logger, gateRunner }) {
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
     if (TERMINAL_STAGES.has(row.to_stage)) {
@@ -1231,10 +1230,10 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner,
       logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
       return false;
     }
-    const completion = completionAdmission(row.task_status, row.task_result ??
+    const completion = deploymentCompletionAdmission(row.task_status, row.task_result ??
       (row.task_error ? { error: row.task_error } : null));
     if (!completion.ok) {
-      const escalation = await retryEscalation(row, completion.reason);
+      const escalation = await requestRetryEscalation(row, completion.reason);
       logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
       if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
       else await rejectRefusedEscalation(client, row.log_id, completion.reason, escalation);
@@ -1271,7 +1270,7 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner,
 
     const route = await buildCompletionRoute(client, row);
     if (route && !route.toStage) {
-      const escalation = await retryEscalation(row, route.reason);
+      const escalation = await requestRetryEscalation(row, route.reason);
       logger.log(`${LOG_PREFIX} [route] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', ` +
         `reason=${route.reason}, relay=${escalation.status}`);
       if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
