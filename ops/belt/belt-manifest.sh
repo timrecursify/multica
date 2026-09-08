@@ -26,6 +26,7 @@
 # MODULE_NOT_FOUND at daemon start, not a deploy error.
 
 doctrine_root="${BELT_DEPLOY_DOCTRINE_ROOT:-${runtime_root%/multica-workers}/multica-doctrine}"
+global_bin_root="${BELT_DEPLOY_GLOBAL_BIN_ROOT:-/usr/local/bin}"
 
 declare -a sources=(
   "$root_dir/multica-bridge.cjs"
@@ -72,6 +73,7 @@ declare -a sources=(
   "$root_dir/belt-concurrency.sh"
   "$root_dir/workspace-root.sh"
   "$root_dir/workspace-gc.sh"
+  "$root_dir/gsp-belt-git-credential.sh"
   "$root_dir/multica-bundle.py"
   "$root_dir/RUNBOOK_SPEC_WORKER.md"
   "$root_dir/RUNBOOK_BUILD_WORKER.md"
@@ -124,6 +126,7 @@ declare -a targets=(
   "$runtime_root/gsp-multica-worker/belt-concurrency.sh"
   "$runtime_root/gsp-multica-worker/workspace-root.sh"
   "$runtime_root/gsp-multica-worker/workspace-gc.sh"
+  "$global_bin_root/gsp-belt-git-credential"
   "$doctrine_root/multica-bundle.py"
   "$doctrine_root/RUNBOOK_SPEC_WORKER.md"
   "$doctrine_root/RUNBOOK_BUILD_WORKER.md"
