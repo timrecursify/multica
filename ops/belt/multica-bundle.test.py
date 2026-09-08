@@ -7,7 +7,7 @@ pull-request trail and latest QC verdict that the database implementation added.
 
 Hermetic -- no database, no network. Run: python3 ops/belt/multica-bundle.test.py
 """
-import importlib.util, os, sys, unittest
+import importlib.util, os, sys, unittest, urllib.parse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 spec = importlib.util.spec_from_file_location('multica_bundle',
@@ -107,6 +107,30 @@ class PullRequestTrail(unittest.TestCase):
         self.assertEqual(loaded['prs'][0]['pr_number'], 1686)
         self.assertEqual(loaded['prs'][0]['verdict'], 'PASS')
         self.assertEqual(len(loaded['comments']), 1)
+
+
+class WorkspaceScopedIssueLookups(unittest.TestCase):
+    def test_every_issue_collection_lookup_carries_worker_workspace(self):
+        class FakeAPI:
+            workspace_id = 'workspace with spaces'
+
+            def __init__(self):
+                self.paths = []
+
+            def get(self, path):
+                self.paths.append(path)
+                if 'number=' in path:
+                    return {'issues': [{'id': 'mega-id'}]}
+                return {'issues': []}
+
+        api = FakeAPI()
+        self.assertEqual(mb.resolve_number(api, 2591), 'mega-id')
+        self.assertEqual(mb.fetch(api, None), [])
+        issue_lookups = [path for path in api.paths if path.startswith('/api/issues/?')]
+        self.assertEqual(len(issue_lookups), 2)
+        for path in issue_lookups:
+            params = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+            self.assertEqual(params.get('workspace_id'), [api.workspace_id], path)
 
 
 if __name__ == '__main__':
