@@ -19,9 +19,9 @@ metadata.bundled_into so the move is reversible.
 Idempotent: a child already folded in with an unchanged content hash is skipped,
 so a crashed or re-run scoper never doubles a MEGA description.
 """
-import argparse, hashlib, json, os, pwd, shutil, shlex, subprocess, sys
+import argparse, hashlib, json, os, pwd, shlex, subprocess, sys
 
-DSN = ['psql', '-h', '127.0.0.1', '-p', '25432']
+DSN = ['/usr/bin/psql', '-h', '127.0.0.1', '-p', '25432']
 GSP_WORKSPACE_ID = 'f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 MARK = '## Bundled work (this MEGA is the only unit of work)'
 PREAMBLE = (
@@ -35,16 +35,18 @@ REQUIRED_DB_ENV = ('MULTICA_POSTGRES_USER', 'MULTICA_POSTGRES_PASSWORD',
 
 
 def ensure_service_identity():
-    """Re-enter as the bridge account when DB credentials are not in the env.
+    """Re-enter root invocations as the bridge account before using credentials.
 
     The bridge environment file is readable only through the existing, audited
     sudo shell path.  Keep credentials out of argv and avoid recursion after
     the service account has been selected.
     """
-    if all(os.environ.get(name) for name in REQUIRED_DB_ENV):
-        return
-    if pwd.getpwuid(os.geteuid()).pw_name == SERVICE_USER:
-        return
+    euid = os.geteuid()
+    if euid != 0:
+        if pwd.getpwuid(euid).pw_name == SERVICE_USER:
+            return
+        if all(os.environ.get(name) for name in REQUIRED_DB_ENV):
+            return
 
     helper = os.path.abspath(__file__)
     command = (
@@ -65,8 +67,6 @@ def q(sql, rows=True):
                                  'MULTICA_POSTGRES_DB') if not os.environ.get(name)]
     if missing:
         sys.exit('missing required environment variable: ' + ', '.join(missing))
-    if shutil.which('psql') is None:
-        sys.exit('psql is not on PATH for the account running multica-bundle.py')
     env = os.environ.copy()
     env['PGPASSWORD'] = env['MULTICA_POSTGRES_PASSWORD']
     dsn = DSN + ['-U', env['MULTICA_POSTGRES_USER'], '-d', env['MULTICA_POSTGRES_DB']]
