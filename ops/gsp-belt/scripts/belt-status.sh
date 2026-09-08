@@ -35,7 +35,7 @@ fail=0
 # a JSON metrics snapshot; absent configuration is explicitly no-opinion.
 if [[ -n "${BELT_COMPLETION_LIVENESS_INPUT:-}" || -n "${BELT_COMPLETION_STALL_WINDOW:-}" ]]; then
   liveness_input="${BELT_COMPLETION_LIVENESS_INPUT:--}"
-  if ! liveness_result="BELT_COMPLETION_LIVENESS_INPUT="$liveness_input" node "$(dirname "$0")/belt-completion-liveness.cjs"; then
+  if ! liveness_result=$(BELT_COMPLETION_LIVENESS_INPUT="$liveness_input" node "$(dirname "$0")/belt-completion-liveness.cjs"); then
     echo "completion_liveness $liveness_result" >&2
     fail=1
   else
