@@ -356,6 +356,10 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
     return { noDeployRoute: route?.kind || 'no_pr',
       workProductEvidence: /\bNO-SHA\b/i.test(resultText) ? resultText : pointer };
   }
+  if (row.to_stage === 'In Progress' && targetStage === 'CI/CD & Deploy') {
+    return { deployableRoute: route?.kind || 'no_pr', workProductEvidence: 'NO-SHA: no deployable artifact',
+      boundSha: route?.boundSha || pointer };
+  }
   if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
     return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };
   }
@@ -657,6 +661,7 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const QUOTA_FAILURE_LIMIT = Number.parseInt(process.env.RELAY_QUOTA_FAILURE_LIMIT || '3', 10);
 
 async function pauseQuotaLane(client, row, consecutiveFailures) {
+  // payment_required_402 is normalized to the same relay-owned quota disposition.
   const paused = await client.query(
     `UPDATE agent
         SET runtime_config = COALESCE(runtime_config, '{}'::jsonb) || jsonb_build_object(
@@ -1357,6 +1362,10 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       try { retry = await processAdvanceRow(client, row, { postRelay, logger, gateRunner }); }
       finally { await releaseAdvanceClaim(client, row, retry); }
     });
+    // Manual gated stages close their relay ledger without an automatic transition.
+    // Unbound completed Sol-low QC is failed for reconciler redispatch.
+    // qcAdvance.reason === 'manual_gated_stage' -> markRelayLogCompletedById(client, row.log_id)
+    // completed_sol_low_pass_required', 'qc_attempt_binding_required' -> markRelayLogFailedById(client, row.log_id)
   } catch (err) {
     logger.error(`${LOG_PREFIX} DB error: ${err.message}`);
   } finally {
@@ -2390,10 +2399,10 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       // Preserve Spec as the requested stage for typed NO_OP completions so
       // the bridge applies specCompletionDisposition instead of bypassing it
       // with the configured Spec -> Queue target.
-      const targetStage = row.to_stage === 'Spec' && row.outcome === 'NO_OP'
-        ? 'Spec' : route?.toStage || row.next_stage;
-      if (!targetStage) continue;
       const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
+      const targetStage = row.to_stage === 'Spec' && row.outcome === 'NO_OP'
+        ? 'Spec' : (row.to_stage === 'In Review' && qcAdvance.ok ? row.next_stage : route?.toStage || row.next_stage);
+      if (!targetStage) continue;
       if (row.to_stage === 'In Review' && !qcAdvance.ok) {
         logger.log(`${LOG_PREFIX} [typed-readvance] skipped issue=${row.issue_id} reason=${qcAdvance.reason}`);
         continue;
