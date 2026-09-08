@@ -337,6 +337,8 @@ jobs:
             ops/belt/guardrails.test.cjs \
             ops/belt/multica-cicd-worker-sweep.test.cjs \
             ops/belt/multica-cicd-worker.test.cjs \
+            ops/belt/parity/multica-relay-advance-daemon-runtime.test.cjs \
+            ops/belt/parity/multica-relay-advance-daemon.test.cjs \
             ops/belt/parity/relay-dead-rows-rescan.test.cjs \
             ops/belt/parked-diagnosis.test.cjs \
             ops/belt/parked-entry-audit.test.cjs \
