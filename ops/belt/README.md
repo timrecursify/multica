@@ -77,8 +77,11 @@ belt-config-guard.timer belt-config-guard.service
 ```
 
 `multica-relay-advance` is a PM2 wrapper process; its launcher invokes the
-runtime daemon path shown above. The runbook currently names the bundle command
-as `python3 ops/belt/multica-bundle.py` from the Multica checkout.
+runtime daemon path shown above. The canonical helper is safe to invoke
+directly as `python3 ops/belt/multica-bundle.py`: when the three
+`MULTICA_POSTGRES_*` variables are absent, it sources the bridge environment
+through the sanctioned non-interactive sudo path and re-execs as `gsp-multica`.
+It never prints the sourced values.
 
 ## Deploy and verify
 

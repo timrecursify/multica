@@ -19,7 +19,7 @@ metadata.bundled_into so the move is reversible.
 Idempotent: a child already folded in with an unchanged content hash is skipped,
 so a crashed or re-run scoper never doubles a MEGA description.
 """
-import hashlib, json, os, shutil, subprocess, sys, argparse
+import argparse, hashlib, json, os, pwd, shutil, shlex, subprocess, sys
 
 DSN = ['psql', '-h', '127.0.0.1', '-p', '25432']
 MARK = '## Bundled work (this MEGA is the only unit of work)'
@@ -27,6 +27,33 @@ PREAMBLE = (
     'Each section below is a ticket folded into this MEGA. Those tickets are\n'
     'archived and invisible to workers; their work is carried entirely here.\n'
     'Deliver every section as one change set against one shared root cause.\n')
+ENV_FILE = '/etc/gsp/multica/gsp-multica-bridge.env'
+SERVICE_USER = 'gsp-multica'
+REQUIRED_DB_ENV = ('MULTICA_POSTGRES_USER', 'MULTICA_POSTGRES_PASSWORD',
+                   'MULTICA_POSTGRES_DB')
+
+
+def ensure_service_identity():
+    """Re-enter as the bridge account when DB credentials are not in the env.
+
+    The bridge environment file is readable only through the existing, audited
+    sudo shell path.  Keep credentials out of argv and avoid recursion after
+    the service account has been selected.
+    """
+    if all(os.environ.get(name) for name in REQUIRED_DB_ENV):
+        return
+    if pwd.getpwuid(os.geteuid()).pw_name == SERVICE_USER:
+        return
+
+    helper = os.path.abspath(__file__)
+    command = (
+        'source ' + shlex.quote(ENV_FILE) +
+        '; exec /usr/bin/sudo -n -u ' + SERVICE_USER +
+        ' --preserve-env /usr/bin/python3 ' + shlex.quote(helper) + ' "$@"'
+    )
+    # bash -c receives the helper arguments after a harmless $0 placeholder.
+    os.execv('/usr/bin/sudo', ['sudo', '-n', '/bin/bash', '-c', command,
+                               'multica-bundle', *sys.argv[1:]])
 
 
 def q(sql, rows=True):
@@ -170,6 +197,7 @@ SELECT coalesce(json_agg(m),'[]') FROM (
 
 
 def main():
+    ensure_service_identity()
     ap = argparse.ArgumentParser()
     ap.add_argument('--mega', help='restrict to one MEGA issue number')
     ap.add_argument('--apply', action='store_true', help='write and archive')

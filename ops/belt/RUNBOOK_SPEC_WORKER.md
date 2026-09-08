@@ -131,6 +131,12 @@ children are no longer visible.
    python3 /opt/gsp/multica-doctrine/multica-bundle.py --mega <mega-number> --apply
    ```
 
+   The canonical helper self-routes when invoked directly: if the three
+   `MULTICA_POSTGRES_*` variables are not already present, it sources
+   `/etc/gsp/multica/gsp-multica-bridge.env` through the sanctioned `sudo -n
+   bash -c` path and re-execs as `gsp-multica`. Do not copy credentials onto
+   the command line.
+
    This copies each child's title, description and acceptance criteria into a
    `## Bundled work` section on the mega, reads the mega back to confirm the
    content is actually there, and only then sets the child to `Archived` with
