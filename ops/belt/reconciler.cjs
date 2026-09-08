@@ -140,7 +140,7 @@ function settingsFor(options = {}) {
 // actions. All other blockers remain on the reconciler's normal skipped path.
 function isHumanReservedBlocker(blocker) {
   const value = String(blocker || '').toLowerCase();
-  return /(?:money|client[_ ]charge|structural[_ ](?:architecture|security)|dangerous.*production|irreversible.*production)/.test(value);
+  return /(?:real[_ ]money[_ ]movement|money[_ ]movement|client[_ ]charge|charge[_ ]client|structural[_ ](?:architecture|security)|dangerous.*production|irreversible.*production)/.test(value);
 }
 
 // Routes a reserved decision off its stage and onto a human's board.
