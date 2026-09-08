@@ -33,3 +33,11 @@ Command: `timeout 300s node --test ops/belt/multica-cicd-worker.test.cjs`
 - Observed: the requested external path `~/dev/seat/results/20260908_WS-CI-DISCOVERY-TYPED.md` was not written because the explicit write scope limits changes to this worktree. This report is the worktree-local equivalent.
 - Observed: no deployment, restart, install, clone, benchmark, full-repo suite, or production worker access was performed.
 - Observed: `DATABASE_URL` and `pg` were not needed by the executed unit suite.
+
+## CI fix — unattended-lifecycle
+
+- Observed: `ops/belt/unattended-lifecycle.test.cjs:325` asserted the full `await cicd.ciState(...)` expression against the legacy string `unknown`.
+- Observed: the same runtime path returned an object with `typeof` `object` and JSON `{"kind":"infrastructure_failure","status":"discovery_transport_failure","cause":{"name":"Error","message":"GitHub unavailable"}}`.
+- Inferred: verdict (a); the product code deliberately returns a typed infrastructure result, so the fixture was stale.
+- Observed: updated only that fixture to assert the exact typed object. The other `unknown` hit at `ops/belt/multica-cicd-worker.cjs:623` remains correct for legacy string handling; all other bounded hits are fallback text or unrelated labels, not this assertion.
+- Observed: unattended-lifecycle could not load because `pg` is missing; its assertions were not executed. Worker suite passed 47/47 with 0 failures and 0 skips.
