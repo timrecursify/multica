@@ -60,6 +60,7 @@ def ensure_service_identity():
 
 
 def q(sql, rows=True):
+    ensure_service_identity()
     # SQL goes in on stdin, never as argv: a folded MEGA description reaches
     # six figures of bytes and `-c` died with E2BIG (Argument list too long).
     missing = [name for name in ('MULTICA_POSTGRES_USER',
