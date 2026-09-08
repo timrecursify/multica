@@ -318,7 +318,7 @@ fi
 selective_receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\) --only multica-cicd-worker$/\1/p' "$tmp_dir/selective.log")"
 [[ "$selective_receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]]
 activation_receipt="$receipt_root/timrecursify/multica/gsp-belt/$source_sha.json"
-node -e 'const r=require(process.argv[1]),s=process.argv[2],a=Date.parse(r.activation?.activated_at),h=Date.parse(r.health?.checked_at);if(r.schema_version!==1||r.repository!=="timrecursify/multica"||r.target!=="gsp-belt"||r.deployment_owner!=="ops/belt/deploy.sh"||r.source_sha!==s||r.activation?.status!=="activated"||r.activation?.process_sha!==s||r.activation?.release!==`git:timrecursify/multica@${s}`||!Number.isFinite(a)||!Number.isFinite(h)||h<a||r.health?.status!=="ok"||r.health?.probe!=="systemd-active-mainpid-runtime-parity-v1")process.exit(1)' \
+node -e 'const r=require(process.argv[1]),s=process.argv[2],a=Date.parse(r.activation?.activated_at),h=Date.parse(r.health?.checked_at);if(r.schema_version!==1||r.repository!=="timrecursify/multica"||r.target!=="gsp-belt"||r.deployment_owner!=="ops/belt/deploy.sh"||r.source_sha!==s||r.activation?.status!=="activated"||r.activation?.process_sha!==s||r.activation?.release!==`git:timrecursify/multica@${s}`||!Number.isFinite(a)||!Number.isFinite(h)||h<a||r.health?.status!=="ok"||r.health?.probe!=="systemd-active-mainpid-runtime-parity-v1"||r.stale_fence_alarm?.status!=="not_required")process.exit(1)' \
   "$activation_receipt" "$source_sha"
 grep -q "^Receipt: $activation_receipt$" "$tmp_dir/selective.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$selective_receipt" --only multica-cicd-worker >/dev/null
