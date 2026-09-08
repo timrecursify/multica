@@ -2175,14 +2175,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
         VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'),
                ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
-      await admin.query(`INSERT INTO "${schema}".issue_work_product
-        (issue_id, scope_revision, kind, repository, branch, pr_number, head_sha,
-         acceptance_evidence, consuming_stage, status, created_at, updated_at)
-        SELECT $1, 1, 'implementation', 'acme/widget', 'fix/belt', 829, repeat('a', 40),
-          jsonb_build_object('task_id', id::text), 'In Review', 'active', now(), now()
-        FROM "${schema}".agent_task_queue
-        WHERE issue_id = $1 AND status = 'completed'
-        ORDER BY created_at, id LIMIT 1`, [issueId]);
+      // No issue_work_product row: this case asserts that an operator release
+      // enqueues a build. A satisfying work product would make build admission
+      // correctly refuse, which is the opposite of what this test exercises.
       await admin.query(`INSERT INTO "${schema}".issue_stage_outcome
         (issue_id, stage, outcome, blocked_on, outcome_at)
         VALUES ($1, 'In Progress', 'BLOCKED', 'human', now() - interval '1 hour')`, [issueId]);
