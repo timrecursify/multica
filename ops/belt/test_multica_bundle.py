@@ -38,6 +38,17 @@ class ServiceIdentityTests(unittest.TestCase):
         self.assertIn('exec /usr/sbin/runuser -u gsp-multica --preserve-environment --',
                       execv.call_args.args[1][4])
 
+    def test_imported_direct_q_root_reexecs_before_psql(self):
+        with mock.patch.dict(os.environ, {
+                'MULTICA_POSTGRES_USER': 'u', 'MULTICA_POSTGRES_PASSWORD': 'p',
+                'MULTICA_POSTGRES_DB': 'd'}), \
+             mock.patch.object(MODULE.os, 'geteuid', return_value=0), \
+             mock.patch.object(MODULE.os, 'execv', side_effect=RuntimeError('reexec')), \
+             mock.patch.object(MODULE.subprocess, 'run') as run:
+            with self.assertRaisesRegex(RuntimeError, 'reexec'):
+                MODULE.q('SELECT 1')
+        run.assert_not_called()
+
 
 class LegacyUnbundleTests(unittest.TestCase):
     def run_main(self, argv, responses):
