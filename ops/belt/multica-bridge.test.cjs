@@ -2135,6 +2135,12 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       originator_source text, trigger_evidence_kind text, result jsonb, error text, started_at timestamptz, completed_at timestamptz,
       prepare_lease_expires_at timestamptz, failure_reason text, trigger_comment_id uuid,
       created_at timestamptz NOT NULL DEFAULT now());
+      CREATE TABLE "${schema}".issue_work_product (
+        issue_id uuid NOT NULL, scope_revision bigint NOT NULL, kind text NOT NULL,
+        repository text, branch text, pr_number integer, head_sha text,
+        acceptance_evidence jsonb NOT NULL, replaces_scope_revision bigint,
+        consuming_stage text NOT NULL, dependency_issue_ids uuid[] NOT NULL DEFAULT '{}',
+        status text NOT NULL, created_at timestamptz NOT NULL, updated_at timestamptz NOT NULL);
       CREATE TABLE "${schema}".relay_run_log (id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text,
       to_stage text, agent_id uuid, task_id uuid, status text NOT NULL, parked_audit jsonb, created_at timestamptz NOT NULL DEFAULT now());
       CREATE TABLE "${schema}".issue_stage_outcome (issue_id uuid NOT NULL, stage text NOT NULL,
@@ -2166,6 +2172,14 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       await admin.query(`INSERT INTO "${schema}".agent_task_queue (agent_id, issue_id, workspace_id, status, priority, context)
         VALUES ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}'),
                ($1, $2, $3, 'completed', 1, '{"to_stage":"In Progress"}')`, [agentId, issueId, workspaceId]);
+      await admin.query(`INSERT INTO "${schema}".issue_work_product
+        (issue_id, scope_revision, kind, repository, branch, pr_number, head_sha,
+         acceptance_evidence, consuming_stage, status, created_at, updated_at)
+        SELECT $1, 1, 'implementation', 'acme/widget', 'fix/belt', 829, repeat('a', 40),
+          jsonb_build_object('task_id', id::text), 'In Review', 'active', now(), now()
+        FROM "${schema}".agent_task_queue
+        WHERE issue_id = $1 AND status = 'completed'
+        ORDER BY created_at, id LIMIT 1`, [issueId]);
       await admin.query(`INSERT INTO "${schema}".issue_stage_outcome
         (issue_id, stage, outcome, blocked_on, outcome_at)
         VALUES ($1, 'In Progress', 'BLOCKED', 'human', now() - interval '1 hour')`, [issueId]);
