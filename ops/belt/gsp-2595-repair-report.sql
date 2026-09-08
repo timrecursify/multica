@@ -1,4 +1,5 @@
--- GSP-2595 read-only repair candidate report.
+-- GSP-2595 read-only repair candidate report. The repair is in
+-- gsp-2595-repair.sql and must be seat-reviewed; this file never mutates data.
 -- Run with default_transaction_read_only=on. This statement does not mutate data.
 WITH declarations AS (
   SELECT o.issue_id, o.stage, o.outcome, o.blocked_on, o.task_id,
@@ -13,7 +14,6 @@ WITH declarations AS (
          '(?im)^OUTCOME:[[:space:]]*(ADVANCED|NO_OP)[[:space:]]*$', 'g'
        ) WITH ORDINALITY AS m(captures, ordinality)
    WHERE i.workspace_id = :'workspace_id'::uuid
-     AND o.outcome = 'FAILED'
      AND o.blocked_on = 'human'
 ), candidates AS (
   SELECT DISTINCT ON (issue_id, stage) *
@@ -21,8 +21,9 @@ WITH declarations AS (
    ORDER BY issue_id, stage, ordinality DESC
 )
 SELECT (stage = task_stage) AS stage_matches_task,
-       declared_outcome, current_issue_status, count(*) AS repair_candidates
+       outcome AS stored_outcome, declared_outcome, current_issue_status,
+       count(*) AS repair_candidates
   FROM candidates
  WHERE issue_id = task_issue_id
- GROUP BY stage_matches_task, declared_outcome, current_issue_status
- ORDER BY stage_matches_task, declared_outcome, current_issue_status;
+ GROUP BY stage_matches_task, stored_outcome, declared_outcome, current_issue_status
+ ORDER BY stage_matches_task, stored_outcome, declared_outcome, current_issue_status;

@@ -164,7 +164,11 @@ test("completed build handoff statement runs against the production relay_run_lo
     )`);
     await client.query(`CREATE TABLE relay_run_log (
       id bigserial PRIMARY KEY, issue_id uuid NOT NULL, from_stage text NOT NULL,
-      to_stage text, agent_id uuid, task_id uuid, status text NOT NULL DEFAULT 'pending'
+      to_stage text, agent_id uuid, task_id uuid, status text NOT NULL DEFAULT 'pending',
+      parked_audit jsonb
+    )`);
+    await client.query(`CREATE TABLE issue_stage_outcome (
+      issue_id uuid NOT NULL, stage text NOT NULL, task_id uuid
     )`);
     await client.query("CREATE INDEX idx_relay_run_log_issue_id ON relay_run_log (issue_id)");
     const indexes = await client.query(
@@ -196,6 +200,22 @@ test("completed build handoff statement runs against the production relay_run_lo
     await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     await client.end();
   }
+});
+
+test("completed same-stage handoff is rearmed when the outcome cites an older task", async () => {
+  const calls = [];
+  const client = { async query(sql, values) {
+    calls.push({ sql, values });
+    if (sql.includes("UPDATE relay_run_log completed")) return { rows: [{ task_id: "new-task" }], rowCount: 1 };
+    if (sql.includes("UPDATE relay_run_log SET task_id = NULL")) return { rows: [], rowCount: 0 };
+    throw new Error(`unexpected SQL: ${sql}`);
+  }};
+  const result = await armCompletedBuildWorkProduct(client, "issue", "In Progress", "new-task");
+  assert.deepEqual(result.rows, [{ task_id: "new-task" }]);
+  const rearm = calls.find(({ sql }) => sql.includes("UPDATE relay_run_log completed"));
+  assert.match(rearm.sql, /completed\.status = 'completed'/);
+  assert.match(rearm.sql, /outcome\.task_id = \$3::uuid/);
+  assert.equal(calls.some(({ sql }) => sql.includes("INSERT INTO relay_run_log")), false);
 });
 
 test("own-stage FAILED build with no QC verdict is admitted as a bounded retry in PostgreSQL", async () => {
