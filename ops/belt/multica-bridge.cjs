@@ -920,6 +920,28 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
   return changed.rowCount > 0;
 }
 
+async function handoffActiveWorkProduct(client, issueId, fromStage, toStage) {
+  let consumingStage = null;
+  if (fromStage === 'In Review' && toStage === 'CI/CD & Deploy') {
+    consumingStage = 'CI/CD & Deploy';
+  } else if (fromStage === 'CI/CD & Deploy' && toStage === 'In Progress') {
+    consumingStage = 'In Review';
+  } else {
+    return;
+  }
+  const handedOff = await client.query(
+    `UPDATE issue_work_product
+        SET consuming_stage = $2::text, updated_at = NOW()
+      WHERE issue_id = $1::uuid AND status = 'active'
+      RETURNING issue_id`,
+    [issueId, consumingStage]
+  );
+  if (handedOff.rowCount > 1) {
+    throw new Error(`work product handoff requires exactly one active row: ` +
+      `issue=${issueId} active_products=${handedOff.rowCount}`);
+  }
+}
+
 // The spec agent's output is recognised by its required headings, not by author:
 // re-running the spec lane under a different agent must keep working.
 
@@ -2825,6 +2847,9 @@ async function relayAdvance(req, res, body) {
         explicitHumanReviewRelease ? reason.trim() : null,
         consumesRetryEscalation(issue, to_stage)]
     );
+    if (result.rowCount > 0) {
+      await handoffActiveWorkProduct(client, issue.id, issue.status, to_stage);
+    }
     if (explicitHumanReviewRelease) {
       // The operator resolved the old Human Review decision. Consume the
       // destination verdict so only a new task result can escalate it again.
@@ -3272,6 +3297,7 @@ module.exports = {
   selectPoolOwner,
   selectStageOwner,
   applyDisposition,
+  handoffActiveWorkProduct,
   hasCurrentPassWorkProduct,
   retireParkedWork,
   consumeParkedQcRecovery,

@@ -98,6 +98,7 @@ const {
   selectPoolOwner,
   selectStageOwner,
   applyDisposition,
+  handoffActiveWorkProduct,
   consumeParkedQcRecovery,
   isNoArtifactQcBlock,
   operatorRescopeIssueId,
@@ -124,6 +125,72 @@ const {
   isNoDispatchArrivalStage,
   normalizeRelayStage
 } = require('./multica-bridge.cjs');
+
+test('work product handoff advances to CI/CD without creating a second active row', async () => {
+  const products = [{ issue_id: '123e4567-e89b-42d3-a456-426614174000',
+    status: 'active', consuming_stage: 'In Review' }];
+  const client = { async query(sql, values) {
+    if (sql.includes('UPDATE issue_work_product')) {
+      const matching = products.filter((row) => row.issue_id === values[0] && row.status === 'active');
+      for (const row of matching) row.consuming_stage = values[1];
+      return { rowCount: matching.length, rows: matching };
+    }
+    if (sql.includes('FROM issue_work_product')) {
+      return { rows: products.filter((row) => row.issue_id === values[0] &&
+        row.status === 'active' && row.consuming_stage === 'CI/CD & Deploy') };
+    }
+    throw new Error(`unexpected query: ${sql}`);
+  } };
+
+  await handoffActiveWorkProduct(client, products[0].issue_id, 'In Review', 'CI/CD & Deploy');
+  const consumed = await client.query(
+    `SELECT issue_id FROM issue_work_product
+      WHERE issue_id=$1::uuid AND status='active'
+        AND consuming_stage='CI/CD & Deploy'`, [products[0].issue_id]);
+  assert.equal(consumed.rows.length, 1);
+  assert.equal(products.filter((row) => row.status === 'active').length, 1);
+});
+
+test('CI/CD return hands the existing active work product back to In Review', async () => {
+  const product = { issue_id: '123e4567-e89b-42d3-a456-426614174000',
+    status: 'active', consuming_stage: 'CI/CD & Deploy' };
+  const client = { async query(sql, values) {
+    assert.match(sql, /UPDATE issue_work_product/);
+    assert.equal(values[0], product.issue_id);
+    product.consuming_stage = values[1];
+    return { rowCount: 1, rows: [product] };
+  } };
+
+  await handoffActiveWorkProduct(client, product.issue_id, 'CI/CD & Deploy', 'In Progress');
+  assert.equal(product.consuming_stage, 'In Review');
+});
+
+test('work product handoff is a no-op when there is no active row', async () => {
+  const calls = [];
+  const client = { async query(sql, values) {
+    calls.push({ sql, values });
+    return { rowCount: 0, rows: [] };
+  } };
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+
+  await handoffActiveWorkProduct(client, issueId, 'In Review', 'CI/CD & Deploy');
+  await handoffActiveWorkProduct(client, issueId, 'CI/CD & Deploy', 'In Progress');
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map(({ values }) => values[1]), ['CI/CD & Deploy', 'In Review']);
+});
+
+test('work product handoff rejects multiple active rows', async () => {
+  const client = { async query() {
+    return { rowCount: 2, rows: [{}, {}] };
+  } };
+
+  await assert.rejects(
+    handoffActiveWorkProduct(client, '123e4567-e89b-42d3-a456-426614174000',
+      'In Review', 'CI/CD & Deploy'),
+    /work product handoff requires exactly one active row: .*active_products=2/
+  );
+});
 
 test('rollup admission with an open child is skipped before a task insert attempt', async () => {
   const calls = [];
@@ -1325,6 +1392,7 @@ test('runbook-shaped verdicts advance through the relay handler', async () => {
     if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
     if (/FROM relay_stage_config rsc/.test(sql)) return { rows: [{ agent_id: null, agent_name: null, owner_id: null }] };
     if (/UPDATE "issue"\s+SET status/.test(sql)) return { rowCount: 1, rows: [{ id: validVerdict.issue_id, status: values[0] }] };
+    if (/UPDATE issue_work_product/.test(sql)) return { rowCount: 1, rows: [{ issue_id: values[0] }] };
     return { rows: [] };
   } };
   const post = async (payload) => {
