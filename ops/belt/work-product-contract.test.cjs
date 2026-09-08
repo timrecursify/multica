@@ -99,7 +99,7 @@ test("build outcome atomically inserts ownership and rework updates its exact id
     await client.query(`SET search_path TO "${schema}"`);
     await client.query("CREATE TABLE issue (id uuid PRIMARY KEY, workspace_id uuid NOT NULL, status text NOT NULL)");
     await client.query("CREATE TABLE agent_task_queue (id uuid PRIMARY KEY, issue_id uuid, status text, context jsonb, result jsonb, created_at timestamptz, completed_at timestamptz)");
-    await client.query("CREATE TABLE relay_run_log (issue_id uuid, from_stage text, to_stage text, created_at timestamptz)");
+    await client.query("CREATE TABLE relay_run_log (issue_id uuid, from_stage text, to_stage text, task_id uuid, created_at timestamptz)");
     await client.query("CREATE TABLE github_pull_request (id uuid PRIMARY KEY, workspace_id uuid, repo_owner text, repo_name text, pr_number int, branch text, html_url text, head_sha text, checks_rollup_state text, updated_at timestamptz)");
     await client.query("CREATE TABLE issue_pull_request (issue_id uuid, pull_request_id uuid)");
     await client.query("CREATE TABLE github_pull_request_check_suite (pr_id uuid, suite_id bigint, status text, conclusion text, head_sha text)");
@@ -110,9 +110,14 @@ test("build outcome atomically inserts ownership and rework updates its exact id
     await client.query("INSERT INTO issue VALUES ($1, $2, 'In Progress')", [issueId, "55555555-5555-4555-8555-555555555555"]);
     await client.query("INSERT INTO github_pull_request VALUES ($1,$2,'acme','widget',7,'fix/belt','https://github.com/acme/widget/pull/7',$3,NULL,NOW())", [prId, "55555555-5555-4555-8555-555555555555", sha1]);
     await client.query("INSERT INTO issue_pull_request VALUES ($1,$2)", [issueId, prId]);
-    const insertTask = async (id, sha) => client.query(
-      "INSERT INTO agent_task_queue VALUES ($1,$2,'completed',$3::jsonb,$4::jsonb,NOW(),NOW())",
-      [id, issueId, JSON.stringify({ to_stage: "In Progress" }), JSON.stringify({ output: `PR https://github.com/acme/widget/pull/7 head ${sha}\nOUTCOME: ADVANCED` })]);
+    const insertTask = async (id, sha) => {
+      await client.query(
+        "INSERT INTO agent_task_queue VALUES ($1,$2,'completed',$3::jsonb,$4::jsonb,NOW(),NOW())",
+        [id, issueId, JSON.stringify({ from_stage: "In Progress", to_stage: "In Review" }), JSON.stringify({ output: `PR https://github.com/acme/widget/pull/7 head ${sha}\nOUTCOME: ADVANCED` })]);
+      await client.query(
+        "INSERT INTO relay_run_log (issue_id, from_stage, to_stage, task_id, created_at) VALUES ($1,'In Progress','In Review',$2,NOW())",
+        [issueId, id]);
+    };
     let observedSha = sha1;
     const githubCommand = async (_args, options) => {
       assert.equal(options.fresh, true);
