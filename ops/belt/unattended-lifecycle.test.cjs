@@ -322,7 +322,10 @@ function runCodeClosureFromImplementation(harness) {
 
 test('GitHub API outage and non-shipping terminal states stay out of shipped metrics', async () => {
   cicd.setTestDependencies({ gh: () => { throw new Error('GitHub unavailable'); }, log() {} });
-  assert.equal(await cicd.ciState('timrecursify/multica', SHA, new Date(BASE_TIME).toISOString()), 'unknown');
+  assert.deepEqual(await cicd.ciState('timrecursify/multica', SHA, new Date(BASE_TIME).toISOString()), {
+    kind: 'infrastructure_failure', status: 'discovery_transport_failure',
+    cause: { name: 'Error', message: 'GitHub unavailable' }
+  });
   const outage = createHarness('github-api-outage');
   runToImplementation(outage);
   arriveAtDeploy(outage);

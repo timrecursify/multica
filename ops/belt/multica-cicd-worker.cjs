@@ -306,16 +306,16 @@ async function watchdogFailure(issue, error, sha = '') {
   // The sentinel is a wall-clock bound independent of poll count. Sparse or
   // failed polls must still produce an auditable human-review hold on time.
   if (watchdog.stalled(row)) {
-    const stalled = watchdog.markAlerted(row);
     const detail = `deploy_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed()} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
     await escalateToSpec(issue, detail, sha);
+    const stalled = watchdog.markAlerted(row);
     return { stalled: true, audit: stalled };
   }
   if (unauthenticatedGh(error)) {
     const detail = `deploy_unauthenticated issue=${issue.id} ${cause}`;
     log(`TERMINAL #${issue.number} github credential unavailable; retrying cannot mint one correlation_key=${row.correlation_key}`);
-    const audit = watchdog.markAlerted(row, 'deploy_unauthenticated');
     await escalateToSpec(issue, detail, sha);
+    const audit = watchdog.markAlerted(row, 'deploy_unauthenticated');
     return { stalled: true, audit };
   }
   if (!watchdog.retryAllowed(row)) {
@@ -603,6 +603,12 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     ci = 'green';
     log(`CI N/A #${issue.number} ${pr.repo} has no workflows or check suites`);
   }
+  if (ci?.kind === 'infrastructure_failure') {
+    const result = { status: 'pending', outcome: ci.status,
+      blocker: { type: ci.status, retry_eligible: true, cause: ci.cause }, retryEligible: true, sha: mergedSha };
+    log(`HOLD #${issue.number} merged ${pr.repo || 'PR'} ci=${ci.status} blocker=${ci.status}`);
+    return result;
+  }
   // A merge may have been authorized retroactively while CI was still queued.
   // Re-check that authorization here, then continue to the deploy-evidence
   // gate; CI queue state alone must not strand an already deployed ticket.
@@ -658,15 +664,18 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
 
 async function closureWatchdog(issue, result, sha) {
   if (!result || result.status !== 'pending') return false;
-  if (result.retryEligible && ['pending', 'discovery_unavailable'].includes(result.outcome)) {
-    watchdog.observe(issue.id, { sha, outcome: result.outcome, error: result.blocker?.type });
-    return false;
-  }
-  const row = watchdog.observe(issue.id, { sha, outcome: 'closure_pending' });
+  const observation = { sha, outcome: result.outcome || 'closure_pending', error: result.blocker?.type };
+  if (result.outcome === 'discovery_auth_failure' || result.outcome === 'discovery_transport_failure') observation.countAttempt = false;
+  const row = watchdog.observe(issue.id, observation);
   if (!watchdog.stalled(row)) return false;
-  const alerted = watchdog.markAlerted(row, 'closure_stalled');
   const elapsed = Date.now() - Date.parse(row.first_seen_at);
   const reason = `retry_escalation:closure_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed} last_error=${row.last_error || 'deploy pending'} correlation_key=${row.correlation_key}`;
+  if (result.outcome === 'discovery_auth_failure' || result.outcome === 'discovery_transport_failure') {
+    await humanReview(issue, reason);
+    const alerted = watchdog.markAlerted(row, 'closure_stalled');
+    return Boolean(alerted);
+  }
+  const alerted = watchdog.markAlerted(row, 'closure_stalled');
   await retryEscalation(issue, 'Spec', reason, {
     trigger_reason: 'closure_stalled', stage: row.stage, elapsed_ms: elapsed,
     last_error: row.last_error || 'deploy pending', correlation_key: row.correlation_key
@@ -802,7 +811,10 @@ async function ciState(repo, sha, createdAt, now = Date.now()) {
     const errorClass = e?.name || e?.constructor?.name || 'Error';
     const errorMessage = String(e?.message || e).split('\n')[0].slice(0, 160);
     log(`CI-UNKNOWN ${repo}@${sha}: ${errorClass}: ${errorMessage}`);
-    return 'unknown';
+    const text = String(e?.message || e);
+    const auth = /\bHTTP\s+(401|403)\b|forbidden|unauthori[sz]ed|bad credentials|requires authentication|authentication required/i.test(text);
+    return { kind: 'infrastructure_failure', status: auth ? 'discovery_auth_failure' : 'discovery_transport_failure',
+      cause: { name: errorClass, message: errorMessage } };
   }
 }
 
@@ -895,6 +907,13 @@ async function sweep() {
       }
       const failures = countCiFailure(issue, pr, product.head_sha, ci);
       if (failures >= CI_FAILURE_POLLS) { await escalateCi(issue, pr, ci); continue; }
+      if (ci?.kind === 'infrastructure_failure') {
+        const result = { status: 'pending', outcome: ci.status, blocker: { type: ci.status, retry_eligible: true, cause: ci.cause },
+          retryEligible: true, sha: product.head_sha };
+        await closureWatchdog(issue, result, product.head_sha);
+        log(`HOLD #${issue.number} ${pr.repo}#${pr.num} ci=${ci.status} blocker=${ci.status}`);
+        continue;
+      }
       if (ci !== 'green') {
         const retro = (ci === 'pending' || ci === 'no_checks' || ci === 'cancelled_only') && info.mergeable !== 'CONFLICTING'
           ? await retroactiveEligible(pr.repo, pr.num, info.headRefOid) : null;
