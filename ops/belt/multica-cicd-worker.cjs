@@ -818,7 +818,8 @@ async function sweep() {
     const task = await pool.query(`SELECT id FROM agent_task_queue WHERE issue_id=$1::uuid AND context->>'to_stage'=$2::text ORDER BY created_at DESC LIMIT 1`, [issue.id, 'CI/CD & Deploy']);
     issue.cicd_task_id = task.rows[0]?.id || null;
     try {
-      watchdog.observe(issue.id);
+      // Presence is not a processing failure and must not consume retry budget.
+      watchdog.observe(issue.id, { countAttempt: false });
       const products = await pool.query(
         `SELECT scope_revision, kind, repository, branch, pr_number, head_sha,
                 acceptance_evidence, replaces_scope_revision, dependency_issue_ids

@@ -323,6 +323,46 @@ jobs:
       - name: Test parked diagnosis backfill
         run: node --test ops/belt/backfill-parked-diagnosis.test.cjs
 
+      - name: Test belt runtime contracts
+        run: |
+          node --test \
+            ops/belt/build-admission.test.cjs \
+            ops/belt/ci-run-reaper.test.cjs \
+            ops/belt/cicd-deploy-evidence.test.cjs \
+            ops/belt/cicd-watchdog.test.cjs \
+            ops/belt/deploy-decision.test.cjs \
+            ops/belt/deployment-fence.test.cjs \
+            ops/belt/escalation-loop-audit.test.cjs \
+            ops/belt/github-api-adapter.test.cjs \
+            ops/belt/guardrails.test.cjs \
+            ops/belt/multica-cicd-worker-sweep.test.cjs \
+            ops/belt/multica-cicd-worker.test.cjs \
+            ops/belt/parity/relay-dead-rows-rescan.test.cjs \
+            ops/belt/parked-diagnosis.test.cjs \
+            ops/belt/parked-entry-audit.test.cjs \
+            ops/belt/qc-gate.test.cjs \
+            ops/belt/qc-lane.test.cjs \
+            ops/belt/qc-strict-evidence.test.cjs \
+            ops/belt/qc-verdict-policy.test.cjs \
+            ops/belt/reconcile-qc-verdicts.test.cjs \
+            ops/belt/recover-in-review-qc.test.cjs \
+            ops/belt/recover-stranded-qc-pass.test.cjs \
+            ops/belt/relay-completion-admission.test.cjs \
+            ops/belt/runs-per-ticket.test.cjs \
+            ops/belt/stage-capacity.test.cjs \
+            ops/belt/transition-policy.test.cjs
+
+      - name: Test belt shell contracts
+        run: |
+          bash ops/belt/belt-concurrency.test.sh
+          bash ops/belt/bridge-health.test.sh
+          bash ops/belt/build-daemon-artifact.test.sh
+          bash ops/belt/daemon-artifact.test.sh
+          bash ops/belt/manifest-closure.test.sh
+          bash ops/belt/manifest-require-graph.test.sh
+          bash ops/belt/workspace-gc.test.sh
+          bash ops/belt/workspace-root.test.sh
+
       - name: Test reconciler against PostgreSQL (asserts 0 skipped)
         run: |
           set +e

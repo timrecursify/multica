@@ -4,6 +4,8 @@ root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 fake="$(mktemp -d)"; trap 'rm -rf "$fake"' EXIT
 export BELT_TEST_MODE=1
 export BELT_WRAPPER_TEST=1
+unset CODEX_BIN
+default_codex_path='/opt/gsp-noc/providers/codex/bin/codex.js'
 cat >"$fake/daemon" <<'EOF'
 #!/bin/sh
 if [ "$*" = 'daemon start --help' ]; then
@@ -20,6 +22,7 @@ if [ -n "${DAEMON_LAUNCH_MARKER:-}" ]; then
   : >"$DAEMON_LAUNCH_MARKER"
 fi
 printf '%s\n' "$*" >"${CAPTURE_FILE:?}"
+printf 'model=%s provider=%s codex=%s\n' "${MULTICA_MODEL:-}" "${MULTICA_PROVIDER:-}" "${CODEX_BIN:-}" >>"${CAPTURE_FILE}"
 printf 'cap=%s root=%s daemon_root=%s workspaces=%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" "${MULTICA_DAEMON_WORKSPACES_ROOT:-}" "${MULTICA_WORKSPACES_ROOT:-}" "${DISCOVERED_WORKSPACES:-2}" >>"${CAPTURE_FILE}"
 printf 'go_path=%s\n' "${PATH%%:*}" >>"${CAPTURE_FILE}"
 printf 'codex_path=%s\n' "${MULTICA_CODEX_PATH:-}" >>"${CAPTURE_FILE}"
@@ -36,15 +39,16 @@ DAEMON_LAUNCH_MARKER="$launch_marker" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_R
 [[ -e "$launch_marker" ]]
 grep -q -- "--workspaces-root=$fake/ws" "$capture"
 grep -q -- "--max-concurrent-tasks=2" "$capture"
+grep -q "model=gpt-5.6-luna provider=openai codex=$default_codex_path" "$capture"
 grep -q 'cap=2 root=.* daemon_root=.* workspaces=2' "$capture"
 grep -qx 'go_path=/usr/local/go/bin' "$capture"
 grep -q "cwd=$daemon_cwd" "$capture"
-grep -q '^codex_path=/opt/gsp-noc/providers/codex/bin/codex.js$' "$capture"
+grep -q "^codex_path=$default_codex_path$" "$capture"
 ! grep -q '/usr/local/bin/codex' "$capture"
 env -u MULTICA_DAEMON_MAX_CONCURRENT_TASKS -u MULTICA_DAEMON_WORKSPACES_ROOT BELT_WORKSPACES_ROOT_OVERRIDE="$fake/ws" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 2' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/empty.lock" "$root_dir/multica-daemon-wrapper.sh"
 grep -q -- '--max-concurrent-tasks=2' "$capture"
 DAEMON_SUPPORTS_WORKSPACES_FLAG=0 BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_RUNNER_COUNT_CMD='printf 12' MULTICA_DAEMON_BIN="$fake/daemon" MULTICA_DAEMON_CWD="$daemon_cwd" CAPTURE_FILE="$capture" MULTICA_DAEMON_LOCK_FILE="$fake/new.lock" MULTICA_DAEMON_MAX_CONCURRENT_TASKS=12 MULTICA_DAEMON_WORKSPACES_ROOT="$fake/new-workspaces" "$root_dir/multica-daemon-wrapper.sh"
-grep -q '^daemon start --foreground --daemon-id=gsp-multica-worker --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks=12$' "$capture"
+grep -q '^daemon start --foreground --daemon-id=gsp-codex --heartbeat-interval=30s --poll-interval=2s --max-concurrent-tasks=12 --profile=gsp-codex$' "$capture"
 grep -q "cap=12 root=$fake/new-workspaces daemon_root=$fake/new-workspaces workspaces=2" "$capture"
 if grep -q -- '--workspaces-root' "$capture"; then
   echo 'flagless daemon unexpectedly received --workspaces-root' >&2

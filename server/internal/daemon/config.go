@@ -101,6 +101,8 @@ type Config struct {
 	KeepEnvAfterTask               bool                  // preserve env after task for debugging
 	HealthPort                     int                   // local HTTP port for health checks (default: 19514)
 	MaxConcurrentTasks             int                   // max tasks running in parallel (default: 20)
+	IOPressureHoldThreshold        float64
+	IOPressureResumeThreshold      float64
 	GCEnabled                      bool                  // enable periodic workspace garbage collection (default: true)
 	GCInterval                     time.Duration         // how often the GC loop runs (default: 2h)
 	GCTTL                          time.Duration         // clean locally completed dirs after this TTL, regardless of issue status (default: 6h)
@@ -340,6 +342,9 @@ func LoadConfig(overrides Overrides) (Config, error) {
 	if overrides.MaxConcurrentTasks > 0 {
 		maxConcurrentTasks = overrides.MaxConcurrentTasks
 	}
+	ioHold, err := float64FromEnv("MULTICA_DAEMON_IO_PRESSURE_HOLD", 0); if err != nil { return Config{}, err }
+	ioResume, err := float64FromEnv("MULTICA_DAEMON_IO_PRESSURE_RESUME", 0); if err != nil { return Config{}, err }
+	if ioHold < 0 || ioResume < 0 || (ioHold > 0 && ioResume >= ioHold) { return Config{}, fmt.Errorf("invalid IO pressure thresholds") }
 
 	// Profile
 	profile := overrides.Profile
@@ -519,6 +524,8 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		AutoReloadEnabled:              autoReloadEnabled,
 		HealthPort:                     healthPort,
 		MaxConcurrentTasks:             maxConcurrentTasks,
+		IOPressureHoldThreshold:        ioHold,
+		IOPressureResumeThreshold:      ioResume,
 		PollInterval:                   pollInterval,
 		HeartbeatInterval:              heartbeatInterval,
 		AgentTimeout:                   agentTimeout,
@@ -535,6 +542,8 @@ func LoadConfig(overrides Overrides) (Config, error) {
 		ProfileCommandOverrides:        profileCommandOverrides,
 	}, nil
 }
+
+func float64FromEnv(name string, fallback float64) (float64, error) { v := strings.TrimSpace(os.Getenv(name)); if v == "" { return fallback, nil }; n, err := strconv.ParseFloat(v, 64); if err != nil { return 0, fmt.Errorf("%s: %w", name, err) }; return n, nil }
 
 // officialCloudHost is the hostname of Multica's hosted cloud. It's the only
 // origin we treat as "official" for the auto-update default — staging,

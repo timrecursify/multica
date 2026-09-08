@@ -14,6 +14,6 @@ EOF
 chmod +x "$fixture/bin/restic"
 RESTIC_LOG="$fixture/restic.log" PATH="$fixture/bin:$PATH" STICK_MOUNT="$fixture/stick" DRY_RUN=1 "$root/fedkit-backup.sh" | grep -q -- '--files-from'
 if CHECKPOINT="$fixture/checkpoint" DRY_RUN=1 "$root/fedkit-restore.sh" 2>/dev/null; then exit 1; fi
-touch "$fixture/checkpoint"
+printf 'fedkit-fence-v1 test-host test-run\n' >"$fixture/checkpoint"
 CHECKPOINT="$fixture/checkpoint" DRY_RUN=1 "$root/fedkit-restore.sh" | grep -q 'no writes'
 echo PASS
