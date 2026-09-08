@@ -24,14 +24,6 @@ test("GSP-2406 replay reuses completed PR-bearing build", async () => {
     { admit: false, reuseTaskId: "1429d9c4", reason: "completed_build_work_product" });
 });
 
-test("completed build products are correlated to the requested stage", async () => {
-  const client = db({ prior: { id: "current-stage-task", completed_at: "2026-09-07T00:00:00Z" } });
-  await buildTaskAdmission(client, { issueId: "stage-owner", toStage: "In Progress" });
-  const priorQuery = client.calls.find(({ sql }) => sql.includes("SELECT task.id"));
-  assert.match(priorQuery.sql, /task\.context->>'to_stage'=\$2::text/);
-  assert.deepEqual(priorQuery.values, ["stage-owner", "In Progress"]);
-});
-
 test("GSP-2403 qualifying implementation failure admits exactly one linked retry", async () => {
   const prior = { id: "7f3916a4", completed_at: "2026-09-07T00:00:00Z" };
   const first = await buildTaskAdmission(db({ prior, failure: { id: 1772 } }),

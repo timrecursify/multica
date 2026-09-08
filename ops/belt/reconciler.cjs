@@ -439,10 +439,10 @@ async function reconcileIssue(client, issueId, options = {}) {
     const admission = await buildTaskAdmission(client, { issueId: issue.id, toStage: issue.status, locked: true });
     if (!admission.admit) {
       if (admission.reason === "completed_build_work_product") {
-        // The completed current-stage task is the durable build product. Arm
-        // its relay row so the normal completion loop records and routes it
-        // without another build. A completed row is re-opened only while the
-        // current stage outcome still points at a different task.
+        // The completed task is the durable build product. Arm its relay row
+        // so the normal completion loop records and routes it without another
+        // build. A completed row is re-opened only while the current stage
+        // outcome still points at a different task.
         const armed = await armCompletedBuildWorkProduct(
           client, issue.id, issue.status, admission.reuseTaskId);
         await client.query("COMMIT");
