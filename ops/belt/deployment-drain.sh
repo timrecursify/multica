@@ -155,10 +155,17 @@ SQL
 # record at all -- it writes only retry counters into issue.metadata -- so no
 # query can observe a merge it has in flight. Draining does not cover that
 # worker. Stop its unit before deploying if that matters.
+#
+# Prepare leases use the same live-work principle. An expired prepare lease is
+# not in-flight work and must not hold a drain open: measured live on
+# 2026-09-08, all 9 prepare leases were expired while dispatched/running work
+# was 0. Compare each lease with its own expiry rather than inventing an age
+# threshold. Keep the status term below: genuinely dispatched/running work
+# must still hold the drain open.
 deployment_drain_snapshot() {
   deployment_psql -At <<'SQL'
 SELECT concat_ws(' ',
-  'leases=' || count(*) FILTER (WHERE status IN ('dispatched','running') OR prepare_lease_expires_at IS NOT NULL),
+  'leases=' || count(*) FILTER (WHERE status IN ('dispatched','running') OR (prepare_lease_expires_at IS NOT NULL AND prepare_lease_expires_at > now())),
   'children=' || count(*) FILTER (WHERE parent_task_id IS NOT NULL AND status IN ('dispatched','running')),
   -- callbacks counts only pending rows the advancer can still consume.
   --
