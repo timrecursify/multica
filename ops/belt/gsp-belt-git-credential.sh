@@ -39,6 +39,8 @@ esac
 repo=""
 if [ "$mode" = token ]; then
   repo="${2:-$DEFAULT_REPO}"
+  repo="${repo##*/}"
+  repo="${repo%.git}"
 else
   # git writes the request as KEY=VALUE lines on stdin. `path` is present only
   # when credential.usehttppath is true; without it fall back to the default.

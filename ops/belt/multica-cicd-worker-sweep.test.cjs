@@ -31,8 +31,9 @@ test('an escalation failure is isolated so later tickets are still processed', a
     if (sql.includes('FROM qc_verdict')) return { rows: [] };
     return { rows: [] };
   } };
-  const relay = async () => { throw new Error('409 actor_denied\nextra details'); };
-  const gh = args => {
+  const relayCalls = [];
+  const relay = async (...args) => { relayCalls.push(args); throw new Error('409 actor_denied\nextra details'); };
+  const gh = async args => {
     if (args[0] === 'pr' && args[1] === 'view' && args[2] === '1') throw new Error('forced PR lookup failure');
     if (args[0] === 'pr' && args[1] === 'view') return JSON.stringify({
       state: 'OPEN', mergeable: 'MERGEABLE', headRefOid: 'a'.repeat(40), createdAt: new Date().toISOString(),
@@ -48,6 +49,8 @@ test('an escalation failure is isolated so later tickets are still processed', a
   assert.ok(logs.some(line => line.includes('ERR #1: forced PR lookup failure')));
   assert.ok(logs.some(line => line.includes('HOLD #2') && line.includes('merging disabled')));
   assert.ok(!logs.some(line => line.includes('[sweep] error:')));
+  assert.match(relayCalls[0][3], /last_error=forced PR lookup failure/);
+  assert.doesNotMatch(relayCalls[0][3], /object Promise/);
 });
 
 test('a stalled deploy escalates directly to Spec as system, not Human Review', async () => {

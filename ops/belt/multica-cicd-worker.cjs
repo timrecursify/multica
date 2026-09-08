@@ -854,7 +854,7 @@ async function sweep() {
       const key = `${pr.repo}#${pr.num}`;
       let info = prCache.get(key);
       if (!info) {
-        info = JSON.parse(gh(['pr', 'view', pr.num, '-R', pr.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit']));
+        info = JSON.parse(await gh(['pr', 'view', pr.num, '-R', pr.repo, '--json', 'state,mergeable,headRefOid,createdAt,mergedAt,mergeCommit']));
         prCache.set(key, info);
       }
       if (info.headRefOid !== product.head_sha) {
