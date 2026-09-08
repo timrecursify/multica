@@ -444,7 +444,19 @@ async function reconcileIssue(client, issueId, options = {}) {
         // build. A completed row is re-opened only while the current stage
         // outcome still points at a different task.
         const armed = await armCompletedBuildWorkProduct(
-          client, issue.id, issue.status, admission.reuseTaskId);
+          client, issue.id, issue.status, admission.reuseTaskId, options.issueCooldownMinutes);
+        if (armed.stalled) {
+          const reason = "completed_build_work_product_handoff_stalled";
+          if (options.humanReviewRouting && HUMAN_REVIEW_FROM.has(issue.status) &&
+              options.budget.humanReview < options.maxHumanReviewPerCycle) {
+            const routed = await moveToHumanReview(client, issue, reason, options);
+            options.budget.humanReview += 1;
+            await client.query("COMMIT");
+            return routed;
+          }
+          await client.query("COMMIT");
+          return { action: "skipped", reason, taskId: admission.reuseTaskId };
+        }
         await client.query("COMMIT");
         if (armed.rows.length) return { action: "handoff", taskId: admission.reuseTaskId };
         return { action: "reused", taskId: admission.reuseTaskId, reason: admission.reason };
@@ -510,7 +522,7 @@ async function reconcileIssue(client, issueId, options = {}) {
   }
 }
 
-async function armCompletedBuildWorkProduct(client, issueId, stage, taskId) {
+async function armCompletedBuildWorkProduct(client, issueId, stage, taskId, staleMinutes = 30) {
   await client.query(
     `UPDATE relay_run_log SET task_id = NULL
       WHERE task_id = $1::uuid AND status = 'completed'
@@ -537,7 +549,7 @@ async function armCompletedBuildWorkProduct(client, issueId, stage, taskId) {
     [issueId, stage, taskId]
   );
   if (rearmed.rows.length) return rearmed;
-  return client.query(
+  const inserted = await client.query(
     `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, agent_id, task_id, status)
      SELECT $1::uuid, $2::text, $2::text, task.agent_id, task.id, 'pending'
        FROM agent_task_queue task
@@ -551,6 +563,16 @@ async function armCompletedBuildWorkProduct(client, issueId, stage, taskId) {
      RETURNING task_id`,
     [issueId, stage, taskId]
   );
+  if (inserted.rows.length) return inserted;
+  const stalled = await client.query(
+    `SELECT task_id FROM relay_run_log
+      WHERE issue_id = $1::uuid AND task_id = $3::uuid
+        AND to_stage IS NOT DISTINCT FROM $2::text AND status = 'pending'
+        AND created_at <= NOW() - ($4::int * INTERVAL '1 minute')
+      LIMIT 1`,
+    [issueId, stage, taskId, staleMinutes]
+  );
+  return { ...inserted, stalled: stalled.rows.length > 0 };
 }
 
 async function reconcileCycle(client, options = {}) {
