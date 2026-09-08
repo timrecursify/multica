@@ -36,7 +36,7 @@ unset MULTICA_TASK_ID MULTICA_TASK_SLOT MULTICA_TASK_CONFIG_ROOT \
 
 # Paid lane remains explicitly opt-in.
 export MULTICA_ALLOW_PAID_LANE="${MULTICA_ALLOW_PAID_LANE:-0}"
-requested_codex_bin="${CODEX_BIN:-/usr/local/bin/codex}"
+requested_codex_bin="${CODEX_BIN:-/var/lib/gsp/tools/codex-native}"
 if [[ "$requested_codex_bin" == */codex-openrouter && "$MULTICA_ALLOW_PAID_LANE" != 1 ]]; then
   echo "multica-daemon-wrapper: refusing paid OpenRouter lane; set MULTICA_ALLOW_PAID_LANE=1 explicitly" >&2
   exit 64
