@@ -30,7 +30,8 @@ PREAMBLE = (
 
 class API:
     def __init__(self):
-        missing = [n for n in ('MULTICA_SERVER_URL', 'MULTICA_TOKEN') if not os.environ.get(n)]
+        missing = [n for n in ('MULTICA_SERVER_URL', 'MULTICA_TOKEN', 'MULTICA_WORKSPACE_ID')
+                   if not os.environ.get(n)]
         if missing:
             sys.exit('missing required environment variable: ' + ', '.join(missing))
         base = os.environ['MULTICA_SERVER_URL'].rstrip('/')
@@ -40,6 +41,7 @@ class API:
             base = 'https://' + base[6:]
         self.base = base[:-3] if base.endswith('/ws') else base
         self.token = os.environ['MULTICA_TOKEN']
+        self.workspace_id = os.environ['MULTICA_WORKSPACE_ID']
 
     def request(self, method, path, body=None):
         data = None if body is None else json.dumps(body).encode()
@@ -65,8 +67,14 @@ def issue_path(issue_id, suffix=''):
     return '/api/issues/' + urllib.parse.quote(str(issue_id), safe='') + suffix
 
 
+def issue_lookup_path(api, **params):
+    """Build an issue collection lookup scoped to the worker's workspace."""
+    params['workspace_id'] = api.workspace_id
+    return '/api/issues/?' + urllib.parse.urlencode(params)
+
+
 def resolve_number(api, number):
-    response = api.get('/api/issues/?number=' + urllib.parse.quote(str(number), safe=''))
+    response = api.get(issue_lookup_path(api, number=number))
     issues = response.get('issues', [])
     if len(issues) != 1:
         sys.exit('#%s was not found in the task token workspace' % number)
@@ -159,7 +167,7 @@ def load_child(api, issue):
 
 def fetch(api, mega_number):
     if mega_number is None:
-        response = api.get('/api/issues/?open_only=true')
+        response = api.get(issue_lookup_path(api, open_only='true'))
         candidates = [row['id'] for row in response.get('issues', [])
                       if (row.get('title') or '').startswith('MEGA')]
     else:
