@@ -158,6 +158,7 @@ for (const destination of ['In Progress', 'Spec', 'Parked']) {
     const client = { async query(sql, values) {
       assert.match(sql, /UPDATE issue_work_product/);
       assert.equal(values[0], product.issue_id);
+      assert.equal(values[2], 'CI/CD & Deploy');
       product.consuming_stage = values[1];
       return { rowCount: 1, rows: [product] };
     } };
@@ -167,7 +168,7 @@ for (const destination of ['In Progress', 'Spec', 'Parked']) {
   });
 }
 
-test('work product handoff is a no-op when there is no active row', async () => {
+test('work product handoff rejects when there is no active row', async () => {
   const calls = [];
   const client = { async query(sql, values) {
     calls.push({ sql, values });
@@ -175,11 +176,9 @@ test('work product handoff is a no-op when there is no active row', async () => 
   } };
   const issueId = '123e4567-e89b-42d3-a456-426614174000';
 
-  await handoffActiveWorkProduct(client, issueId, 'In Review', 'CI/CD & Deploy');
-  await handoffActiveWorkProduct(client, issueId, 'CI/CD & Deploy', 'In Progress');
-
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls.map(({ values }) => values[1]), ['CI/CD & Deploy', 'In Review']);
+  await assert.rejects(handoffActiveWorkProduct(client, issueId, 'In Review', 'CI/CD & Deploy'), /active_products=0/);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].values, [issueId, 'CI/CD & Deploy', 'In Review']);
 });
 
 test('work product handoff rejects multiple active rows', async () => {
