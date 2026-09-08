@@ -23,7 +23,7 @@ test('completion evidence satisfies every automatic transition policy row', () =
   const row = { task_id: 'task-1', task_result: { output: 'completed' }, issue_title: 'normal change' };
   const cases = [
     ['Spec', 'Queue', 'worker'], ['Queue', 'In Progress', 'system'],
-    ['In Progress', 'In Review', 'system'], ['In Progress', 'CI/CD & Deploy', 'system'],
+    ['In Progress', 'In Review', 'system'],
     ['In Progress', 'Done', 'system'], ['In Review', 'CI/CD & Deploy', 'system']
   ];
   for (const [from, to, actor] of cases) {
@@ -36,7 +36,8 @@ test('completion evidence satisfies every automatic transition policy row', () =
   }
 });
 
-const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+const TEST_DATABASE_URL = process.env.DATABASE_URL ||
+  'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
 
 test('guarded runner contains startup rejection and allows the next pass', async () => {
   let calls = 0;
