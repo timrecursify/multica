@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import pathlib
+import subprocess
 import unittest
 from unittest import mock
 
@@ -63,6 +64,25 @@ class LegacyUnbundleTests(unittest.TestCase):
     def test_unverified_legacy_provenance_fails_closed(self):
         with self.assertRaises(SystemExit):
             self.run_main(['helper', '--unbundle', '2169', '--from-mega', '2536'], ['', ''])
+
+
+class SqlSafetyTests(unittest.TestCase):
+    def test_psql_stops_on_sql_errors_and_all_issue_paths_name_workspace(self):
+        source = HELPER.read_text()
+        self.assertGreaterEqual(source.count("workspace_id='%s'"), 5)
+        self.assertIn("AND c.workspace_id = '%s'", source)
+        self.assertIn("AND p.workspace_id = '%s'", source)
+        self.assertIn("['-v', 'ON_ERROR_STOP=1']", source)
+
+    def test_psql_error_is_fatal(self):
+        result = subprocess.CompletedProcess([], 1, '', 'syntax error')
+        with mock.patch.dict(os.environ, {
+                'MULTICA_POSTGRES_USER': 'u', 'MULTICA_POSTGRES_PASSWORD': 'p',
+                'MULTICA_POSTGRES_DB': 'd'}), \
+             mock.patch.object(MODULE.shutil, 'which', return_value='/usr/bin/psql'), \
+             mock.patch.object(MODULE.subprocess, 'run', return_value=result):
+            with self.assertRaises(SystemExit):
+                MODULE.q('SELECT 1')
 
     def test_service_identity_does_not_reexec_without_credentials(self):
         with mock.patch.dict(os.environ, {}, clear=True), \

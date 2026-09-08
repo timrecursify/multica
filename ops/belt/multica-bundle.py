@@ -22,6 +22,7 @@ so a crashed or re-run scoper never doubles a MEGA description.
 import argparse, hashlib, json, os, pwd, shutil, shlex, subprocess, sys
 
 DSN = ['psql', '-h', '127.0.0.1', '-p', '25432']
+GSP_WORKSPACE_ID = 'f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'
 MARK = '## Bundled work (this MEGA is the only unit of work)'
 PREAMBLE = (
     'Each section below is a ticket folded into this MEGA. Those tickets are\n'
@@ -69,7 +70,8 @@ def q(sql, rows=True):
     env = os.environ.copy()
     env['PGPASSWORD'] = env['MULTICA_POSTGRES_PASSWORD']
     dsn = DSN + ['-U', env['MULTICA_POSTGRES_USER'], '-d', env['MULTICA_POSTGRES_DB']]
-    r = subprocess.run(dsn + (['-At', '-f', '-'] if rows else ['-q', '-f', '-']),
+    r = subprocess.run(dsn + ['-v', 'ON_ERROR_STOP=1'] +
+                       (['-At', '-f', '-'] if rows else ['-q', '-f', '-']),
                        input=sql, capture_output=True, text=True, env=env)
     if r.returncode:
         sys.exit('psql failed: ' + r.stderr.strip()[:400])
@@ -188,12 +190,14 @@ SELECT coalesce(json_agg(m),'[]') FROM (
                     WHERE ivpr.issue_id = c.id) pj)) AS k
                FROM issue c
               WHERE c.parent_issue_id = p.id
+                AND c.workspace_id = '%s'
                 AND c.title NOT LIKE 'MEGA%%'
                 AND c.status NOT IN ('Archived','Cancelled')) s) AS kids
   FROM issue p
   WHERE p.title LIKE 'MEGA%%' AND p.status NOT IN ('Done','Cancelled','Archived')
+    AND p.workspace_id = '%s'
     %s
-) m WHERE m.kids IS NOT NULL;""" % mega_filter).strip())
+) m WHERE m.kids IS NOT NULL;""" % (GSP_WORKSPACE_ID, GSP_WORKSPACE_ID, mega_filter)).strip())
 
 
 def main():
@@ -212,7 +216,9 @@ def main():
     # of being stuck with whatever cluster created the mega.
     if a.unbundle:
         row = q("SELECT id, metadata->>'bundled_into' FROM issue WHERE number = %d"
-                " AND metadata->>'bundled_by' = 'multica-bundle'" % int(a.unbundle)).strip()
+                " AND workspace_id = '%s'"
+                " AND metadata->>'bundled_by' = 'multica-bundle'"
+                % (int(a.unbundle), GSP_WORKSPACE_ID)).strip()
         if not row:
             if a.from_mega is None:
                 sys.exit('#%s is not a folded ticket; legacy recovery requires --from-mega'
@@ -226,12 +232,14 @@ SELECT c.id, m.id, m.number
   FROM issue c
   JOIN issue m ON m.number = %d
  WHERE c.number = %d
+   AND c.workspace_id = '%s'
+   AND m.workspace_id = '%s'
    AND c.status = 'Cancelled'
    AND c.parent_issue_id IS NULL
    AND m.title LIKE 'MEGA%%'
    AND m.status NOT IN ('Done','Cancelled','Archived')
    AND m.description ~ ('(^|[^[:alnum:]_])gsp:' || c.number::text || '([^[:alnum:]_]|$)')
-""" % (a.from_mega, int(a.unbundle))).strip()
+""" % (a.from_mega, int(a.unbundle), GSP_WORKSPACE_ID, GSP_WORKSPACE_ID)).strip()
             if not legacy:
                 sys.exit('#%s is not a verified legacy bundle from MEGA #%s'
                          % (a.unbundle, a.from_mega))
@@ -241,10 +249,10 @@ SELECT c.id, m.id, m.number
                       (a.unbundle, mega_number)); return
             q("UPDATE issue SET status='Registered', parent_issue_id=NULL, "
               "metadata = coalesce(metadata,'{}'::jsonb) || %s::jsonb, updated_at=now() "
-              "WHERE id='%s'" %
+              "WHERE id='%s' AND workspace_id='%s'" %
               (lit(json.dumps({'unbundled_from': mega_number,
                                'unbundled_from_id': mega_id,
-                               'unbundled_by': 'multica-bundle'})), iid), rows=False)
+                               'unbundled_by': 'multica-bundle'})), iid, GSP_WORKSPACE_ID), rows=False)
             print('unbundled legacy #%s from MEGA #%s -> Registered' %
                   (a.unbundle, mega_number))
             return
@@ -254,7 +262,8 @@ SELECT c.id, m.id, m.number
         q("UPDATE issue SET status='Registered', parent_issue_id=NULL, "
           "metadata = (coalesce(metadata,'{}'::jsonb) - 'bundled_into' - 'bundled_into_id' "
           "- 'content_md5' - 'bundled_by') || '{\"unbundled_from\": \"%s\"}'::jsonb, "
-          "updated_at=now() WHERE id='%s'" % (mega, iid), rows=False)
+          "updated_at=now() WHERE id='%s' AND workspace_id='%s'" %
+          (mega, iid, GSP_WORKSPACE_ID), rows=False)
         print('unbundled #%s from MEGA #%s -> Registered' % (a.unbundle, mega))
         return
 
@@ -288,11 +297,12 @@ SELECT c.id, m.id, m.number
             print('DRY mega #%s children=%d bytes=%d' % (m['mega_number'], len(m['kids']), len(newd)))
             continue
 
-        q("UPDATE issue SET description=%s, updated_at=now() WHERE id='%s'"
-          % (lit(newd), m['mega_id']), rows=False)
+        q("UPDATE issue SET description=%s, updated_at=now() WHERE id='%s' AND workspace_id='%s'"
+          % (lit(newd), m['mega_id'], GSP_WORKSPACE_ID), rows=False)
         # Read back what the database actually holds. A write that silently
         # truncated must not be allowed to authorise an archive.
-        live = q("SELECT description FROM issue WHERE id='%s'" % m['mega_id'])
+        live = q("SELECT description FROM issue WHERE id='%s' AND workspace_id='%s'"
+                 % (m['mega_id'], GSP_WORKSPACE_ID))
         folded += 1
 
         for c, h in todo:
@@ -307,7 +317,8 @@ SELECT c.id, m.id, m.number
                                'content_md5': h, 'bundled_by': 'multica-bundle'})
             q("UPDATE issue SET status='Archived', "
               "metadata = coalesce(metadata,'{}'::jsonb) || %s::jsonb, updated_at=now() "
-              "WHERE id='%s'" % (lit(prov), c['id']), rows=False)
+              "WHERE id='%s' AND workspace_id='%s'" %
+              (lit(prov), c['id'], GSP_WORKSPACE_ID), rows=False)
             archived += 1
 
     print('megas_folded=%d children_archived=%d skipped_idempotent=%d blocked=%d'
