@@ -30,8 +30,8 @@ health() {
     const required=["gsp-multica-bridge","multica-relay-advance","multica-archiver"];
     if(process.env.INCLUDE_WORKER==="1") required.push("gsp-multica-worker");
     if(process.env.SKIP_CICD!=="1") required.push("multica-cicd-worker");
-    const expected=`${release}/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh`, byName=new Map(apps.map(a=>[a.name,a])); let ok=true;
-    for(const name of required){const app=byName.get(name),e=app?.pm2_env||{}, pathOk=name!=="multica-relay-advance"||e.pm_exec_path===expected;
+    const expectedPaths={"multica-relay-advance":`${release}/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh`,"gsp-multica-worker":`${release}/ops/belt/multica-daemon-wrapper.sh`,"multica-cicd-worker":`${release}/ops/belt/multica-cicd-worker.cjs`,"multica-archiver":`${release}/ops/belt/multica-archiver.cjs`}, byName=new Map(apps.map(a=>[a.name,a])); let ok=true;
+    for(const name of required){const app=byName.get(name),e=app?.pm2_env||{}, expected=expectedPaths[name], pathOk=!expected||e.pm_exec_path===expected;
       if(!app||e.status!=="online"||e.pm_cwd!==release||!pathOk){console.error(`health: app=${name} status=${e.status||"missing"} pid=${app?.pid??"unknown"} exit_code=${e.exit_code??"unknown"} exit_signal=${e.exit_signal||"unknown"} restarts=${e.unstable_restarts??"unknown"} error_log=${e.pm_err_log_path||"unknown"} expected_script=${name==="multica-relay-advance"?expected:"release cwd"}`);ok=false;}}
     process.exit(ok?0:1);'
 }
@@ -59,6 +59,7 @@ if [[ "$mode" == --rollback ]]; then
   [[ -f "$ecosystem" ]] || { echo "release missing: $release" >&2; exit 66; }
   MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env
   health || { echo 'rollback health failed' >&2; exit 67; }
+  "$pm2_bin" save >/dev/null || { echo 'rollback pm2 save failed' >&2; exit 68; }
   exit 0
 fi
 preflight "$checkout"
@@ -71,7 +72,7 @@ manifest_sha256="$(manifest_checksum "$release")"
 printf '{"source_sha":"%s","manifest_sha256":"%s","credential_keys":["DATABASE_URL","RELAY_AGENT_SECRET","RELAY_OPERATOR_SECRET","MULTICA_WORKSPACE_ID"]}\n' "$requested_sha" "$manifest_sha256" > "$release/.gsp-belt-release.json"
 "$release/ops/belt/build-daemon-artifact.sh" "artifacts"
 "$checkout/ops/belt/normalize-release-permissions.sh" "$release"
-if ! MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env || ! health; then
+if ! MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$ecosystem" --update-env || ! health || ! "$pm2_bin" save >/dev/null; then
   prior_sha="${MULTICA_PRIOR_SHA:-}"
   if [[ "$prior_sha" =~ ^[0-9a-f]{40}$ && -f "$release_root/$prior_sha/ops/belt/ecosystem.gsp-belt.config.js" ]]; then
     MULTICA_INCLUDE_WORKER="$include_worker" MULTICA_SKIP_CICD_WORKER="$skip_cicd_worker" "$pm2_bin" startOrReload "$release_root/$prior_sha/ops/belt/ecosystem.gsp-belt.config.js" --update-env || true
