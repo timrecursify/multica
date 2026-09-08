@@ -7,7 +7,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, runBounded,
-  parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired } = require('./multica-relay-advance-daemon.cjs');
+  parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired, requeueCandidateSql } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
@@ -442,16 +442,16 @@ test('genuine failures and completed tasks without artifacts consume an attempt'
 });
 
 test('requeue candidate SQL binds the stage array with a real PostgreSQL client', async (t) => {
-  const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
-  const start = source.indexOf('`WITH stranded AS (');
-  const end = source.indexOf('`', start + 1);
-  assert.ok(start >= 0 && end > start, 'requeue candidate SQL must be present');
-  const sql = source.slice(start + 1, end);
+  const sql = requeueCandidateSql();
+  assert.equal(typeof sql, 'string');
   assert.match(sql, /i\.status = ANY\(\$2::text\[\]\)/);
   assert.match(sql, /WHERE rn <= \$1::int/);
   assert.match(sql, /SELECT budgeted\.\*, NULL::bigint AS rn,/,
     'both UNION branches must expose the ranked row-number column');
   const params = [3, ['Queue', 'In Progress', 'Spec', 'In Review'], 120, 2, 6];
+  assert.equal(params[0], 3, '$1 must be supplied as a bound parameter');
+  assert.deepEqual(params[1], ['Queue', 'In Progress', 'Spec', 'In Review'],
+    '$2 must be supplied as a bound PostgreSQL text array');
   const client = new Client({ connectionString: TEST_DATABASE_URL, connectionTimeoutMillis: 5000 });
   try {
     await client.connect();
@@ -460,6 +460,9 @@ test('requeue candidate SQL binds the stage array with a real PostgreSQL client'
       t.skip('test DB schema lacks public.relay_run_log; live-schema validation remains required');
       return;
     }
+    await client.query(`CREATE TEMP TABLE qc_verdict (
+      issue_id uuid NOT NULL, checker_id uuid, created_at timestamptz NOT NULL
+    ) ON COMMIT DROP`);
     const result = await client.query(sql, params);
     assert.ok(Array.isArray(result.rows));
   } finally {
