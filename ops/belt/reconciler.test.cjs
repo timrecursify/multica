@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
-  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql, mergedPullRequestNoop,
+  moveToHumanReview, isHumanReservedBlocker, terminalBlocker, isLeafSql, lifetimeTasksSql, mergedPullRequestNoop,
   armCompletedBuildWorkProduct, stageAttemptBudget } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
@@ -224,7 +224,7 @@ test("stale pending completed-build handoff is detected instead of silently reus
   assert.equal(detection.values[3], 30);
 });
 
-test("stale pending completed-build handoff routes the issue to Human Review", async () => {
+test("stale pending completed-build handoff stays technical", async () => {
   const completed = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const db = harness();
   const original = db.query;
@@ -240,9 +240,9 @@ test("stale pending completed-build handoff routes the issue to Human Review", a
     return original(sql, values);
   };
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
-    action: "human_review", reason: "completed_build_work_product_handoff_stalled"
+    action: "skipped", reason: "technical_blocker"
   });
-  assert.ok(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Human Review'")));
+  assert.equal(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Human Review'")), false);
   assert.equal(db.calls.some(({ sql }) => sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
@@ -617,7 +617,7 @@ function strandedReasons(row, issueParkedAt) {
 test("moveToHumanReview cannot strand an unconsumable pending relay row", async () => {
   const calls = [];
   const db = { query: async (sql, values) => { calls.push({ sql, values }); return { rows: [] }; } };
-  await moveToHumanReview(db, { ...issue, status: "Spec" }, "blocked_dependency_unobservable", { evaluate: ok });
+  await moveToHumanReview(db, { ...issue, status: "Spec" }, "money_movement", { evaluate: ok });
 
   // The producer performs the advance itself, so the issue is parked on to_stage.
   const moved = calls.find((c) => /UPDATE issue SET status = 'Human Review'/.test(c.sql || ""));
@@ -628,25 +628,23 @@ test("moveToHumanReview cannot strand an unconsumable pending relay row", async 
     "moveToHumanReview wrote a relay row no consumer can ever close");
 });
 
-test("moveToHumanReview asks as the operator the belt acts for", async () => {
+test("moveToHumanReview asks as system for a reserved decision", async () => {
   const seen = [];
   const db = { query: async (sql, values) => { seen.push({ sql, values }); return { rows: [] }; } };
-  const result = await moveToHumanReview(db, issue, "blocked_human", {
+  const result = await moveToHumanReview(db, issue, "money_movement", {
     evaluate: (input) => { seen.push({ evaluate: input }); return { ok: true }; }
   });
-  assert.deepEqual(result, { action: "human_review", reason: "blocked_human" });
+  assert.deepEqual(result, { action: "human_review", reason: "money_movement" });
   const call = seen.find((s) => s.evaluate).evaluate;
-  // Every `* -> Human Review` row in transition-policy lists actors ['operator'];
-  // 'system' was refused as actor_denied, which left the function unusable.
-  assert.equal(call.actor, "operator");
+  assert.equal(call.actor, "system");
   assert.equal(call.to, "Human Review");
-  assert.deepEqual(call.evidence, { blocker: "blocked_human" });
+  assert.deepEqual(call.evidence, { blocker: "money_movement" });
   assert.ok(seen.some((s) => /multica.relay_authorized/.test(s.sql || "")));
   assert.ok(seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
   assert.ok(seen.some((s) => /INSERT INTO relay_run_log/.test(s.sql || "")));
 });
 
-test("a capped Spec ticket can still exit to Human Review", async () => {
+test("a capped Spec ticket remains on the technical skipped path", async () => {
   // Spec was excluded from HUMAN_REVIEW_FROM on the belief that RULES barred
   // the transition. It does not: transition-policy lists Spec -> Human Review
   // for the operator actor. With Spec excluded, a Spec ticket that had spent
@@ -664,10 +662,16 @@ test("a capped Spec ticket can still exit to Human Review", async () => {
   const result = await moveToHumanReview(
     db, { ...issue, status: "Spec" }, "lifetime_task_limit:33/6", { evaluate }
   );
-  assert.deepEqual(result, { action: "human_review", reason: "lifetime_task_limit:33/6" });
-  assert.ok(seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
-  const logged = seen.find((s) => /INSERT INTO relay_run_log/.test(s.sql || ""));
-  assert.equal(logged.values[1], "Spec");
+  assert.deepEqual(result, { action: "skipped", reason: "technical_blocker" });
+  assert.ok(!seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
+});
+
+test("only Tim's reserved blocker categories may enter Human Review", () => {
+  for (const blocker of ["money_movement", "client_charge", "structural_architecture", "structural_security", "dangerous_production", "irreversible_production"]) {
+    assert.equal(isHumanReservedBlocker(blocker), true, blocker);
+  }
+  assert.equal(isHumanReservedBlocker("blocked_dependency_unobservable"), false);
+  assert.equal(isHumanReservedBlocker("technical_timeout"), false);
 });
 
 test("a policy rejection leaves the issue skipped rather than erroring the cycle", async () => {
@@ -678,7 +682,7 @@ test("a policy rejection leaves the issue skipped rather than erroring the cycle
     return { rows: [] };
   };
   await assert.rejects(
-    () => moveToHumanReview(db, issue, "blocked_human", { evaluate: () => ({ ok: false, code: "actor_denied" }) }),
+    () => moveToHumanReview(db, issue, "money_movement", { evaluate: () => ({ ok: false, code: "actor_denied" }) }),
     /actor_denied/
   );
 });

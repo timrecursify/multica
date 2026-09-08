@@ -135,12 +135,19 @@ function settingsFor(options = {}) {
   };
 }
 
-// Routes a stuck issue off its stage and onto a human's board. transition-policy
-// lists every `* -> Human Review` row with actors ['operator'], so this asks as
-// the operator the belt is acting for; 'system' was refused as actor_denied.
+// Only these decisions belong to a human: money movement/client charges,
+// structural architecture or security, and dangerous/irreversible production
+// actions. All other blockers remain on the reconciler's normal skipped path.
+function isHumanReservedBlocker(blocker) {
+  const value = String(blocker || '').toLowerCase();
+  return /(?:money|client[_ ]charge|structural[_ ](?:architecture|security)|dangerous.*production|irreversible.*production)/.test(value);
+}
+
+// Routes a reserved decision off its stage and onto a human's board.
 async function moveToHumanReview(client, issue, reason, options) {
+  if (!isHumanReservedBlocker(reason)) return { action: "skipped", reason: "technical_blocker" };
   const verdict = policyFor(options)({
-    from: issue.status, to: "Human Review", actor: "operator", evidence: { blocker: reason }
+    from: issue.status, to: "Human Review", actor: "system", evidence: { blocker: reason }
   });
   if (!verdict?.ok) throw new Error(`reconcile policy rejected Human Review: ${reason} (${verdict?.code})`);
   // The UPDATE below performs the advance itself, so the relay row is audit-only
@@ -614,4 +621,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, isHumanReservedBlocker, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
