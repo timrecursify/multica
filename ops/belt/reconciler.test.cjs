@@ -244,7 +244,7 @@ test("own-stage FAILED build with no QC verdict is admitted as a bounded retry i
        VALUES ($1, 'FAIL', 'evidence', false, '2026-09-07T20:00:02Z')`, [issueId]);
     assert.deepEqual(await buildTaskAdmission(client, {
       issueId, toStage: "In Progress"
-    }), { admit: false, reuseTaskId: taskId, reason: "completed_build_work_product" });
+    }), { admit: true, retryOfTaskId: taskId });
   } finally {
     await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
     await client.end();

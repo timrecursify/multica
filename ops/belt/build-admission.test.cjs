@@ -42,6 +42,15 @@ test("correlated FAILED build without any QC verdict admits a retry", async () =
   { admit: true, retryOfTaskId: prior.id });
 });
 
+test("historical QC verdict does not suppress a current correlated FAILED retry", async () => {
+  const prior = { id: "failed-build", completed_at: "2026-09-07T00:00:00Z" };
+  const client = db({ prior, unreviewedFailure: { task_id: prior.id } });
+  assert.deepEqual(await buildTaskAdmission(client, { issueId: "stranded", toStage: "In Progress" }),
+    { admit: true, retryOfTaskId: prior.id });
+  const admissionSql = client.calls.find(({ sql }) => sql.includes("SELECT outcome.task_id")).sql;
+  assert.doesNotMatch(admissionSql, /NOT EXISTS[\s\S]*qc_effective_verdict/);
+});
+
 test("non-build stages bypass admission", async () => {
   const client = db();
   assert.deepEqual(await buildTaskAdmission(client, { issueId: "issue", toStage: "In Review" }), { admit: true });

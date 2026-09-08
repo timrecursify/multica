@@ -2339,19 +2339,12 @@ function relayAdvanceConfirmation(response, targetStage) {
 
 async function recordRefusedAdvance(client, row) {
   await markRelayLogFailedById(client, row.log_id);
-  if (!TYPED_OUTCOMES) return;
-  await client.query(
-    `INSERT INTO issue_stage_outcome
-       (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
-     VALUES ($1::uuid, $2::text, 'FAILED', 'human', $3::uuid, NULL, NOW())
-     ON CONFLICT (issue_id, stage) DO UPDATE SET outcome = 'FAILED', blocked_on = 'human',
-       task_id = EXCLUDED.task_id, input_hash = NULL, outcome_at = NOW()`,
-    [row.issue_id, row.to_stage, row.task_id]);
 }
 
 // Retry recorded successful work without creating another agent task.  A relay
-// refusal (4xx) parks the outcome for a human at once; a denial that can clear
-// by itself is retried at most three times, then the outcome becomes human-owned.
+// refusal is relay state, not permission to rewrite the task's typed outcome.
+// Denial diagnostics and retry counts live on relay_run_log. Human ownership is
+// reserved for an explicit BLOCKED/human task outcome or an independent policy.
 async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRelay,
   logger = console, typedOutcomes = TYPED_OUTCOMES } = {}) {
   if (!typedOutcomes) return [];
@@ -2364,6 +2357,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
          FROM issue_stage_outcome o
          JOIN issue i ON i.id = o.issue_id AND i.status = o.stage
          JOIN agent_task_queue t ON t.id = o.task_id AND t.status = 'completed'
+          AND t.issue_id = o.issue_id AND t.context->>'to_stage' = o.stage
          LEFT JOIN relay_stage_config rsc
            ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
          ${evidenceSql.joins}
@@ -2383,10 +2377,6 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       if (!targetStage) continue;
       const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
       if (row.to_stage === 'In Review' && !qcAdvance.ok) {
-        const blockedOn = /sha|md5/i.test(qcAdvance.reason) ? 'sha' : 'human';
-        await client.query(`UPDATE issue_stage_outcome SET blocked_on = $3::text
-          WHERE issue_id = $1::uuid AND stage = $2::text`,
-        [row.issue_id, row.to_stage, blockedOn]);
         logger.log(`${LOG_PREFIX} [typed-readvance] skipped issue=${row.issue_id} reason=${qcAdvance.reason}`);
         continue;
       }
@@ -2410,30 +2400,15 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         continue;
       }
       const error = `status=${response.status}; error=${relayDenialDetail(response)}`;
-      const denied = await client.query(
+      await client.query(
         `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
              jsonb_build_object('typed_readvance_denials',
                COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) + 1,
                'typed_readvance_error', $2::text)
           WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)
         RETURNING COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) AS denials`, [row.task_id, error]);
-      // A 4xx is the relay refusing on policy, not failing: the identical POST
-      // earns the identical refusal until something outside this loop changes
-      // the ticket, so retrying it is pure waste. The three-strike allowance is
-      // for a denial that can clear by itself (202 deferred, 5xx no-owner).
-      //
-      // The counter alone did not bound the 4xx case: it lives on the task's
-      // newest relay_run_log row, and a completed task that never produced one
-      // makes the UPDATE match nothing, so `denials` reads 0 forever. Issue
-      // cae70ef9 (task ce297efa, zero relay_run_log rows) was refused
-      // `parked_release_required` on every cycle for hours on 2026-09-06 while
-      // issues whose task did have a run log stopped at exactly three.
-      const refused = (response.status >= 400 && response.status < 500) ||
-        (response.status === 200 && !confirmation.ok);
-      if (refused || Number(denied.rows[0]?.denials || 0) >= 3) {
-        await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = 'human'
-          WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
-      }
+      // Keep refusal diagnostics on relay_run_log. The typed task outcome stays
+      // authoritative even for a policy 4xx, a mismatched 200, or repeated 5xx.
       logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);
     }
     return advanced;
