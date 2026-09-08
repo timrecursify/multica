@@ -31,7 +31,6 @@ const TRANSITIONS = Object.freeze([
   ['Queue', 'In Progress', ['system'], 'queued'],
   ['Queue', 'Spec', ['system'], 'retryEscalation'],
   ['In Progress', 'In Review', ['worker', 'system'], 'reviewed'],
-  ['In Progress', 'CI/CD & Deploy', ['system'], 'deploy'],
   // A build worker may only hand implementation work to In Review.  Done is
   // the no-deploy terminal path and is admitted by the relay/system after it
   // has independently checked the work product; allowing `worker` here made

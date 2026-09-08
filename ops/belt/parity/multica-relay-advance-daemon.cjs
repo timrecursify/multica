@@ -356,11 +356,6 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
     return { noDeployRoute: route?.kind || 'no_pr',
       workProductEvidence: /\bNO-SHA\b/i.test(resultText) ? resultText : pointer };
   }
-  if (row.to_stage === 'In Progress' && targetStage === 'CI/CD & Deploy') {
-    return { noReviewRoute: route?.kind || 'no_pr', deployableRoute: route?.kind || 'no_pr', pr: route?.pr_url || pointer,
-      workProductEvidence: 'NO-SHA: no deployable artifact',
-      boundSha: route?.boundSha || pointer };
-  }
   if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
     return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };
   }
