@@ -607,6 +607,34 @@ test("a capped Spec ticket can still exit to Human Review", async () => {
   assert.equal(logged.values[1], "Spec");
 });
 
+function lifetimeCapHarness(status, count) {
+  const calls = [];
+  return { calls, query: async (sql, values = []) => {
+    calls.push({ sql, values });
+    if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [{ ...issue, status }] };
+    if (sql.includes("AS is_leaf")) return { rows: [{ is_leaf: true }] };
+    if (sql.includes("FROM agent_task_queue") && sql.includes("FOR UPDATE")) return { rows: [] };
+    if (sql.includes("SELECT count(*)") || sql.includes("COUNT(*)")) return { rows: [{ count }] };
+    return { rows: [] };
+  }};
+}
+
+test("lifetime cap routes a Spec issue to Human Review", async () => {
+  const db = lifetimeCapHarness("Spec", 6);
+  const { evaluate } = require("./transition-policy.cjs");
+  const result = await reconcileIssue(db, issue.id, {
+    evaluate, lifetimeTaskLimit: 6
+  });
+  assert.deepEqual(result, { action: "human_review", reason: "lifetime_task_limit:6/6" });
+});
+
+test("lifetime cap keeps an In Progress issue on the belt", async () => {
+  const db = lifetimeCapHarness("In Progress", 6);
+  const result = await reconcileIssue(db, issue.id, { lifetimeTaskLimit: 6 });
+  assert.deepEqual(result, { action: "skipped", reason: "lifetime_task_limit", count: 6 });
+  assert.equal(db.calls.some((call) => call.sql.includes("UPDATE issue SET status = 'Human Review'")), false);
+});
+
 test("a policy rejection leaves the issue skipped rather than erroring the cycle", async () => {
   const db = harness();
   db.query = async (sql, values = []) => {

@@ -160,6 +160,9 @@ async function moveToHumanReview(client, issue, reason, options) {
 // spent its lifetime task budget can no longer be re-dispatched, and without an
 // exit it is re-evaluated every cycle forever instead of reaching a human.
 const HUMAN_REVIEW_FROM = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
+// The lifetime-cap exception is authorized only by ops/belt/sql/2026-09-07_lifetime_cap_human_review.sql.
+// A capped ticket in any other stage stops spending desk tasks but stays on the belt because its stage worker still owns a free exit.
+const LIFETIME_CAP_HUMAN_REVIEW_FROM = new Set(["Spec"]);
 const LINK_TABLE = { ci: "issue_pull_request", sha: "issue_pull_request", dependency: "issue_dependency" };
 
 // A recorded BLOCKED outcome is terminal when no machine-observable input remains
@@ -420,7 +423,7 @@ async function reconcileIssue(client, issueId, options = {}) {
     const lifetimeCount = Number(lifetime.rows[0]?.count || 0);
     if (lifetimeCount >= options.lifetimeTaskLimit) {
       const capReason = `lifetime_task_limit:${lifetimeCount}/${options.lifetimeTaskLimit}`;
-      const routed = options.humanReviewRouting && HUMAN_REVIEW_FROM.has(issue.status) &&
+      const routed = options.humanReviewRouting && LIFETIME_CAP_HUMAN_REVIEW_FROM.has(issue.status) &&
         options.budget.humanReview < options.maxHumanReviewPerCycle
         ? await moveToHumanReview(client, issue, capReason, options) : null;
       if (routed) {
