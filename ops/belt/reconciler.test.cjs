@@ -239,9 +239,7 @@ test("stale pending completed-build handoff stays technical", async () => {
     if (sql.includes("SELECT task_id FROM relay_run_log")) return { rows: [{ task_id: completed }] };
     return original(sql, values);
   };
-  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
-    action: "skipped", reason: "technical_blocker"
-  });
+  assert.equal(await reconcileIssue(db, issue.id, { evaluate: ok }), null);
   assert.equal(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Human Review'")), false);
   assert.equal(db.calls.some(({ sql }) => sql.includes("INSERT INTO agent_task_queue")), false);
 });
@@ -662,7 +660,7 @@ test("a capped Spec ticket remains on the technical skipped path", async () => {
   const result = await moveToHumanReview(
     db, { ...issue, status: "Spec" }, "lifetime_task_limit:33/6", { evaluate }
   );
-  assert.deepEqual(result, { action: "skipped", reason: "technical_blocker" });
+  assert.equal(result, null);
   assert.ok(!seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
 });
 

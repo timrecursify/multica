@@ -138,7 +138,7 @@ function settingsFor(options = {}) {
 
 // Routes a reserved decision off its stage and onto a human's board.
 async function moveToHumanReview(client, issue, reason, options) {
-  if (!isHumanReservedBlocker(reason)) return { action: "skipped", reason: "technical_blocker" };
+  if (!isHumanReservedBlocker(reason)) return null;
   const verdict = policyFor(options)({
     from: issue.status, to: "Human Review", actor: "system", evidence: { blocker: reason }
   });
@@ -418,7 +418,7 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     // Lifetime cap is per issue and includes every reconciler-created task,
     // regardless of terminal status.  Stop the paid loop before selecting an
-    // owner or inserting another task; route the durable blocker to a human.
+    // owner or inserting another task; technical work remains skipped.
     const lifetime = await client.query(lifetimeTasksSql(), [issue.id, issue.status]);
     const lifetimeCount = Number(lifetime.rows[0]?.count || 0);
     if (lifetimeCount >= options.lifetimeTaskLimit) {
