@@ -925,20 +925,25 @@ async function handoffActiveWorkProduct(client, issueId, fromStage, toStage) {
   if (fromStage === 'In Review' && toStage === 'CI/CD & Deploy') {
     consumingStage = 'CI/CD & Deploy';
   } else if (fromStage === 'CI/CD & Deploy' &&
-      ['In Progress', 'Spec', 'Parked'].includes(toStage)) {
+      ['In Progress', 'Spec', 'Parked', 'Human Review', 'In Review'].includes(toStage)) {
     // Every failed CI/CD exit hands the implementation back to the review
     // boundary. In particular, retry escalation is performed by the bridge
     // after a worker crash, so this cannot depend on worker-side cleanup.
     consumingStage = 'In Review';
+  } else if (fromStage === 'CI/CD & Deploy' && toStage === 'Done') {
+    consumingStage = null;
+  } else if (fromStage === 'CI/CD & Deploy' && toStage === 'Cancelled') {
+    consumingStage = null;
   } else {
     return;
   }
+  const terminal = toStage === 'Done' ? 'completed' : toStage === 'Cancelled' ? 'cancelled' : null;
   const handedOff = await client.query(
     `UPDATE issue_work_product
-        SET consuming_stage = $2::text, updated_at = NOW()
+        SET consuming_stage = $2::text, status = COALESCE($3::text, status), updated_at = NOW()
       WHERE issue_id = $1::uuid AND status = 'active'
       RETURNING issue_id`,
-    [issueId, consumingStage]
+    [issueId, consumingStage, terminal]
   );
   if (handedOff.rowCount > 1) {
     throw new Error(`work product handoff requires exactly one active row: ` +

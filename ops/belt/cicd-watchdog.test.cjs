@@ -23,6 +23,19 @@ test('watchdog persists first-seen and correlation state across restart', () => 
   assert.equal(restored.attempts, 2);
 });
 
+test('presence does not consume retry budget; one failure records one attempt', () => {
+  const w = createWatchdog();
+  assert.equal(w.seen('issue-presence').attempts, 0);
+  assert.equal(w.observe('issue-presence', { error: 'lookup failed' }).attempts, 1);
+  assert.equal(w.seen('issue-presence').attempts, 1);
+});
+
+test('attempts are capped at the configured retry limit', () => {
+  const w = createWatchdog();
+  for (let i = 0; i < 9; i++) w.observe('issue-cap', { error: 'failed' });
+  assert.equal(w.snapshot()['issue-cap:CI/CD & Deploy'].attempts, 5);
+});
+
 test('stalled alert is emitted once after threshold and backoff is capped', () => {
   let now = 0; const w = createWatchdog({ now: () => now });
   const row = w.observe('issue-2', { error: 'provider unavailable' });
