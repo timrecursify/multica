@@ -247,23 +247,28 @@ SELECT c.id, m.id, m.number
             if not a.apply:
                 print('DRY legacy unbundle #%s from MEGA #%s' %
                       (a.unbundle, mega_number)); return
-            q("UPDATE issue SET status='Registered', parent_issue_id=NULL, "
+            # Migration 297's guard matches the canonical bridge/reconciler:
+            # authority is transaction-local and must precede the status write.
+            q("BEGIN; SELECT set_config('multica.relay_authorized','on',true); "
+              "UPDATE issue SET status='Registered', parent_issue_id=NULL, "
               "metadata = coalesce(metadata,'{}'::jsonb) || %s::jsonb, updated_at=now() "
               "WHERE id='%s' AND workspace_id='%s'" %
               (lit(json.dumps({'unbundled_from': mega_number,
                                'unbundled_from_id': mega_id,
-                               'unbundled_by': 'multica-bundle'})), iid, GSP_WORKSPACE_ID), rows=False)
+                               'unbundled_by': 'multica-bundle'})), iid, GSP_WORKSPACE_ID) +
+              "; COMMIT;", rows=False)
             print('unbundled legacy #%s from MEGA #%s -> Registered' %
                   (a.unbundle, mega_number))
             return
         iid, mega = row.split('|')
         if not a.apply:
             print('DRY unbundle #%s from MEGA #%s' % (a.unbundle, mega)); return
-        q("UPDATE issue SET status='Registered', parent_issue_id=NULL, "
+        q("BEGIN; SELECT set_config('multica.relay_authorized','on',true); "
+          "UPDATE issue SET status='Registered', parent_issue_id=NULL, "
           "metadata = (coalesce(metadata,'{}'::jsonb) - 'bundled_into' - 'bundled_into_id' "
           "- 'content_md5' - 'bundled_by') || '{\"unbundled_from\": \"%s\"}'::jsonb, "
           "updated_at=now() WHERE id='%s' AND workspace_id='%s'" %
-          (mega, iid, GSP_WORKSPACE_ID), rows=False)
+          (mega, iid, GSP_WORKSPACE_ID) + "; COMMIT;", rows=False)
         print('unbundled #%s from MEGA #%s -> Registered' % (a.unbundle, mega))
         return
 
@@ -315,10 +320,11 @@ SELECT c.id, m.id, m.number
             prov = json.dumps({'bundled_into': m['mega_number'],
                                'bundled_into_id': m['mega_id'],
                                'content_md5': h, 'bundled_by': 'multica-bundle'})
-            q("UPDATE issue SET status='Archived', "
+            q("BEGIN; SELECT set_config('multica.relay_authorized','on',true); "
+              "UPDATE issue SET status='Archived', "
               "metadata = coalesce(metadata,'{}'::jsonb) || %s::jsonb, updated_at=now() "
               "WHERE id='%s' AND workspace_id='%s'" %
-              (lit(prov), c['id'], GSP_WORKSPACE_ID), rows=False)
+              (lit(prov), c['id'], GSP_WORKSPACE_ID) + "; COMMIT;", rows=False)
             archived += 1
 
     print('megas_folded=%d children_archived=%d skipped_idempotent=%d blocked=%d'

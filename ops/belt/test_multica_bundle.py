@@ -58,6 +58,10 @@ class LegacyUnbundleTests(unittest.TestCase):
         self.assertEqual(len(calls), 3)
         sql, rows = calls[2]
         self.assertFalse(rows)
+        self.assertLess(sql.index('BEGIN;'), sql.index("set_config('multica.relay_authorized','on',true)"))
+        self.assertLess(sql.index("set_config('multica.relay_authorized','on',true)"),
+                        sql.index("UPDATE issue SET status='Registered'"))
+        self.assertGreater(sql.index('COMMIT;'), sql.index("UPDATE issue SET status='Registered'"))
         self.assertIn("status='Registered'", sql)
         self.assertIn('unbundled_from', sql)
 
