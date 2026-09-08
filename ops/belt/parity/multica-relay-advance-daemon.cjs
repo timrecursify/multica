@@ -845,6 +845,18 @@ async function markRelayLogFailedById(client, logId) {
   }
 }
 
+async function rejectRefusedEscalation(client, logId, reason, escalation) {
+  return client.query(
+    `UPDATE relay_run_log
+        SET status = 'rejected',
+            parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
+              jsonb_build_object('reason', 'retry_escalation_refused',
+                'completion_reason', $2::text, 'relay_status', $3::int)
+      WHERE id = $1 AND status = 'pending'`,
+    [logId, reason, escalation.status]
+  );
+}
+
 async function failMissingQcVerdict(client, logId) {
   return client.query(
     `UPDATE relay_run_log
@@ -1210,7 +1222,8 @@ async function runBounded(items, concurrency, operation) {
   await Promise.all(Array.from({ length: count }, () => worker()));
 }
 
-async function processAdvanceRow(client, row, { postRelay, logger, gateRunner }) {
+async function processAdvanceRow(client, row, { postRelay, logger, gateRunner,
+  retryEscalation = requestRetryEscalation, completionAdmission = deploymentCompletionAdmission }) {
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
     if (TERMINAL_STAGES.has(row.to_stage)) {
@@ -1218,12 +1231,13 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
       logger.log(`${LOG_PREFIX} TERMINAL: issue=${row.issue_id}, stage='${row.to_stage}', relay=${row.log_id}`);
       return false;
     }
-    const completion = deploymentCompletionAdmission(row.task_status, row.task_result ??
+    const completion = completionAdmission(row.task_status, row.task_result ??
       (row.task_error ? { error: row.task_error } : null));
     if (!completion.ok) {
-      const escalation = await requestRetryEscalation(row, completion.reason);
+      const escalation = await retryEscalation(row, completion.reason);
       logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
-      await markRelayLogFailedById(client, row.log_id);
+      if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
+      else await rejectRefusedEscalation(client, row.log_id, completion.reason, escalation);
       return false;
     }
     const qcAdvance = qcCompletionAdvance(row);
@@ -1257,10 +1271,11 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
 
     const route = await buildCompletionRoute(client, row);
     if (route && !route.toStage) {
-      const escalation = await requestRetryEscalation(row, route.reason);
+      const escalation = await retryEscalation(row, route.reason);
       logger.log(`${LOG_PREFIX} [route] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', ` +
         `reason=${route.reason}, relay=${escalation.status}`);
       if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
+      else await rejectRefusedEscalation(client, row.log_id, route.reason, escalation);
       return false;
     }
     const targetStage = route?.toStage || row.next_stage;
@@ -2545,4 +2560,4 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup,
   advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency,
-  relayAdvanceConfirmation };
+  processAdvanceRow, relayAdvanceConfirmation };
