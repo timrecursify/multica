@@ -151,19 +151,21 @@ test('work product handoff advances to CI/CD without creating a second active ro
   assert.equal(products.filter((row) => row.status === 'active').length, 1);
 });
 
-test('CI/CD return hands the existing active work product back to In Review', async () => {
-  const product = { issue_id: '123e4567-e89b-42d3-a456-426614174000',
-    status: 'active', consuming_stage: 'CI/CD & Deploy' };
-  const client = { async query(sql, values) {
-    assert.match(sql, /UPDATE issue_work_product/);
-    assert.equal(values[0], product.issue_id);
-    product.consuming_stage = values[1];
-    return { rowCount: 1, rows: [product] };
-  } };
+for (const destination of ['In Progress', 'Spec', 'Parked']) {
+  test(`CI/CD exit to ${destination} hands the existing active work product back to In Review`, async () => {
+    const product = { issue_id: '123e4567-e89b-42d3-a456-426614174000',
+      status: 'active', consuming_stage: 'CI/CD & Deploy' };
+    const client = { async query(sql, values) {
+      assert.match(sql, /UPDATE issue_work_product/);
+      assert.equal(values[0], product.issue_id);
+      product.consuming_stage = values[1];
+      return { rowCount: 1, rows: [product] };
+    } };
 
-  await handoffActiveWorkProduct(client, product.issue_id, 'CI/CD & Deploy', 'In Progress');
-  assert.equal(product.consuming_stage, 'In Review');
-});
+    await handoffActiveWorkProduct(client, product.issue_id, 'CI/CD & Deploy', destination);
+    assert.equal(product.consuming_stage, 'In Review');
+  });
+}
 
 test('work product handoff is a no-op when there is no active row', async () => {
   const calls = [];
