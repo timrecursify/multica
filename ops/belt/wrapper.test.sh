@@ -4,6 +4,7 @@ root_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 fake="$(mktemp -d)"; trap 'rm -rf "$fake"' EXIT
 export BELT_TEST_MODE=1
 export BELT_WRAPPER_TEST=1
+unset CODEX_BIN
 cat >"$fake/daemon" <<'EOF'
 #!/bin/sh
 if [ "$*" = 'daemon start --help' ]; then
@@ -20,6 +21,7 @@ if [ -n "${DAEMON_LAUNCH_MARKER:-}" ]; then
   : >"$DAEMON_LAUNCH_MARKER"
 fi
 printf '%s\n' "$*" >"${CAPTURE_FILE:?}"
+printf 'model=%s provider=%s codex=%s\n' "${MULTICA_MODEL:-}" "${MULTICA_PROVIDER:-}" "${CODEX_BIN:-}" >>"${CAPTURE_FILE}"
 printf 'cap=%s root=%s daemon_root=%s workspaces=%s\n' "${MULTICA_DAEMON_MAX_CONCURRENT_TASKS:-}" "${MULTICA_DAEMON_WORKSPACES_ROOT:-}" "${MULTICA_WORKSPACES_ROOT:-}" "${DISCOVERED_WORKSPACES:-2}" >>"${CAPTURE_FILE}"
 printf 'go_path=%s\n' "${PATH%%:*}" >>"${CAPTURE_FILE}"
 printf 'codex_path=%s\n' "${MULTICA_CODEX_PATH:-}" >>"${CAPTURE_FILE}"
@@ -36,6 +38,7 @@ DAEMON_LAUNCH_MARKER="$launch_marker" BELT_CPU_COUNT_CMD='printf 12' BELT_IDLE_R
 [[ -e "$launch_marker" ]]
 grep -q -- "--workspaces-root=$fake/ws" "$capture"
 grep -q -- "--max-concurrent-tasks=2" "$capture"
+grep -q 'model=gpt-5.6-luna provider=openai codex=/var/lib/gsp/tools/codex-native' "$capture"
 grep -q 'cap=2 root=.* daemon_root=.* workspaces=2' "$capture"
 grep -qx 'go_path=/usr/local/go/bin' "$capture"
 grep -q "cwd=$daemon_cwd" "$capture"
