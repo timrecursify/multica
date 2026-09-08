@@ -82,3 +82,42 @@ Step 4 — corrected release measurement:
 Step 5 — verification:
 - `git diff --check` passed.
 - Runaway requeue remains bounded by existing `completed_stage_cooldown` and `issue_cooldown` branches in ops/belt/reconciler.cjs:424-430, which skip recent completed or recent same-stage tasks.
+# RESULT
+
+Outcome: completed the belt GitHub Actions read-permission fix in this worktree.
+
+## Findings
+
+- Observed: before, the helper requested `contents=write, pull_requests=write, workflows=write, metadata=read, checks=read, statuses=read`.
+- Observed: after, it requests the same set plus `actions=read`; repository narrowing remains exactly `repositories:["$repo"]` at `ops/belt/gsp-belt-git-credential.sh:90`.
+- Observed: `ops/belt/belt-manifest.sh` declares deployment artifact paths only; no helper permission map is declared or asserted, so it was not changed.
+- Observed: `ops/belt/multica-cicd-worker.cjs:801-805` catches CI lookup exceptions, derives a short error class/message, logs `CI-UNKNOWN <repo>@<sha>: ...`, and returns `unknown`. The catch does not call the failure watchdog.
+- Inferred: the new permission request allows the existing Actions workflow/run reads once newly minted tokens are used; no live GitHub API call was made.
+
+## Files changed
+
+- `ops/belt/gsp-belt-git-credential.sh:9,90` — document and request `actions=read`.
+- `ops/belt/gsp-belt-git-credential.test.sh:27,84-85` — assert the captured request body contains `actions=read`.
+- `RESULT.md` — this report.
+
+## Regression proof
+
+- Observed, without the fix: `bash ops/belt/gsp-belt-git-credential.test.sh` failed (`0 pass, 1 fail, 0 skip`) with `needs actions, but the minted permission set omits it`.
+- Observed, after the fix: the same command passed (`1 pass, 0 fail, 0 skip`; shell test has no TAP skip count).
+
+## Testing
+
+- `bash ops/belt/gsp-belt-git-credential.test.sh` — before `0/1/0`, after `1/0/0` pass/fail/skip.
+- `node ops/belt/multica-cicd-worker.test.cjs` — after `22/0/0` pass/fail/skip. Not run before the change.
+- `node ops/belt/multica-cicd-worker-sweep.test.cjs` — after `2/0/0` pass/fail/skip. Not run before the change.
+- `git diff --check` — passed.
+- Observed: no live API call, database test, install, full-repo suite, deploy, restart, or token mint against GitHub was performed.
+
+## PR
+
+- PR number: pending until branch push/PR creation.
+- The intended PR body will state that the installation already holds `actions`, this only adds it to the token request, references GSP-2671, and warns that deployment restarts belt credential minting and needs seat sign-off plus Tim's deploy decision.
+
+## Blocker
+
+- Observed: deployment is not authorized in this lane; seat sign-off and Tim's deploy decision remain required. This worktree does not verify production behavior or token issuance.
