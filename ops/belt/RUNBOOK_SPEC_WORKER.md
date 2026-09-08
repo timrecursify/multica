@@ -167,7 +167,7 @@ the folded content itself:
   ```bash
   python3 /opt/gsp/multica-doctrine/multica-bundle.py --unbundle <ticket-number> --apply
   python3 /opt/gsp/multica-doctrine/multica-bundle.py --mega <new-mega-number> --apply
-```
+  ```
 
 For older administrative bundles whose source is Cancelled and has no
 `bundled_by` metadata, recovery is intentionally explicit: add
