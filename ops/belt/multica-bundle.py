@@ -48,8 +48,8 @@ def ensure_service_identity():
     helper = os.path.abspath(__file__)
     command = (
         'source ' + shlex.quote(ENV_FILE) +
-        '; exec /usr/bin/sudo -n -u ' + SERVICE_USER +
-        ' --preserve-env /usr/bin/python3 ' + shlex.quote(helper) + ' "$@"'
+        '; exec /usr/sbin/runuser -u ' + SERVICE_USER +
+        ' --preserve-environment -- /usr/bin/python3 ' + shlex.quote(helper) + ' "$@"'
     )
     # bash -c receives the helper arguments after a harmless $0 placeholder.
     os.execv('/usr/bin/sudo', ['sudo', '-n', '/bin/bash', '-c', command,
