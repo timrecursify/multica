@@ -65,6 +65,13 @@ test("stageEligibility ignores a stale blocker after an operator release", async
   assert.equal(c.calls.length, 1);
 });
 
+test("stageEligibility blocks insertion at the attempt ceiling without a prior outcome", async () => {
+  const c = fakeClient([[]]);
+  const result = await so.stageEligibility(c, "i-cap", "Queue", { attempt: 3, maxAttempts: 3 });
+  assert.deepEqual(result, { eligible: false, reason: "attempt_budget_exhausted" });
+  assert.equal(c.calls.length, 0, "capped admission must stop before outcome lookup or insertion");
+});
+
 test("recordStageOutcomes upserts one row per unrecorded completion", async () => {
   const c = fakeClient([[{ id: "t1", issue_id: "i1", stage: "In Review", output: "OUTCOME: ADVANCED" }], [{ input_hash: "h" }], []]);
   const r = await so.recordStageOutcomes(c, { logger: { log() {} } });

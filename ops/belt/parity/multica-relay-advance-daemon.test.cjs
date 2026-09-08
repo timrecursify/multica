@@ -13,6 +13,12 @@ const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
 
+test('same-stage no-advance replay is explicitly reasoned and bounded once', () => {
+  const source = fs.readFileSync('ops/belt/parity/multica-relay-advance-daemon.cjs', 'utf8');
+  assert.match(source, /replay\.retry_of_task_id = t\.id/);
+  assert.match(source, /replay_reason: coldStart \? 'stage_entry_recovery' : 'same_stage_no_advance'/);
+});
+
 test('completion evidence satisfies every automatic transition policy row', () => {
   const row = { task_id: 'task-1', task_result: { output: 'completed' }, issue_title: 'normal change' };
   const cases = [

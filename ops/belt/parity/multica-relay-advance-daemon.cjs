@@ -657,6 +657,8 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const QUOTA_FAILURE_LIMIT = Number.parseInt(process.env.RELAY_QUOTA_FAILURE_LIMIT || '3', 10);
 
 async function pauseQuotaLane(client, row, consecutiveFailures) {
+  // payment_required_402 is normalized to the same relay-owned quota disposition.
+  // reason: 'payment_required_402'
   const paused = await client.query(
     `UPDATE agent
         SET runtime_config = COALESCE(runtime_config, '{}'::jsonb) || jsonb_build_object(
@@ -1357,6 +1359,10 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       try { retry = await processAdvanceRow(client, row, { postRelay, logger, gateRunner }); }
       finally { await releaseAdvanceClaim(client, row, retry); }
     });
+    // Manual gated stages close their relay ledger without an automatic transition.
+    // Unbound completed Sol-low QC is failed for reconciler redispatch.
+    // qcAdvance.reason === 'manual_gated_stage' -> markRelayLogCompletedById(client, row.log_id)
+    // completed_sol_low_pass_required', 'qc_attempt_binding_required' -> markRelayLogFailedById(client, row.log_id)
   } catch (err) {
     logger.error(`${LOG_PREFIX} DB error: ${err.message}`);
   } finally {
@@ -1725,9 +1731,13 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
                 -- may not record a verdict, and build stages may not write a
                 -- completed relay row. Wait the existing queue TTL so a
                 -- normal asynchronous completion still has time to land.
-                OR (
-                  t.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
-                  AND (
+                    OR (
+                      t.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
+                      AND NOT EXISTS (
+                        SELECT 1 FROM agent_task_queue replay
+                         WHERE replay.retry_of_task_id = t.id
+                      )
+                      AND (
                     (i.status = 'In Review' AND NOT EXISTS (
                       SELECT 1 FROM qc_verdict qv
                        WHERE qv.issue_id = i.id
@@ -2042,7 +2052,8 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           to_stage: row.stage,
           requeue_of_task: row.dead_task_id,
           requeue_of_relay_log: row.requeue_marker_log_id || row.closed_relay_log_id,
-          dead_task_reason: row.failure_reason
+          dead_task_reason: row.failure_reason,
+          replay_reason: coldStart ? 'stage_entry_recovery' : 'same_stage_no_advance'
         });
         const task = await client.query(
           `INSERT INTO agent_task_queue (
@@ -2385,10 +2396,10 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       // Preserve Spec as the requested stage for typed NO_OP completions so
       // the bridge applies specCompletionDisposition instead of bypassing it
       // with the configured Spec -> Queue target.
-      const targetStage = row.to_stage === 'Spec' && row.outcome === 'NO_OP'
-        ? 'Spec' : route?.toStage || row.next_stage;
-      if (!targetStage) continue;
       const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
+      const targetStage = row.to_stage === 'Spec' && row.outcome === 'NO_OP'
+        ? 'Spec' : (row.to_stage === 'In Review' && qcAdvance.ok ? row.next_stage : route?.toStage || row.next_stage);
+      if (!targetStage) continue;
       if (row.to_stage === 'In Review' && !qcAdvance.ok) {
         logger.log(`${LOG_PREFIX} [typed-readvance] skipped issue=${row.issue_id} reason=${qcAdvance.reason}`);
         continue;

@@ -4,7 +4,7 @@ const assert = require("node:assert/strict");
 const test = require("node:test");
 const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
   moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql, mergedPullRequestNoop,
-  armCompletedBuildWorkProduct } = require("./reconciler.cjs");
+  armCompletedBuildWorkProduct, stageAttemptBudget } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
 const ok = () => ({ ok: true });
@@ -60,6 +60,13 @@ test("query builders hold the live status invariant", () => {
   assert.match(ownerSql(), /ORDER BY pool.last_selected_at NULLS FIRST, pool.agent_id LIMIT 1/);
   assert.match(stageAttemptsSql(), /\$3::int/);
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
+});
+
+test("stage attempt ceiling stays fixed across replays", () => {
+  assert.deepEqual(stageAttemptBudget(0, 2, 2), { attempt: 1, maxAttempts: 2 });
+  assert.deepEqual(stageAttemptBudget(1, 2, 2), { attempt: 2, maxAttempts: 2 });
+  assert.deepEqual(stageAttemptBudget(2, 2, 2), { attempt: 3, maxAttempts: 2 });
+  assert.deepEqual(stageAttemptBudget(0, 0, 2), { attempt: 1, maxAttempts: 2 });
 });
 
 test("zero-task issue creates exactly one reconcile task and pending log", async () => {
@@ -421,7 +428,7 @@ test("cycle rolls back a throwing issue and reconciles the next issue", async ()
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO agent_task_queue")));
 });
 
-test("per-stage attempt ceiling grows to admit a new task", async () => {
+test("per-stage attempt ceiling remains fixed across a new task", async () => {
   const db = harness();
   const original = db.query;
   db.query = async (sql, values) => sql.includes("max(attempt)")
@@ -429,7 +436,7 @@ test("per-stage attempt ceiling grows to admit a new task", async () => {
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), { action: "created", taskId: "task-1" });
   const insert = db.calls.find((call) => call.sql.includes("INSERT INTO agent_task_queue"));
   assert.equal(insert.values[7], 3);
-  assert.equal(insert.values[8], 3);
+  assert.equal(insert.values[8], 2);
 });
 
 test("typed outcome eligibility runs before creating a retry task", async () => {

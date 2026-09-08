@@ -1,53 +1,46 @@
-Outcome: centralized repeatable belt gate reads by repository/SHA, removed synchronous subprocesses from relay/QC/CICD reads, added durable issue/SHA claims and bounded gate workers, and preserved the rebased activation-receipt contract; deployment remains supervisor-owned.
+# Multica belt optimisation — ALPHA-000192
 
-# Repeated-work inventory
+## Outcome
 
-Production snapshot: 2026-09-07 15:13:59 UTC. Counts marked `lower bound` are the strongest value recoverable because the old processes did not record endpoint-level invocation counts; the new advance metrics make those counts exact after deployment.
+Built three bounded changes on `fix/belt-throughput-20260907`: fixed same-stage replay/attempt ceilings, consumed stale retry-escalation state on stage departure, and wired the bridge suite to a PostgreSQL 17/pgvector CI service with declared Node dependencies. No deploy occurred: `sk graph build --timeout-seconds 600 --dirty` completed its census but failed publication with a `status.json SHA mismatch` (GSP-2428), and the newly enabled bridge suite exposes 18 existing failures. Production remained unchanged.
 
-| repeated operation | call site | last-hour executions | result scope | central disposition |
-|---|---|---:|---|---|
-| Completed-task evidence/admission reads | `ops/belt/parity/multica-relay-advance-daemon.cjs:1250-1274` | 146 completed tasks (DB exact) | per task/issue | Keep per-ticket admission; fair `created_at,id` selection and a bounded worker consume the batch. |
-| PR pointer discovery from normalized link, comments, then task result | `ops/belt/qc-gate.cjs:53-64`; `ops/belt/multica-cicd-worker.cjs:825-842` | 33 persisted gates across 23 issues; 2 CI/CD exits (DB exact outcomes, lookup calls unlogged) | per issue | Not shareable; remains an issue-scoped DB read. |
-| PR state, branch/head existence, mergeability | `ops/belt/qc-gate.cjs:73-75`; `ops/belt/parity/multica-relay-advance-daemon.cjs:260-289`; `ops/belt/multica-cicd-worker.cjs:850-859` | at least 33 gate reads; CICD polling beyond 2 exits was unlogged | repository + PR, yielding SHA | Shared TTL/in-flight cache; no ticket key. SHA-derived reads use repository+SHA. |
-| Check runs and combined commit status | `ops/belt/qc-gate.cjs:76-88`; `ops/belt/parity/multica-relay-advance-daemon.cjs:227-241`; `ops/belt/multica-cicd-worker.cjs:778-801` | at least 33 gate reads; exact endpoint count unlogged | repository + SHA | One in-flight/TTL read per repository+SHA+endpoint. QC check-runs and files start concurrently. |
-| PR changed-file manifest and risk/scope scan | `ops/belt/qc-gate.cjs:76-106`; `ops/belt/parity/multica-relay-advance-daemon.cjs:284-287`; `ops/belt/multica-cicd-worker.cjs:44-49,74-81` | at least 33 gate manifests; CICD calls unlogged | repository + SHA | Shared repository/SHA cache; activation-receipt target selection from the landed upstream work remains authoritative. |
-| Source-file content reads for size checks | `ops/belt/qc-gate.cjs:94-104` | file-dependent; old code recorded no count | repository + SHA + path | Shared TTL/in-flight cache keyed by repository+SHA+path. |
-| Git tree hashing and fetch-on-miss | `ops/belt/qc-gate.cjs:31-51` | up to 33 persisted gate runs; fetch misses unlogged | repository + SHA | Async subprocess; one cached tree digest per repository+SHA. Clone/store work remains owned by ALPHA-000372. |
-| GitHub credential mint and rate-limit state | `ops/belt/parity/multica-relay-advance-daemon.cjs:179-220`; `ops/belt/github-api-adapter.cjs:34-61,95-149`; `ops/belt/multica-cicd-worker.cjs:91-189` | old calls unlogged; formerly repeated with GitHub reads | credential, token repository-scoped | Token fetch is TTL/in-flight cached per repository; one file-backed cooldown budget is shared under credential scope. |
-| CICD action runs, workflows, jobs, and comparisons | `ops/belt/multica-cicd-worker.cjs:366-456,778-801` | 2 CI/CD→Done transitions; poll/read count unlogged; 0 tickets present at snapshot | repository + SHA/run | Async command path with repository/SHA TTL/in-flight reads. Mutating reruns bypass cache. |
-| Activation receipt reads | `ops/belt/multica-cicd-worker.cjs:309-320,541-579` | 2 CI/CD→Done transitions; receipt count depends on required targets and was unlogged | repository + target + SHA | Per-SHA/target and shareable, but deliberately not changed: ALPHA-000363 owns deploy-evidence/receipt logic and the rebased receipt contract must remain authoritative. |
-| Merge call | `ops/belt/multica-cicd-worker.cjs:936-939` | 0 current merge candidates at snapshot; last-hour attempts unlogged | repository + PR | Never cached; serialized per repository and idempotency remains GitHub/relay enforced. |
-| Workspace validation/preparation and repository metadata | `ops/belt/multica-daemon-wrapper.sh:63,126-136` | 163 task starts and 136 distinct work dirs (DB exact); individual filesystem operations unlogged | workspace/repository, then task workdir | Inventory only: dependency, clone, store and workspace IO are owned by ALPHA-000372; its `RESULT.md` was absent when checked. |
-| Static prompt/runbook assembly | daemon launched at `ops/belt/multica-daemon-wrapper.sh:126-136`; runbooks are `ops/belt/RUNBOOK_*_WORKER.md` and `WORKER_COMMON.md` | 163 task starts (DB exact opportunities; one assembly per start inferred) | stage/workspace, with per-ticket payload | Installed daemon implementation is outside this repository source. Static assembly is shareable upstream; ticket content is not. |
+## Recon and ranking
 
-# Implementation and correctness
+- Observer 05:33Z: 244 open, 1 live task, 177 tasks/hour, 1 closure/hour, 184 frozen issues; `WATCH-REPORT.md` exact queries are retained in the observer worktree.
+- Six-hour relay query returned 1,733 completed rows, 400 same-stage (23.1%): In Progress 200, Queue 89, Spec 84, In Review 24, CI/CD & Deploy 3.
+- Six-hour task query returned 1,579 completed, 678 failed, 220 distinct completed-task issues. Issue-update closure query returned 29 Done/Archived; 54.4 completed tasks per observed closure is directional because populations differ.
+- Frozen current-stage query found 90 In Progress issues with no live task. Their current outcomes included FAILED 29, NO_OP 20, ADVANCED 10, and no outcome 9.
+- Spec Sol-low is not healthy enough to trust solely from green existence: observer found 16 completed and 93 failed in two hours, though at least one green completion exists.
+- Ranking from Astra ALPHA-000198: bounded recovery/ceiling first, convergence/evidence second, dependency cache third. Cache integration is deferred because installer ownership was not located; Human Review/Astra routing remains proposal-only.
 
-- `GATE_CHECK_CONCURRENCY` defaults to `1`, the former effective sequential value; invalid values also fail back to `1` (`ops/belt/parity/multica-relay-advance-daemon.cjs:48-55`). This is separate from model/QC concurrency.
-- The advance batch uses fair ordering, bounded workers and exact per-pass metrics (`ops/belt/parity/multica-relay-advance-daemon.cjs:1250-1299`).
-- A single atomic statement claims both the issue/SHA and its relay row, with no transaction held over GitHub/git calls; the claim and retry eligibility survive process loss and expire using the existing QC pending-recheck interval (`ops/belt/parity/multica-relay-advance-daemon.cjs:1104-1155`).
-- Transient external failures persist retry eligibility instead of failing the relay row (`ops/belt/parity/multica-relay-advance-daemon.cjs:1240-1246`).
-- CICD merges stay serialized per repository while unrelated repositories remain independent (`ops/belt/multica-cicd-worker.cjs:194-200,919-921`).
-- Rebase onto `origin/main` preserved the activation-receipt contract from upstream and converted only its changed-path GitHub read to async; workflow success still cannot substitute for activation evidence (`ops/belt/multica-cicd-worker.cjs:44-49,541-579`).
+## Items
 
-# Measurement and proof
+1. Re-dispatch gap: cause is split between parity recovery and reconciler admission. `ops/belt/parity/multica-relay-advance-daemon.cjs` now refuses a second replay by `retry_of_task_id` and records `same_stage_no_advance`; `ops/belt/reconciler.cjs` no longer raises `max_attempts` to `attempt + 1`; `ops/belt/stage-outcome.cjs` checks exhaustion before its no-outcome early return. Commit `7d1e42d3d`.
+2. Token waste: unchanged attempts are now bounded. Focused reconciler/outcome QC passed 41/41. Exact causality by spec quality remains unverified; the live gate-shim outage produced 423 refused tasks since 22:46Z and is supervisor-owned by ALPHA-000164.
+3. GSP-2400 cache: design completed in WORKBOOK.md; implementation deferred because installer ownership is unverified. No cache code was guessed.
+4. Re-park trap: `ops/belt/multica-bridge.cjs` removes active `metadata.retry_escalation` when leaving its trigger stage while retaining `retry_escalation_at`. Focused lifecycle test passed 1/1. Commit `b42dc6f5b`.
+5. ADVANCED downgraded without PR: observer now measured 0 in two hours. Existing `ops/belt/stage-outcome.cjs` PR/head validation remains; no additional change was justified.
+6. Human Review: 17 non-excluded tickets were observed. No tickets were moved and no Astra agent row was created; global routing change requires seat sign-off.
+7. Deploy verification: `bin/ppp-deploy-artifact` belongs to PPP checkouts, not this Multica worktree. Unchanged; PPP-24178 remains Parked.
+8. CI: `.github/workflows/ci.yml` now provisions `pgvector/pgvector:pg17`, installs frozen pnpm dependencies, and runs the bridge suite with a non-sentinel DATABASE_URL. Root `package.json` now declares `jsonwebtoken`; frozen install passes. Commit `b42dc6f5b` plus `3f3ec1bee`.
 
-| measure | before | after |
-|---|---:|---:|
-| Production advance duration | greater than the 15,000 ms cadence (provided observation; old PM2 logs were unavailable through `sk`) | pending supervisor deployment; every pass will emit `duration_ms` at `ops/belt/parity/multica-relay-advance-daemon.cjs:1294-1299` |
-| Production external calls/pass | uninstrumented | pending supervisor deployment; every pass will emit `external_calls` and `cache_hits` at the same call site |
-| Synthetic six independent 30 ms gates | 182 ms sequential | 61 ms at gate concurrency 3 |
-| Synthetic six identical repository/SHA reads | 6 loader calls without sharing | 1 external load + 5 in-flight hits |
+## Exact recon queries
 
-Verification:
+```sql
+SELECT count(*) completed_transitions, count(*) FILTER (WHERE from_stage=to_stage) no_stage_change, round(100.0*count(*) FILTER (WHERE from_stage=to_stage)/NULLIF(count(*),0),1) pct FROM relay_run_log WHERE status='completed' AND created_at>NOW()-interval '6 hours';
+SELECT from_stage,count(*) FROM relay_run_log WHERE status='completed' AND from_stage=to_stage AND created_at>NOW()-interval '6 hours' GROUP BY from_stage ORDER BY count(*) DESC;
+SELECT count(*) FILTER (WHERE status='completed') completed, count(*) FILTER (WHERE status='failed') failed, count(DISTINCT issue_id) FILTER (WHERE status='completed') completed_issues FROM agent_task_queue WHERE completed_at>NOW()-interval '6 hours';
+SELECT count(*) FROM issue WHERE status IN ('Done','Archived') AND updated_at>NOW()-interval '6 hours';
+```
 
-- 79/79 targeted adapter, QC gate, CICD worker/sweep, and reconciler tests passed after rebasing.
-- 9/9 unattended-lifecycle checks passed after updating the harness to await the asynchronous CI/CD API.
-- Relay concurrency/claim assertions passed 8/8 with an injected `pg` boundary. The full relay suite could not load because this checkout has no `pg` module; dependency installation was not duplicated because ALPHA-000372 owns it.
-- Slow-worker/heartbeat isolation is covered at `ops/belt/parity/multica-relay-advance-daemon.test.cjs:1575-1587`; atomic claims at `:1590-1600`; TTL/in-flight collapse at `ops/belt/github-api-adapter.test.cjs:75-97`; async QC fan-out at `ops/belt/qc-gate.test.cjs:8-47`; merge serialization at `ops/belt/multica-cicd-worker.test.cjs:764-779`.
-- `iostat -x 1 2` verified the bottleneck during this lane: the live one-second sample had 19.98% CPU idle, 54.53% iowait, `sda` 83.40% utilized, and 13.01 ms write await.
-- Production DB was read only. At the snapshot it showed 168 task creations, 163 starts, 146 completions, 33 QC-gate comments across 23 issues, and 42 tickets across Spec/Queue/In Progress/In Review.
-- No deploy, restart, credential rotation, PPP-23686 access, or Multica ticket occurred.
+## QC, blockers, next action
 
-Implementation commit: `14b603d34e6db06152f3de4cc5d5ed0b43fe3da0`
+- PASS: `pnpm install --frozen-lockfile`; reconciler/outcome tests 41/41; retry lifecycle focused test 1/1; Node syntax for bridge, reconciler, and parity daemon; YAML parse; `git diff --check`.
+- FAIL: full bridge suite collected 108 tests: 86 pass, 18 fail, 4 skip. The failures predate these focused changes but mean the new CI job will correctly stay red until repaired.
+- BLOCKED: Docker socket denied, so the pgvector integration could not run locally. `sk graph` covered 2,076/2,076 supported files then failed its receipt SHA verification; GSP-2428 tracks it.
+- Next action: repair GSP-2428 and the 18 bridge regressions, rebase/push/open PR, then deploy one packet at a time and measure 30 minutes before/after. No production receipt or after metrics exist because deployment was not safe.
 
-PR: https://github.com/timrecursify/multica/pull/785
+## Seat asks
+
+1. Provide the supervisor-owned privileged rollout for ALPHA-000164's gate-shim fix; its local wrapper test passed but both worker restarts are blocked by `sudo -n`.
+2. Decide whether to configure the proposed Astra Human Review lane; no routing row was changed.
