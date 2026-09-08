@@ -300,7 +300,7 @@ async function escalateToSpec(issue, detail, sha) {
 }
 
 async function watchdogFailure(issue, error, sha = '') {
-  const row = watchdog.observe(issue.id, { sha, outcome: 'retrying', error });
+  const row = watchdog.recordFailure(issue.id, { sha, outcome: 'retrying', error });
   const elapsed = () => Date.now() - Date.parse(row.first_seen_at);
   const cause = `stage=${row.stage} attempts=${row.attempts} elapsed_ms=${elapsed()} last_error=${row.last_error || 'unknown'} correlation_key=${row.correlation_key}`;
   // The sentinel is a wall-clock bound independent of poll count. Sparse or
@@ -659,10 +659,10 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
 async function closureWatchdog(issue, result, sha) {
   if (!result || result.status !== 'pending') return false;
   if (result.retryEligible && ['pending', 'discovery_unavailable'].includes(result.outcome)) {
-    watchdog.observe(issue.id, { sha, outcome: result.outcome, error: result.blocker?.type });
+    watchdog.observePresence(issue.id, { sha, outcome: result.outcome, error: result.blocker?.type });
     return false;
   }
-  const row = watchdog.observe(issue.id, { sha, outcome: 'closure_pending' });
+  const row = watchdog.recordFailure(issue.id, { sha, outcome: 'closure_pending' });
   if (!watchdog.stalled(row)) return false;
   const alerted = watchdog.markAlerted(row, 'closure_stalled');
   const elapsed = Date.now() - Date.parse(row.first_seen_at);
@@ -818,7 +818,7 @@ async function sweep() {
     const task = await pool.query(`SELECT id FROM agent_task_queue WHERE issue_id=$1::uuid AND context->>'to_stage'=$2::text ORDER BY created_at DESC LIMIT 1`, [issue.id, 'CI/CD & Deploy']);
     issue.cicd_task_id = task.rows[0]?.id || null;
     try {
-      watchdog.observe(issue.id);
+      watchdog.observePresence(issue.id);
       const products = await pool.query(
         `SELECT scope_revision, kind, repository, branch, pr_number, head_sha,
                 acceptance_evidence, replaces_scope_revision, dependency_issue_ids
