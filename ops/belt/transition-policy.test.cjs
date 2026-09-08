@@ -88,6 +88,18 @@ test('permits Human Review only for reserved blockers', () => {
   }
 });
 
+test('production Human Review callers provide admitted reserved categories', () => {
+  const callers = [
+    ['CI/CD closure stall', 'CI/CD & Deploy', { blocker: 'closure stalled', namedBlocker: true, human_review_category: 'dangerous_production' }],
+    ['QC gate exhausted/no owner', 'In Progress', { blocker: 'QC gate exhausted', human_review_category: 'structural_architecture' }],
+    ['QC bounce ceiling', 'In Review', { blocker: 'QC failure', implementationFail: 'QC failure', human_review_category: 'structural_architecture' }],
+    ['completion evidence', 'In Progress', { blocker: 'blocked on human', namedBlocker: true, human_review_category: 'structural_architecture' }]
+  ];
+  for (const [name, from, evidence] of callers) {
+    assert.equal(evaluate({ from, to: 'Human Review', actor: 'operator', evidence }).ok, true, name);
+  }
+});
+
 test('requires destination evidence after Human Review and QC PASS when risk requires it', () => {
   assert.equal(evaluate({ from: 'Human Review', to: 'Queue', actor: 'operator',
     evidence: { recordedDecision: true } }).code, 'evidence_missing');

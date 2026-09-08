@@ -266,7 +266,7 @@ function receiptFor(repo, target, sha, owner) {
 }
 
 async function humanReview(issue, reason) {
-  const evidence = { blocker: reason, namedBlocker: true };
+  const evidence = { blocker: reason, namedBlocker: true, human_review_category: 'dangerous_production' };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Human Review', actor: 'operator', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Human Review: ${verdict.code}`);
   await relay(issue.id, 'Human Review', null, reason, null, evidence);
