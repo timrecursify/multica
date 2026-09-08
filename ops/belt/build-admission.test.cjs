@@ -2,11 +2,12 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { buildTaskAdmission } = require("./build-admission.cjs");
 
-function db({ prior, failure, unreviewedFailure, successor } = {}) {
+function db({ prior, failure, unreviewedFailure, successor, product } = {}) {
   return { calls: [], async query(sql, values) {
     this.calls.push({ sql, values });
     if (sql.includes("pg_advisory_xact_lock")) return { rows: [] };
-    if (sql.includes("SELECT task.id")) return { rows: prior ? [prior] : [] };
+    if (sql.includes("FROM issue_work_product")) return { rows: product ? [product] : [] };
+    if (sql.includes("SELECT id, completed_at")) return { rows: prior ? [prior] : [] };
     if (sql.includes("SELECT id FROM qc_effective_verdict")) return { rows: failure ? [failure] : [] };
     if (sql.includes("SELECT outcome.task_id")) return { rows: unreviewedFailure ? [unreviewedFailure] : [] };
     if (sql.includes("retry_of_task_id")) return { rows: successor ? [successor] : [] };
@@ -18,10 +19,11 @@ test("first build is admitted", async () => {
   assert.deepEqual(await buildTaskAdmission(db(), { issueId: "issue", toStage: "Queue" }), { admit: true });
 });
 
-test("GSP-2406 replay reuses completed PR-bearing build", async () => {
-  const client = db({ prior: { id: "1429d9c4", completed_at: "2026-09-07T00:00:00Z" } });
+test("active canonical product reuses correlated build", async () => {
+  const id = "1429d9c4-1111-4111-8111-1429d9c40000";
+  const client = db({ prior: { id, completed_at: "2026-09-07T00:00:00Z" }, product: { kind:"implementation", consuming_stage:"In Review", repository:"timrecursify/multica", branch:"main", pr_number:1, head_sha:"a".repeat(40), producer_task_id:id } });
   assert.deepEqual(await buildTaskAdmission(client, { issueId: "gsp-2406", toStage: "In Progress" }),
-    { admit: false, reuseTaskId: "1429d9c4", reason: "completed_build_work_product" });
+    { admit: false, reuseTaskId: id, reason: "completed_build_work_product" });
 });
 
 test("GSP-2403 qualifying implementation failure admits exactly one linked retry", async () => {
