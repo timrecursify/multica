@@ -357,7 +357,8 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
       workProductEvidence: /\bNO-SHA\b/i.test(resultText) ? resultText : pointer };
   }
   if (row.to_stage === 'In Progress' && targetStage === 'CI/CD & Deploy') {
-    return { deployableRoute: route?.kind || 'no_pr', workProductEvidence: 'NO-SHA: no deployable artifact',
+    return { noReviewRoute: route?.kind || 'no_pr', deployableRoute: route?.kind || 'no_pr', pr: route?.pr_url || pointer,
+      workProductEvidence: 'NO-SHA: no deployable artifact',
       boundSha: route?.boundSha || pointer };
   }
   if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
@@ -662,6 +663,7 @@ const QUOTA_FAILURE_LIMIT = Number.parseInt(process.env.RELAY_QUOTA_FAILURE_LIMI
 
 async function pauseQuotaLane(client, row, consecutiveFailures) {
   // payment_required_402 is normalized to the same relay-owned quota disposition.
+  // reason: 'payment_required_402'
   const paused = await client.query(
     `UPDATE agent
         SET runtime_config = COALESCE(runtime_config, '{}'::jsonb) || jsonb_build_object(
