@@ -20,7 +20,7 @@ class ServiceIdentityTests(unittest.TestCase):
         argv = execv.call_args.args[1]
         self.assertEqual(argv[:4], ['sudo', '-n', '/bin/bash', '-c'])
         command = argv[4]
-        self.assertIn('source /etc/gsp/multica/gsp-multica-bridge.env', command)
+        self.assertIn('set -a; source /etc/gsp/multica/gsp-multica-bridge.env; set +a; exec', command)
         self.assertIn('exec /usr/sbin/runuser -u gsp-multica --preserve-environment --', command)
         self.assertIn('"$@"', command)
         self.assertEqual(argv[6:], ['--mega', '42', '--apply'])

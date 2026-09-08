@@ -47,7 +47,7 @@ def ensure_service_identity():
 
     helper = os.path.abspath(__file__)
     command = (
-        'source ' + shlex.quote(ENV_FILE) +
+        'set -a; source ' + shlex.quote(ENV_FILE) + '; set +a' +
         '; exec /usr/sbin/runuser -u ' + SERVICE_USER +
         ' --preserve-environment -- /usr/bin/python3 ' + shlex.quote(helper) + ' "$@"'
     )
