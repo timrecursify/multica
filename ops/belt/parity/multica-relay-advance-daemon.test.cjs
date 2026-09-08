@@ -1713,35 +1713,41 @@ test('risk-path PR completing In Progress still enters In Review once', async ()
   assert.equal(route.toStage, 'In Review');
 });
 
-function noPrClient(lastMessage, seen) {
+function noPrClient(lastMessage, seen, comment = 'Already delivered in https://github.com/acme/widget/pull/42') {
   return { release() {}, query: async (sql) => {
     if (seen) seen.push(sql);
     if (sql.includes('FROM issue_pull_request')) return { rows: [] };
     if (sql.includes('FROM task_message')) return { rows: [{ content: lastMessage }] };
     if (sql.includes('FROM comment')) {
-      return { rows: [{ content: 'Already delivered in https://github.com/acme/widget/pull/42' }] };
+      return { rows: comment ? [{ content: comment }] : [] };
     }
     throw new Error(`unexpected query: ${sql}`);
   }};
 }
 
-test('NO_OP build outcome reaches Done and never adopts the PR it cites', async () => {
+test('NO_OP build outcome with comment PR enters In Review and inspects that PR', async () => {
   const seen = [];
   const githubCalls = [];
   const route = await buildCompletionRoute(noPrClient('OUTCOME: NO_OP', seen), {
     issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
-  }, { githubCommand: (args) => { githubCalls.push(args); return '{}'; } });
+  }, { githubCommand: (args) => { githubCalls.push(args); return JSON.stringify({ state: 'OPEN', files: [{ path: 'src/index.js' }], headRefOid: 'a'.repeat(40), mergeStateStatus: 'CLEAN', statusCheckRollup: [{ conclusion: 'SUCCESS' }] }); } });
+  assert.equal(route.toStage, 'In Review');
+  assert.equal(route.pr_url, 'https://github.com/acme/widget/pull/42');
+  assert.equal(route.boundSha, 'a'.repeat(40));
+  assert.equal(githubCalls.length, 1);
+  assert.equal(seen.some((sql) => sql.includes('FROM comment')), true);
+});
+
+test('genuine no-code NO_OP still reaches Done without QC', async () => {
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: NO_OP', null, null), {
+    issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: () => '{}' });
   assert.equal(route.toStage, 'Done');
-  assert.equal(route.kind, 'no_pr');
   assert.equal(route.noopDelivered, true);
-  assert.equal(route.reason, 'completed_noop_already_delivered');
-  // The cited merged PR is prior work: it must not be fetched or adopted.
-  assert.equal(githubCalls.length, 0);
-  assert.equal(seen.some((sql) => sql.includes('FROM comment')), false);
 });
 
 test('ALREADY_FIXED is treated as a NO_OP delivery', async () => {
-  const route = await buildCompletionRoute(noPrClient('OUTCOME: ALREADY_FIXED'), {
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: ALREADY_FIXED', null, null), {
     issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
   }, { githubCommand: () => '{}' });
   assert.equal(route.toStage, 'Done');
