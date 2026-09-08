@@ -779,13 +779,14 @@ test('In Progress -> In Review dispatch requires canonical implementation eviden
   const prUrl = 'https://github.com/acme/relay/pull/42';
   const response = () => ({ status: 0, body: '', writeHead(status) { this.status = status; },
     end(body = '') { this.body = body; } });
-  const invoke = async (metadata) => {
+  const invoke = async (metadata, product = null) => {
     const calls = [];
     const issue = { id: issueId, number: 1531, workspace_id: 'workspace-1', status: 'In Progress',
       description: '', parent_issue_id: null, title: 'handoff', priority: 'medium', metadata };
     const client = { async connect() {}, async end() {}, async query(sql, values = []) {
       calls.push({ sql, values });
       if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [issue] };
+      if (sql.includes('FROM issue_work_product')) return { rows: product ? [product] : [] };
       if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'In Review' }] };
       if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'In Review' }] };
       if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'In Review', alt_next_stages: [] }] };
@@ -807,7 +808,10 @@ test('In Progress -> In Review dispatch requires canonical implementation eviden
     return { res, calls };
   };
 
-  const valid = await invoke({ pr_url: prUrl, bound_sha: sha });
+  const valid = await invoke({ pr_url: prUrl, bound_sha: sha }, {
+    kind: 'implementation', consuming_stage: 'In Review', repository: 'acme/relay',
+    branch: 'feature/handoff', pr_number: 42, head_sha: sha
+  });
   assert.equal(valid.res.status, 200, valid.res.body);
   assert.equal(JSON.parse(valid.res.body).task_id, 'qc-task-1');
   const inserts = valid.calls.filter(({ sql }) => sql.includes('INSERT INTO agent_task_queue ('));

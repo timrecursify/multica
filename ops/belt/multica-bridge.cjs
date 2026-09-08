@@ -1967,14 +1967,28 @@ async function relayAdvance(req, res, body) {
     const noArtifactRescope = await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
-    if (issue.status === 'In Progress' && to_stage === 'In Review' &&
-        (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+$/.test(String(issue.metadata?.pr_url || '')) ||
-         !/^[0-9a-f]{40}$/.test(String(issue.metadata?.bound_sha || '')) ||
-         String(issue.metadata.bound_sha) !== String(issue.metadata.bound_sha).toLowerCase())) {
-      await client.query('ROLLBACK');
-      res.writeHead(409, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'implementation_evidence_required' }));
-      return;
+    if (issue.status === 'In Progress' && to_stage === 'In Review') {
+      // Canonical work-product identity is the sole authority for this
+      // admission. It is locked in the same transaction as the issue and
+      // subsequent stage mutation, so request hints and metadata cannot be
+      // substituted or race the handoff.
+      const products = (await client.query(
+        `SELECT kind, consuming_stage, repository, branch, pr_number, head_sha
+           FROM issue_work_product
+          WHERE issue_id = $1::uuid AND status = 'active'
+          FOR UPDATE`, [issue.id])).rows;
+      const valid = products.length === 1 && products[0].kind === 'implementation' &&
+        products[0].consuming_stage === 'In Review' &&
+        /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(products[0].repository || '')) &&
+        typeof products[0].branch === 'string' && products[0].branch.length > 0 &&
+        Number.isInteger(Number(products[0].pr_number)) && Number(products[0].pr_number) > 0 &&
+        /^[0-9a-f]{40}$/.test(String(products[0].head_sha || ''));
+      if (!valid) {
+        await client.query('ROLLBACK');
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'implementation_evidence_required' }));
+        return;
+      }
     }
     if (noArtifactRescope && to_stage === "In Progress") {
       to_stage = "Spec";
