@@ -922,6 +922,20 @@ func (h *Handler) DeleteWorkspace(w http.ResponseWriter, r *http.Request) {
 			run:  func() error { return qtx.DeleteWorkspaceComments(ctx, requester.WorkspaceID) },
 		},
 		{
+			name: "delete QC verdicts",
+			run: func() error {
+				var exists bool
+				if err := tx.QueryRow(ctx, `SELECT to_regclass('public.qc_verdict') IS NOT NULL`).Scan(&exists); err != nil {
+					return err
+				}
+				if !exists {
+					return nil
+				}
+				_, err := tx.Exec(ctx, `DELETE FROM qc_verdict WHERE issue_id IN (SELECT id FROM issue WHERE workspace_id = $1)`, requester.WorkspaceID)
+				return err
+			},
+		},
+		{
 			name: "delete issue roots",
 			run:  func() error { return qtx.DeleteWorkspaceIssueRoots(ctx, requester.WorkspaceID) },
 		},
