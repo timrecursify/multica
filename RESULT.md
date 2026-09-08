@@ -115,7 +115,7 @@ Outcome: completed the belt GitHub Actions read-permission fix in this worktree.
 
 ## PR
 
-- PR number: pending until branch push/PR creation.
+- Observed: draft PR #847 was opened from `belt/ciauth-actions-read-20260908`.
 - The intended PR body will state that the installation already holds `actions`, this only adds it to the token request, references GSP-2671, and warns that deployment restarts belt credential minting and needs seat sign-off plus Tim's deploy decision.
 
 ## Blocker
