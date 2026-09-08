@@ -2608,4 +2608,4 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup,
   advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency,
-  processAdvanceRow, relayAdvanceConfirmation, requeueCandidateSql };
+  processAdvanceRow, relayAdvanceConfirmation };
