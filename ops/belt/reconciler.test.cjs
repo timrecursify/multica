@@ -617,7 +617,7 @@ function strandedReasons(row, issueParkedAt) {
 test("moveToHumanReview cannot strand an unconsumable pending relay row", async () => {
   const calls = [];
   const db = { query: async (sql, values) => { calls.push({ sql, values }); return { rows: [] }; } };
-  await moveToHumanReview(db, { ...issue, status: "Spec" }, "money_movement", { evaluate: ok });
+  await moveToHumanReview(db, { ...issue, status: "Spec" }, "money movement detail", { evaluate: ok, humanReviewCategory: "money_movement" });
 
   // The producer performs the advance itself, so the issue is parked on to_stage.
   const moved = calls.find((c) => /UPDATE issue SET status = 'Human Review'/.test(c.sql || ""));
@@ -631,14 +631,14 @@ test("moveToHumanReview cannot strand an unconsumable pending relay row", async 
 test("moveToHumanReview asks as system for a reserved decision", async () => {
   const seen = [];
   const db = { query: async (sql, values) => { seen.push({ sql, values }); return { rows: [] }; } };
-  const result = await moveToHumanReview(db, issue, "money_movement", {
+  const result = await moveToHumanReview(db, issue, "money movement detail", { humanReviewCategory: "money_movement",
     evaluate: (input) => { seen.push({ evaluate: input }); return { ok: true }; }
   });
-  assert.deepEqual(result, { action: "human_review", reason: "money_movement" });
+  assert.deepEqual(result, { action: "human_review", reason: "money movement detail" });
   const call = seen.find((s) => s.evaluate).evaluate;
   assert.equal(call.actor, "system");
   assert.equal(call.to, "Human Review");
-  assert.deepEqual(call.evidence, { blocker: "money_movement" });
+  assert.deepEqual(call.evidence, { human_review_category: "money_movement", blocker: "money movement detail" });
   assert.ok(seen.some((s) => /multica.relay_authorized/.test(s.sql || "")));
   assert.ok(seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
   assert.ok(seen.some((s) => /INSERT INTO relay_run_log/.test(s.sql || "")));
@@ -690,7 +690,7 @@ test("a policy rejection leaves the issue skipped rather than erroring the cycle
     return { rows: [] };
   };
   await assert.rejects(
-    () => moveToHumanReview(db, issue, "money_movement", { evaluate: () => ({ ok: false, code: "actor_denied" }) }),
+    () => moveToHumanReview(db, issue, "money movement detail", { humanReviewCategory: "money_movement", evaluate: () => ({ ok: false, code: "actor_denied" }) }),
     /actor_denied/
   );
 });

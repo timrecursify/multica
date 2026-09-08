@@ -5,8 +5,10 @@ const test = require('node:test');
 const { TRANSITIONS, evaluate } = require('./transition-policy.cjs');
 
 function evidenceFor(fields) {
-  return Object.fromEntries(fields.map((field) => [field,
-    field === 'reason' ? 'operator reason' : field === 'blocker' ? 'money_movement' : field === 'workProductEvidence' ? 'NO-SHA: no deployable artifact' : true]));
+  const evidence = Object.fromEntries(fields.map((field) => [field,
+    field === 'reason' ? 'operator reason' : field === 'blocker' ? 'money_movement' : field === 'human_review_category' ? 'money_movement' : field === 'workProductEvidence' ? 'NO-SHA: no deployable artifact' : true]));
+  if (fields.includes('blocker') && !fields.includes('human_review_category')) evidence.human_review_category = 'money_movement';
+  return evidence;
 }
 
 test('accepts every DESIGN transition table row with its required evidence', () => {
@@ -77,10 +79,10 @@ test('permits Human Review only for reserved blockers', () => {
   for (const from of ['Spec', 'Queue', 'In Progress', 'In Review', 'CI/CD & Deploy']) {
     for (const actor of ['system', 'operator']) {
       assert.equal(evaluate({ from, to: 'Human Review', actor,
-        evidence: { blocker: 'technical_reason' } }).code, 'human_review_blocker_not_reserved', `${from}/${actor}`);
-      for (const blocker of ['money_movement', 'client_charge', 'structural_architecture', 'structural_security', 'dangerous_production']) {
+        evidence: { blocker: 'wire $5,000 to vendor' } }).code, 'human_review_blocker_not_reserved', `${from}/${actor}`);
+      for (const blocker of ['money_movement', 'client_charge', 'structural_architecture', 'structural_security', 'dangerous_production', 'irreversible_production']) {
         assert.equal(evaluate({ from, to: 'Human Review', actor,
-          evidence: { blocker } }).ok, true, `${from}/${actor}/${blocker}`);
+          evidence: { blocker: blocker === 'money_movement' ? 'wire $5,000 to vendor' : 'detail', human_review_category: blocker } }).ok, true, `${from}/${actor}/${blocker}`);
       }
     }
   }

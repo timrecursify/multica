@@ -138,9 +138,18 @@ function settingsFor(options = {}) {
 
 // Routes a reserved decision off its stage and onto a human's board.
 async function moveToHumanReview(client, issue, reason, options) {
-  if (!isHumanReservedBlocker(reason)) return null;
+  const category = options.humanReviewCategory;
+  if (!isHumanReservedBlocker(category)) {
+    await client.query(`INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+      VALUES ($1::uuid, $2::uuid, 'system', 'human_review_denied_unclassified', $3::jsonb)`,
+      [issue.workspace_id, issue.id, JSON.stringify({ source_stage: issue.status,
+        category: category ?? null, detail: reason ?? null,
+        policy_code: 'human_review_blocker_not_reserved' })]);
+    return null;
+  }
   const verdict = policyFor(options)({
-    from: issue.status, to: "Human Review", actor: "system", evidence: { blocker: reason }
+    from: issue.status, to: "Human Review", actor: "system",
+    evidence: { human_review_category: category, blocker: reason }
   });
   if (!verdict?.ok) throw new Error(`reconcile policy rejected Human Review: ${reason} (${verdict?.code})`);
   // The UPDATE below performs the advance itself, so the relay row is audit-only

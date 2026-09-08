@@ -79,9 +79,13 @@ const LEGACY_AUTHORITY_KEYS = new Set([
   'operator_release', 'parked_release_required', 'isOperator', 'isSystem'
 ]);
 
-function isHumanReservedBlocker(blocker) {
-  const value = String(blocker || '').toLowerCase();
-  return /(?:real[_ ]money[_ ]movement|money[_ ]movement|client[_ ]charge|charge[_ ]client|structural[_ ](?:architecture|security)|dangerous.*production|irreversible.*production)/.test(value);
+const HUMAN_REVIEW_CATEGORIES = Object.freeze(new Set([
+  'money_movement', 'client_charge', 'structural_architecture',
+  'structural_security', 'dangerous_production', 'irreversible_production'
+]));
+
+function isHumanReservedBlocker(category) {
+  return typeof category === 'string' && HUMAN_REVIEW_CATEGORIES.has(category.trim());
 }
 
 function hasLegacyAuthority(input) {
@@ -95,7 +99,7 @@ function evaluate({ from, to, actor, evidence = {}, ...request } = {}) {
   const transition = TRANSITIONS.find((row) => row.from === from && row.to === to);
   if (!transition) return { ok: false, code: 'transition_denied' };
   if (!transition.actors.includes(actor)) return { ok: false, code: 'actor_denied' };
-  if (to === 'Human Review' && !isHumanReservedBlocker(evidence.blocker)) {
+  if (to === 'Human Review' && !isHumanReservedBlocker(evidence.human_review_category)) {
     return { ok: false, code: 'human_review_blocker_not_reserved' };
   }
   if (to === 'Cancelled' && (typeof evidence.reason !== 'string' || !evidence.reason.trim())) {
@@ -135,4 +139,4 @@ function evaluate({ from, to, actor, evidence = {}, ...request } = {}) {
   return { ok: true, transition: { ...transition, evidence: requiredEvidence } };
 }
 
-module.exports = { EVIDENCE, STAGES, TRANSITIONS, isHumanReservedBlocker, evaluate };
+module.exports = { EVIDENCE, STAGES, TRANSITIONS, HUMAN_REVIEW_CATEGORIES, isHumanReservedBlocker, evaluate };

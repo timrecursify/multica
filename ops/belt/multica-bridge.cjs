@@ -1070,13 +1070,11 @@ function admitConfiguredTransition({ fromStage, toStage, expectedStage, altStage
   exceptional = false, actor, evidence = {} }) {
   const allowed = [expectedStage, ...altStages].filter(Boolean);
   const configured = exceptional || allowed.includes(toStage);
-  // Cancellation is the policy boundary being added here. Other bridge routes
-  // already have route-specific authentication and evidence gates; applying
-  // the whole canonical matrix a second time would reject legacy operator
-  // recoveries and would change which existing guard explains a refusal.
+  // Human Review is a policy boundary at the production bridge. Other routes
+  // retain their existing route-specific authentication and evidence gates.
   const policy = !configured
     ? { ok: false, code: 'transition_denied' }
-    : toStage !== 'Cancelled'
+    : toStage !== 'Cancelled' && toStage !== 'Human Review'
       ? { ok: true }
       : evaluateTransitionPolicy({ from: fromStage, to: toStage, actor, evidence });
   return {
@@ -2390,6 +2388,15 @@ async function relayAdvance(req, res, body) {
     });
     if (!transitionAdmission.ok) {
       await client.query("ROLLBACK");
+      if (to_stage === 'Human Review' && transitionAdmission.code === 'human_review_blocker_not_reserved') {
+        await client.query("BEGIN");
+        await client.query(`INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details)
+          VALUES ($1::uuid, $2::uuid, 'system', 'human_review_denied_unclassified', $3::jsonb)`,
+          [issue.workspace_id, issue.id, JSON.stringify({ from_stage: issue.status, to_stage: to_stage,
+            category: policyEvidence.human_review_category ?? null, detail: policyEvidence.blocker ?? null,
+            policy_code: transitionAdmission.code, source_stage: issue.status })]);
+        await client.query("COMMIT");
+      }
       rejectInvalidRelayTransition(res, issue.status, to_stage);
       return;
     }
