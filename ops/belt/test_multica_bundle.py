@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import pathlib
+import re
 import subprocess
 import unittest
 from unittest import mock
@@ -26,12 +27,16 @@ class ServiceIdentityTests(unittest.TestCase):
         self.assertIn('"$@"', command)
         self.assertEqual(argv[6:], ['--mega', '42', '--apply'])
 
-    def test_existing_credentials_do_not_reexec(self):
+    def test_root_existing_credentials_still_reexecs(self):
         with mock.patch.dict(os.environ, {
                 'MULTICA_POSTGRES_USER': 'u', 'MULTICA_POSTGRES_PASSWORD': 'secret',
-                'MULTICA_POSTGRES_DB': 'd'}), mock.patch.object(MODULE.os, 'execv') as execv:
+                'MULTICA_POSTGRES_DB': 'd'}), \
+             mock.patch.object(MODULE.os, 'geteuid', return_value=0), \
+             mock.patch.object(MODULE.os, 'execv') as execv:
             MODULE.ensure_service_identity()
-        execv.assert_not_called()
+        execv.assert_called_once()
+        self.assertIn('exec /usr/sbin/runuser -u gsp-multica --preserve-environment --',
+                      execv.call_args.args[1][4])
 
 
 class LegacyUnbundleTests(unittest.TestCase):
@@ -73,7 +78,16 @@ class LegacyUnbundleTests(unittest.TestCase):
 class SqlSafetyTests(unittest.TestCase):
     def test_psql_stops_on_sql_errors_and_all_issue_paths_name_workspace(self):
         source = HELPER.read_text()
-        self.assertGreaterEqual(source.count("workspace_id='%s'"), 5)
+        mutations = re.findall(
+            r"UPDATE\s+issue\s+SET.*?WHERE id='%s' AND workspace_id='%s'",
+            source,
+            flags=re.DOTALL,
+        )
+        self.assertEqual(len(mutations), 4)
+        self.assertEqual(sum("status='Registered'" in mutation for mutation in mutations), 2)
+        self.assertEqual(sum('SET description=%s' in mutation for mutation in mutations), 1)
+        self.assertEqual(sum("status='Archived'" in mutation for mutation in mutations), 1)
+        self.assertTrue(all(mutation.count("workspace_id='%s'") == 1 for mutation in mutations))
         self.assertIn("AND c.workspace_id = '%s'", source)
         self.assertIn("AND p.workspace_id = '%s'", source)
         self.assertIn("['-v', 'ON_ERROR_STOP=1']", source)
@@ -83,10 +97,11 @@ class SqlSafetyTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {
                 'MULTICA_POSTGRES_USER': 'u', 'MULTICA_POSTGRES_PASSWORD': 'p',
                 'MULTICA_POSTGRES_DB': 'd'}), \
-             mock.patch.object(MODULE.shutil, 'which', return_value='/usr/bin/psql'), \
              mock.patch.object(MODULE.subprocess, 'run', return_value=result):
             with self.assertRaises(SystemExit):
                 MODULE.q('SELECT 1')
+
+        self.assertEqual(MODULE.DSN[0], '/usr/bin/psql')
 
     def test_service_identity_does_not_reexec_without_credentials(self):
         with mock.patch.dict(os.environ, {}, clear=True), \
