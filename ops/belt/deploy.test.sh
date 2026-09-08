@@ -104,6 +104,7 @@ done
 runtime_root="$tmp_dir"
 . "$root_dir/belt-manifest.sh"
 [[ "${#sources[@]}" -eq "${#targets[@]}" ]] || { echo 'manifest arrays are not index-aligned' >&2; exit 1; }
+"$root_dir/manifest-require-graph.test.sh"
 
 # The wrapper sources helper scripts by absolute path, so a runtime missing one
 # cannot start -- belt-concurrency.sh was absent from a live worker for exactly
