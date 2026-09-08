@@ -366,6 +366,7 @@ jobs:
           bash ops/belt/bridge-health.test.sh
           bash ops/belt/build-daemon-artifact.test.sh
           bash ops/belt/daemon-artifact.test.sh
+          bash ops/belt/deploy-release.test.sh
           bash ops/belt/manifest-closure.test.sh
           bash ops/belt/manifest-require-graph.test.sh
           bash ops/belt/workspace-gc.test.sh

@@ -15,7 +15,7 @@ node -e "require(process.argv[1])" "$tmp/fixture/dist/cc-intercom.js"
 cat >"$tmp/bin/go" <<'EOF'
 #!/usr/bin/env bash
 while [[ $# -gt 0 ]]; do [[ "$1" == -o ]] && { shift; out="$1"; }; shift || true; done
-printf '#!/usr/bin/env bash\nprintf "{\\"commit\\": \\"%s\\"}" "${GIT_FAKE_SHA:-unknown}"\n' > "$out"; chmod +x "$out"
+printf '#!/usr/bin/env bash\nprintf "{\\"commit\\": \\"%%s\\"}" "${GIT_FAKE_SHA:-unknown}"\n' > "$out"; chmod +x "$out"
 EOF
 chmod +x "$tmp/bin/go"
 cat >"$tmp/bin/pm2" <<'EOF'
@@ -27,8 +27,8 @@ env PM2_BIN="$tmp/bin/pm2" MULTICA_RELEASE_ROOT="$tmp/releases" MULTICA_RECEIPT_
 [[ ! -e "$tmp/releases/$sha" ]]
 env PATH="$tmp/bin:$PATH" GIT_FAKE_SHA="$sha" PM2_BIN="$tmp/bin/pm2" MULTICA_RELEASE_ROOT="$tmp/releases" MULTICA_RECEIPT_ROOT="$tmp/receipts" "$root/ops/belt/deploy-release.sh" --apply "$sha"
 [[ -f "$tmp/receipts/belt-$sha.json" ]] && node -e 'const fs=require("fs");const s=fs.readFileSync(process.argv[1],"utf8");process.exit((s.match(/script:/g)||[]).length===6 && s.includes("multica-relay-advance-wrapper.sh") ? 0 : 1)' "$tmp/releases/$sha/ops/belt/ecosystem.gsp-belt.config.js"
-[[ "$(tail -n 1 "$tmp/pm2.log")" == '0 0' ]]
+[[ "$(<"$tmp/pm2.log")" == $'0 0\nsave' ]]
 env PATH="$tmp/bin:$PATH" GIT_FAKE_SHA="$sha" PM2_BIN="$tmp/bin/pm2" MULTICA_RELEASE_ROOT="$tmp/releases" MULTICA_RECEIPT_ROOT="$tmp/receipts" "$root/ops/belt/deploy-release.sh" --rollback "$sha" --include-worker --skip-cicd-worker
-[[ "$(tail -n 1 "$tmp/pm2.log")" == '1 1' ]]
+[[ "$(<"$tmp/pm2.log")" == $'0 0\nsave\n1 1\nsave' ]]
 set +e; env MULTICA_RELEASE_ROOT="$tmp/releases" "$root/ops/belt/deploy-release.sh" --preflight 0000000000000000000000000000000000000000 >/dev/null 2>&1; rc=$?; set -e; [[ $rc == 65 ]]
 echo 'deploy release tests passed'
