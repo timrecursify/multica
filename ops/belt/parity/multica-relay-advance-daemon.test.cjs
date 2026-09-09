@@ -11,6 +11,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
 const { completionEvidenceWithNoSha } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
+const { recordRefusedAdvance } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
 const { evaluate } = require('../transition-policy.cjs');
 
@@ -1727,6 +1728,26 @@ test('a mismatched 200 response preserves the task-declared ADVANCED outcome', a
     postRelay: async () => ({ ok: true, status: 200, issue: { status: 'Queue' } }),
     logger: { log() {} }, typedOutcomes: true });
   assert.equal(calls.some(({ sql }) => /issue_stage_outcome SET|INSERT INTO issue_stage_outcome/.test(sql)), false);
+});
+
+test('relay refusal records correlated diagnostics without mutating typed outcome', async () => {
+  const calls = [];
+  const client = { query: async (sql, values) => {
+    calls.push({ sql, values });
+    return { rowCount: 1, rows: [] };
+  } };
+  await recordRefusedAdvance(client, { log_id: 'relay-log-1', to_stage: 'Done' },
+    { status: 409, error: 'parked_release_required' },
+    { reason: 'parked_release_required', actualStage: 'Parked' }, 'Done');
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].sql, /UPDATE relay_run_log/);
+  assert.match(calls[0].sql, /parked_audit/);
+  assert.match(calls[0].sql, /relay_refusal/);
+  assert.match(calls[0].sql, /actual_stage/);
+  assert.match(calls[0].sql, /target_stage/);
+  assert.match(calls[0].sql, /status = 'failed'/);
+  assert.deepEqual(calls[0].values, ['relay-log-1', 409, 'parked_release_required', 'Parked', 'Done']);
+  assert.equal(calls.some(({ sql }) => /issue_stage_outcome/.test(sql)), false);
 });
 
 test('typed readvance requires task issue and stage ownership', async () => {
