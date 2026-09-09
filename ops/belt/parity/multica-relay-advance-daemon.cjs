@@ -1222,7 +1222,7 @@ async function runBounded(items, concurrency, operation) {
   await Promise.all(Array.from({ length: count }, () => worker()));
 }
 
-async function processAdvanceRow(client, row, { postRelay, logger, gateRunner }) {
+async function processAdvanceRow(client, row, { postRelay, logger, gateRunner, requestRetryEscalationFn = requestRetryEscalation }) {
   const gatedStages = ['CI/CD & Deploy', 'Done', 'Fable QC'];
   try {
     if (TERMINAL_STAGES.has(row.to_stage)) {
@@ -1233,7 +1233,7 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
     const completion = deploymentCompletionAdmission(row.task_status, row.task_result ??
       (row.task_error ? { error: row.task_error } : null));
     if (!completion.ok) {
-      const escalation = await requestRetryEscalation(row, completion.reason);
+      const escalation = await requestRetryEscalationFn(row, completion.reason);
       logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
       if (escalation.ok) {
         await markRelayLogFailedById(client, row.log_id);
@@ -2566,7 +2566,7 @@ function startDaemon() {
 
 if (require.main === module) startDaemon();
 
-module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestCapDisposition, requestRetryEscalation,
+module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceTick, adoptUnloggedInReviewTasks, buildCompletionRoute, enqueuePassWithoutRelayRows, findAndAdvanceTasks, pauseQuotaLane, qcCompletionAdvance, completionEvidence, requestCapDisposition, requestRetryEscalation, processAdvanceRow,
   reconcileQuotaPauses, processParkedDiagnoses, requeueStrandedTasks, requeueTriggerSummary, startDaemon, scheduleEvery,
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,

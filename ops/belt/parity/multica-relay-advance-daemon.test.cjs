@@ -7,7 +7,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, runBounded,
-  parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired } = require('./multica-relay-advance-daemon.cjs');
+  parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired, processAdvanceRow } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
@@ -31,6 +31,41 @@ test('completion evidence satisfies every automatic transition policy row', () =
 });
 
 const TEST_DATABASE_URL = 'postgres://multica:multica@127.0.0.1:15436/multica?sslmode=disable';
+
+test('refused completion RESPEC is disposed once and source row is not recycled', async () => {
+  const updates = [];
+  const client = { query: async (sql, params) => { updates.push({ sql, params }); return { rows: [] }; } };
+  const row = { issue_id: 'issue-1', log_id: 'relay-1', task_id: 'task-1', to_stage: 'In Progress',
+    task_status: 'failed', task_error: 'deployment failed' };
+  let respecCalls = 0; let dispositionCalls = 0;
+  const postRelay = async (payload) => { if (payload.to_stage === 'Human Review') dispositionCalls += 1; return { ok: true, status: 200 }; };
+  await processAdvanceRow(client, row, { postRelay, logger: { log() {} }, gateRunner: async () => {},
+    requestRetryEscalationFn: async () => { respecCalls += 1; return { ok: false, status: 409 }; } });
+  assert.equal(respecCalls, 1);
+  assert.equal(dispositionCalls, 1);
+  assert.match(updates[0].sql, /SET status = 'completed'/);
+  assert.equal(updates.some((u) => /SET status = 'failed'/.test(u.sql)), false);
+});
+
+test('successful completion RESPEC keeps failed-row handling', async () => {
+  const updates = [];
+  const client = { query: async (sql, params) => { updates.push({ sql, params }); return { rows: [] }; } };
+  const row = { issue_id: 'issue-2', log_id: 'relay-2', task_id: 'task-2', to_stage: 'In Progress',
+    task_status: 'failed', task_error: 'deployment failed' };
+  await processAdvanceRow(client, row, { postRelay: async () => ({ ok: true, status: 200 }), logger: { log() {} }, gateRunner: async () => {},
+    requestRetryEscalationFn: async () => ({ ok: true, status: 200 }) });
+  assert.equal(updates.some((u) => /SET status = 'failed'/.test(u.sql)), true);
+});
+
+test('GSP terminal-route migration is scoped, idempotent, and reversible', () => {
+  const up = fs.readFileSync('server/migrations/312_gsp_relay_terminal_routes.up.sql', 'utf8');
+  const down = fs.readFileSync('server/migrations/312_gsp_relay_terminal_routes.down.sql', 'utf8');
+  assert.match(up, /workspace_id = 'f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'/g);
+  assert.match(up, /stage_name IN \('Queue', 'In Progress', 'CI\/CD & Deploy'\)/);
+  assert.match(up, /NOT \('Human Review' = ANY/);
+  assert.match(down, /array_remove/);
+  assert.match(down, /workspace_id = 'f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f'/g);
+});
 
 test('guarded runner contains startup rejection and allows the next pass', async () => {
   let calls = 0;
