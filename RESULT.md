@@ -221,3 +221,32 @@ Outcome: completed the belt GitHub Actions read-permission fix in this worktree.
 - Installed frozen workspace dependencies without changing the lockfile. Added both a direct unit regression and the relay integration expectation. Focused post-fix tests passed 1/1 each; `node --check` and `git diff --check` passed.
 - A broader three-file run executed 154 tests: 113 passed, 26 failed, 15 skipped. Failures include the known transition-policy fixture drift, unavailable PostgreSQL endpoints (`127.0.0.1:15436` and host `test`), and existing harness drift around advance claims; the two focused changed-path tests pass.
 - Wrote verified findings to `sk brain` entry `1788928330-3c4d4b6e`. Rebased onto `origin/main`, pushed the atomic fix, and opened PR #869 (`https://github.com/timrecursify/multica/pull/869`). No deployment or production mutation was performed.
+
+## 2026-09-09 ALPHA-000765 — belt token-waste P0
+
+Outcome: implemented a transaction-bound hard invariant preventing every same-stage relay
+transition from reaching the shared task enqueue primitive. HTTP 200 responses carrying a
+`handled` disposition are now explicitly classified as no progress. Typed re-advance denials
+persist their reason, relevant-input hash, retry count, terminal classification, and next retry;
+unchanged terminal denials are suppressed, retryable denials use bounded exponential backoff,
+and changed issue/task/work-product/routing input re-arms the row.
+
+Evidence: `ops/belt/multica-bridge.cjs:1200` and its invariant test at
+`ops/belt/multica-bridge.test.cjs:1976`; handled-response classification, denial policy,
+durable persistence, and input filtering at
+`ops/belt/parity/multica-relay-advance-daemon.cjs:2389`, `:2405`, `:2415`, and `:2480`;
+contract and restart-style suppression tests at
+`ops/belt/parity/multica-relay-advance-daemon.test.cjs:34` and `:1730`.
+Durable per-issue/stage columns are added by
+`ops/belt/sql/2026-09-09_typed_readvance_denial.up.sql` (with a matching rollback); relay-log
+diagnostics remain supplemental and are no longer required for suppression.
+
+Deployed-SHA verdict: MATCH. The read-only deployed bridge SHA-256 is
+`9b99e20e52ce710d69b1a0f03a14430895bf852302d4b148fb2a3fbaedc36c96`, equal
+to the file SHA from repository commit `3d0f5a4c1` that added the `already_in_spec` guard.
+No deployment or service restart was performed.
+
+PR URL: https://github.com/timrecursify/multica/pull/907
+
+Follow-ups: deploy the reviewed PR through the supervisor-owned release process, then verify
+that same-stage redispatch and unchanged deterministic-denial journal rates fall to zero.
