@@ -82,3 +82,33 @@ Step 4 — corrected release measurement:
 Step 5 — verification:
 - `git diff --check` passed.
 - Runaway requeue remains bounded by existing `completed_stage_cooldown` and `issue_cooldown` branches in ops/belt/reconciler.cjs:424-430, which skip recent completed or recent same-stage tasks.
+---
+
+# ALPHA-000666 progress
+
+## Step 1 — preflight and source verification
+
+- Ran `sk help brain`, `sk help report`, the required spawn inbox, and `sk brain search` before repository investigation; inbox returned no instructions.
+- Read the complete root `CLAUDE.md` and confirmed the checkout is on `belt/hr-lifetime-routing-20260909` tracking `origin/main`, initially clean.
+- Verified `ops/belt/reconciler.cjs`: the default cap is 6; the cap branch runs when the stage-window count is greater than or equal to the cap; non-Spec tickets currently move to Spec with a completed audit row; Spec tickets make `moveToAgentDecision` return null and then silently return `skipped/lifetime_task_limit`.
+- Verified `lifetimeTasksSql()` is stage-entry-window scoped through `stageEntryWindowSql()`, not a true lifetime count. The window starts at the latest real stage arrival or Parked/Human Review release timestamp.
+- Verified `issueCandidatesSql()` has no caller-supplied workspace predicate. This query path has not yet been changed.
+
+## Step 2 — failing regression test
+
+- Added `a capped Spec ticket gets a timed retry and durable audit instead of a silent skip` to `ops/belt/reconciler.test.cjs` before changing production code.
+- Confirmed the test fails for the target defect: expected `{ action: 'deferred', reason: 'lifetime_task_limit:6/6', retryAfterMinutes: 720 }`, but the pre-fix branch returned `{ action: 'skipped', reason: 'lifetime_task_limit', count: 6 }` and wrote neither timer nor audit.
+
+## Step 3 — implementation and narrow verification
+
+- Chose an in-place timed deferral: the ticket remains in its configured agent-owned stage, cap exhaustion writes a completed same-stage `relay_run_log` audit row plus `mechanical_retry_after`, and expiry automatically writes `mechanical_retry_release_at` to open a fresh stage-entry window.
+- This uses the existing stage-window semantics without adding a stage edge, changing stage configuration, raising the cap, or sending any mechanical outcome to Human Review.
+- The focused regression now passes (1 pass, 0 fail, 0 skip).
+- The complete reconciler file has 36 genuine unit passes. Its only 2 failures are the explicitly PostgreSQL-backed cases refusing to run because `DATABASE_URL` is absent; they are not unit regressions.
+
+## Step 4 — broader local verification
+
+- Installed the repository's frozen dependencies successfully without lockfile changes.
+- Re-ran `ops/belt/reconciler.test.cjs` against the required unavailable PostgreSQL endpoint at `127.0.0.1:15436`: 40 total, 38 passed, 2 failed, 0 skipped. Both failures are PostgreSQL integration tests and both report `connect ECONNREFUSED 127.0.0.1:15436`; all unit tests passed.
+- The broader `ops/belt/*.test.cjs` probe initially showed dependency-load failures before installation and a deployment-fixture drift check expected while `reconciler.cjs` differs from HEAD. These are setup/commit-order observations, not product-test regressions; final verification will be rerun after the atomic commit.
+- Unit-only reconciler run: 38 passed, 0 failed, 0 skipped. PostgreSQL integration run reported separately: 0 passed, 2 failed, 0 skipped, both solely `ECONNREFUSED 127.0.0.1:15436`.
