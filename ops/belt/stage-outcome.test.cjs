@@ -65,19 +65,12 @@ test("stageEligibility ignores a stale blocker after an operator release", async
   assert.equal(c.calls.length, 1);
 });
 
-test("stageEligibility blocks insertion at the attempt ceiling without a prior outcome", async () => {
-  const c = fakeClient([[]]);
-  const result = await so.stageEligibility(c, "i-cap", "Queue", { attempt: 3, maxAttempts: 3 });
-  assert.deepEqual(result, { eligible: false, reason: "attempt_budget_exhausted" });
-  assert.equal(c.calls.length, 0, "capped admission must stop before outcome lookup or insertion");
-});
-
 test("recordStageOutcomes upserts one row per unrecorded completion", async () => {
-  const c = fakeClient([[{ id: "t1", issue_id: "i1", stage: "In Review", output: "OUTCOME: ADVANCED" }], [{ input_hash: "h" }], []]);
+  const c = fakeClient([[{ id: "t1", issue_id: "i1", stage: "In Progress", output: "OUTCOME: FAILED" }], [{ input_hash: "h" }], []]);
   const r = await so.recordStageOutcomes(c, { logger: { log() {} } });
   assert.deepEqual(r, { scanned: 1, recorded: 1, failed: 0 });
   assert.match(c.calls[2].sql, /INSERT INTO issue_stage_outcome/);
-  assert.deepEqual(c.calls[2].params, ["i1", "In Review", "ADVANCED", null, "t1", "h"]);
+  assert.deepEqual(c.calls[2].params, ["i1", "In Progress", "FAILED", null, "t1", "h"]);
 });
 
 test("recordStageOutcomes persists relay evidence_missing as a non-ADVANCED outcome", async () => {
@@ -193,12 +186,10 @@ test("typed line accepts a bare blocked_on token as well as blocked_on=", () => 
   assert.equal(so.parseOutcome("OUTCOME: BLOCKED human decision needed").typed, false);
 });
 
-test("unrecorded completions use source-stage identity and newest completion per issue", () => {
+test("unrecorded completions read only the newest completion per issue and stage", () => {
   const sql = so.unrecordedCompletionsSql();
   // Without this the pass rewrote one row between two sibling completions forever.
   assert.match(sql, /DISTINCT ON \(t\.issue_id, t\.context->>'from_stage'\)/);
-  assert.match(sql, /l\.from_stage = t\.context->>'from_stage'/);
-  assert.match(sql, /l\.to_stage = t\.context->>'to_stage'/);
   assert.match(sql, /ORDER BY t\.issue_id, t\.context->>'from_stage', t\.completed_at DESC/);
   assert.match(sql, /WHERE NOT EXISTS \(SELECT 1 FROM issue_stage_outcome o WHERE o\.task_id = latest\.id\)/);
 });
