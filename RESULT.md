@@ -112,3 +112,10 @@ Step 5 — verification:
 - Re-ran `ops/belt/reconciler.test.cjs` against the required unavailable PostgreSQL endpoint at `127.0.0.1:15436`: 40 total, 38 passed, 2 failed, 0 skipped. Both failures are PostgreSQL integration tests and both report `connect ECONNREFUSED 127.0.0.1:15436`; all unit tests passed.
 - The broader `ops/belt/*.test.cjs` probe initially showed dependency-load failures before installation and a deployment-fixture drift check expected while `reconciler.cjs` differs from HEAD. These are setup/commit-order observations, not product-test regressions; final verification will be rerun after the atomic commit.
 - Unit-only reconciler run: 38 passed, 0 failed, 0 skipped. PostgreSQL integration run reported separately: 0 passed, 2 failed, 0 skipped, both solely `ECONNREFUSED 127.0.0.1:15436`.
+
+## Step 5 — PR handoff
+
+- Committed the belt change as `960920dde` and opened PR #868: https://github.com/timrecursify/multica/pull/868
+- Post-commit deployment fixture passed. Full belt CJS suite: 427 total, 419 passed, 8 failed, 0 skipped; all 8 failures are PostgreSQL integration tests at the expected unavailable `127.0.0.1:15436` endpoint.
+- No deployment, ticket release, stage-config mutation, or tenant query-path change was performed.
+- Estimated impact against the supplied 24-hour measurement: all 119/119 `lifetime_task_limit` Human Review arrivals (100%) are removed from that route; future cap events remain visible and automatically retry instead.
