@@ -961,6 +961,29 @@ async function hasCurrentPassWorkProduct(client, issueId, workProductMd5) {
     row.work_product_md5.toLowerCase() === String(workProductMd5 || '').toLowerCase());
 }
 
+// The QC PASS authorizes the existing canonical product; hand it to the
+// deploy consumer in the same transaction as the stage mutation.
+async function handoffWorkProductToDeploy(client, issueId) {
+  const current = await client.query(
+    `SELECT scope_revision FROM issue_work_product
+      WHERE issue_id = $1::uuid AND status = 'active'
+        AND consuming_stage = 'In Review'
+      FOR UPDATE`, [issueId]);
+  if (current.rowCount !== 1) {
+    throw new Error(`work_product_handoff_requires_exactly_one_active_in_review:${issueId}:${current.rowCount}`);
+  }
+  const updated = await client.query(
+    `UPDATE issue_work_product
+        SET consuming_stage = 'CI/CD & Deploy', updated_at = NOW()
+      WHERE issue_id = $1::uuid AND status = 'active'
+        AND consuming_stage = 'In Review'
+      RETURNING issue_id`, [issueId]);
+  if (updated.rowCount !== 1) {
+    throw new Error(`work_product_handoff_update_failed:${issueId}:${updated.rowCount}`);
+  }
+  return current.rows[0].scope_revision;
+}
+
 // Parked is a durable hold: retire every actionable predecessor while the
 // issue row/advisory lock is held.  The diagnosis task is intentionally kept.
 async function retireParkedWork(client, issue, reason) {
@@ -2835,8 +2858,12 @@ async function relayAdvance(req, res, body) {
       )) {
         throw new Error(`CI/CD return authorization already consumed: ${issue.id}`);
       }
-      if (noArtifactRescope && !await consumeNoArtifactRescope(client, issue)) {
+    if (noArtifactRescope && !await consumeNoArtifactRescope(client, issue)) {
         throw new Error(`no-artifact re-scope authorization already consumed: ${issue.id}`);
+      }
+
+      if (verifiedPassAdvance && issue.status === 'In Review' && to_stage === 'CI/CD & Deploy') {
+        await handoffWorkProductToDeploy(client, issue.id);
       }
 
       // Keep the database trigger as the last leaf-rule defence, but refuse
@@ -3332,6 +3359,7 @@ module.exports = {
   applyDisposition,
   handoffActiveWorkProduct,
   hasCurrentPassWorkProduct,
+  handoffWorkProductToDeploy,
   retireParkedWork,
   consumeParkedQcRecovery,
   taskResultText,
