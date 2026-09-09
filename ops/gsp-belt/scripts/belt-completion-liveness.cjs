@@ -17,11 +17,15 @@ const last=data.last_done_at?Date.parse(data.last_done_at):null; const age=last=
 const active=admitted&&(consumed||due), stalled=active&&age>=window;
 const statePath=process.env.BELT_COMPLETION_LIVENESS_STATE||'/var/lib/gsp/.local/state/belt-completion-liveness.json'; let state={};
 try{state=JSON.parse(fs.readFileSync(statePath,'utf8'))}catch{}
-if(stalled && process.env.BELT_COMPLETION_INCIDENT_COMMAND){
+const previous=state[ws]||{};
+const observedDone=data.last_done_at||null;
+const recovered=previous.incident===true && observedDone && observedDone!==previous.last_done_at;
+const effectiveIncident=stalled || (previous.incident===true && !recovered);
+if(effectiveIncident && process.env.BELT_COMPLETION_INCIDENT_COMMAND){
   try{require('child_process').execFileSync('/bin/sh',['-c',process.env.BELT_COMPLETION_INCIDENT_COMMAND],{input:JSON.stringify({code:'belt_completion_stalled',workspace:ws,oldest_pending_obligation:data.oldest_pending_obligation||null,last_done_at:data.last_done_at||null,task_consumption:Number(data.task_consumption||0),rejected_handoffs:Number(data.rejected_handoffs||0),blocker_reasons:data.blocker_reasons||{}}),stdio:['pipe','ignore','pipe']})}
   catch(e){console.error(JSON.stringify({code:'belt_completion_incident_delivery_failed',healthy:false,error:e.message}));process.exit(2)}
 }
-state[ws]={last_done_at:data.last_done_at||null,oldest_pending_obligation:data.oldest_pending_obligation||null,updated_at:new Date(now).toISOString(),incident:stalled,acknowledged:stalled&&Boolean(process.env.BELT_COMPLETION_INCIDENT_COMMAND)};
+state[ws]={last_done_at:observedDone,oldest_pending_obligation:data.oldest_pending_obligation||null,updated_at:new Date(now).toISOString(),incident:effectiveIncident,acknowledged:effectiveIncident&&Boolean(process.env.BELT_COMPLETION_INCIDENT_COMMAND)};
 try{fs.mkdirSync(require('path').dirname(statePath),{recursive:true}); const t=statePath+'.tmp'; fs.writeFileSync(t,JSON.stringify(state)); fs.renameSync(t,statePath)}catch(e){console.error(JSON.stringify({code:'belt_completion_incident_persist_failed',healthy:false,error:e.message}));process.exit(2)}
 const out={code:stalled?'belt_completion_stalled':'ok',healthy:!stalled,workspace:ws,last_done_at:data.last_done_at||null,oldest_pending_obligation:data.oldest_pending_obligation||null,task_consumption:Number(data.task_consumption||0),rejected_handoffs:Number(data.rejected_handoffs||0),blocker_reasons:data.blocker_reasons||{}};
 console.log(JSON.stringify(out)); process.exit(stalled?1:0);
