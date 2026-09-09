@@ -1785,7 +1785,7 @@ test('Queue -> In Progress is bookkeeping and never a paid builder dispatch', ()
 test('bookkeeping handoff links the existing builder task to the QC trigger', async () => {
   const calls = [];
   const replies = [
-    { rows: [{ id: 'builder-task', agent_id: 'builder-agent', status: 'completed',
+    { rows: [{ id: 'builder-task', agent_id: 'builder-agent', status: 'completed', has_work_product: true,
       result: { output: 'Implemented the fix; work product: PR #123' } }] },
     { rows: [{ id: 'handoff-log' }] }
   ];
@@ -1796,10 +1796,11 @@ test('bookkeeping handoff links the existing builder task to the QC trigger', as
 
   const result = await recordBookkeepingHandoff(client, 'issue-1');
 
-  assert.deepEqual(result, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.deepEqual(result, { taskId: 'builder-task', relayLogId: 'handoff-log',
+    missingWorkProduct: false });
   assert.match(calls[0].sql, /context->>'to_stage' = 'Queue'/);
   assert.match(calls[0].sql, /status = 'completed'/);
-  assert.match(calls[0].sql, /SELECT id, agent_id, status, result/);
+  assert.match(calls[0].sql, /EXISTS \(SELECT 1 FROM issue_work_product/);
   assert.match(calls[1].sql, /INSERT INTO relay_run_log/);
   assert.deepEqual(calls[1].values, ['issue-1', 'builder-agent', 'builder-task']);
   assert.doesNotMatch(calls.map(({ sql }) => sql).join('\n'), /INSERT INTO agent_task_queue/);
@@ -1818,19 +1819,25 @@ test('bookkeeping handoff rejects a running predecessor even if a mock returns i
   assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
 });
 
-test('bookkeeping handoff rejects a failed predecessor and missing work product', async () => {
+test('bookkeeping handoff admits completed builders and records missing work product as a typed blocker', async () => {
   for (const task of [
     { id: 'failed-builder', agent_id: 'builder-agent', status: 'completed', result: { output: 'FAILED: tests' } },
     { id: 'empty-builder', agent_id: 'builder-agent', status: 'completed', result: null }
   ]) {
     const calls = [];
-    const client = { query: async (sql) => {
-      calls.push(sql);
-      return { rows: [task] };
+    const client = { query: async (sql, values) => {
+      calls.push({ sql, values });
+      if (calls.length === 1) return { rows: [task] };
+      if (/INSERT INTO issue_stage_outcome/.test(sql)) return { rows: [] };
+      if (/INSERT INTO relay_run_log/.test(sql)) return { rows: [{ id: 'handoff-log' }] };
+      throw new Error(`unexpected query: ${sql}`);
     } };
-    assert.equal(await recordBookkeepingHandoff(client, 'issue-invalid'), null);
-    assert.equal(calls.length, 1);
-    assert.doesNotMatch(calls.join('\n'), /INSERT INTO relay_run_log/);
+    assert.deepEqual(await recordBookkeepingHandoff(client, 'issue-invalid'),
+      { taskId: task.id, relayLogId: 'handoff-log', missingWorkProduct: true });
+    assert.equal(calls.length, 3);
+    assert.match(calls[1].sql, /'In Progress', 'BLOCKED', 'sha'/);
+    assert.deepEqual(calls[1].values, ['issue-invalid', task.id]);
+    assert.match(calls[2].sql, /INSERT INTO relay_run_log/);
   }
 });
 
@@ -1839,15 +1846,17 @@ test('bookkeeping handoff replay reuses the existing correlated relay row', asyn
   const client = { query: async (sql, values) => {
     calls.push({ sql, values });
     return calls.length % 2 === 1
-      ? { rows: [{ id: 'builder-task', agent_id: 'builder-agent', status: 'completed',
+      ? { rows: [{ id: 'builder-task', agent_id: 'builder-agent', status: 'completed', has_work_product: true,
           result: { output: 'work product: PR #123' } }] }
       : { rows: [{ id: 'handoff-log' }] };
   } };
 
   const first = await recordBookkeepingHandoff(client, 'issue-replay');
   const second = await recordBookkeepingHandoff(client, 'issue-replay');
-  assert.deepEqual(first, { taskId: 'builder-task', relayLogId: 'handoff-log' });
-  assert.deepEqual(second, { taskId: 'builder-task', relayLogId: 'handoff-log' });
+  assert.deepEqual(first, { taskId: 'builder-task', relayLogId: 'handoff-log',
+    missingWorkProduct: false });
+  assert.deepEqual(second, { taskId: 'builder-task', relayLogId: 'handoff-log',
+    missingWorkProduct: false });
   assert.equal(calls.filter(({ sql }) => /INSERT INTO relay_run_log/.test(sql)).length, 2);
   assert.match(calls[1].sql, /WHERE NOT EXISTS/);
 });
