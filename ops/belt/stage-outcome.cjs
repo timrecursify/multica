@@ -2,6 +2,11 @@
 // Typed stage outcomes (GSP-1826). One row per (issue, stage): what the last agent
 // run concluded and the hash of the inputs it saw. The reconciler re-dispatches a
 // stage only when no outcome exists or the input hash changed.
+// Production writers are persistOutcome/upsertOutcomeSql (normal completion),
+// QC/readvance updates in parity/multica-relay-advance-daemon.cjs, and the
+// historical refusal branches. Refusal is now relay_run_log-only. The ownership
+// predicate below prevents a stale (issue, stage) row from retaining task A while
+// an upsert supplies task B whose context.to_stage differs (the reported mismatch).
 
 const OUTCOMES = new Set(["ADVANCED", "BLOCKED", "NO_OP", "FAILED"]);
 const BLOCKED_ON = new Set(["ci", "human", "sha", "dependency", "quota", "checkout"]);
@@ -86,7 +91,10 @@ function outcomeForStageSql() {
 
 function upsertOutcomeSql() {
   return `INSERT INTO issue_stage_outcome (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
-    VALUES ($1::uuid, $2::text, $3::text, $4::text, $5::uuid, $6::text, NOW())
+    SELECT $1::uuid, $2::text, $3::text, $4::text, $5::uuid, $6::text, NOW()
+    WHERE EXISTS (SELECT 1 FROM agent_task_queue t
+      WHERE t.id = $5::uuid AND t.issue_id = $1::uuid
+        AND t.context->>'to_stage' = $2::text)
     ON CONFLICT (issue_id, stage) DO UPDATE SET outcome = EXCLUDED.outcome, blocked_on = EXCLUDED.blocked_on,
       task_id = EXCLUDED.task_id, input_hash = EXCLUDED.input_hash, outcome_at = NOW()`;
 }
@@ -262,7 +270,10 @@ async function recordOneOutcome(client, row, logger, githubCommand) {
 async function persistOutcome(client, row, parsed, logger) {
   const hash = (await client.query(stageInputHashSql(), [row.issue_id])).rows[0]?.input_hash || null;
   try {
-    await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, parsed.blockedOn, row.id, hash]);
+    const written = await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, parsed.blockedOn, row.id, hash]);
+    if (written.rowCount === 0) {
+      throw new Error(`task_stage_ownership_mismatch task=${row.id} issue=${row.issue_id} stage=${row.stage}`);
+    }
   } catch (error) {
     if (!parsed.blockedOn) throw error;
     logger.log(`[stage-outcome] blocked_on=${parsed.blockedOn} refused task=${row.id} stage=${row.stage}: ${error?.message || error}`);
