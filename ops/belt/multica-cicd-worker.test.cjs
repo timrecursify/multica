@@ -212,6 +212,26 @@ test('closure stall returns to Spec with system retry-escalation evidence', asyn
   }), relay: async (...args) => calls.push(args) });
 });
 
+test('closure discovery outage returns to Spec instead of Human Review', async () => {
+  const calls = [];
+  worker.setTestDependencies({
+    watchdog: {
+      observe: () => ({ stage: 'CI/CD & Deploy', first_seen_at: new Date(0).toISOString(),
+        last_error: 'discovery_auth_failure', correlation_key: 'corr-auth' }),
+      stalled: () => true,
+      markAlerted: row => row
+    },
+    relay: async (...args) => calls.push(args)
+  });
+  const alerted = await worker.closureWatchdog(issue, {
+    status: 'pending', outcome: 'discovery_auth_failure',
+    blocker: { type: 'discovery_auth_failure', retry_eligible: true }
+  }, sha);
+  assert.equal(alerted, true);
+  assert.equal(calls[0][1], 'Spec');
+  assert.equal(calls[0][5].retry_escalation, true);
+});
+
 test('retryable deploy blocker remains observable to the closure watchdog', async () => {
   const calls = [];
   const observations = [];

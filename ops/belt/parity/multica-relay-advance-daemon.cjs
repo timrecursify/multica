@@ -1110,9 +1110,14 @@ async function enqueueQcGateRework(client, row, failed, postRelay) {
   const selected = config.rows[0];
   const attempt = Number(source.attempt || 0) + 1;
   const maxAttempts = Number(source.max_attempts || 3);
-  if (attempt > maxAttempts || !selected?.agent_id) {
+  if (attempt > maxAttempts) {
+    await requestRetryEscalation(
+      { ...row, stage: row.to_stage || 'In Review' }, 'stage_cycle_limit', postRelay);
+    return null;
+  }
+  if (!selected?.agent_id) {
     await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review', agent_token: RELAY_AGENT_SECRET,
-      relay_source_task_id: row.task_id, reason: attempt > maxAttempts ? 'QC-GATE FAIL attempts exhausted' : 'QC-GATE FAIL no In Progress stage owner' });
+      relay_source_task_id: row.task_id, reason: 'QC-GATE FAIL no In Progress stage owner' });
     return null;
   }
   const checks = failed.map(c => ({ name: c.name, detail: c.detail }));
@@ -2520,14 +2525,10 @@ async function returnFailedQcOutcomes({ dbPool = pool, postRelay = postToRelay,
         [row.issue_id]);
       const count = Number(bounce.rows[0]?.n || 0);
       if (count >= STAGE_CYCLE_LIMIT) {
-        const response = await postRelay({ issue_id: row.issue_id, to_stage: 'Human Review',
-          agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
-          reason: `QC bounce ceiling reached (${count}/${STAGE_CYCLE_LIMIT}); human review required`,
-          evidence: { implementationFail: cause, qcBounceCeiling: { count, ceiling: STAGE_CYCLE_LIMIT } },
-          parked_audit: { reason: 'qc_bounce_ceiling', bounce_count: count, ceiling: STAGE_CYCLE_LIMIT,
-            issue_id: row.issue_id, disposition: 'Human Review' } });
+        const response = await requestRetryEscalation(
+          { ...row, stage: 'In Review' }, 'qc_bounce_ceiling', postRelay);
         if (response.ok) {
-          await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = 'human'
+          await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = NULL
             WHERE issue_id = $1::uuid AND stage = 'In Review'`, [row.issue_id]);
           returned.push(row.issue_id);
           logger.log(`${LOG_PREFIX} [qc-fail-return] capped issue=${row.issue_id} bounces=${count}/${STAGE_CYCLE_LIMIT}`);
