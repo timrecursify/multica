@@ -189,8 +189,8 @@ test("typed line accepts a bare blocked_on token as well as blocked_on=", () => 
 test("unrecorded completions read only the newest completion per issue and stage", () => {
   const sql = so.unrecordedCompletionsSql();
   // Without this the pass rewrote one row between two sibling completions forever.
-  assert.match(sql, /DISTINCT ON \(t\.issue_id, t\.context->>'to_stage'\)/);
-  assert.match(sql, /ORDER BY t\.issue_id, t\.context->>'to_stage', t\.completed_at DESC/);
+  assert.match(sql, /DISTINCT ON \(t\.issue_id, t\.context->>'from_stage'\)/);
+  assert.match(sql, /ORDER BY t\.issue_id, t\.context->>'from_stage', t\.completed_at DESC/);
   assert.match(sql, /WHERE NOT EXISTS \(SELECT 1 FROM issue_stage_outcome o WHERE o\.task_id = latest\.id\)/);
 });
 
