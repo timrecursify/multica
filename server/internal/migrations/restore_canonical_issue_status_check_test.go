@@ -55,8 +55,8 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 			('00000000-0000-0000-0000-000000000008', 'Done'),
 			('00000000-0000-0000-0000-000000000009', 'Archived'),
 			('00000000-0000-0000-0000-000000000010', 'Cancelled'),
-			('00000000-0000-0000-0000-000000000011', 'Parked'),
-			('00000000-0000-0000-0000-000000000012', 'Rejected');
+			('00000000-0000-0000-0000-000000000011', 'Archived'),
+			('00000000-0000-0000-0000-000000000012', 'Cancelled');
 	`); err != nil {
 		t.Fatalf("seed canonical issue state: %v", err)
 	}
@@ -74,8 +74,21 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 		"00000000-0000-0000-0000-000000000008": "Done",
 		"00000000-0000-0000-0000-000000000009": "Archived",
 		"00000000-0000-0000-0000-000000000010": "Cancelled",
-		"00000000-0000-0000-0000-000000000011": "Spec",
-		"00000000-0000-0000-0000-000000000012": "Spec",
+		"00000000-0000-0000-0000-000000000011": "Archived",
+		"00000000-0000-0000-0000-000000000012": "Cancelled",
+	})
+
+	// Migration 312 must add both dispositions without rewriting existing data.
+	if _, err := conn.Exec(ctx, `ALTER TABLE issue DROP CONSTRAINT issue_status_check;
+		INSERT INTO issue (id, status) VALUES
+		('00000000-0000-0000-0000-000000000015', 'Parked'),
+		('00000000-0000-0000-0000-000000000016', 'Rejected');`); err != nil {
+		t.Fatalf("seed parked/rejected upgrade state: %v", err)
+	}
+	applyMigrationFile(t, ctx, conn.Conn(), "312_restore_parked_issue_status_contract.up.sql")
+	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
+		"00000000-0000-0000-0000-000000000015": "Parked",
+		"00000000-0000-0000-0000-000000000016": "Rejected",
 	})
 
 	if _, err := conn.Exec(ctx, `INSERT INTO issue (id, status) VALUES ('00000000-0000-0000-0000-000000000013', 'in_progress')`); err != nil {
