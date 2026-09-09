@@ -4,7 +4,13 @@
 -- under a new immutable version instead of rewriting migration history.
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
-UPDATE issue SET status = 'Spec' WHERE status IN ('Parked', 'Rejected');
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM issue WHERE status IN ('Parked', 'Rejected')) THEN
+        RAISE EXCEPTION 'refusing migration 285: Parked/Rejected rows require preservation path';
+    END IF;
+END;
+$$;
 
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
     ('Registered', 'Spec', 'Queue', 'In Progress', 'In Review',
