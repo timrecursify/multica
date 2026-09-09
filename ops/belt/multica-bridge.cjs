@@ -1859,6 +1859,7 @@ async function relayAdvance(req, res, body) {
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
     let escalationLoop = false;
+    let verifiedNoPrCompletion = false;
     const issueResult = await client.query(
       `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
        FROM "issue"
@@ -1917,6 +1918,7 @@ async function relayAdvance(req, res, body) {
           message: 'In Progress -> Done requires an independently checked NO-SHA work product' }));
         return;
       }
+      verifiedNoPrCompletion = true;
     }
     if (issue.status === 'In Progress' && to_stage === 'CI/CD & Deploy' && !body.merged_pr_evidence) {
       const allowed = await directDeployQcAdmission(client, issue.id);
@@ -2518,7 +2520,7 @@ async function relayAdvance(req, res, body) {
       }
     }
 
-    if (to_stage === "Done") {
+    if (to_stage === "Done" && !verifiedNoPrCompletion) {
       const verdict = await client.query(
         `SELECT verdict, work_product_md5 FROM qc_verdict
           WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 1`, [issue.id]
