@@ -23,7 +23,9 @@ Paths below are relative to that root and must stay inside it at deploy time.
 | `ops/belt/parity/multica-relay-advance-daemon.cjs` | `/home/newadmin/gsp-multica/parity/multica-relay-advance-daemon.cjs` | `multica-relay-advance` | Requeue + advance pass; deployed by `ops/belt/deploy.sh` |
 | `ops/gsp-belt/relay/multica-relay-advance-launcher.cjs` | `<release>/ops/gsp-belt/relay/multica-relay-advance-launcher.cjs` | `multica-relay-advance` | Renders env from operator `.env` |
 | `ops/gsp-belt/relay/multica-relay-advance-wrapper.sh` | `<release>/ops/gsp-belt/relay/multica-relay-advance-wrapper.sh` | `multica-relay-advance` | PM2 entry |
-| `ops/gsp-belt/{scripts,systemd}/belt-unit-guard*` | `/usr/local/libexec` and `/etc/systemd/system` | six enabled belt units | Minute timer self-starts inactive units; deployed as `belt-unit-guard` by `ops/belt/deploy.sh` |
+| `ops/gsp-belt/scripts/belt-unit-guard.sh` | `/usr/local/libexec` | six enabled belt units | Minute timer self-starts inactive units; deployed as `belt-unit-guard` by `ops/belt/deploy.sh` |
+| `ops/gsp-belt/systemd/belt-unit-guard.service` | `/etc/systemd/system` | six enabled belt units | Minute timer self-starts inactive units; deployed as `belt-unit-guard` by `ops/belt/deploy.sh` |
+| `ops/gsp-belt/systemd/belt-unit-guard.timer` | `/etc/systemd/system` | six enabled belt units | Minute timer self-starts inactive units; deployed as `belt-unit-guard` by `ops/belt/deploy.sh` |
 | Not run by PM2 — migration/parity SQL kept for provenance | `<release>/ops/gsp-belt/sql/*.sql` | (`noc2`/`prod` parity; seed) | Read-only, applied separately |
 
 ## Migration provenance
