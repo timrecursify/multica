@@ -129,11 +129,18 @@ SQL
 }
 
 deployment_fence_open() {
-  deployment_psql -v invocation="$BELT_DEPLOY_INVOCATION_ID" <<'SQL' >/dev/null
+  local released
+  released="$(deployment_psql -At -v invocation="$BELT_DEPLOY_INVOCATION_ID" <<'SQL'
 UPDATE belt_deployment_control
 SET admission_held = false, released_at = clock_timestamp()
-WHERE singleton AND invocation_id = :'invocation';
+WHERE singleton AND invocation_id = :'invocation'
+RETURNING 1;
 SQL
+  )"
+  if [[ "$released" != "1" ]]; then
+    printf 'Admission fence open skipped: invocation=%s is not the current owner; durable/local hold retained\n' "$BELT_DEPLOY_INVOCATION_ID" >&2
+    return 1
+  fi
   rm -f -- "$BELT_DEPLOY_STATE_ROOT/deployment.hold"
   deployment_fence_closed=0
   printf 'Admission fence opened: invocation=%s\n' "$BELT_DEPLOY_INVOCATION_ID"
