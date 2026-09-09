@@ -1605,7 +1605,7 @@ test('advance claim is one atomic issue-SHA lease without an external transactio
   assert.equal(calls[0].values[1], `issue-1:${'a'.repeat(40)}`);
 });
 
-test('a 409 relay refusal parks the outcome instead of re-posting it every cycle', async () => {
+test('a 409 relay refusal preserves the typed outcome and records diagnostics only', async () => {
   const calls = [];
   const logs = [];
   const client = { release() {}, query: async (sql, values) => {
@@ -1613,8 +1613,6 @@ test('a 409 relay refusal parks the outcome instead of re-posting it every cycle
     if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1',
       to_stage: 'Parked', outcome: 'ADVANCED', task_id: 'task-1', task_status: 'completed',
       task_result: { output: 'done' }, issue_title: 'work', next_stage: 'Queue' }] };
-    // The completed task has no relay_run_log row, so the denial counter has
-    // nowhere to live and the UPDATE matches nothing.
     return { rows: [] };
   }};
   let posts = 0;
@@ -1624,9 +1622,7 @@ test('a 409 relay refusal parks the outcome instead of re-posting it every cycle
       body: '{"error":"parked_release_required","message":"a completed Sol-low diagnosis must authorize one deliberate release"}' }; },
     logger: { log: (line) => logs.push(line) }, typedOutcomes: true });
   assert.equal(posts, 1);
-  const parked = calls.find(({ sql }) => sql.includes("SET blocked_on = 'human'"));
-  assert.ok(parked, 'a 409 refusal must park the outcome, or the daemon re-posts it every cycle');
-  assert.deepEqual(parked.values, ['issue-1', 'Parked']);
+  assert.equal(calls.some(({ sql }) => sql.includes("SET outcome = 'FAILED', blocked_on = 'human'")), false);
   assert.match(logs.join('\n'), /a completed Sol-low diagnosis must authorize one deliberate release/);
 });
 
