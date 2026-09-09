@@ -343,12 +343,13 @@ test('red open non-runtime PR routes to Human Review with evidence', async () =>
   assert.equal(route.reason, 'non_runtime_pr_not_merged');
 });
 
-test('409 relay refusals are memoized by issue state and PR head', () => {
+test('stable 409 refusals are memoized but a pending builder work product is retried', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
   assert.match(source, /const relayRefusalMemo = new Map\(\)/);
   assert.match(source, /row\.issue_updated_at.*route\?\.boundSha/s);
   assert.match(source, /relayRefusalMemo\.get\(row\.issue_id\) === refusalFingerprint/);
-  assert.match(source, /response\.status === 409.*relayRefusalMemo\.set/s);
+  assert.match(source,
+    /response\.status === 409 && response\.error !== 'builder_work_product_required'/);
 });
 
 test('verified no-PR ticket with clean checkout carries real NO-SHA evidence', async () => {

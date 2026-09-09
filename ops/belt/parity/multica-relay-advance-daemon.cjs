@@ -1331,7 +1331,12 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
       logger.log(`${LOG_PREFIX} REFUSED: ${row.issue_id} requested='${targetStage}' ` +
         `actual='${confirmation.actualStage || 'unknown'}' status=${response.status} ` +
         `reason=${confirmation.reason}`);
-      if (response.status === 409) relayRefusalMemo.set(row.issue_id, refusalFingerprint);
+      // The work-product writer runs asynchronously. An initial builder can
+      // finish immediately before its canonical row lands, so this refusal is
+      // retryable; memoising it forever strands the now-valid handoff.
+      if (response.status === 409 && response.error !== 'builder_work_product_required') {
+        relayRefusalMemo.set(row.issue_id, refusalFingerprint);
+      }
       await recordRefusedAdvance(client, row);
     }
     return false;

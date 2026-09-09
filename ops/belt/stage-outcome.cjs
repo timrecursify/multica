@@ -309,7 +309,10 @@ async function recordOneOutcome(client, row, logger, githubCommand) {
   const parsed = parseOutcome(row.output);
   // Every implementation, no-change, and operational handoff has one explicit
   // active product with verified evidence. Free text cannot supply ownership.
-  if (parsed.outcome === "ADVANCED" && row.stage === "In Progress") {
+  // Initial builders are dispatched by Spec -> Queue, while rework builders
+  // are dispatched back into In Progress. Both produce the same canonical
+  // review artifact and must pass through the same evidence transaction.
+  if (parsed.outcome === "ADVANCED" && ["Queue", "In Progress"].includes(row.stage)) {
     await client.query('BEGIN');
     try {
       const productProduced = await produceImplementationWorkProduct(client, row, githubCommand);
