@@ -84,7 +84,8 @@ func newRelayAdvanceStageFixture(t *testing.T) relayAdvanceStageFixture {
 		insertEdge("Spec", "Queue", "")
 		insertEdge("Queue", "In Progress", "")
 		insertEdge("In Progress", "In Review", "")
-		insertEdge("In Review", "Human Review", "")
+		insertEdge("In Review", "Done", "")
+		insertEdge("Done", "", "")
 	}
 	recreateStageConfig()
 
@@ -112,6 +113,79 @@ func newRelayAdvanceStageFixture(t *testing.T) relayAdvanceStageFixture {
 		testPool.Exec(context.Background(), `DELETE FROM relay_stage_config WHERE workspace_id = $1`, testWorkspaceID)
 	})
 	return relayAdvanceStageFixture{IssueID: issueID, AgentID: agentID, RuntimeID: runtimeID.String}
+}
+
+func relayReconcileHTTP(t *testing.T, workspaceID string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"workspace_id": workspaceID})
+	req := httptest.NewRequest(http.MethodPost, "/api/relay/reconcile/stale", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	testHandler.RelayReconcileStale(rr, req)
+	return rr
+}
+
+func markRelayIssueStale(t *testing.T, issueID, status string) {
+	t.Helper()
+	if _, err := testPool.Exec(context.Background(), `UPDATE issue SET status = $2, updated_at = now() - interval '61 minutes' WHERE id = $1`, issueID, status); err != nil {
+		t.Fatalf("mark issue stale: %v", err)
+	}
+}
+
+func TestRelayReconcileStaleRecoversAndIsIdempotent(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newRelayAdvanceStageFixture(t)
+	markRelayIssueStale(t, fx.IssueID, "In Review")
+	first := relayReconcileHTTP(t, testWorkspaceID)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first reconcile status = %d: %s", first.Code, first.Body.String())
+	}
+	if got := issueStatusOf(t, fx.IssueID); got != "Done" {
+		t.Fatalf("status = %q, want Done", got)
+	}
+	if got := queuedTaskCountForIssue(t, fx.IssueID); got != 1 {
+		t.Fatalf("queued task count = %d, want 1", got)
+	}
+	second := relayReconcileHTTP(t, testWorkspaceID)
+	if second.Code != http.StatusOK {
+		t.Fatalf("second reconcile status = %d: %s", second.Code, second.Body.String())
+	}
+	if got := queuedTaskCountForIssue(t, fx.IssueID); got != 1 {
+		t.Fatalf("queued task count after repeat = %d, want 1", got)
+	}
+}
+
+func TestRelayReconcileStaleRejectsUnavailableOwnerAndAudits(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newRelayAdvanceStageFixture(t)
+	markRelayIssueStale(t, fx.IssueID, "In Review")
+	if _, err := testPool.Exec(context.Background(), `UPDATE agent SET runtime_id = NULL WHERE id = $1`, fx.AgentID); err != nil {
+		t.Fatalf("clear runtime: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = testPool.Exec(context.Background(), `UPDATE agent SET runtime_id = $1 WHERE id = $2`, fx.RuntimeID, fx.AgentID)
+	})
+	rr := relayReconcileHTTP(t, testWorkspaceID)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("reconcile status = %d: %s", rr.Code, rr.Body.String())
+	}
+	if got := issueStatusOf(t, fx.IssueID); got != "In Review" {
+		t.Fatalf("status = %q, want unchanged In Review", got)
+	}
+	if got := queuedTaskCountForIssue(t, fx.IssueID); got != 0 {
+		t.Fatalf("queued task count = %d, want 0", got)
+	}
+	var status, reason string
+	if err := testPool.QueryRow(context.Background(), `SELECT status, reason FROM relay_run_log WHERE issue_id = $1 ORDER BY id DESC LIMIT 1`, fx.IssueID).Scan(&status, &reason); err != nil {
+		t.Fatalf("read reconcile audit: %v", err)
+	}
+	if status != "failed" || reason == "" {
+		t.Fatalf("audit = (%q, %q), want failed with reason", status, reason)
+	}
 }
 
 func relayAdvanceHTTP(t *testing.T, issueID, toStage string) *httptest.ResponseRecorder {

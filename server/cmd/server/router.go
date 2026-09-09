@@ -1151,6 +1151,10 @@ func NewRouterWithOptions(pool *pgxpool.Pool, hub *realtime.Hub, bus *events.Bus
 		r.Use(operatorAuth)
 		r.Post("/", h.RelayAdvanceStage)
 	})
+	r.Route("/api/relay/reconcile", func(r chi.Router) {
+		r.Use(operatorAuth)
+		r.Post("/stale", h.RelayReconcileStale)
+	})
 
 	// Protected API routes
 	r.Group(func(r chi.Router) {
