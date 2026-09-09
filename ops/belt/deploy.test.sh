@@ -50,6 +50,11 @@ printf '%s\n' \
   'case "$command_name" in' \
   '  show)' \
   '    if [[ " $* " == *" --value "* ]]; then printf "%s\\n" "$pid"' \
+  '    elif [[ " $* " == *" ActiveState "* && -e "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.health-sequence" ]]; then' \
+  '      IFS="|" read -r sequence_pid sequence_active sequence_substate sequence_entered < "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.health-sequence"' \
+  '      tail -n +2 "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.health-sequence" > "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.health-sequence.next"' \
+  '      mv -- "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.health-sequence.next" "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.health-sequence"' \
+  '      printf "MainPID=%s\\nActiveState=%s\\nSubState=%s\\n" "$sequence_pid" "$sequence_active" "$sequence_substate"' \
   '    elif [[ " $* " == *" ActiveState "* && -e "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.health-fail" ]]; then' \
   '      printf "MainPID=%s\\nActiveState=failed\\nSubState=%s\\n" "$pid" "$substate"' \
   '    else printf "MainPID=%s\\nActiveState=%s\\nSubState=%s\\nActiveEnterTimestamp=%s\\n" "$pid" "$active" "$substate" "$entered"; fi ;;' \
@@ -68,6 +73,7 @@ printf '%s\n' \
   '    esac' \
   '    mkdir -p -- "$BELT_DEPLOY_PROC_ROOT/$new_pid"' \
   '    printf "%s\\0%s\\0" "$executable" "$entrypoint" > "$BELT_DEPLOY_PROC_ROOT/$new_pid/cmdline"' \
+  '    if [[ -e "$BELT_DEPLOY_SYSTEMCTL_STATE/$unit.wrong-entrypoint" ]]; then printf "%s\\0%s\\0" "$executable" /tmp/wrong-entrypoint.cjs > "$BELT_DEPLOY_PROC_ROOT/$new_pid/cmdline"; fi' \
   '    printf "%s|active|running|Mon 2026-09-07 14:00:00 UTC\\n" "$new_pid" > "$state_file"' \
   '    printf "%s|%s|%s\\n" "$unit" "$pid" "$new_pid" >> "$BELT_DEPLOY_SYSTEMCTL_STATE/restarts.log" ;;' \
   '  *) exit 2 ;;' \
@@ -92,6 +98,7 @@ export BELT_DEPLOY_PROC_ROOT="$fake_proc"
 export BELT_DEPLOY_STATE_ROOT="$tmp_dir/deploy-state"
 export BELT_DEPLOY_DATABASE_URL="postgres://fixture"
 export BELT_DEPLOY_DRAIN_TIMEOUT_SECONDS=2
+export BELT_DEPLOY_HEALTH_SETTLE_SECONDS=1
 export BELT_DEPLOY_TEST_PSQL_LOG="$tmp_dir/psql.log"
 : > "$BELT_DEPLOY_TEST_PSQL_LOG"
 receipt_root="$tmp_dir/receipts"
@@ -378,6 +385,38 @@ if MULTICA_RECEIPT_ROOT="$health_fail_receipt_root" BELT_DEPLOY_RUNTIME_ROOT="$t
 fi
 grep -q '^Health probe systemd-active-mainpid-runtime-parity-v1 failed: multica-cicd-worker ' "$tmp_dir/health-fail.log"
 [[ ! -e "$health_fail_receipt_root/timrecursify/multica/gsp-belt/$source_sha.json" ]]
+
+# A restart can briefly report auto-restart/activating before systemd exposes
+# the replacement process. The health probe must settle and then validate the
+# PID it actually observes.
+rm -f -- "$fake_state/multica-cicd-worker.health-fail"
+printf '\nstale-runtime\n' >> "$cicd_dir/multica-cicd-worker.cjs"
+settle_pid=$(( $(cut -d'|' -f1 "$fake_state/multica-cicd-worker.state") + 100 ))
+printf '0|activating|auto-restart|\n0|activating|auto-restart|\n%s|active|running|\n' "$settle_pid" \
+  > "$fake_state/multica-cicd-worker.health-sequence"
+BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-cicd-worker > "$tmp_dir/health-settle-pass.log"
+grep -q "^Health probe systemd-active-mainpid-runtime-parity-v1 passed: multica-cicd-worker pid=$settle_pid$" "$tmp_dir/health-settle-pass.log"
+
+# A unit stuck in auto-restart beyond the bounded window must still fail.
+printf '\nstale-runtime\n' >> "$cicd_dir/multica-cicd-worker.cjs"
+for _ in {1..40}; do printf '0|activating|auto-restart|\n'; done > "$fake_state/multica-cicd-worker.health-sequence"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-cicd-worker > "$tmp_dir/health-settle-timeout.log" 2>&1; then
+  echo 'expected a unit stuck in auto-restart to fail health probe' >&2
+  exit 1
+fi
+grep -q 'settle_window_seconds=1' "$tmp_dir/health-settle-timeout.log"
+
+# Reaching active/running is not sufficient when the observed process is not
+# the deployed entrypoint.
+printf '\nstale-runtime\n' >> "$cicd_dir/multica-cicd-worker.cjs"
+entrypoint_pid=$(( $(cut -d'|' -f1 "$fake_state/multica-cicd-worker.state") + 100 ))
+printf '%s|active|running|\n' "$entrypoint_pid" > "$fake_state/multica-cicd-worker.health-sequence"
+: > "$fake_state/multica-cicd-worker.wrong-entrypoint"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply --only multica-cicd-worker > "$tmp_dir/health-entrypoint-fail.log" 2>&1; then
+  echo 'expected wrong deployed entrypoint to fail health probe' >&2
+  exit 1
+fi
+grep -q 'did not report the deployed entrypoint' "$tmp_dir/health-entrypoint-fail.log"
 
 # A restart command that exits zero can still leave the service failed. The
 # deploy must reject that state and include journal evidence.
