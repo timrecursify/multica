@@ -30,3 +30,27 @@
 
 - Commit `f0ee8651b` was pushed on `fix/nosha-real-evidence` and PR #876 was opened against `main`.
 - No deployment, merge, configuration change, database write, or credential rotation was performed.
+
+## Batch 6: production regression verification
+
+- The deployed `multica-relay-advance.service` reports `MainPID=1643088`, `WorkingDirectory=/opt/gsp/multica-workers/multica-relay-advance`, and no unit `Environment` values. Direct `/proc` inspection is access-restricted to this operator, but the service metadata independently confirms the non-source runtime cwd; attempting `git -C` there cannot enter the directory as this operator.
+- `REPOSITORY_ROOT` falls back to `process.cwd()` when `MULTICA_CHECKOUT_ROOT` and `BELT_SOURCE_ROOT` are absent, and `inspectCheckout` converts every git error to `null`. The pre-fix function returned evidence without `NO-SHA` on that null path.
+- The parent of `d416679b1` queried the newest issue comment containing the word `NO-SHA`, matching `RUNBOOK_BUILD_WORKER.md`, which instructs a no-change builder to record `NO-SHA` and independently verified acceptance evidence in its work-product comment.
+
+## Batch 7: attestation restoration
+
+- Restored the newest `NO-SHA` comment as the builder attestation for a verified `no_pr` Done route when checkout inspection is unavailable or clean.
+- Preserved `route.noPrVerified === true` as the attestation gate. An observed dirty checkout or nonempty changed-file list now overrides and withholds the comment token while reporting the observation.
+- A clean observed checkout may still create the relay attestation; without either a builder comment or an observed clean checkout, no `NO-SHA` token is emitted.
+- Added the required production-case, dirty-refusal, and missing-evidence tests; adapted the existing clean-checkout test to the restored comment query.
+
+## Batch 8: focused verification
+
+- Focused daemon tests passed 5/5: open PR classification, clean-checkout attestation, dirty-checkout refusal despite a builder comment, builder-comment fallback with an uninspectable checkout, and refusal with neither a comment nor an observed clean checkout.
+- Daemon syntax validation and `git diff --check` passed.
+
+## Batch 9: full regression suites
+
+- Full daemon suite executed 114 tests: 93 passed, 6 failed, and 15 skipped. The five PostgreSQL-backed failures are caused by the unavailable fixture at `127.0.0.1:15436`; the pre-existing transition-policy matrix failure remains. All four NO-SHA evidence tests passed, so this change added no daemon failure.
+- Full bridge suite matched the stated baseline exactly: 129 tests, 125 passed and only the four pre-existing database-dependent tests failed (comment-reply lifetime cap, two concurrency tests, and operator Human Review release).
+- `ops/belt/multica-bridge.cjs` was not changed.

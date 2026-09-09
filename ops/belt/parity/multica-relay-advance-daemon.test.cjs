@@ -352,7 +352,7 @@ test('409 relay refusals are memoized by issue state and PR head', () => {
 });
 
 test('verified no-PR ticket with clean checkout carries real NO-SHA evidence', async () => {
-  const evidence = await completionEvidenceWithNoSha({}, {
+  const evidence = await completionEvidenceWithNoSha({ query: async () => ({ rows: [] }) }, {
     issue_id: 'issue-1', task_id: 'task-1', task_result: 'NO-SHA: worker claim', to_stage: 'In Progress'
   }, 'Done', { kind: 'no_pr', noPrVerified: true }, { ok: false }, {
     checkoutInspector: async () => ({ checkoutClean: true, changedFiles: [] })
@@ -364,13 +364,37 @@ test('verified no-PR ticket with clean checkout carries real NO-SHA evidence', a
 });
 
 test('dirty no-PR checkout reports changed files without synthesising NO-SHA', async () => {
-  const evidence = await completionEvidenceWithNoSha({}, {
+  const evidence = await completionEvidenceWithNoSha({
+    query: async () => ({ rows: [{ content: 'NO-SHA: builder attestation' }] })
+  }, {
     issue_id: 'issue-1', task_id: 'task-1', task_result: 'NO-SHA: worker claim', to_stage: 'In Progress'
   }, 'Done', { kind: 'no_pr', noPrVerified: true }, { ok: false }, {
     checkoutInspector: async () => ({ checkoutClean: false, changedFiles: ['ops/belt/dirty.cjs'] })
   });
   assert.equal(evidence.checkoutClean, false);
   assert.deepEqual(evidence.changedFiles, ['ops/belt/dirty.cjs']);
+  assert.doesNotMatch(evidence.workProductEvidence, /\bNO-SHA\b/);
+});
+
+test('builder NO-SHA comment survives an uninspectable no-PR checkout', async () => {
+  const evidence = await completionEvidenceWithNoSha({
+    query: async () => ({ rows: [{ content: 'NO-SHA: runbook edit only' }] })
+  }, {
+    issue_id: 'issue-1', task_id: 'task-1', task_result: 'completed', to_stage: 'In Progress'
+  }, 'Done', { kind: 'no_pr', noPrVerified: true }, { ok: false }, {
+    checkoutInspector: async () => null
+  });
+  assert.equal(evidence.workProductEvidence, 'NO-SHA: runbook edit only');
+  assert.equal(evidence.checkoutClean, undefined);
+  assert.equal(evidence.changedFiles, undefined);
+});
+
+test('no-PR ticket without comment or observable clean checkout gets no NO-SHA', async () => {
+  const evidence = await completionEvidenceWithNoSha({ query: async () => ({ rows: [] }) }, {
+    issue_id: 'issue-1', task_id: 'task-1', task_result: 'completed', to_stage: 'In Progress'
+  }, 'Done', { kind: 'no_pr', noPrVerified: true }, { ok: false }, {
+    checkoutInspector: async () => null
+  });
   assert.doesNotMatch(evidence.workProductEvidence, /\bNO-SHA\b/);
 });
 

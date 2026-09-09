@@ -377,18 +377,25 @@ async function inspectCheckout(run = execFileAsync, checkout = REPOSITORY_ROOT) 
   }
 }
 
-// NO-SHA is a relay attestation, never worker prose. It is emitted only after
-// route discovery found neither a linked nor a cited PR and git independently
-// observed a clean checkout with no changed files. Unknown evidence fails shut.
+// RUNBOOK_BUILD_WORKER.md tells a builder to record NO-SHA in its comment for
+// no-code work, while the bridge reads NO-SHA from the posted work product.
+// Checkout inspection is an additional refusal guard: a dirty observation
+// overrides the comment, but an unavailable checkout preserves the attestation.
 async function completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance,
   { checkoutInspector = inspectCheckout } = {}) {
   const evidence = completionEvidence(row, targetStage, route, qcAdvance);
   if (route?.kind !== 'no_pr' || route.noPrVerified !== true || targetStage !== 'Done') return evidence;
+  const comment = await client.query(
+    `SELECT content FROM comment WHERE issue_id = $1::uuid AND content ~* '\\mNO-SHA\\M'
+      ORDER BY created_at DESC LIMIT 1`, [row.issue_id]);
   const checkout = await checkoutInspector();
-  if (!checkout) return evidence;
+  if (!checkout) {
+    return comment.rows[0] ? { ...evidence, workProductEvidence: comment.rows[0].content } : evidence;
+  }
   const observed = { ...evidence, checkoutClean: checkout.checkoutClean === true,
     changedFiles: Array.isArray(checkout.changedFiles) ? checkout.changedFiles : [] };
   if (!observed.checkoutClean || observed.changedFiles.length > 0) return observed;
+  if (comment.rows[0]) return { ...observed, workProductEvidence: comment.rows[0].content };
   return { ...observed,
     workProductEvidence: `NO-SHA: relay verified no pull request and a clean checkout for issue ${row.issue_id}` };
 }
