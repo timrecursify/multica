@@ -156,7 +156,15 @@ function uniqueOutputPullRequest(output) {
   return unique.length === 1 ? unique[0] : null;
 }
 
-async function linkOutputPullRequest(client, issueId, workspaceId, outputPr, githubCommand) {
+function canonicalPullRequestUrl(value) {
+  const match = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9][0-9]*)$/i.exec(
+    String(value || '').trim());
+  return match ? {
+    repository: `${match[1]}/${match[2]}`, prNumber: Number(match[3]), url: match[0]
+  } : null;
+}
+
+async function linkOutputPullRequest(client, issueId, workspaceId, outputPr, githubCommand, expectedBranch) {
   let pr;
   try {
     pr = JSON.parse(await githubCommand(['pr', 'view', outputPr.url, '--json',
@@ -164,7 +172,12 @@ async function linkOutputPullRequest(client, issueId, workspaceId, outputPr, git
       'author,headRefName,additions,deletions,changedFiles,mergeable,mergeStateStatus,statusCheckRollup'],
     { fresh: true }));
   } catch (_) { return false; }
-  if (Number(pr?.number) !== outputPr.prNumber || !pr?.state || !pr?.headRefOid) return false;
+  const headSha = String(pr?.headRefOid || '').toLowerCase();
+  const branch = String(pr?.headRefName || '');
+  if (Number(pr?.number) !== outputPr.prNumber || !pr?.state ||
+      String(pr?.url || '').toLowerCase() !== outputPr.url.toLowerCase() ||
+      !branch || !/^[0-9a-f]{40}$/.test(headSha) ||
+      (expectedBranch && expectedBranch !== branch)) return false;
   const rollup = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
   const conclusions = rollup.map((check) =>
     String(check.conclusion || check.state || '').toUpperCase()).filter(Boolean);
@@ -190,7 +203,7 @@ async function linkOutputPullRequest(client, issueId, workspaceId, outputPr, git
     [workspaceId, owner, repo, pr.number, pr.title || outputPr.url,
       String(pr.state).toLowerCase(), pr.url || outputPr.url, pr.headRefName || null,
       pr.author?.login || null, pr.mergedAt || null, pr.closedAt || null,
-      pr.createdAt, pr.updatedAt, String(pr.headRefOid).toLowerCase(),
+      pr.createdAt, pr.updatedAt, headSha,
       pr.additions ?? 0, pr.deletions ?? 0, pr.changedFiles ?? 0,
       pr.mergeable || null, pr.mergeStateStatus || null, rollupState]);
   if (inserted.rows.length !== 1) return false;
@@ -212,7 +225,17 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
       WHERE issue_id = $1::uuid AND status = 'active' FOR UPDATE`, [row.issue_id])).rows;
   if (active.length > 1 || (active[0] && active[0].kind !== 'implementation')) return false;
 
-  const outputPr = uniqueOutputPullRequest(row.output);
+  let outputPr = uniqueOutputPullRequest(row.output);
+  if (!outputPr) {
+    const historicalUrl = (await client.query(
+      `SELECT result->>'pr_url' AS pr_url
+         FROM agent_task_queue
+        WHERE issue_id = $1::uuid AND status = 'completed'
+          AND NULLIF(btrim(result->>'pr_url'), '') IS NOT NULL
+        ORDER BY completed_at DESC
+        LIMIT 1`, [row.issue_id])).rows[0]?.pr_url;
+    outputPr = canonicalPullRequestUrl(historicalUrl);
+  }
   if (active[0] && outputPr &&
       (active[0].repository.toLowerCase() !== outputPr.repository.toLowerCase() ||
        Number(active[0].pr_number) !== outputPr.prNumber)) return false;
@@ -229,7 +252,8 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
         AND ($3::int IS NULL OR p.pr_number = $3::int)
       `, [row.issue_id, selectedRepository, selectedPrNumber])).rows;
   if (linked.length === 0 && outputPr) {
-    await linkOutputPullRequest(client, row.issue_id, issue.workspace_id, outputPr, githubCommand);
+    await linkOutputPullRequest(client, row.issue_id, issue.workspace_id, outputPr, githubCommand,
+      active[0]?.branch);
     linked = (await client.query(
       `SELECT DISTINCT p.repo_owner || '/' || p.repo_name AS repository, p.pr_number,
               p.branch, p.html_url
@@ -385,4 +409,4 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
 
 module.exports = { OUTCOMES, BLOCKED_ON, parseOutcome, legacyOutcome, stageInputHashSql, outcomeForStageSql,
   upsertOutcomeSql, unrecordedCompletionsSql, recordStageOutcomes, stageEligibility,
-  uniqueOutputPullRequest, produceImplementationWorkProduct };
+  uniqueOutputPullRequest, canonicalPullRequestUrl, produceImplementationWorkProduct };
