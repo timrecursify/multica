@@ -4,7 +4,7 @@ set -euo pipefail
 # Narrow privileged entry point for the work-product backfill.  The caller can
 # invoke only the reviewed backfill modes; the relay credentials never become
 # command-line arguments or part of the helper's output.
-env_file="${WP_BACKFILL_ENV_FILE:-/etc/gsp/multica/multica-relay-advance.env}"
+readonly env_file=/etc/gsp/multica/multica-relay-advance.env
 case "${1-}" in
   --dry-run|--apply) mode="$1"; shift ;;
   *) printf '%s\n' 'usage: wp-backfill (--dry-run|--apply) [reviewed backfill options]' >&2; exit 2 ;;
