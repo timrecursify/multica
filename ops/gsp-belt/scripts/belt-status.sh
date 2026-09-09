@@ -29,12 +29,24 @@ while [[ $# -gt 0 ]]; do
 done
 [[ -n "$release_dir" ]] || { echo "usage: belt-status.sh --release DIR" >&2; exit 2; }
 [[ "$burst_threshold" =~ ^[0-9]+$ && "$burst_window" =~ ^[0-9]+$ ]] || { echo "status: invalid restart burst configuration" >&2; exit 2; }
+fail=0
+
+# Optional workspace-scoped completion liveness contract.  The caller supplies
+# a JSON metrics snapshot; absent configuration is explicitly no-opinion.
+if [[ -n "${BELT_COMPLETION_LIVENESS_INPUT:-}" || -n "${BELT_COMPLETION_STALL_WINDOW:-}" ]]; then
+  liveness_input="${BELT_COMPLETION_LIVENESS_INPUT:--}"
+  if ! liveness_result=$(BELT_COMPLETION_LIVENESS_INPUT="$liveness_input" node "$(dirname "$0")/belt-completion-liveness.cjs"); then
+    echo "completion_liveness $liveness_result" >&2
+    fail=1
+  else
+    echo "completion_liveness $liveness_result"
+  fi
+fi
 metadata="$release_dir/.gsp-belt-release.json"
 [[ -r "$metadata" ]] || { echo "status: release metadata missing: $metadata" >&2; exit 1; }
 commit_sha="$(python3 -c "import json; print(json.load(open('$metadata'))['commit_sha'])")"
 [[ "$commit_sha" =~ ^[0-9a-f]{40}$ ]] || { echo "status: invalid release commit SHA" >&2; exit 1; }
 
-fail=0
 capacity_query="SELECT workspace_slug, stage_name, capacity_budget, available_capacity, ready_count, waiting_count, running_count FROM public.relay_stage_capacity_status ORDER BY workspace_slug, stage_name;"
 echo "stage capacity: workspace|stage|budget|available|ready|waiting|running"
 if ! sudo -n /bin/bash -c "docker exec gsp-multica-v2-postgres-1 psql -U gsp_multica -d gsp_multica -At -c \"$capacity_query\""; then
