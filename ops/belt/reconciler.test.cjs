@@ -3,7 +3,7 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
 const { reconcileIssue, reconcileCycle, taskContext, issueCandidatesSql, liveTasksSql, ownerSql, stageAttemptsSql,
-  moveToHumanReview, terminalBlocker, isLeafSql, lifetimeTasksSql, mergedPullRequestNoop,
+  moveToHumanReview, moveToAgentDecision, terminalBlocker, isLeafSql, lifetimeTasksSql, mergedPullRequestNoop,
   armCompletedBuildWorkProduct, stageAttemptBudget } = require("./reconciler.cjs");
 
 const issue = { id: "11111111-1111-4111-8111-111111111111", workspace_id: "22222222-2222-4222-8222-222222222222", status: "Queue", priority: "none" };
@@ -224,7 +224,7 @@ test("stale pending completed-build handoff is detected instead of silently reus
   assert.equal(detection.values[3], 30);
 });
 
-test("stale pending completed-build handoff routes the issue to Human Review", async () => {
+test("stale pending completed-build handoff routes to agent-owned Spec", async () => {
   const completed = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const db = harness();
   const original = db.query;
@@ -240,9 +240,10 @@ test("stale pending completed-build handoff routes the issue to Human Review", a
     return original(sql, values);
   };
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
-    action: "human_review", reason: "completed_build_work_product_handoff_stalled"
+    action: "agent_decision", reason: "completed_build_work_product_handoff_stalled", status: "Spec"
   });
-  assert.ok(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Human Review'")));
+  assert.ok(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Spec'")));
+  assert.equal(db.calls.some(({ sql }) => sql.includes("UPDATE issue SET status = 'Human Review'")), false);
   assert.equal(db.calls.some(({ sql }) => sql.includes("INSERT INTO agent_task_queue")), false);
 });
 
@@ -646,28 +647,24 @@ test("moveToHumanReview asks as the operator the belt acts for", async () => {
   assert.ok(seen.some((s) => /INSERT INTO relay_run_log/.test(s.sql || "")));
 });
 
-test("a capped Spec ticket can still exit to Human Review", async () => {
-  // Spec was excluded from HUMAN_REVIEW_FROM on the belief that RULES barred
-  // the transition. It does not: transition-policy lists Spec -> Human Review
-  // for the operator actor. With Spec excluded, a Spec ticket that had spent
-  // its lifetime task budget could neither be re-dispatched nor routed, so it
-  // was re-evaluated every cycle forever. Assert against the real policy.
+test("a technical lifetime cap routes to agent-owned Spec, never Human Review", async () => {
   const { evaluate } = require("./transition-policy.cjs");
   const verdict = evaluate({
-    from: "Spec", to: "Human Review", actor: "operator",
-    evidence: { blocker: "lifetime_task_limit:33/6" }
+    from: "Queue", to: "Spec", actor: "system",
+    evidence: { retry_escalation: true, blocker: "lifetime_task_limit:33/6" }
   });
   assert.equal(verdict.ok, true);
 
   const seen = [];
   const db = { query: async (sql, values) => { seen.push({ sql, values }); return { rows: [] }; } };
-  const result = await moveToHumanReview(
-    db, { ...issue, status: "Spec" }, "lifetime_task_limit:33/6", { evaluate }
+  const result = await moveToAgentDecision(
+    db, { ...issue, status: "Queue" }, "lifetime_task_limit:33/6", { evaluate }
   );
-  assert.deepEqual(result, { action: "human_review", reason: "lifetime_task_limit:33/6" });
-  assert.ok(seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")));
+  assert.deepEqual(result, { action: "agent_decision", reason: "lifetime_task_limit:33/6", status: "Spec" });
+  assert.ok(seen.some((s) => /UPDATE issue SET status = 'Spec'/.test(s.sql || "")));
+  assert.equal(seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")), false);
   const logged = seen.find((s) => /INSERT INTO relay_run_log/.test(s.sql || ""));
-  assert.equal(logged.values[1], "Spec");
+  assert.equal(logged.values[1], "Queue");
 });
 
 test("a policy rejection leaves the issue skipped rather than erroring the cycle", async () => {
