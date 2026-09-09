@@ -110,31 +110,35 @@ test("build outcome atomically inserts ownership and rework updates its exact id
     await client.query("INSERT INTO issue VALUES ($1, $2, 'In Progress')", [issueId, "55555555-5555-4555-8555-555555555555"]);
     await client.query("INSERT INTO github_pull_request VALUES ($1,$2,'acme','widget',7,'fix/belt','https://github.com/acme/widget/pull/7',$3,NULL,NOW())", [prId, "55555555-5555-4555-8555-555555555555", sha1]);
     await client.query("INSERT INTO issue_pull_request VALUES ($1,$2)", [issueId, prId]);
-    const insertTask = async (id, sha) => client.query(
+    const insertTask = async (id, sha, stage) => client.query(
       "INSERT INTO agent_task_queue VALUES ($1,$2,'completed',$3::jsonb,$4::jsonb,NOW(),NOW())",
-      [id, issueId, JSON.stringify({ to_stage: "In Progress" }), JSON.stringify({ output: `PR https://github.com/acme/widget/pull/7 head ${sha}\nOUTCOME: ADVANCED` })]);
+      [id, issueId, JSON.stringify({ to_stage: stage }), JSON.stringify({ output: `PR https://github.com/acme/widget/pull/7 head ${sha}\nOUTCOME: ADVANCED` })]);
     let observedSha = sha1;
     const githubCommand = async (_args, options) => {
       assert.equal(options.fresh, true);
       return JSON.stringify({ number: 7, url: "https://github.com/acme/widget/pull/7", headRefName: "fix/belt", headRefOid: observedSha });
     };
-    await insertTask(task1, sha1);
+    // The initial builder is launched by Spec -> Queue. This is the exact
+    // production shape that previously skipped canonical product creation.
+    await insertTask(task1, sha1, "Queue");
     assert.deepEqual(await stageOutcome.recordStageOutcomes(client, { githubCommand, logger: { log() {} } }), { scanned: 1, recorded: 1, failed: 0 });
     const first = (await client.query("SELECT * FROM issue_work_product WHERE issue_id=$1", [issueId])).rows[0];
     assert.equal(first.repository, "acme/widget"); assert.equal(first.branch, "fix/belt");
     assert.equal(first.pr_number, 7); assert.equal(first.head_sha, sha1);
     await client.query("UPDATE github_pull_request SET head_sha=$2, updated_at=NOW() WHERE id=$1", [prId, sha2]);
-    observedSha = sha2; await insertTask(task2, sha2);
+    observedSha = sha2; await insertTask(task2, sha2, "In Progress");
     assert.deepEqual(await stageOutcome.recordStageOutcomes(client, { githubCommand, logger: { log() {} } }), { scanned: 1, recorded: 1, failed: 0 });
     const products = (await client.query("SELECT * FROM issue_work_product WHERE issue_id=$1", [issueId])).rows;
     assert.equal(products.length, 1); assert.equal(products[0].scope_revision, first.scope_revision);
     assert.equal(products[0].head_sha, sha2); assert.equal(products[0].created_at.toISOString(), first.created_at.toISOString());
-    const outcome = (await client.query("SELECT outcome, task_id FROM issue_stage_outcome WHERE issue_id=$1", [issueId])).rows[0];
+    const outcome = (await client.query(
+      "SELECT outcome, task_id FROM issue_stage_outcome WHERE issue_id=$1 AND stage='In Progress'",
+      [issueId])).rows[0];
     assert.deepEqual(outcome, { outcome: "ADVANCED", task_id: task2 });
     await client.query(`ALTER TABLE issue_stage_outcome ADD CONSTRAINT reject_third_task
       CHECK (task_id <> '${task3}'::uuid)`);
     await client.query("UPDATE github_pull_request SET head_sha=$2, updated_at=NOW() WHERE id=$1", [prId, sha3]);
-    observedSha = sha3; await insertTask(task3, sha3);
+    observedSha = sha3; await insertTask(task3, sha3, "In Progress");
     assert.deepEqual(await stageOutcome.recordStageOutcomes(client, { githubCommand, logger: { log() {} } }), { scanned: 1, recorded: 0, failed: 1 });
     const rolledBack = (await client.query("SELECT head_sha FROM issue_work_product WHERE issue_id=$1", [issueId])).rows[0];
     assert.equal(rolledBack.head_sha, sha2, "outcome failure must roll back the work-product update");
