@@ -96,6 +96,28 @@ test("stageEligibility re-opens a stage when inputs change after evidence_missin
   assert.equal(result.reason, "input_changed");
 });
 
+test("stageEligibility identifies durable outcomes stranded without an input hash", async () => {
+  for (const outcome of ["NO_OP", "BLOCKED"]) {
+    const prior = { outcome, blocked_on: null, input_hash: null, outcome_at: "2026-09-05T19:45:00Z" };
+    const c = fakeClient([[prior], [{ input_hash: null, issue_status: "In Progress" }]]);
+    const result = await so.stageEligibility(c, "i-null", "In Progress");
+    assert.equal(result.eligible, false);
+    assert.equal(result.reason, "outcome_missing_input_hash");
+  }
+});
+
+test("stageEligibility re-opens a durable outcome when a missing hash becomes observable", async () => {
+  for (const outcome of ["NO_OP", "BLOCKED"]) {
+    const prior = { outcome, blocked_on: null, input_hash: null, outcome_at: "2026-09-05T19:45:00Z" };
+    const c = fakeClient([[prior], [{ input_hash: "h1", issue_status: "In Progress" }]]);
+    const result = await so.stageEligibility(c, "i-null-changed", "In Progress", {
+      attempt: 1, maxAttempts: 2
+    });
+    assert.equal(result.eligible, true);
+    assert.equal(result.reason, "input_changed");
+  }
+});
+
 test("stageEligibility retries FAILED after TTL but not before or at the attempt cap", async () => {
   const now = Date.parse("2026-09-05T20:00:00Z");
   const prior = { outcome: "FAILED", blocked_on: null, input_hash: "h1", outcome_at: "2026-09-05T19:45:00Z" };
@@ -106,6 +128,19 @@ test("stageEligibility retries FAILED after TTL but not before or at the attempt
   c = fakeClient([[prior], [{ input_hash: "h1" }]]);
   const capped = await so.stageEligibility(c, "i3", "In Progress", { failedTtlMinutes: 15, now, attempt: 2, maxAttempts: 2 });
   assert.deepEqual({ eligible: capped.eligible, reason: capped.reason }, { eligible: false, reason: "attempt_budget_exhausted" });
+});
+
+test("stageEligibility keeps FAILED with a NULL hash on its existing TTL path", async () => {
+  const now = Date.parse("2026-09-05T20:00:00Z");
+  const prior = { outcome: "FAILED", blocked_on: null, input_hash: null, outcome_at: "2026-09-05T19:45:00Z" };
+  let c = fakeClient([[prior], [{ input_hash: "newly-observable", issue_status: "In Progress" }]]);
+  assert.equal((await so.stageEligibility(c, "i-failed-null", "In Progress", {
+    failedTtlMinutes: 30, now
+  })).reason, "outcome_unchanged:FAILED");
+  c = fakeClient([[prior], [{ input_hash: "newly-observable", issue_status: "In Progress" }]]);
+  assert.equal((await so.stageEligibility(c, "i-failed-null", "In Progress", {
+    failedTtlMinutes: 15, now
+  })).reason, "failed_ttl_expired");
 });
 
 test("FAILED/human remains terminal after the generic failure TTL", async () => {

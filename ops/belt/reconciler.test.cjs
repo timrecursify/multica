@@ -497,6 +497,29 @@ test("attempt-budget exhaustion gets a timed mechanical retry, not a bare skip",
   assert.equal(budget.humanReview, 0);
 });
 
+test("durable NULL-hash outcome gets a bounded mechanical retry without Human Review", async () => {
+  const budget = { created: 0, humanReview: 0, byAgent: new Map() };
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.includes("COALESCE(max(attempt)")) return { rows: [{ attempt: 1, max_attempts: 2 }] };
+    if (sql.includes("FROM issue_stage_outcome")) return { rows: [{
+      outcome: "BLOCKED", blocked_on: "human", input_hash: null, outcome_at: new Date().toISOString()
+    }] };
+    if (sql.includes("AS input_hash")) return { rows: [{ input_hash: null, issue_status: issue.status }] };
+    return original(sql, values);
+  };
+
+  assert.deepEqual(await reconcileIssue(db, issue.id, {
+    evaluate: ok, typedOutcomes: true, mechanicalRetryMinutes: 720, budget
+  }), {
+    action: "deferred", reason: "outcome_missing_input_hash", retryAfterMinutes: 720
+  });
+  assert.ok(db.calls.some(({ sql }) => /mechanical_retry_after/.test(sql || "")));
+  assert.equal(db.calls.some(({ sql }) => /status = 'Human Review'/.test(sql || "")), false);
+  assert.equal(budget.humanReview, 0);
+});
+
 test("expired attempt-budget deferral releases a fresh stage-entry window", async () => {
   let deferred = false;
   let released = false;

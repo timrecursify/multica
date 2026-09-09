@@ -381,7 +381,11 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
   if (currentRow.issue_status && currentRow.issue_status !== stage) {
     return { eligible: false, reason: `stage_moved_on:${currentRow.issue_status}`, prior };
   }
-  if (current && prior.input_hash && current !== prior.input_hash) return { eligible: true, reason: "input_changed", prior };
+  const durableOutcome = prior.outcome === "NO_OP" || prior.outcome === "BLOCKED";
+  if (current && ((durableOutcome && prior.input_hash === null) ||
+      (prior.input_hash && current !== prior.input_hash))) {
+    return { eligible: true, reason: "input_changed", prior };
+  }
   if (Number.isInteger(attempt) && Number.isInteger(maxAttempts) && attempt >= maxAttempts) {
     return { eligible: false, reason: "attempt_budget_exhausted", prior };
   }
@@ -394,6 +398,13 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
       Number.isFinite(ttl) && ttl > 0 && Number.isFinite(outcomeAt) &&
       Number(now) - outcomeAt >= ttl * 60 * 1000) {
     return { eligible: true, reason: "failed_ttl_expired", prior };
+  }
+  // NO_OP and BLOCKED are normally durable until their recorded input changes.
+  // When neither the recorded nor current input has a hash, there is no change
+  // to observe. Let the reconciler park these outcomes on its existing bounded
+  // mechanical-retry path instead of treating them as final forever.
+  if (durableOutcome && prior.input_hash === null && current === null) {
+    return { eligible: false, reason: "outcome_missing_input_hash", prior };
   }
   if (prior.outcome === "ADVANCED") {
     const configured = Number(process.env.MULTICA_ADVANCED_STALL_TTL_MINUTES);
