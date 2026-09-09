@@ -1,4 +1,7 @@
 "use strict";
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const execFileAsync = promisify(execFile);
 // Typed stage outcomes (GSP-1826). One row per (issue, stage): what the last agent
 // run concluded and the hash of the inputs it saw. The reconciler re-dispatches a
 // stage only when no outcome exists or the input hash changed.
@@ -104,7 +107,7 @@ function unrecordedCompletionsSql() {
   return `WITH latest AS (
       SELECT DISTINCT ON (t.issue_id, t.context->>'to_stage')
              t.id, t.issue_id, t.context->>'to_stage' AS stage,
-             t.result->>'output' AS output, t.created_at,
+             t.result->>'output' AS output, t.work_dir, t.created_at,
              CASE WHEN (t.context->>'scope_revision') ~ '^[1-9][0-9]*$'
                THEN (t.context->>'scope_revision')::bigint
                ELSE floor(extract(epoch FROM t.created_at) * 1000000)::bigint
@@ -117,7 +120,7 @@ function unrecordedCompletionsSql() {
           WHERE l.issue_id = t.issue_id AND l.to_stage = t.context->>'to_stage'
             AND l.from_stage <> l.to_stage), '-infinity')
       ORDER BY t.issue_id, t.context->>'to_stage', t.completed_at DESC)
-    SELECT latest.id, latest.issue_id, latest.stage, latest.output, latest.scope_revision
+    SELECT latest.id, latest.issue_id, latest.stage, latest.output, latest.work_dir, latest.scope_revision
     FROM latest
     WHERE NOT EXISTS (SELECT 1 FROM issue_stage_outcome o WHERE o.task_id = latest.id)
     ORDER BY latest.completed_at ASC LIMIT 200`;
@@ -130,13 +133,14 @@ function unrecordedCompletionsSql() {
 // as long as it stayed in the window. Each row is therefore isolated, and a write
 // the database refuses is retried once without blocked_on so the outcome kind
 // still lands.
-async function recordStageOutcomes(client, { windowMinutes = 180, logger = console, githubCommand } = {}) {
+async function recordStageOutcomes(client, { windowMinutes = 180, logger = console, githubCommand,
+  gitCommand: runGit } = {}) {
   const rows = (await client.query(unrecordedCompletionsSql(), [windowMinutes])).rows;
   let recorded = 0;
   let failed = 0;
   for (const row of rows) {
     try {
-      recorded += await recordOneOutcome(client, row, logger, githubCommand);
+      recorded += await recordOneOutcome(client, row, logger, githubCommand, runGit);
     } catch (error) {
       failed += 1;
       logger.log(`[stage-outcome] record failed task=${row.id} stage=${row.stage}: ${error?.message || error}`);
@@ -305,17 +309,65 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
   return inserted.rowCount === 1;
 }
 
-async function recordOneOutcome(client, row, logger, githubCommand) {
+async function gitCommand(args) {
+  const { stdout } = await execFileAsync('git', args, { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
+  return stdout;
+}
+
+function githubRepository(remote) {
+  const match = /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?$/.exec(
+    String(remote || '').trim());
+  return match ? match[1] : null;
+}
+
+async function produceNoChangeWorkProduct(client, row, runGit = gitCommand) {
+  if (!row.work_dir || typeof runGit !== 'function') return false;
+  const active = (await client.query(
+    `SELECT scope_revision, kind FROM issue_work_product
+      WHERE issue_id = $1::uuid AND status = 'active' FOR UPDATE`, [row.issue_id])).rows;
+  if (active.length !== 0) return false;
+
+  let remote, baseRef, baseSha, headSha, status;
+  try {
+    remote = await runGit(['-C', row.work_dir, 'config', '--get', 'remote.origin.url']);
+    baseRef = String(await runGit(
+      ['-C', row.work_dir, 'symbolic-ref', 'refs/remotes/origin/HEAD'])).trim();
+    baseSha = String(await runGit(['-C', row.work_dir, 'rev-parse', `${baseRef}^{commit}`])).trim().toLowerCase();
+    headSha = String(await runGit(['-C', row.work_dir, 'rev-parse', 'HEAD^{commit}'])).trim().toLowerCase();
+    status = String(await runGit(['-C', row.work_dir, 'status', '--porcelain']));
+  } catch (_) { return false; }
+  const repository = githubRepository(remote);
+  if (!repository || !/^refs\/remotes\/origin\/[A-Za-z0-9._\/-]+$/.test(baseRef) ||
+      !/^[0-9a-f]{40}$/.test(baseSha) || headSha !== baseSha || status.trim() !== '') return false;
+
+  const evidence = JSON.stringify({ source: 'checked_task_checkout', task_id: row.id,
+    repository, base_ref: baseRef, base_sha: baseSha, verified: true });
+  const inserted = await client.query(
+    `INSERT INTO issue_work_product (issue_id, scope_revision, kind, repository, branch,
+        pr_number, head_sha, acceptance_evidence, replaces_scope_revision,
+        consuming_stage, dependency_issue_ids, status)
+      VALUES ($1::uuid, $2::bigint, 'no_change', NULL, NULL, NULL, NULL,
+        $3::jsonb, NULL, 'In Review', '{}'::uuid[], 'active') RETURNING issue_id`,
+    [row.issue_id, row.scope_revision, evidence]);
+  return inserted.rowCount === 1;
+}
+
+async function recordOneOutcome(client, row, logger, githubCommand, runGit) {
   const parsed = parseOutcome(row.output);
   // Every implementation, no-change, and operational handoff has one explicit
   // active product with verified evidence. Free text cannot supply ownership.
   // Initial builders are dispatched by Spec -> Queue, while rework builders
-  // are dispatched back into In Progress. Both produce the same canonical
-  // review artifact and must pass through the same evidence transaction.
-  if (parsed.outcome === "ADVANCED" && ["Queue", "In Progress"].includes(row.stage)) {
+  // are dispatched back into In Progress. Both implementation and typed
+  // no-change results must pass through the same evidence transaction.
+  if (["ADVANCED", "NO_OP"].includes(parsed.outcome) && ["Queue", "In Progress"].includes(row.stage)) {
     await client.query('BEGIN');
     try {
-      const productProduced = await produceImplementationWorkProduct(client, row, githubCommand);
+      const claimedOutcome = parsed.outcome;
+      const productProduced = claimedOutcome === "NO_OP" && parsed.typed
+        ? await produceNoChangeWorkProduct(client, row, runGit)
+        : claimedOutcome === "ADVANCED"
+          ? await produceImplementationWorkProduct(client, row, githubCommand)
+          : false;
       const evidence = (await client.query(
         `SELECT EXISTS (
            SELECT 1 FROM issue_work_product wp
@@ -333,7 +385,7 @@ async function recordOneOutcome(client, row, logger, githubCommand) {
       if (!productProduced || !evidence?.has_review_evidence) {
         parsed.outcome = "FAILED";
         parsed.blockedOn = null;
-        logger.log(`[stage-outcome] rejected unsupported ADVANCED task=${row.id} stage=${row.stage}: missing review evidence`);
+        logger.log(`[stage-outcome] rejected unsupported ${claimedOutcome} task=${row.id} stage=${row.stage}: missing review evidence`);
       }
       const result = await persistOutcome(client, row, parsed, logger);
       await client.query('COMMIT');
@@ -423,4 +475,5 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
 
 module.exports = { OUTCOMES, BLOCKED_ON, parseOutcome, legacyOutcome, stageInputHashSql, outcomeForStageSql,
   upsertOutcomeSql, unrecordedCompletionsSql, recordStageOutcomes, stageEligibility,
-  uniqueOutputPullRequest, canonicalPullRequestUrl, produceImplementationWorkProduct };
+  uniqueOutputPullRequest, canonicalPullRequestUrl, produceImplementationWorkProduct,
+  githubRepository, produceNoChangeWorkProduct };
