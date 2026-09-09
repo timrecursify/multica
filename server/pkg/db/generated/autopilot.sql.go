@@ -303,12 +303,12 @@ func (q *Queries) CreateAutopilotRun(ctx context.Context, arg CreateAutopilotRun
 const createAutopilotTask = `-- name: CreateAutopilotTask :one
 
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, autopilot_run_id, trigger_summary,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, autopilot_run_id, trigger_summary,
     originator_user_id, accountable_user_id, rule_version_id,
     originator_source, trigger_evidence_kind, trigger_evidence_ref_id
 )
 VALUES (
-    $1, $2, NULL, 'queued', $3, $4, $5,
+    $1, $2, NULL, (SELECT workspace_id FROM agent WHERE id = $1), 'queued', $3, $4, $5,
     $6,
     $7,
     $8,

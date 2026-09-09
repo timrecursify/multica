@@ -564,17 +564,18 @@ async function relayAdvance(req, res, body) {
       // task is redundant; the stage transition must not be sacrificed to it.
       const taskResult = await client.query(
         `INSERT INTO agent_task_queue (
-           agent_id, issue_id, status, runtime_id, context,
+           agent_id, issue_id, workspace_id, status, runtime_id, context,
            trigger_summary, force_fresh_session, originator_source,
            trigger_evidence_kind
          )
-         VALUES ($1, $2, 'queued', $3, $4::jsonb, $5, TRUE,
+         VALUES ($1, $2, $3, 'queued', $4, $5::jsonb, $6, TRUE,
                  'unattributed', 'relay_stage_transition')
          ON CONFLICT DO NOTHING
          RETURNING id`,
         [
           stage.agent_id,
           issue_id,
+          issue.workspace_id,
           stage.selected_runtime_id,
           context,
           retryEscalation

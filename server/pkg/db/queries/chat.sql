@@ -909,13 +909,13 @@ WHERE id = $1;
 -- attribution provenance is stamped so this path is not a NULL-source enqueue
 -- bypass (MUL-4302 §2).
 INSERT INTO agent_task_queue (
-    agent_id, runtime_id, issue_id, status, priority, chat_session_id,
+    agent_id, runtime_id, issue_id, workspace_id, status, priority, chat_session_id,
     initiator_user_id, originator_user_id, accountable_user_id, force_fresh_session, runtime_mcp_overlay,
     runtime_connected_apps, originator_source, trigger_evidence_kind, trigger_evidence_ref_id,
     fire_at
 )
 VALUES (
-    $1, $2, NULL,
+    $1, $2, NULL, (SELECT workspace_id FROM agent WHERE id = $1),
     CASE WHEN sqlc.narg('fire_at')::timestamptz IS NULL THEN 'queued' ELSE 'deferred' END,
     $3, $4, $5,
     sqlc.narg(originator_user_id),
