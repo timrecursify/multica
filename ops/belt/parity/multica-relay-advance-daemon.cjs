@@ -46,6 +46,10 @@ const githubTokenCache = createTtlCache({ ttlMs: QC_GATE_PENDING_RECHECK_MS });
 const workProductCache = createTtlCache({ ttlMs: QC_GATE_PENDING_RECHECK_MS });
 const githubClients = new Map();
 const execFileAsync = promisify(execFile);
+// The deployed daemon is copied into a runtime bundle that is not a git tree.
+// Its launcher inherits the source checkout cwd; operators may make that
+// identity explicit with the same source-root variables used by belt tooling.
+const REPOSITORY_ROOT = process.env.MULTICA_CHECKOUT_ROOT || process.env.BELT_SOURCE_ROOT || process.cwd();
 function parseGateCheckConcurrency(value) {
   if (value === undefined) return 1;
   const parsed = Number(value);
@@ -352,9 +356,8 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
       retryEscalationTaskId: row.task_id };
   }
   if (row.to_stage === 'In Progress' && targetStage === 'Done') {
-    const resultText = typeof row.task_result === 'string' ? row.task_result : JSON.stringify(row.task_result || '');
     return { noDeployRoute: route?.kind || 'no_pr',
-      workProductEvidence: /\bNO-SHA\b/i.test(resultText) ? resultText : pointer };
+      workProductEvidence: pointer };
   }
   if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
     return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };
@@ -362,17 +365,39 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
   return {};
 }
 
+async function inspectCheckout(run = execFileAsync, checkout = REPOSITORY_ROOT) {
+  try {
+    const { stdout } = await run('git', ['-C', checkout, 'status', '--porcelain', '--untracked-files=all'],
+      { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
+    const changedFiles = String(stdout || '').split(/\r?\n/).filter(Boolean)
+      .map((line) => line.slice(3).trim()).filter(Boolean);
+    return { checkoutClean: changedFiles.length === 0, changedFiles };
+  } catch {
+    return null;
+  }
+}
+
 // RUNBOOK_BUILD_WORKER.md tells a builder to record NO-SHA in its comment for
 // no-code work, while the bridge reads NO-SHA from the posted work product.
-// Carry the newest NO-SHA comment when the task result itself lacks the token.
-async function completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance) {
+// Checkout inspection is an additional refusal guard: a dirty observation
+// overrides the comment, but an unavailable checkout preserves the attestation.
+async function completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance,
+  { checkoutInspector = inspectCheckout } = {}) {
   const evidence = completionEvidence(row, targetStage, route, qcAdvance);
-  if (route?.kind !== 'no_pr' || targetStage !== 'Done' ||
-      /\bNO-SHA\b/i.test(String(evidence.workProductEvidence || ''))) return evidence;
+  if (route?.kind !== 'no_pr' || route.noPrVerified !== true || targetStage !== 'Done') return evidence;
   const comment = await client.query(
     `SELECT content FROM comment WHERE issue_id = $1::uuid AND content ~* '\\mNO-SHA\\M'
       ORDER BY created_at DESC LIMIT 1`, [row.issue_id]);
-  return comment.rows[0] ? { ...evidence, workProductEvidence: comment.rows[0].content } : evidence;
+  const checkout = await checkoutInspector();
+  if (!checkout) {
+    return comment.rows[0] ? { ...evidence, workProductEvidence: comment.rows[0].content } : evidence;
+  }
+  const observed = { ...evidence, checkoutClean: checkout.checkoutClean === true,
+    changedFiles: Array.isArray(checkout.changedFiles) ? checkout.changedFiles : [] };
+  if (!observed.checkoutClean || observed.changedFiles.length > 0) return observed;
+  if (comment.rows[0]) return { ...observed, workProductEvidence: comment.rows[0].content };
+  return { ...observed,
+    workProductEvidence: `NO-SHA: relay verified no pull request and a clean checkout for issue ${row.issue_id}` };
 }
 
 // Gate by ticket transition and PR evidence, never by the stage row that
@@ -449,7 +474,7 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
       evidence: `blocked_on=human ${resultPointer(row)}` };
   }
   if (declared && declared.outcome === 'NO_OP' && row.to_stage === 'In Progress' && !commentMatch) {
-    return { kind: 'no_pr', noopDelivered: true, toStage: 'Done',
+    return { kind: 'no_pr', noPrVerified: true, noopDelivered: true, toStage: 'Done',
       reason: 'completed_noop_already_delivered' };
   }
   // A completed NO_OP has no deployable artifact. Park it instead of asking
@@ -458,7 +483,7 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
     if (declared && declared.outcome === 'NO_OP') {
       return { kind: 'no_pr_noop', toStage: 'Parked', reason: 'completed_spec_noop' };
     }
-    return { kind: 'no_pr', toStage: 'Done' };
+    return { kind: 'no_pr', toStage: 'Done', noPrVerified: true };
   }
   const issuePr = linked.rows[0];
   const repo = issuePr
@@ -2573,5 +2598,6 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup,
+  inspectCheckout, completionEvidenceWithNoSha,
   advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency,
   processAdvanceRow, relayAdvanceConfirmation };
