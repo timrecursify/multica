@@ -2339,15 +2339,16 @@ function relayAdvanceConfirmation(response, targetStage) {
 
 async function recordRefusedAdvance(client, row) {
   await markRelayLogFailedById(client, row.log_id);
-  if (!TYPED_OUTCOMES) return;
-  await client.query(
-    `INSERT INTO issue_stage_outcome
-       (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
-     VALUES ($1::uuid, $2::text, 'FAILED', 'human', $3::uuid, NULL, NOW())
-     ON CONFLICT (issue_id, stage) DO UPDATE SET outcome = 'FAILED', blocked_on = 'human',
-       task_id = EXCLUDED.task_id, input_hash = NULL, outcome_at = NOW()`,
-    [row.issue_id, row.to_stage, row.task_id]);
+  // Relay refusal is transport/routing state, not a task outcome.  The
+  // completed task's typed ADVANCED/NO_OP row remains authoritative; refusal
+  // details are retained in relay_run_log by the caller.
 }
+
+// Writer trace (issue_stage_outcome): stage-outcome.cjs::recordOneOutcome is
+// the typed task-result writer; this daemon's former refusal/retry branches
+// were the only other production writers. They now update relay_run_log only.
+// Every task_id-bearing readvance is constrained to the same issue and
+// context.to_stage, preventing the historical cross-stage association.
 
 // Retry recorded successful work without creating another agent task.  A relay
 // refusal (4xx) parks the outcome for a human at once; a denial that can clear
@@ -2364,6 +2365,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
          FROM issue_stage_outcome o
          JOIN issue i ON i.id = o.issue_id AND i.status = o.stage
          JOIN agent_task_queue t ON t.id = o.task_id AND t.status = 'completed'
+          AND t.issue_id = o.issue_id AND t.context->>'to_stage' = o.stage
          LEFT JOIN relay_stage_config rsc
            ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
          ${evidenceSql.joins}
@@ -2431,8 +2433,8 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       const refused = (response.status >= 400 && response.status < 500) ||
         (response.status === 200 && !confirmation.ok);
       if (refused || Number(denied.rows[0]?.denials || 0) >= 3) {
-        await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = 'human'
-          WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
+        // Retry exhaustion is recorded in relay_run_log only. Never downgrade
+        // a typed ADVANCED/NO_OP task result into FAILED/human.
       }
       logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);
     }
