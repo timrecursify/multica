@@ -2697,9 +2697,6 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     priority: 'medium', metadata: {} };
   const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
   const queries = [];
-  const workProduct = { issue_id: issue.id, scope_revision: 7, kind: 'implementation',
-    repository: 'multica', branch: 'feature/test', pr_number: 872,
-    head_sha: '5627f7973b98c0cf7a43da24f04ce4eb9ac9afe0', consuming_stage: 'CI/CD & Deploy' };
   const client = { async connect() {}, async end() {}, async query(sql, values = []) {
     queries.push({ sql, values });
     if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
@@ -2707,9 +2704,12 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Parked' }] };
     if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Parked', alt_next_stages: [] }] };
     if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Parked' }] };
-    if (sql.includes('UPDATE issue_work_product') && sql.includes('RETURNING issue_id')) {
-      assert.deepEqual(values, [issue.id, 'In Review', 'CI/CD & Deploy']);
-      workProduct.consuming_stage = values[1];
+    if (sql.includes('UPDATE issue_work_product')) {
+      // Parked exits must hand the sole active product back to In Review;
+      // model the canonical row so the fail-closed handoff can commit.
+      assert.equal(values[0], issue.id);
+      assert.equal(values[1], 'In Review');
+      assert.equal(values[2], 'CI/CD & Deploy');
       return { rowCount: 1, rows: [{ issue_id: issue.id }] };
     }
     if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
@@ -2747,7 +2747,9 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
       intended_stage: null, attempts: 0, task_count: 0 } }]);
   assert.deepEqual(persisted.agent_task_queue, []);
   assert.equal(persisted.issue.status, 'Parked');
-  assert.equal(workProduct.consuming_stage, 'In Review');
+  assert.ok(queries.some(({ sql, values }) => sql.includes('UPDATE issue_work_product') &&
+    values[1] === 'In Review' && values[2] === 'CI/CD & Deploy'),
+  'Parked exit did not retarget the active product back to In Review');
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
   // Parking must retire stale work as part of the same locked transition.
   assert.ok(queries.some(({ sql }) => /UPDATE agent_task_queue/i.test(sql) && /cancel|retir/i.test(sql)),
