@@ -87,7 +87,8 @@ function stageEntryWindowSql() {
                      '-infinity'::timestamptz),
                    COALESCE((SELECT GREATEST(
                        NULLIF(metadata->>'parked_release_at', '')::timestamptz,
-                       NULLIF(metadata->>'human_review_release_at', '')::timestamptz)
+                       NULLIF(metadata->>'human_review_release_at', '')::timestamptz,
+                       NULLIF(metadata->>'mechanical_retry_release_at', '')::timestamptz)
                      FROM issue WHERE id = $1::uuid), '-infinity'::timestamptz))`;
 }
 
@@ -132,6 +133,7 @@ function settingsFor(options = {}) {
     defaultMaxAttempts: positive(options.defaultMaxAttempts ?? process.env.RECONCILE_DEFAULT_MAX_ATTEMPTS, 2),
     issueCooldownMinutes: positive(options.issueCooldownMinutes ?? process.env.RECONCILE_ISSUE_COOLDOWN_MINUTES, 30),
     completedStageCooldownMinutes: positive(options.completedStageCooldownMinutes ?? process.env.RECONCILE_COMPLETED_STAGE_COOLDOWN_MINUTES, 720),
+    mechanicalRetryMinutes: positive(options.mechanicalRetryMinutes ?? process.env.RECONCILE_MECHANICAL_RETRY_MINUTES, 720),
     failedTtlMinutes: positive(options.failedTtlMinutes ?? process.env.MULTICA_FAILED_TTL_MINUTES, 15),
     typedOutcomes: options.typedOutcomes ?? process.env.RECONCILE_TYPED_OUTCOMES === "1",
     humanReviewRouting: options.humanReviewRouting ?? process.env.RECONCILE_HUMAN_REVIEW_ROUTING !== "0",
@@ -185,6 +187,25 @@ async function moveToAgentDecision(client, issue, reason, options) {
     [issue.id, issue.status, reason]
   );
   return { action: "agent_decision", reason, status: "Spec" };
+}
+
+async function deferMechanicalRetry(client, issue, reason, minutes) {
+  await client.query(
+    `UPDATE issue
+        SET metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object(
+              'mechanical_retry_after', NOW() + ($2::int * interval '1 minute')),
+            updated_at = NOW()
+      WHERE id = $1::uuid`,
+    [issue.id, minutes]
+  );
+  await client.query(
+    `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
+     VALUES ($1::uuid, $2, $2, 'completed', jsonb_build_object(
+       'reason', $3::text, 'mechanical_retry', true, 'retry_after_minutes', $4::int))`,
+    [issue.id, issue.status, reason, minutes]
+  );
+  console.warn(`[reconcile] mechanical retry deferred issue=${issue.id} stage=${issue.status} reason=${reason} minutes=${minutes}`);
+  return { action: "deferred", reason, retryAfterMinutes: minutes };
 }
 
 // Human Review remains reachable for a genuine human-only decision from every
@@ -352,6 +373,22 @@ async function reconcileIssue(client, issueId, options = {}) {
       await client.query("COMMIT");
       return { action: "skipped" };
     }
+    const mechanicalRetryAfter = issue.metadata?.mechanical_retry_after;
+    if (mechanicalRetryAfter) {
+      const remainingMs = Date.parse(mechanicalRetryAfter) - Date.now();
+      if (Number.isFinite(remainingMs) && remainingMs > 0) {
+        await client.query("COMMIT");
+        return { action: "deferred", reason: "mechanical_retry_wait", retryAfterMinutes: Math.ceil(remainingMs / 60000) };
+      }
+      await client.query(
+        `UPDATE issue
+            SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb) - 'mechanical_retry_after',
+                                    '{mechanical_retry_release_at}', to_jsonb(NOW()), true),
+                updated_at = NOW()
+          WHERE id = $1::uuid`,
+        [issue.id]
+      );
+    }
     const leaf = (await client.query(isLeafSql(), [issue.id])).rows[0];
     if (!leaf || leaf.is_leaf === false) {
       await client.query("COMMIT");
@@ -449,20 +486,17 @@ async function reconcileIssue(client, issueId, options = {}) {
         return routed || { action: "skipped", reason: eligibility.reason };
       }
     }
-    // Lifetime cap is per issue and includes every reconciler-created task,
-    // regardless of terminal status.  Stop the paid loop before selecting an
-    // owner or inserting another task; route the technical decision to Spec.
+    // This cap is per stage-entry window. Stop the paid loop before selecting
+    // an owner, record the exhaustion, and automatically open a fresh window
+    // after a bounded delay. The issue stays on its agent-owned belt stage.
     const lifetime = await client.query(lifetimeTasksSql(), [issue.id, issue.status]);
     const lifetimeCount = Number(lifetime.rows[0]?.count || 0);
     if (lifetimeCount >= options.lifetimeTaskLimit) {
       const capReason = `lifetime_task_limit:${lifetimeCount}/${options.lifetimeTaskLimit}`;
-      const routed = await moveToAgentDecision(client, issue, capReason, options);
-      if (routed) {
-        await client.query("COMMIT");
-        return routed;
-      }
+      const deferred = await deferMechanicalRetry(
+        client, issue, capReason, options.mechanicalRetryMinutes);
       await client.query("COMMIT");
-      return { action: "skipped", reason: "lifetime_task_limit", count: lifetimeCount };
+      return deferred;
     }
     if (issue.status === "CI/CD & Deploy") {
       // The CI/CD worker owns this stage's exit; a desk task here buys nothing.
@@ -639,4 +673,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, moveToAgentDecision, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, moveToAgentDecision, deferMechanicalRetry, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
