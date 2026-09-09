@@ -101,9 +101,9 @@ func TestParkedIssueStatusContractUsesCanonicalRunner(t *testing.T) {
 		t.Fatalf("unrecord migration 312 for live fixture: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO issue (id, workspace_id, title, status, creator_type, creator_id, metadata) VALUES
-			('00000000-0000-0000-0000-000000000104', '00000000-0000-0000-0000-000000000102', 'parked fixture', 'Parked', 'member', '00000000-0000-0000-0000-000000000103', '{"marker":"parked"}'),
-			('00000000-0000-0000-0000-000000000105', '00000000-0000-0000-0000-000000000102', 'rejected fixture', 'Rejected', 'member', '00000000-0000-0000-0000-000000000103', '{"marker":"rejected"}');
+		INSERT INTO issue (id, workspace_id, title, status, creator_type, creator_id, number, metadata) VALUES
+			('00000000-0000-0000-0000-000000000104', '00000000-0000-0000-0000-000000000102', 'parked fixture', 'Parked', 'member', '00000000-0000-0000-0000-000000000103', 1, '{"marker":"parked"}'),
+			('00000000-0000-0000-0000-000000000105', '00000000-0000-0000-0000-000000000102', 'rejected fixture', 'Rejected', 'member', '00000000-0000-0000-0000-000000000103', 2, '{"marker":"rejected"}');
 	`); err != nil {
 		t.Fatalf("seed live twelve-status fixture: %v", err)
 	}
