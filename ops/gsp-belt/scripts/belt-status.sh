@@ -31,11 +31,14 @@ done
 [[ "$burst_threshold" =~ ^[0-9]+$ && "$burst_window" =~ ^[0-9]+$ ]] || { echo "status: invalid restart burst configuration" >&2; exit 2; }
 fail=0
 
-# Optional workspace-scoped completion liveness contract.  The caller supplies
-# a JSON metrics snapshot; absent configuration is explicitly no-opinion.
-if [[ -n "${BELT_COMPLETION_LIVENESS_INPUT:-}" || -n "${BELT_COMPLETION_STALL_WINDOW:-}" ]]; then
-  liveness_input="${BELT_COMPLETION_LIVENESS_INPUT:--}"
-  if ! liveness_result=$(BELT_COMPLETION_LIVENESS_INPUT="$liveness_input" node "$(dirname "$0")/belt-completion-liveness.cjs"); then
+# Workspace-scoped completion liveness. Deployed runs always use the
+# authoritative adapter; BELT_COMPLETION_LIVENESS_INPUT is retained for tests.
+if [[ -n "${BELT_COMPLETION_STALL_WINDOW:-}" ]]; then
+  if [[ -z "${BELT_COMPLETION_LIVENESS_INPUT:-}" ]]; then
+    metrics_cmd="node $(dirname "$0")/belt-completion-metrics.cjs"
+    export BELT_COMPLETION_METRICS_COMMAND="$metrics_cmd"
+  fi
+  if ! liveness_result=$(node "$(dirname "$0")/belt-completion-liveness.cjs"); then
     echo "completion_liveness $liveness_result" >&2
     fail=1
   else
