@@ -130,7 +130,7 @@ fi
 # silently renamed the running daemon, and a daemon-id that disagrees with its
 # token is rejected as "daemon_id does not match token".
 daemon_args=(daemon start --foreground
-  --daemon-id=gsp-codex
+  --daemon-id="${MULTICA_DAEMON_ID:-gsp-multica-worker}"
   --heartbeat-interval="${MULTICA_DAEMON_HEARTBEAT_INTERVAL:-30s}"
   --poll-interval="${MULTICA_DAEMON_POLL_INTERVAL:-2s}"
   --max-concurrent-tasks="$cap_raw")
@@ -154,9 +154,12 @@ for arg in "${daemon_args[@]:2}"; do
   fi
 done
 
-# Profile is supported by the installed daemon but intentionally absent from
-# older help output, so append the production profile after capability checks.
-daemon_args+=(--profile=gsp-codex)
+# --profile is accepted by the installed daemon but is absent from its help, so
+# it is appended after the help-driven check rather than being rejected by it.
+# It is opt-in: without it the daemon uses its own default profile.
+if [[ -n "${MULTICA_DAEMON_PROFILE-}" ]]; then
+  daemon_args+=(--profile="$MULTICA_DAEMON_PROFILE")
+fi
 
 # The Claude scoping driver runs beside the worker and is what scopes tickets.
 # It is supervised by this unit, so it starts here and not from a second unit.
