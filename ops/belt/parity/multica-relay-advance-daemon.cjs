@@ -2416,6 +2416,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       const response = await postRelay({ issue_id: row.issue_id, to_stage: targetStage,
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
         evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
+        ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}),
         ...(route ? { routing_classification: route } : {}) });
       const confirmation = relayAdvanceConfirmation(response, targetStage);
       if (confirmation.ok) {
