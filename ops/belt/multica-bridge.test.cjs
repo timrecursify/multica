@@ -2517,6 +2517,16 @@ test('both daemon accounting paths verify the returned issue stage', () => {
   assert.doesNotMatch(refusalWriter, /issue_stage_outcome/);
 });
 
+test('GSP-2595 documents every outcome writer and the cross-stage repair boundary', () => {
+  const fs = require('node:fs');
+  const trace = fs.readFileSync(require.resolve('./gsp-2595-outcome-writer-trace.md'), 'utf8');
+  assert.match(trace, /stage-outcome\.cjs:87-92/);
+  assert.match(trace, /recordRefusedAdvance/);
+  assert.match(trace, /QC return path/);
+  assert.match(trace, /stage-A row could then cite a stage-B task/);
+  assert.match(trace, /reported 81 rows/);
+});
+
 test('a no-op disposition reports that no issue transition was applied', async () => {
   const calls = [];
   const client = { query: async (sql) => {
