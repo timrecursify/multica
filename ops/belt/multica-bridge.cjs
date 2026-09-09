@@ -2744,6 +2744,23 @@ async function relayAdvance(req, res, body) {
             reason: cycle.reason }));
           return;
         }
+        // Spec is already the bounded re-scoping lane. A stage-cycle cap on a
+        // normal Spec advance can select Spec as its disposition, but that is
+        // a no-op re-entry: do not mutate the issue or spend another task.
+        // Keep the source-task check above so this stop does not weaken the
+        // escalation evidence gate. An authenticated operator bypass remains
+        // available through the existing operatorCapBypass path.
+        if (issue.status === cycle.disposition && !operatorCapBypass) {
+          await client.query("COMMIT");
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({
+            success: true,
+            issue: { id: issue.id, status: issue.status },
+            transition: "retry_escalation_handled",
+            handled: "already_in_spec"
+          }));
+          return;
+        }
         retryEscalation = {
           reason: cycle.reason,
           trigger_stage: issue.status,

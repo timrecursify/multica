@@ -2843,6 +2843,72 @@ test('a same-stage replay records an allowed status and returns a clean no-op', 
   assert.match(inserted[0].sql, /parked_audit->>'reason' = 'same_stage'/);
 });
 
+test('a capped Spec re-entry is handled without mutating or dispatching a no-op', async () => {
+  const issueId = '00000000-0000-4000-8000-0000000024060';
+  const workspaceId = '10000000-0000-4000-8000-000000000001';
+  const sourceTaskId = '20000000-0000-4000-8000-000000000001';
+  const calls = [];
+  const client = {
+    async connect() {},
+    async end() {},
+    async query(sql, values = []) {
+      calls.push({ sql, values });
+      if (/FROM "issue"\s+WHERE id = \$1\s+FOR UPDATE/.test(sql)) {
+        return { rows: [{ id: issueId, status: 'Spec', workspace_id: workspaceId,
+          description: '', parent_issue_id: null, title: 'capped spec re-entry',
+          priority: 'none', metadata: {} }] };
+      }
+      if (/SELECT stage_name FROM relay_stage_config/.test(sql)) {
+        return { rows: [{ stage_name: values[1] }] };
+      }
+      if (/SELECT next_stage, alt_next_stages/.test(sql)) {
+        return { rows: [{ next_stage: 'Queue', alt_next_stages: [] }] };
+      }
+      if (/SELECT next_stage FROM relay_stage_config/.test(sql)) {
+        return { rows: [{ next_stage: 'Queue' }] };
+      }
+      if (/SELECT t\.id FROM agent_task_queue t/.test(sql)) {
+        return { rows: [{ id: sourceTaskId }] };
+      }
+      if (/SELECT count\(\*\)::int AS n FROM agent_task_queue/.test(sql)) {
+        return { rows: [{ n: 2 }] };
+      }
+      if (/FROM relay_stage_agent_pool/.test(sql)) return { rows: [] };
+      if (/FROM relay_stage_config rsc/.test(sql)) {
+        return { rows: [{ agent_id: '30000000-0000-4000-8000-000000000001',
+          agent_name: 'queue-worker', owner_id: '30000000-0000-4000-8000-000000000001',
+          runtime_id: '40000000-0000-4000-8000-000000000001', archived_at: null,
+          instructions: 'Queue', model: 'gpt-5.6-terra', thinking_level: 'low',
+          max_concurrent_tasks: 1, runtime_config: {}, selected_runtime_provider: 'codex',
+          selected_runtime_id: '40000000-0000-4000-8000-000000000001' }] };
+      }
+      if (/pg_advisory_xact_lock/.test(sql)) return { rows: [] };
+      if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql) || /set_config\('multica\.relay_authorized'/.test(sql)) {
+        return { rows: [] };
+      }
+      throw new Error(`unexpected query after capped Spec re-entry: ${sql}`);
+    }
+  };
+  const res = { writeHead(status) { this.status = status; }, end(body) { this.body = body; } };
+  setTestClientFactory(() => client);
+  try {
+    await relayAdvance({ headers: {} }, res, {
+      issue_id: issueId, to_stage: 'Queue', agent_token: 'test-relay-secret'
+    });
+  } finally { setTestClientFactory(null); }
+
+  assert.equal(res.status, 200);
+  assert.deepEqual(JSON.parse(res.body), {
+    success: true,
+    issue: { id: issueId, status: 'Spec' },
+    transition: 'retry_escalation_handled',
+    handled: 'already_in_spec'
+  });
+  assert.equal(calls.some(({ sql }) => /SET status = \$1/.test(sql)), false);
+  assert.equal(calls.some(({ sql }) => /INSERT INTO agent_task_queue/.test(sql)), false);
+  assert.equal(calls.some(({ sql }) => /INSERT INTO activity_log/.test(sql)), false);
+});
+
 // Every status literal written into relay_run_log anywhere in the bridge must
 // be one the production check constraint admits.
 test('every relay_run_log status literal in the bridge is an allowed status', () => {
