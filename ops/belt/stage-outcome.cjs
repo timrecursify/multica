@@ -86,7 +86,9 @@ function outcomeForStageSql() {
 
 function upsertOutcomeSql() {
   return `INSERT INTO issue_stage_outcome (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
-    VALUES ($1::uuid, $2::text, $3::text, $4::text, $5::uuid, $6::text, NOW())
+    SELECT $1::uuid, $2::text, $3::text, $4::text, $5::uuid, $6::text, NOW()
+    WHERE EXISTS (SELECT 1 FROM agent_task_queue t
+      WHERE t.id = $5::uuid AND t.issue_id = $1::uuid AND t.context->>'to_stage' = $2::text)
     ON CONFLICT (issue_id, stage) DO UPDATE SET outcome = EXCLUDED.outcome, blocked_on = EXCLUDED.blocked_on,
       task_id = EXCLUDED.task_id, input_hash = EXCLUDED.input_hash, outcome_at = NOW()`;
 }
