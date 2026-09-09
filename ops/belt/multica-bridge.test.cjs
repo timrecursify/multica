@@ -2696,6 +2696,9 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     status: 'CI/CD & Deploy', description: '', parent_issue_id: null, title: 'park me',
     priority: 'medium', metadata: {} };
   const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
+  const product = { issue_id: issue.id, scope_revision: 7, kind: 'implementation',
+    repository: 'timrecursify/multica', branch: 'fix/handoff', pr_number: 872,
+    head_sha: 'a'.repeat(40), status: 'active', consuming_stage: 'CI/CD & Deploy' };
   const queries = [];
   const client = { async connect() {}, async end() {}, async query(sql, values = []) {
     queries.push({ sql, values });
@@ -2704,6 +2707,13 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Parked' }] };
     if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Parked', alt_next_stages: [] }] };
     if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Parked' }] };
+    if (sql.includes('UPDATE issue_work_product')) {
+      assert.deepEqual(values, [issue.id, 'In Review', 'CI/CD & Deploy']);
+      assert.equal(product.status, 'active');
+      assert.equal(product.consuming_stage, 'CI/CD & Deploy');
+      product.consuming_stage = values[1];
+      return { rowCount: 1, rows: [{ issue_id: product.issue_id }] };
+    }
     if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
       persisted.issue.status = values[0];
       return { rowCount: 1, rows: [{ id: persisted.issue.id, status: persisted.issue.status }] };
@@ -2739,6 +2749,10 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
       intended_stage: null, attempts: 0, task_count: 0 } }]);
   assert.deepEqual(persisted.agent_task_queue, []);
   assert.equal(persisted.issue.status, 'Parked');
+  assert.equal(product.consuming_stage, 'In Review');
+  assert.equal(product.scope_revision, 7);
+  assert.equal(product.pr_number, 872);
+  assert.equal(product.head_sha, 'a'.repeat(40));
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
   // Parking must retire stale work as part of the same locked transition.
   assert.ok(queries.some(({ sql }) => /UPDATE agent_task_queue/i.test(sql) && /cancel|retir/i.test(sql)),
