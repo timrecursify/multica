@@ -102,8 +102,9 @@ function upsertOutcomeSql() {
 // hold, so a recorded stage goes quiet instead of churning.
 function unrecordedCompletionsSql() {
   return `WITH latest AS (
-      SELECT DISTINCT ON (t.issue_id, t.context->>'to_stage')
-             t.id, t.issue_id, t.context->>'to_stage' AS stage,
+      SELECT DISTINCT ON (t.issue_id, t.context->>'from_stage')
+             t.id, t.issue_id, t.context->>'from_stage' AS stage,
+             t.context->>'to_stage' AS to_stage,
              t.result->>'output' AS output, t.created_at,
              CASE WHEN (t.context->>'scope_revision') ~ '^[1-9][0-9]*$'
                THEN (t.context->>'scope_revision')::bigint
@@ -111,12 +112,14 @@ function unrecordedCompletionsSql() {
              END AS scope_revision,
              t.completed_at
       FROM agent_task_queue t
+      JOIN relay_run_log visit ON visit.task_id = t.id
+        AND visit.issue_id = t.issue_id
+        AND visit.from_stage = t.context->>'from_stage'
+        AND visit.to_stage = t.context->>'to_stage'
+        AND visit.from_stage = 'In Progress' AND visit.to_stage = 'In Review'
       WHERE t.status = 'completed' AND t.completed_at > NOW() - ($1::int * interval '1 minute')
         AND t.context->>'to_stage' IS NOT NULL AND t.issue_id IS NOT NULL
-        AND t.completed_at > COALESCE((SELECT max(l.created_at) FROM relay_run_log l
-          WHERE l.issue_id = t.issue_id AND l.to_stage = t.context->>'to_stage'
-            AND l.from_stage <> l.to_stage), '-infinity')
-      ORDER BY t.issue_id, t.context->>'to_stage', t.completed_at DESC)
+      ORDER BY t.issue_id, t.context->>'from_stage', t.completed_at DESC)
     SELECT latest.id, latest.issue_id, latest.stage, latest.output, latest.scope_revision
     FROM latest
     WHERE NOT EXISTS (SELECT 1 FROM issue_stage_outcome o WHERE o.task_id = latest.id)
@@ -156,19 +159,21 @@ function uniqueOutputPullRequest(output) {
   return unique.length === 1 ? unique[0] : null;
 }
 
-async function produceImplementationWorkProduct(client, row, githubCommand) {
-  if (typeof githubCommand !== 'function') return false;
+async function produceImplementationWorkProduct(client, row, githubCommand, logger = console) {
+  const reject = (reason) => { logger.log(`[stage-outcome] producer_rejected task=${row.id} reason=${reason}${reason === 'no_github_command' ? ' (missing review evidence)' : ''}`); return false; };
+  if (typeof githubCommand !== 'function') return reject('no_github_command');
   await client.query("SELECT id FROM issue WHERE id = $1::uuid FOR UPDATE", [row.issue_id]);
   const active = (await client.query(
     `SELECT scope_revision, kind, repository, branch, pr_number
        FROM issue_work_product
       WHERE issue_id = $1::uuid AND status = 'active' FOR UPDATE`, [row.issue_id])).rows;
-  if (active.length > 1 || (active[0] && active[0].kind !== 'implementation')) return false;
+  if (active.length > 1) return reject('conflicting_active_product');
+  if (active[0] && active[0].kind !== 'implementation') return reject('conflicting_active_product_kind');
 
   const outputPr = uniqueOutputPullRequest(row.output);
   if (active[0] && outputPr &&
       (active[0].repository.toLowerCase() !== outputPr.repository.toLowerCase() ||
-       Number(active[0].pr_number) !== outputPr.prNumber)) return false;
+       Number(active[0].pr_number) !== outputPr.prNumber)) return reject('output_active_product_mismatch');
   const selectedRepository = active[0]?.repository || outputPr?.repository || null;
   const selectedPrNumber = active[0]?.pr_number || outputPr?.prNumber || null;
   const linked = (await client.query(
@@ -181,23 +186,23 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
         AND ($2::text IS NULL OR lower(p.repo_owner || '/' || p.repo_name) = lower($2::text))
         AND ($3::int IS NULL OR p.pr_number = $3::int)
       `, [row.issue_id, selectedRepository, selectedPrNumber])).rows;
-  if (linked.length !== 1) return false;
+  if (linked.length !== 1) return reject(linked.length === 0 ? 'missing_linked_pr' : 'ambiguous_linked_pr');
   const candidate = linked[0];
   if (active[0] && (active[0].repository.toLowerCase() !== candidate.repository.toLowerCase() ||
-      Number(active[0].pr_number) !== Number(candidate.pr_number))) return false;
+      Number(active[0].pr_number) !== Number(candidate.pr_number))) return reject('linked_pr_active_product_mismatch');
 
   let view;
   try {
     view = JSON.parse(await githubCommand(['pr', 'view', candidate.html_url, '--json',
       'number,url,headRefName,headRefOid'], { fresh: true }));
-  } catch (_) { return false; }
+  } catch (_) { return reject('github_lookup_failure'); }
   const sha = String(view?.headRefOid || '').toLowerCase();
   const branch = String(view?.headRefName || '');
   if (Number(view?.number) !== Number(candidate.pr_number) ||
       String(view?.url || '').toLowerCase() !== String(candidate.html_url).toLowerCase() ||
       !branch || !/^[0-9a-f]{40}$/.test(sha) ||
       (candidate.branch && candidate.branch !== branch) ||
-      (active[0] && active[0].branch !== branch)) return false;
+      (active[0] && active[0].branch !== branch)) return reject('github_identity_mismatch');
 
   const evidence = JSON.stringify({ source: 'github_api', task_id: row.id,
     pull_request_url: view.url, head_sha: sha });
@@ -209,7 +214,8 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
           AND repository = $4 AND branch = $5 AND pr_number = $6::int
         RETURNING issue_id`, [row.issue_id, sha, evidence, active[0].repository,
         active[0].branch, active[0].pr_number]);
-    return updated.rowCount === 1;
+    if (updated.rowCount !== 1) return reject('database_write_failure');
+    return true;
   }
   const inserted = await client.query(
     `INSERT INTO issue_work_product (issue_id, scope_revision, kind, repository, branch,
@@ -218,7 +224,8 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
       VALUES ($1::uuid, $2::bigint, 'implementation', $3, $4, $5::int, $6,
         $7::jsonb, NULL, 'In Review', '{}'::uuid[], 'active') RETURNING issue_id`,
     [row.issue_id, row.scope_revision, candidate.repository, branch, candidate.pr_number, sha, evidence]);
-  return inserted.rowCount === 1;
+  if (inserted.rowCount !== 1) return reject('database_write_failure');
+  return true;
 }
 
 async function recordOneOutcome(client, row, logger, githubCommand) {
@@ -228,7 +235,7 @@ async function recordOneOutcome(client, row, logger, githubCommand) {
   if (parsed.outcome === "ADVANCED" && row.stage === "In Progress") {
     await client.query('BEGIN');
     try {
-      const productProduced = await produceImplementationWorkProduct(client, row, githubCommand);
+      const productProduced = await produceImplementationWorkProduct(client, row, githubCommand, logger);
       const evidence = (await client.query(
         `SELECT EXISTS (
            SELECT 1 FROM issue_work_product wp
@@ -246,6 +253,7 @@ async function recordOneOutcome(client, row, logger, githubCommand) {
       if (!productProduced || !evidence?.has_review_evidence) {
         parsed.outcome = "FAILED";
         parsed.blockedOn = null;
+        logger.log(`[stage-outcome] missing review evidence task=${row.id}`);
         logger.log(`[stage-outcome] rejected unsupported ADVANCED task=${row.id} stage=${row.stage}: missing review evidence`);
       }
       const result = await persistOutcome(client, row, parsed, logger);
