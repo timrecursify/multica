@@ -64,6 +64,7 @@ test("query builders hold the live status invariant", () => {
   assert.match(stageAttemptsSql(), /parked_release_at/);
   assert.match(stageAttemptsSql(), /human_review_release_at/);
   assert.match(stageAttemptsSql(), /NOT \(status = 'completed' AND failure_reason IS NULL\)/);
+  assert.match(stageAttemptsSql(), /mechanical_retry_release_at/);
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
 });
 
@@ -664,7 +665,7 @@ test("moveToHumanReview asks as the operator the belt acts for", async () => {
   assert.ok(seen.some((s) => /INSERT INTO relay_run_log/.test(s.sql || "")));
 });
 
-test("a technical lifetime cap routes to agent-owned Spec, never Human Review", async () => {
+test("moveToAgentDecision routes technical blockers to Spec, never Human Review", async () => {
   const { evaluate } = require("./transition-policy.cjs");
   const verdict = evaluate({
     from: "Queue", to: "Spec", actor: "system",
@@ -682,6 +683,65 @@ test("a technical lifetime cap routes to agent-owned Spec, never Human Review", 
   assert.equal(seen.some((s) => /UPDATE issue SET status = 'Human Review'/.test(s.sql || "")), false);
   const logged = seen.find((s) => /INSERT INTO relay_run_log/.test(s.sql || ""));
   assert.equal(logged.values[1], "Queue");
+});
+
+test("a capped Spec ticket gets a timed retry and durable audit instead of a silent skip", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) {
+      return { rows: [{ ...issue, status: "Spec", metadata: {} }] };
+    }
+    if (sql.includes("COALESCE(max(attempt)")) return { rows: [{ attempt: 6, max_attempts: 2 }] };
+    if (sql.startsWith("SELECT count(*)::int AS count")) return { rows: [{ count: 6 }] };
+    return original(sql, values);
+  };
+
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "deferred", reason: "lifetime_task_limit:6/6", retryAfterMinutes: 720
+  });
+  assert.ok(db.calls.some(({ sql }) => /mechanical_retry_after/.test(sql || "")),
+    "cap exhaustion must persist its automatic release timer");
+  const audit = db.calls.find(({ sql }) => /INSERT INTO relay_run_log/.test(sql || ""));
+  assert.ok(audit, "cap exhaustion must write a durable relay audit row");
+  assert.equal(audit.values[1], "Spec");
+  assert.equal(db.calls.some(({ sql }) => /status = 'Human Review'/.test(sql || "")), false);
+});
+
+test("a mechanical retry waits on the belt without creating another task", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) {
+      return { rows: [{ ...issue, status: "Spec", metadata: {
+        mechanical_retry_after: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+      } }] };
+    }
+    return original(sql, values);
+  };
+  const result = await reconcileIssue(db, issue.id, { evaluate: ok });
+  assert.equal(result.action, "deferred");
+  assert.equal(result.reason, "mechanical_retry_wait");
+  assert.ok(result.retryAfterMinutes > 0 && result.retryAfterMinutes <= 60);
+  assert.equal(db.calls.some(({ sql }) => /INSERT INTO agent_task_queue/.test(sql || "")), false);
+});
+
+test("an expired mechanical retry opens a fresh stage window automatically", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) {
+      return { rows: [{ ...issue, status: "Spec", metadata: {
+        mechanical_retry_after: "2020-01-01T00:00:00.000Z"
+      } }] };
+    }
+    return original(sql, values);
+  };
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
+    action: "created", taskId: "task-1"
+  });
+  assert.ok(db.calls.some(({ sql }) => /mechanical_retry_release_at/.test(sql || "")),
+    "automatic release must persist the fresh stage-window boundary");
 });
 
 test("a policy rejection leaves the issue skipped rather than erroring the cycle", async () => {
@@ -793,4 +853,5 @@ test("the task budget counts only tasks since the issue entered its stage", asyn
   // against an arrival that predated the release.
   assert.match(sql, /parked_release_at/);
   assert.match(sql, /human_review_release_at/);
+  assert.match(sql, /mechanical_retry_release_at/);
 });
