@@ -127,3 +127,9 @@ Step 5 — verification:
 - Root cause/action: unchanged; no additional edits in this batch.
 - Verified evidence: combined `stage-outcome`, `work-product-contract`, and `reconciler` run passed 60/63 tests. The only three failures explicitly require `DATABASE_URL` for real-PostgreSQL regression tests; this shell did not provide it. All non-database adjacent tests passed, including the new recovery test and the ownership/prose guards.
 - Action taken: ran the adjacent Node suites. No production access or writes.
+
+## Batch 7 — commit and PR publication attempt
+
+- Root cause/action: code and diagnosis are committed locally as `052b4321e` (`fix(belt): recover missing PR links from task output`).
+- Verified evidence: the configured `GH_TOKEN` is rejected by GitHub; the sanctioned `gsp-belt-git-credential token multica` cannot read `/etc/gsp/gh-app/gsp.env` as this user and passwordless sudo is unavailable; the local `belt` App credential file is absent; the stored alternate GitHub login is also rejected for this repository. No credential value was intentionally printed or stored.
+- Action taken: attempted the required push through each available sanctioned credential route. All failed authentication before any remote ref or PR was created. No service restart, deployment, or production mutation occurred.
