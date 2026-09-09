@@ -305,6 +305,8 @@ const STATUS_BAR_BG: Record<IssueStatus, string> = {
   "In Review": "bg-success",
   "Human Review": "bg-success",
   "CI/CD & Deploy": "bg-warning",
+  Parked: "bg-muted-foreground/50",
+  Rejected: "bg-muted-foreground/50",
   Done: "bg-info",
   Archived: "bg-muted-foreground/40",
   Cancelled: "bg-muted-foreground/40",

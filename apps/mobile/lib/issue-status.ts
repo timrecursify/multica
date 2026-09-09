@@ -37,6 +37,8 @@ export const STATUS_LABEL: Record<IssueStatus, string> = {
   "In Review": "In Review",
   "Human Review": "Human Review",
   "CI/CD & Deploy": "CI/CD & Deploy",
+  Parked: "Parked",
+  Rejected: "Rejected",
   Done: "Done",
   Archived: "Archived",
   Cancelled: "Cancelled",
