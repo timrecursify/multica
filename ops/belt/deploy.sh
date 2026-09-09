@@ -500,6 +500,11 @@ for index in "${!sources[@]}"; do
     if [[ "${BELT_DEPLOY_SKIP_OWNERSHIP:-0}" != 1 ]]; then
       chown root:root -- "$target_file"
     fi
+  elif [[ "$target_file" == "$global_bin_root/wp-backfill" ]]; then
+    chmod 0755 -- "$target_file"
+    if [[ "${BELT_DEPLOY_SKIP_OWNERSHIP:-0}" != 1 ]]; then
+      chown root:root -- "$target_file"
+    fi
   elif [[ "$target_file" == "$doctrine_root/"* ]]; then
     chgrp --reference="$doctrine_root" -- "$target_file"
     case "$target_file" in
