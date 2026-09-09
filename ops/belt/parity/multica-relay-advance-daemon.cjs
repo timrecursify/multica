@@ -1507,11 +1507,15 @@ function postToPath(path, payload) {
 function requestRetryEscalation(row, reason, relay = postToRelay) {
   const taskId = row.task_id || row.dead_task_id;
   const triggerStage = row.to_stage || row.stage;
-  // Spec is already the re-scoping lane.  Do not emit a meaningless
-  // Spec -> Spec request that the relay cannot execute; report an explicit
-  // handled result so the failed source row can be closed by the caller.
-  if (triggerStage === 'Spec') {
-    return Promise.resolve({ ok: true, status: 200, handled: 'already_in_spec' });
+  const sameStageQcRedispatch = triggerStage === 'In Review' &&
+    reason === 'qc_verdict_missing_after_task_created';
+  // Spec is already the re-scoping lane. Missing-verdict QC rows are failed
+  // deliberately so the reconciler redispatches them in the same stage;
+  // moving them to Spec is both unnecessary and tenant-dependent because not
+  // every live In Review config admits that edge.
+  if (triggerStage === 'Spec' || sameStageQcRedispatch) {
+    return Promise.resolve({ ok: true, status: 200,
+      handled: triggerStage === 'Spec' ? 'already_in_spec' : 'same_stage_redispatch' });
   }
   return relay({
     issue_id: row.issue_id,
