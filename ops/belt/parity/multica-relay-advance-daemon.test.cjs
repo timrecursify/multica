@@ -199,23 +199,31 @@ test('typed In Review re-advance supplies strict QC pass evidence', async () => 
   assert.deepEqual(payloads[0].evidence, {
     qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: 'qc-task'
   });
+  assert.equal(payloads[0].current_work_product_md5,
+    '76becea4ab970644b7a21220665a1619');
 });
 
-test('typed In Review re-advance preserves ADVANCED when QC evidence is incomplete', async () => {
-  const calls = [];
-  const client = { release() {}, query: async (sql, values) => {
-    calls.push({ sql, values });
-    return sql.includes('FROM issue_stage_outcome')
-      ? { rows: [typedReadvanceQcRow({ qc_verdict: 'FAIL' })] } : { rows: [] };
-  }};
-  let posts = 0;
-  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
-    postRelay: async () => { posts += 1; return { ok: true }; },
-    logger: { log() {} }, typedOutcomes: true });
-  assert.equal(posts, 0);
-  assert.equal(calls.some(({ sql }) => /UPDATE issue_stage_outcome SET blocked_on/.test(sql)), false);
-  assert.equal(calls.some(({ sql }) => sql.includes('typed_readvance_denials')), false);
-});
+for (const [name, overrides] of [
+  ['missing', { qc_verdict: null, qc_verdict_work_product_md5: null }],
+  ['FAIL', { qc_verdict: 'FAIL' }],
+  ['stale', { qc_attempt_work_product_md5: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }]
+]) {
+  test(`typed In Review re-advance preserves ADVANCED when QC evidence is ${name}`, async () => {
+    const calls = [];
+    const client = { release() {}, query: async (sql, values) => {
+      calls.push({ sql, values });
+      return sql.includes('FROM issue_stage_outcome')
+        ? { rows: [typedReadvanceQcRow(overrides)] } : { rows: [] };
+    }};
+    let posts = 0;
+    await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+      postRelay: async () => { posts += 1; return { ok: true }; },
+      logger: { log() {} }, typedOutcomes: true });
+    assert.equal(posts, 0);
+    assert.equal(calls.some(({ sql }) => /UPDATE issue_stage_outcome SET blocked_on/.test(sql)), false);
+    assert.equal(calls.some(({ sql }) => sql.includes('typed_readvance_denials')), false);
+  });
+}
 
 test('no linked PR completion routes directly to Done and never In Review', () => {
   const source = fs.readFileSync(require.resolve('./multica-relay-advance-daemon.cjs'), 'utf8');
