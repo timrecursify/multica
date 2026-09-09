@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -61,7 +62,9 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 		t.Fatalf("seed canonical issue state: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "283_restore_canonical_issue_status_check.up.sql")
+	if err := applyMigrationFileErr(t, ctx, conn.Conn(), "283_restore_canonical_issue_status_check.up.sql"); err == nil {
+		t.Fatal("migration 283 must refuse to rewrite Parked/Rejected")
+	}
 	assertIssueStatusDefault(t, ctx, conn.Conn(), "'Spec'::text")
 	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
 		"00000000-0000-0000-0000-000000000001": "Registered",
@@ -74,8 +77,8 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 		"00000000-0000-0000-0000-000000000008": "Done",
 		"00000000-0000-0000-0000-000000000009": "Archived",
 		"00000000-0000-0000-0000-000000000010": "Cancelled",
-		"00000000-0000-0000-0000-000000000011": "Spec",
-		"00000000-0000-0000-0000-000000000012": "Spec",
+		"00000000-0000-0000-0000-000000000011": "Parked",
+		"00000000-0000-0000-0000-000000000012": "Rejected",
 	})
 
 	if _, err := conn.Exec(ctx, `INSERT INTO issue (id, status) VALUES ('00000000-0000-0000-0000-000000000013', 'in_progress')`); err != nil {
@@ -87,4 +90,12 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 	if _, err := conn.Exec(ctx, `INSERT INTO issue (id, status) VALUES ('00000000-0000-0000-0000-000000000014', 'unknown')`); !isCheckViolation(err) {
 		t.Fatalf("canonical constraint accepted unknown status: %v", err)
 	}
+}
+
+func applyMigrationFileErr(t *testing.T, ctx context.Context, conn interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}, name string) error {
+	t.Helper()
+	_, err := conn.Exec(ctx, readMigrationFile(t, name))
+	return err
 }
