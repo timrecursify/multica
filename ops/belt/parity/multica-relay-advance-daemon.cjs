@@ -2339,14 +2339,9 @@ function relayAdvanceConfirmation(response, targetStage) {
 
 async function recordRefusedAdvance(client, row) {
   await markRelayLogFailedById(client, row.log_id);
-  if (!TYPED_OUTCOMES) return;
-  await client.query(
-    `INSERT INTO issue_stage_outcome
-       (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
-     VALUES ($1::uuid, $2::text, 'FAILED', 'human', $3::uuid, NULL, NOW())
-     ON CONFLICT (issue_id, stage) DO UPDATE SET outcome = 'FAILED', blocked_on = 'human',
-       task_id = EXCLUDED.task_id, input_hash = NULL, outcome_at = NOW()`,
-    [row.issue_id, row.to_stage, row.task_id]);
+  // A relay refusal is transport/policy telemetry, not a worker result.  In
+  // particular, never replace a task's typed ADVANCED/NO_OP outcome with
+  // FAILED/human here; doing so routes ordinary refusals to Human Review.
 }
 
 // Retry recorded successful work without creating another agent task.  A relay
@@ -2364,6 +2359,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
          FROM issue_stage_outcome o
          JOIN issue i ON i.id = o.issue_id AND i.status = o.stage
          JOIN agent_task_queue t ON t.id = o.task_id AND t.status = 'completed'
+          AND t.issue_id = o.issue_id AND t.context->>'to_stage' = o.stage
          LEFT JOIN relay_stage_config rsc
            ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
          ${evidenceSql.joins}
@@ -2430,10 +2426,8 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       // issues whose task did have a run log stopped at exactly three.
       const refused = (response.status >= 400 && response.status < 500) ||
         (response.status === 200 && !confirmation.ok);
-      if (refused || Number(denied.rows[0]?.denials || 0) >= 3) {
-        await client.query(`UPDATE issue_stage_outcome SET outcome = 'FAILED', blocked_on = 'human'
-          WHERE issue_id = $1::uuid AND stage = $2::text`, [row.issue_id, row.to_stage]);
-      }
+      // Keep the typed task outcome authoritative after refusal/retry
+      // exhaustion. The denial count is durable relay telemetry only.
       logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);
     }
     return advanced;
