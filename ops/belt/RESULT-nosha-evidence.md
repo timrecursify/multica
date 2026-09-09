@@ -54,3 +54,9 @@
 - Full daemon suite executed 114 tests: 93 passed, 6 failed, and 15 skipped. The five PostgreSQL-backed failures are caused by the unavailable fixture at `127.0.0.1:15436`; the pre-existing transition-policy matrix failure remains. All four NO-SHA evidence tests passed, so this change added no daemon failure.
 - Full bridge suite matched the stated baseline exactly: 129 tests, 125 passed and only the four pre-existing database-dependent tests failed (comment-reply lifetime cap, two concurrency tests, and operator Human Review release).
 - `ops/belt/multica-bridge.cjs` was not changed.
+
+## Batch 10: branch and pull request update
+
+- Committed the correction as `97e7fad0d` (`fix(belt): preserve builder no-SHA attestations`) and pushed it to the existing `fix/nosha-real-evidence` branch.
+- The branch already had open PR #876 against `main`, so no duplicate pull request was created.
+- No deployment, merge, configuration change, database write, or credential rotation was performed.
