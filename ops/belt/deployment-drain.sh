@@ -48,8 +48,6 @@ deployment_controller_alive() {
 
 deployment_fence_alarm() {
   local stale_invocation="$1" stale_pid="$2" sk="${BELT_DEPLOY_SK:-}" out
-  local alarm_user="${BELT_DEPLOY_ALARM_USER:-newadmin}" runuser_bin="${BELT_DEPLOY_RUNUSER:-/usr/sbin/runuser}"
-  local alarm_home="${BELT_DEPLOY_ALARM_HOME:-/home/$alarm_user}" alarm_path="${BELT_DEPLOY_ALARM_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
   if [[ -z "$sk" ]]; then
     sk="$(command -v sk 2>/dev/null || true)"
     [[ -n "$sk" ]] || sk=/home/newadmin/.local/bin/sk
@@ -59,12 +57,7 @@ deployment_fence_alarm() {
     printf 'CRITICAL: unable to file stale-fence P0: sk executable unavailable (resolved path: %s)\n' "${sk:-none}" >&2
     return 1
   fi
-  if [[ ! -x "$runuser_bin" ]]; then
-    deployment_fence_alarm_status=failed
-    printf 'CRITICAL: unable to file stale-fence P0: unprivileged launcher unavailable (resolved path: %s)\n' "$runuser_bin" >&2
-    return 1
-  fi
-  if out=$("$runuser_bin" -u "$alarm_user" -- env -i HOME="$alarm_home" PATH="$alarm_path" BELT_DEPLOY_ALARM_USER="$alarm_user" "$sk" multica create --board gsp \
+  if out=$("$sk" multica create --board gsp \
     --title 'P0: belt admission fence has a dead controller' \
     --desc - 2>&1 <<EOF
 Automated by ops/belt/deploy.sh on $(hostname) at $(date -Is).
@@ -136,11 +129,18 @@ SQL
 }
 
 deployment_fence_open() {
-  deployment_psql -v invocation="$BELT_DEPLOY_INVOCATION_ID" <<'SQL' >/dev/null
+  local released
+  released="$(deployment_psql -At -v invocation="$BELT_DEPLOY_INVOCATION_ID" <<'SQL'
 UPDATE belt_deployment_control
 SET admission_held = false, released_at = clock_timestamp()
-WHERE singleton AND invocation_id = :'invocation';
+WHERE singleton AND invocation_id = :'invocation'
+RETURNING 1;
 SQL
+  )"
+  if [[ "$released" != "1" ]]; then
+    printf 'Admission fence open skipped: invocation=%s is not the current owner; durable/local hold retained\n' "$BELT_DEPLOY_INVOCATION_ID" >&2
+    return 1
+  fi
   rm -f -- "$BELT_DEPLOY_STATE_ROOT/deployment.hold"
   deployment_fence_closed=0
   printf 'Admission fence opened: invocation=%s\n' "$BELT_DEPLOY_INVOCATION_ID"
@@ -162,13 +162,6 @@ SQL
 # record at all -- it writes only retry counters into issue.metadata -- so no
 # query can observe a merge it has in flight. Draining does not cover that
 # worker. Stop its unit before deploying if that matters.
-#
-# Prepare leases use the same live-work principle. An expired prepare lease is
-# not in-flight work and must not hold a drain open: measured live on
-# 2026-09-08, all 9 prepare leases were expired while dispatched/running work
-# was 0. Compare each lease with its own expiry rather than inventing an age
-# threshold. Keep the status term below: genuinely dispatched/running work
-# must still hold the drain open.
 deployment_drain_snapshot() {
   deployment_psql -At <<'SQL'
 SELECT concat_ws(' ',
