@@ -62,6 +62,8 @@ const cleanSchemaSkipVersion = "286_build_budget_scope_workspace"
 // success would let migration 262 drop the still-valid v1, leaving all four
 // dashboard rollups on a full table scan.
 var preMigrationHooks = map[string]preMigrationHook{
+	"283_restore_canonical_issue_status_check":         refuseDestructiveIssueStatusRewriteHook,
+	"285_reconcile_parked_rejected_statuses":           refuseDestructiveIssueStatusRewriteHook,
 	"103_drop_legacy_daily_rollups":                         runTaskUsageHourlyHook,
 	"198_agent_task_attribution_strict_constraint_validate": runAttributionStrictHook,
 	"257_agent_task_queue_channel_media_pending_unique_v2":  cleanupInvalidConcurrentIndexHook("idx_one_pending_task_per_issue_agent_v2"),
@@ -70,6 +72,30 @@ var preMigrationHooks = map[string]preMigrationHook{
 		"uq_build_budget_scope_workspace",
 		"CREATE UNIQUE INDEX uq_build_budget_scope_workspace ON public.build_budget USING btree (workspace_id, scope, scope_ref)",
 	),
+}
+
+// Historical status migrations rewrite Parked/Rejected to Spec. Refuse to
+// cross that boundary when dispositions already exist; recovery is an
+// audit-backed operation and must not be guessed by the runner.
+func refuseDestructiveIssueStatusRewriteHook(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+	var present bool
+	err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM pg_catalog.pg_class c
+			JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relname = 'issue' AND n.nspname = current_schema()
+		)`).Scan(&present)
+	if err != nil || !present {
+		return false, err
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM issue WHERE status IN ('Parked','Rejected')`).Scan(&count); err != nil {
+		return false, err
+	}
+	if count > 0 {
+		return false, fmt.Errorf("refusing historical status migration: %d issue rows use Parked or Rejected; preserve them through a separately reviewed upgrade", count)
+	}
+	return false, nil
 }
 
 // cleanupInvalidConcurrentIndexHook removes an INVALID index left by an
