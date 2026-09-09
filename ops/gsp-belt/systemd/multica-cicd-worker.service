@@ -1,0 +1,20 @@
+[Unit]
+Description=Multica CI/CD Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gsp-multica
+Group=gsp-multica
+Slice=gsp.slice
+WorkingDirectory=/opt/gsp/multica-workers/multica-cicd-worker
+EnvironmentFile=/etc/gsp/multica/multica-cicd-worker.env
+ExecStart=/usr/bin/node /opt/gsp/multica-workers/multica-cicd-worker/multica-cicd-worker.cjs
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gsp-multica/runtime/receipts
+NoNewPrivileges=yes
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
