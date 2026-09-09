@@ -2696,11 +2696,21 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     status: 'CI/CD & Deploy', description: '', parent_issue_id: null, title: 'park me',
     priority: 'medium', metadata: {} };
   const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
+  const product = { issue_id: issue.id, status: 'active', consuming_stage: 'CI/CD & Deploy',
+    scope_revision: 7, repository: 'timrecursify/multica', branch: 'agent/test', pr_number: 872,
+    head_sha: '5627f7973b98c0cf7a43da24f04ce4eb9ac9afe0' };
   const queries = [];
   const client = { async connect() {}, async end() {}, async query(sql, values = []) {
     queries.push({ sql, values });
     if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
     if (sql.includes('FROM agent_task_queue t') && sql.includes("t.context->>'to_stage' = 'In Review'")) return { rows: [] };
+    if (sql.includes('UPDATE issue_work_product')) {
+      assert.equal(values[0], issue.id);
+      assert.equal(values[1], 'In Review');
+      assert.equal(values[2], 'CI/CD & Deploy');
+      product.consuming_stage = values[1];
+      return { rowCount: 1, rows: [product] };
+    }
     if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Parked' }] };
     if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Parked', alt_next_stages: [] }] };
     if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Parked' }] };
@@ -2739,6 +2749,9 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
       intended_stage: null, attempts: 0, task_count: 0 } }]);
   assert.deepEqual(persisted.agent_task_queue, []);
   assert.equal(persisted.issue.status, 'Parked');
+  assert.equal(product.consuming_stage, 'In Review');
+  assert.ok(queries.some(({ sql, values }) => sql.includes('UPDATE issue_work_product') &&
+    values[2] === 'CI/CD & Deploy' && values[1] === 'In Review'));
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
   // Parking must retire stale work as part of the same locked transition.
   assert.ok(queries.some(({ sql }) => /UPDATE agent_task_queue/i.test(sql) && /cancel|retir/i.test(sql)),
