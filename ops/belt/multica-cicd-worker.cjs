@@ -11,8 +11,9 @@
 //   <root>/<owner>/<repository>/<target>/<source-sha>.json
 // The JSON binds schema_version=1, repository, target, deployment_owner and
 // source_sha to activation.status=activated and health.status=ok evidence.
-// Workflow discovery is never deployment evidence. Changed PR paths select
-// every required target; only exact receipts for all targets can prove deploy.
+// Workflow path filters select every required target. Multica targets require
+// exact receipts; PPP targets require a refs/deploy/<app> marker whose history
+// contains the merge commit. Workflow runs alone are never deployment evidence.
 const fs = require('fs');
 const http = require('http');
 const { execFile } = require('child_process');
@@ -27,11 +28,33 @@ const RECEIPT_ROOT = process.env.MULTICA_RECEIPT_ROOT || '/var/lib/gsp/gsp-multi
 const DOCS_ONLY_PATHS = ['*.md', '**/*.md', 'docs/**', 'apps/docs/**'];
 const DEPLOY_TARGET_RULES = {
   'timrecursify/multica': {
-    default: { target: 'gsp-multica', owner: 'multica-application-deployer' },
-    rules: [{ target: 'gsp-belt', owner: 'ops/belt/deploy.sh', paths: ['ops/belt/**', 'ops/gsp-belt/**'] }]
+    default: { target: 'gsp-multica', owner: 'multica-application-deployer', writer: 'receipt' },
+    rules: [{ target: 'gsp-belt', owner: 'ops/belt/deploy.sh', writer: 'receipt', paths: ['ops/belt/**', 'ops/gsp-belt/**'] }]
   },
-  'timrecursify/sk-cli': { default: { target: 'fleet-sk-cli', owner: 'sk-cli-release' }, rules: [] },
-  'timrecursify/ppp': { default: { target: 'ppp-production', owner: 'ppp-release' }, rules: [] }
+  'timrecursify/sk-cli': {
+    default: { target: 'fleet-sk-cli', owner: 'sk-cli-release', writer: null }, rules: []
+  },
+  // Source: timrecursify/ppp main:.github/workflows/deploy-<app>.yml on.push.paths (2026-09-09).
+  'timrecursify/ppp': { default: null, rules: [
+    { target: 'ambassador-web', owner: 'refs/deploy/ambassador-web', writer: 'deploy_marker', paths: ['apps/ambassador-web/**', 'packages/core/**', 'packages/ds-portal/**', 'bin/ppp-build-artifact', 'bin/ppp-deploy-artifact', 'tools/pack-artifact.sh', '.github/workflows/deploy-ambassador-web.yml'], excludedPaths: ['apps/ambassador-web/**/*.md', 'apps/ambassador-web/docs/**'] },
+    { target: 'auth', owner: 'refs/deploy/auth', writer: 'deploy_marker', paths: ['apps/auth/**', 'packages/core/**', 'bin/ppp-build-artifact', 'bin/ppp-deploy-artifact', 'tools/pack-artifact.sh', '.github/workflows/deploy-auth.yml'], excludedPaths: ['apps/auth/**/*.md', 'apps/auth/docs/**'] },
+    { target: 'billing-admin', owner: 'refs/deploy/billing-admin', writer: 'deploy_marker', paths: ['apps/billing/admin/**', '.github/workflows/deploy-billing-admin.yml'], excludedPaths: ['apps/billing/admin/**/*.md', 'apps/billing/admin/docs/**'] },
+    { target: 'billing-server', owner: 'refs/deploy/billing-server', writer: 'deploy_marker', paths: ['apps/billing/server/**', 'apps/billing/pay-page/**', 'packages/core/**', 'packages/integrations/**', 'packages/pd/**', 'packages/google-ads/**', 'packages/queue-registry/**', 'bin/ppp-pkg-build-cache.sh', 'tools/locked-tsup.sh', '.github/workflows/deploy-billing-server.yml'], excludedPaths: ['apps/billing/server/**/*.md', 'apps/billing/server/docs/**', 'apps/billing/pay-page/**/*.md'] },
+    { target: 'consiglieri-listener', owner: 'refs/deploy/consiglieri-listener', writer: 'deploy_marker', paths: ['apps/consiglieri-listener/**', '.github/workflows/deploy-consiglieri-listener.yml'], excludedPaths: ['apps/consiglieri-listener/**/*.md', 'apps/consiglieri-listener/docs/**'] },
+    { target: 'editor', owner: 'refs/deploy/editor', writer: 'deploy_marker', paths: ['apps/editor/**', 'packages/core/**', 'packages/ds-portal/**', 'bin/ppp-build-artifact', 'bin/ppp-deploy-artifact', 'tools/pack-artifact.sh', '.github/workflows/deploy-editor.yml'], excludedPaths: ['apps/editor/**/*.md', 'apps/editor/docs/**'] },
+    { target: 'editors', owner: 'refs/deploy/editors', writer: 'deploy_marker', paths: ['apps/editors/**', 'packages/core/**', 'packages/ds-portal/**', 'bin/ppp-deploy-editors', 'bin/ppp-pkg-build-cache.sh', 'tools/locked-tsup.sh', '.github/workflows/deploy-editors.yml'], excludedPaths: ['apps/editors/**/*.md', 'apps/editors/docs/**'] },
+    { target: 'embed', owner: 'refs/deploy/embed', writer: 'deploy_marker', paths: ['apps/embed/**', '.github/workflows/deploy-embed.yml'], excludedPaths: ['apps/embed/**/*.md', 'apps/embed/docs/**'] },
+    { target: 'lead-api', owner: 'refs/deploy/lead-api', writer: 'deploy_marker', paths: ['apps/lead-api/**', 'packages/core/**', 'packages/integrations/**', 'packages/legal/**', 'packages/pd/**', 'bin/ppp-pkg-build-cache.sh', 'tools/locked-tsup.sh', '.github/workflows/deploy-lead-api.yml'], excludedPaths: ['apps/lead-api/**/*.md', 'apps/lead-api/docs/**'] },
+    { target: 'mcp-server', owner: 'refs/deploy/mcp-server', writer: 'deploy_marker', paths: ['apps/mcp-server/**', 'packages/core/**', 'packages/integrations/**', 'packages/pd/**', '.github/workflows/deploy-mcp-server.yml'], excludedPaths: ['apps/mcp-server/**/*.md', 'apps/mcp-server/docs/**'] },
+    { target: 'ops', owner: 'refs/deploy/ops', writer: 'deploy_marker', paths: ['apps/ops/**', 'packages/core/**', 'packages/ds-portal/**', 'bin/ppp-build-artifact', 'bin/ppp-deploy-artifact', 'tools/pack-artifact.sh', '.github/workflows/deploy-ops.yml'], excludedPaths: ['apps/ops/**/*.md', 'apps/ops/docs/**'] },
+    { target: 'portal', owner: 'refs/deploy/portal', writer: 'deploy_marker', paths: ['apps/portal/**', 'packages/ds-portal/**', 'bin/ppp-build-artifact', 'bin/ppp-deploy-artifact', 'tools/pack-artifact.sh', '.github/workflows/deploy-portal.yml'], excludedPaths: ['apps/portal/**/*.md', 'apps/portal/docs/**'] },
+    { target: 'portfolio', owner: 'refs/deploy/portfolio', writer: 'deploy_marker', paths: ['apps/portfolio/**', 'bin/ppp-deploy-portfolio', '.github/workflows/deploy-portfolio.yml'], excludedPaths: ['apps/portfolio/**/*.md'] },
+    { target: 'quotes-web', owner: 'refs/deploy/quotes-web', writer: 'deploy_marker', paths: ['apps/quotes-web/**', 'packages/core/**', 'packages/ds-portal/**', 'bin/ppp-build-artifact', 'bin/ppp-deploy-artifact', 'tools/pack-artifact.sh', '.github/workflows/deploy-quotes-web.yml'], excludedPaths: ['apps/quotes-web/**/*.md', 'apps/quotes-web/docs/**'] },
+    { target: 'sentinel', owner: 'refs/deploy/sentinel', writer: 'deploy_marker', paths: ['apps/sentinel/**', 'packages/core/**', 'packages/integrations/**', 'packages/queue-registry/**', 'packages/pd/**', 'bin/ppp-pkg-build-cache.sh', 'tools/locked-tsup.sh', '.github/workflows/deploy-sentinel.yml'], excludedPaths: ['apps/sentinel/**/*.md', 'apps/sentinel/docs/**'] },
+    { target: 'site', owner: 'refs/deploy/site', writer: 'deploy_marker', paths: ['apps/site/**', 'packages/legal/**', 'bin/ppp-deploy-site', '.github/workflows/deploy-site.yml'], excludedPaths: ['apps/site/**/*.md', 'apps/site/docs/**'] },
+    { target: 'status', owner: 'refs/deploy/status', writer: 'deploy_marker', paths: ['apps/status/**', 'bin/ppp-deploy-status', '.github/workflows/deploy-status.yml'], excludedPaths: ['apps/status/**/*.md'] },
+    { target: 'vendor', owner: 'refs/deploy/vendor', writer: 'deploy_marker', paths: ['apps/vendor/**', 'packages/core/**', 'packages/ds-portal/**', 'bin/ppp-build-artifact', 'bin/ppp-deploy-artifact', 'tools/pack-artifact.sh', '.github/workflows/deploy-vendor.yml'], excludedPaths: ['apps/vendor/**/*.md', 'apps/vendor/docs/**'] }
+  ] }
 };
 const DEFAULT_SK_COMMAND = '/opt/gsp/.sk/bin/sk';
 function resolveSkCommand(env = process.env) {
@@ -339,6 +362,25 @@ function inspectReceipt(repo, requirement, sha) {
   }
 }
 
+async function inspectDeployMarker(repo, requirement, sha) {
+  try {
+    const ref = JSON.parse(await gh(['api', `repos/${repo}/git/ref/deploy/${requirement.target}`]));
+    const markerSha = ref?.object?.sha;
+    if (!/^[0-9a-f]{40}$/i.test(markerSha || '')) return { kind: 'invalid', problem: 'marker_sha' };
+    // GitHub compares BASE...HEAD. The deployed marker contains source_sha
+    // only when HEAD (the marker) is ahead of or identical to BASE (source).
+    const comparison = JSON.parse(await gh(['api', `repos/${repo}/compare/${sha}...${markerSha}`]));
+    if (comparison.status !== 'ahead' && comparison.status !== 'identical') {
+      return { kind: 'missing', markerSha, status: comparison.status || 'unknown' };
+    }
+    return { kind: 'valid', evidence: { target: requirement.target, source_sha: sha,
+      marker_ref: requirement.owner, marker_sha: markerSha, comparison_status: comparison.status } };
+  } catch (error) {
+    if (/HTTP 404|not found/i.test(String(error?.message))) return { kind: 'missing' };
+    return { kind: 'unavailable', error: String(error?.message || error).slice(0, 160) };
+  }
+}
+
 function receiptSummary(receipt) {
   if (!receipt || typeof receipt !== 'object') return { present: false };
   return {
@@ -375,12 +417,14 @@ function deploymentRequirements(repo, paths) {
   const requirements = new Map();
   const matchedPaths = new Set();
   for (const rule of config.rules) {
-    if (!paths.some(path => rule.paths.some(pattern => globRegex(pattern).test(path)))) continue;
-    requirements.set(rule.target, { target: rule.target, owner: rule.owner });
-    paths.filter(path => rule.paths.some(pattern => globRegex(pattern).test(path)))
+    const matches = path => rule.paths.some(pattern => globRegex(pattern).test(path))
+      && !(rule.excludedPaths || []).some(pattern => globRegex(pattern).test(path));
+    if (!paths.some(matches)) continue;
+    requirements.set(rule.target, { target: rule.target, owner: rule.owner, writer: rule.writer });
+    paths.filter(matches)
       .forEach(path => matchedPaths.add(path));
   }
-  if (paths.some(path => !matchedPaths.has(path))) requirements.set(config.default.target, config.default);
+  if (config.default && paths.some(path => !matchedPaths.has(path))) requirements.set(config.default.target, config.default);
   return [...requirements.values()].sort((a, b) => a.target.localeCompare(b.target));
 }
 
@@ -572,12 +616,35 @@ async function mergeDeployEvidence(repo, sha, pr = {}) {
     classification: 'docs_only', changed_paths: manifest.paths
   } };
   const requirements = deploymentRequirements(repo, manifest.paths);
-  if (!requirements?.length) return { outcome: 'failed', blocker: {
+  if (!requirements) return { outcome: 'failed', blocker: {
     type: 'deployment_target_unclassified', retry_eligible: false, repository: repo
   } };
+  if (!requirements.length) return { outcome: 'verified_not_applicable', evidence: {
+    kind: 'changed_path_manifest', repository: repo, source_sha: sha,
+    classification: 'no_deploy_target', changed_paths: manifest.paths
+  } };
+  const ownerless = requirements.find(requirement => !requirement.writer);
+  if (ownerless) return { outcome: 'failed', blocker: {
+    type: 'deployment_owner_absent', retry_eligible: false, target: ownerless.target
+  } };
   const receipts = [];
+  const markers = [];
   const missing = [];
   for (const requirement of requirements) {
+    if (requirement.writer === 'deploy_marker') {
+      const result = await inspectDeployMarker(repo, requirement, sha);
+      if (result.kind === 'missing') { missing.push(requirement.target); continue; }
+      if (result.kind === 'unavailable') return { outcome: 'discovery_unavailable', blocker: {
+        type: 'deploy_marker_discovery_unavailable', retry_eligible: true,
+        target: requirement.target, detail: result.error
+      } };
+      if (result.kind === 'invalid') return { outcome: 'failed', blocker: {
+        type: 'deploy_marker_invalid', retry_eligible: false, target: requirement.target,
+        field: result.problem
+      } };
+      markers.push(result.evidence);
+      continue;
+    }
     const result = inspectReceipt(repo, requirement, sha);
     if (result.kind === 'missing') { missing.push(requirement.target); continue; }
     if (result.kind === 'unavailable') return { outcome: 'discovery_unavailable', blocker: {
@@ -590,8 +657,12 @@ async function mergeDeployEvidence(repo, sha, pr = {}) {
     receipts.push(result.receipt);
   }
   if (missing.length) return { outcome: 'pending', blocker: {
-    type: 'activation_receipt_missing', retry_eligible: true, missing_targets: missing
+    type: markers.length || requirements.some(item => item.writer === 'deploy_marker')
+      ? 'deploy_marker_missing' : 'activation_receipt_missing',
+    retry_eligible: true, missing_targets: missing
   } };
+  if (markers.length) return { outcome: 'deployed', evidence: { kind: 'deploy_markers', repository: repo,
+    source_sha: sha, targets: requirements.map(item => item.target), markers } };
   return { outcome: 'deployed', evidence: { kind: 'activation_receipts', repository: repo,
     source_sha: sha, targets: requirements.map(item => item.target), receipts } };
 }
@@ -636,6 +707,12 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
     return { status: 'returned' };
   }
   const deploy = await mergeDeployEvidence(pr.repo, mergedSha, pr);
+  if (deploy.blocker?.type === 'deployment_owner_absent') {
+    const reason = `${note}; deployment_owner_absent target=${deploy.blocker.target} sha=${mergedSha}`;
+    await humanReview(issue, reason);
+    return { status: 'human_review', outcome: 'failed', blocker: deploy.blocker,
+      retryEligible: false, sha: mergedSha };
+  }
   if (deploy.outcome === 'failed') {
     await returnIssueToBuild(issue, `${note}; deployment evidence failed for ${mergedSha} (${deploy.blocker.type})`);
     return { status: 'returned' };
@@ -664,6 +741,7 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
 
 async function closureWatchdog(issue, result, sha) {
   if (!result || result.status !== 'pending') return false;
+  if (result.blocker?.type === 'deployment_owner_absent' || result.retryEligible === false) return false;
   const observation = { sha, outcome: result.outcome || 'closure_pending', error: result.blocker?.type };
   if (result.outcome === 'discovery_auth_failure' || result.outcome === 'discovery_transport_failure') observation.countAttempt = false;
   const row = watchdog.observe(issue.id, observation);

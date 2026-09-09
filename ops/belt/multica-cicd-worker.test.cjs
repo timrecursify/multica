@@ -541,9 +541,11 @@ test('a just-merged sha stays pending inside the deploy trigger grace window', a
   assert.equal(await worker.noDeployRunTriggered('timrecursify/ppp', sha, undefined), false);
 });
 
-test('wrongly named successful workflow refuses Done without a receipt', async () => {
+test('wrongly named successful workflow cannot substitute for a deploy marker', async () => {
   const gh = (args) => {
     const path = args[1] || '';
+    if (path.includes('/git/ref/deploy/billing-server')) return JSON.stringify({ object: { sha: 'c'.repeat(40) } });
+    if (path.includes('/compare/')) return JSON.stringify({ status: 'behind' });
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
     if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{
       id: 41, path: '.github/workflows/release-production.yml', event: 'workflow_dispatch', conclusion: 'success'
@@ -551,15 +553,18 @@ test('wrongly named successful workflow refuses Done without a receipt', async (
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha,
+    { changedPaths: ['apps/billing/server/index.js'] });
   assert.equal(result.outcome, 'pending');
-  assert.equal(result.blocker.type, 'activation_receipt_missing');
+  assert.equal(result.blocker.type, 'deploy_marker_missing');
   worker.setTestDependencies({ log: defaultLog });
 });
 
-test('workflow with zero jobs refuses Done without a receipt', async () => {
+test('workflow with zero jobs cannot substitute for a deploy marker', async () => {
   const gh = (args) => {
     const path = args[1] || '';
+    if (path.includes('/git/ref/deploy/billing-server')) return JSON.stringify({ object: { sha: 'c'.repeat(40) } });
+    if (path.includes('/compare/')) return JSON.stringify({ status: 'behind' });
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
     if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{
       id: 42, path: '.github/workflows/deploy-billing-server.yml', event: 'workflow_dispatch', conclusion: 'cancelled'
@@ -568,13 +573,16 @@ test('workflow with zero jobs refuses Done without a receipt', async () => {
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha,
+    { changedPaths: ['apps/billing/server/index.js'] });
   assert.equal(result.outcome, 'pending');
 });
 
-test('skipped dispatch deploy still refuses Done without a receipt', async () => {
+test('skipped dispatch deploy cannot substitute for a deploy marker', async () => {
   const gh = (args) => {
     const path = args[1] || '';
+    if (path.includes('/git/ref/deploy/billing-server')) return JSON.stringify({ object: { sha: 'c'.repeat(40) } });
+    if (path.includes('/compare/')) return JSON.stringify({ status: 'behind' });
     if (path.includes('/contents/.github/workflows')) return JSON.stringify([{ name: 'deploy-billing-server.yml' }]);
     if (path.includes('/actions/runs?head_sha=')) return JSON.stringify({ workflow_runs: [{
       id: 43, path: '.github/workflows/deploy-billing-server.yml', event: 'workflow_dispatch', conclusion: 'success'
@@ -586,9 +594,75 @@ test('skipped dispatch deploy still refuses Done without a receipt', async () =>
     throw new Error(`unexpected gh ${args.join(' ')}`);
   };
   worker.setTestDependencies({ readReceipt: () => { throw new Error('missing'); }, gh });
-  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha, { changedPaths: ['src/index.js'] });
+  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha,
+    { changedPaths: ['apps/billing/server/index.js'] });
   assert.equal(result.outcome, 'pending');
-  assert.equal(result.blocker.type, 'activation_receipt_missing');
+  assert.equal(result.blocker.type, 'deploy_marker_missing');
+});
+
+test('PPP workflow path selects its per-app deploy marker', () => {
+  assert.deepStrictEqual(worker.deploymentRequirements('timrecursify/ppp', ['apps/lead-api/src/index.ts']), [{
+    target: 'lead-api', owner: 'refs/deploy/lead-api', writer: 'deploy_marker'
+  }]);
+  assert.deepStrictEqual(worker.deploymentRequirements('timrecursify/ppp', ['packages/core/src/index.ts'])
+    .map(item => item.target), [
+    'ambassador-web', 'auth', 'billing-server', 'editor', 'editors', 'lead-api', 'mcp-server',
+    'ops', 'quotes-web', 'sentinel', 'vendor'
+  ]);
+});
+
+test('PPP marker containing the merge SHA is accepted with auditable marker evidence', async () => {
+  const markerSha = 'b'.repeat(40);
+  worker.setTestDependencies({ gh: args => {
+    const path = args[1] || '';
+    if (path.endsWith('/git/ref/deploy/lead-api')) return JSON.stringify({ object: { sha: markerSha } });
+    if (path.endsWith(`/compare/${sha}...${markerSha}`)) return JSON.stringify({ status: 'ahead' });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  } });
+  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha,
+    { changedPaths: ['apps/lead-api/src/index.ts'] });
+  assert.equal(result.outcome, 'deployed');
+  assert.equal(result.evidence.kind, 'deploy_markers');
+  assert.equal(result.evidence.markers[0].marker_sha, markerSha);
+  assert.equal(result.evidence.markers[0].comparison_status, 'ahead');
+});
+
+test('PPP marker not containing the merge SHA is refused', async () => {
+  const markerSha = 'b'.repeat(40);
+  worker.setTestDependencies({ gh: args => {
+    const path = args[1] || '';
+    if (path.endsWith('/git/ref/deploy/lead-api')) return JSON.stringify({ object: { sha: markerSha } });
+    if (path.endsWith(`/compare/${sha}...${markerSha}`)) return JSON.stringify({ status: 'behind' });
+    throw new Error(`unexpected gh ${args.join(' ')}`);
+  } });
+  const result = await worker.mergeDeployEvidence('timrecursify/ppp', sha,
+    { changedPaths: ['apps/lead-api/src/index.ts'] });
+  assert.equal(result.outcome, 'pending');
+  assert.equal(result.blocker.type, 'deploy_marker_missing');
+  assert.deepStrictEqual(result.blocker.missing_targets, ['lead-api']);
+});
+
+test('target without a deployment writer routes once to Human Review', async () => {
+  const calls = dependencies({ receipt: null });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, {
+    ...pr, repo: 'timrecursify/sk-cli', changedPaths: ['cmd/sk/main.go']
+  });
+  assert.equal(result.status, 'human_review');
+  assert.equal(result.retryEligible, false);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1], 'Human Review');
+  assert.match(calls[0][3], /deployment_owner_absent target=fleet-sk-cli/);
+});
+
+test('ownerless deployment blocker is never counted as a watchdog retry', async () => {
+  let observed = false;
+  worker.setTestDependencies({ watchdog: { observe: () => { observed = true; } } });
+  const alerted = await worker.closureWatchdog(issue, {
+    status: 'pending', retryEligible: false,
+    blocker: { type: 'deployment_owner_absent', retry_eligible: false, target: 'fleet-sk-cli' }
+  }, sha);
+  assert.equal(alerted, false);
+  assert.equal(observed, false);
 });
 
 test('GitHub changed-path outage is retryable and refuses Done', async () => {
