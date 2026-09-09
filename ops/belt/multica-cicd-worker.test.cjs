@@ -27,13 +27,13 @@ function greenGh(args) {
   throw new Error(`unexpected gh ${args.join(' ')}`);
 }
 
-function activationReceipt(target = 'gsp-belt', sourceSha = sha) {
+function activationReceipt(target = 'gsp-belt', sourceSha = sha, repository = 'timrecursify/multica') {
   const owners = {
     'gsp-belt': 'ops/belt/deploy.sh',
-    'gsp-multica': 'multica-application-deployer'
+    'gsp-multica': 'multica-application-deployer', 'fleet-sk-cli': 'sk-cli-release'
   };
   return {
-    schema_version: 1, repository: 'timrecursify/multica', target,
+    schema_version: 1, repository, target,
     deployment_owner: owners[target], source_sha: sourceSha,
     activation: { status: 'activated', activated_at: '2026-09-07T14:00:00Z',
       process_sha: sourceSha, release: `/releases/${sourceSha}` },
@@ -47,9 +47,9 @@ function dependencies({ receipt, verdict = pass, gh = greenGh }) {
     pool: { query: async () => ({ rows: verdict ? [verdict] : [] }) },
     relay: async (...args) => calls.push(args), gh,
     readChangedPaths: () => ['ops/belt/multica-cicd-worker.cjs'],
-    readReceipt: (_repo, target) => {
+    readReceipt: (repo, target) => {
       if (!receipt) { const error = new Error('missing'); error.code = 'ENOENT'; throw error; }
-      return activationReceipt(target, receipt.source_sha);
+      return activationReceipt(target, receipt.source_sha, repo);
     }
   });
   return calls;
@@ -664,16 +664,47 @@ test('PPP marker not containing the merge SHA is refused', async () => {
   assert.deepStrictEqual(result.blocker.missing_targets, ['lead-api']);
 });
 
-test('target without a deployment writer routes once to configured Spec', async () => {
+test('sk-cli merge waits for its activation receipt instead of ownerless re-spec', async () => {
   const calls = dependencies({ receipt: null });
   const result = await worker.routeFinishedPR(issue, 'merged', sha, {
     ...pr, repo: 'timrecursify/sk-cli', changedPaths: ['cmd/sk/main.go']
   });
-  assert.equal(result.status, 'respec');
-  assert.equal(result.retryEligible, false);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0][1], 'Spec');
-  assert.match(calls[0][3], /deployment_owner_absent target=fleet-sk-cli/);
+  assert.equal(result.status, 'pending');
+  assert.equal(result.blocker.type, 'activation_receipt_missing');
+  assert.equal(result.retryEligible, true);
+  assert.equal(calls.length, 0);
+});
+
+test('sk-cli merge with a valid receipt reaches Done', async () => {
+  const calls = dependencies({ receipt: { source_sha: sha } });
+  const result = await worker.routeFinishedPR(issue, 'merged', sha,
+    { ...pr, repo: 'timrecursify/sk-cli', changedPaths: ['cmd/sk/main.go'] });
+  assert.equal(result.status, 'done');
+  assert.equal(calls[0][1], 'Done');
+});
+
+test('sk-cli receipt rejects wrong source, owner, target, and failed health', async () => {
+  const valid = activationReceipt('fleet-sk-cli', sha, 'timrecursify/sk-cli');
+  for (const [field, value] of [
+    ['source_sha', 'c'.repeat(40)], ['deployment_owner', 'wrong-owner'],
+    ['target', 'wrong-target'], ['health', { status: 'failed', checked_at: '2026-09-07T14:00:05Z', probe: 'x' }]
+  ]) {
+    const receipt = { ...valid, [field]: value };
+    worker.setTestDependencies({ readReceipt: () => receipt });
+    const result = await worker.mergeDeployEvidence('timrecursify/sk-cli', sha,
+      { changedPaths: ['cmd/sk/main.go'] });
+    assert.equal(result.outcome, 'failed');
+    assert.equal(result.blocker.type, 'activation_receipt_invalid');
+  }
+});
+
+test('sk-cli docs-only merge is verified without a receipt', async () => {
+  worker.setTestDependencies({ readChangedPaths: () => ['README.md'], readReceipt: () => {
+    throw new Error('receipt should not be read');
+  } });
+  const result = await worker.mergeDeployEvidence('timrecursify/sk-cli', sha,
+    { changedPaths: ['README.md'] });
+  assert.equal(result.outcome, 'verified_not_applicable');
 });
 
 test('ownerless deployment blocker is never counted as a watchdog retry', async () => {
