@@ -191,4 +191,57 @@ describe("useIssueStatusBranches", () => {
     );
     queryClient.clear();
   });
+
+  it("requests and aggregates every populated facet status with exact keys", async () => {
+    const issues = [
+      { ...makeIssue("parked"), status: "Parked" as IssueStatus },
+      { ...makeIssue("rejected"), status: "Rejected" as IssueStatus },
+      { ...makeIssue("queue"), status: "Queue" as IssueStatus },
+    ];
+    const listIssueTableRows = vi.fn(async (request: IssueTableRowsRequest) => {
+      const status = request.group_key?.slice("status:".length);
+      const rows = issues.filter((issue) => issue.status === status);
+      return {
+        query_fingerprint: "test",
+        group_key: request.group_key,
+        parent_id: request.parent_id,
+        total: 0,
+        rows: rows.map((issue) => ({ issue, direct_child_count: 0 })),
+        branch_total: rows.length,
+        next_cursor: null,
+      };
+    });
+    setApiInstance({ listIssueTableRows } as unknown as ApiClient);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, staleTime: Infinity } },
+    });
+    const { result } = renderHook(
+      () => useIssueStatusBranches({
+        wsId: "ws-1", query,
+        statuses: ["Parked", "Rejected", "Queue"],
+        facets: {
+          query_fingerprint: "test", total: 3,
+          facets: [{ kind: "status", values: [
+            { key: "Parked", count: 1 },
+            { key: "Rejected", count: 1 },
+            { key: "Queue", count: 1 },
+          ] }],
+        },
+        facetsPending: false, facetsFetching: false, enabled: true,
+      }),
+      { wrapper: wrapper(queryClient) },
+    );
+    await waitFor(() => expect(result.current.issues).toHaveLength(3));
+    expect(result.current.pagination.Parked.total).toBe(1);
+    expect(result.current.pagination.Rejected.total).toBe(1);
+    expect(result.current.pagination.Queue.total).toBe(1);
+    expect(listIssueTableRows).toHaveBeenCalledTimes(3);
+    for (const status of ["Parked", "Rejected", "Queue"]) {
+      expect(listIssueTableRows).toHaveBeenCalledWith(expect.objectContaining({
+        group_key: `status:${status}`,
+        hierarchy: { enabled: false },
+      }));
+    }
+    queryClient.clear();
+  });
 });
