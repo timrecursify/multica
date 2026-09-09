@@ -75,6 +75,19 @@ docs-only. The worker currently declares:
 | `timrecursify/sk-cli` | any non-docs path | `fleet-sk-cli` | `sk-cli-release` |
 | `timrecursify/ppp` | any non-docs path | `ppp-production` | `ppp-release` |
 
+For `timrecursify/sk-cli`, `sk-cli-release` is the producer and this worker is
+the consumer. The producer must not publish a success receipt until the exact
+`source_sha` is installed across the declared `fleet-sk-cli` cohort, the
+installed executable reports that exact SHA, and its existing non-mutating
+health probe succeeds. It then atomically publishes the schema-v1 receipt at
+`${MULTICA_RECEIPT_ROOT}/timrecursify/sk-cli/fleet-sk-cli/${source_sha}.json`.
+The worker may select this target immediately, but must keep the merged issue
+pending until that receipt is readable; the mapping does not assert producer
+availability or permit a fabricated receipt. Failed, partial, mismatched, or
+interrupted activation must publish no success receipt. The owner and consumer
+must coordinate enabling this mapping only after the producer is deployed and
+the receipt root is readable by the worker.
+
 A PR can select multiple rows. Every selected target must provide its own valid
 receipt for the same source SHA. Only changes whose complete manifest consists
 of Markdown files or paths below `docs/` or `apps/docs/` are

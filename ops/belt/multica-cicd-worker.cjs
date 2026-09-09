@@ -32,7 +32,7 @@ const DEPLOY_TARGET_RULES = {
     rules: [{ target: 'gsp-belt', owner: 'ops/belt/deploy.sh', writer: 'receipt', paths: ['ops/belt/**', 'ops/gsp-belt/**'] }]
   },
   'timrecursify/sk-cli': {
-    default: { target: 'fleet-sk-cli', owner: 'sk-cli-release', writer: null }, rules: []
+    default: { target: 'fleet-sk-cli', owner: 'sk-cli-release', writer: 'receipt' }, rules: []
   },
   // Source: timrecursify/ppp main:.github/workflows/deploy-<app>.yml on.push.paths (2026-09-09).
   'timrecursify/ppp': { default: null, rules: [
