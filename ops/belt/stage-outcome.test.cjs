@@ -193,11 +193,13 @@ test("typed line accepts a bare blocked_on token as well as blocked_on=", () => 
   assert.equal(so.parseOutcome("OUTCOME: BLOCKED human decision needed").typed, false);
 });
 
-test("unrecorded completions read only the newest completion per issue and stage", () => {
+test("unrecorded completions use source-stage identity and newest completion per issue", () => {
   const sql = so.unrecordedCompletionsSql();
   // Without this the pass rewrote one row between two sibling completions forever.
-  assert.match(sql, /DISTINCT ON \(t\.issue_id, t\.context->>'to_stage'\)/);
-  assert.match(sql, /ORDER BY t\.issue_id, t\.context->>'to_stage', t\.completed_at DESC/);
+  assert.match(sql, /DISTINCT ON \(t\.issue_id, t\.context->>'from_stage'\)/);
+  assert.match(sql, /l\.from_stage = t\.context->>'from_stage'/);
+  assert.match(sql, /l\.to_stage = t\.context->>'to_stage'/);
+  assert.match(sql, /ORDER BY t\.issue_id, t\.context->>'from_stage', t\.completed_at DESC/);
   assert.match(sql, /WHERE NOT EXISTS \(SELECT 1 FROM issue_stage_outcome o WHERE o\.task_id = latest\.id\)/);
 });
 
