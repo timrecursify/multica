@@ -146,3 +146,15 @@ Step 5 — verification:
 - Root cause status: fixed in commit `65bd155f5`; evidence and constraints are unchanged from Batch 8.
 - Verified evidence: focused tests pass 23/23 and `git diff --check` passes. The prerequisite remains open as PR #870, so GitHub records this follow-on against its head branch.
 - Action taken: pushed `belt/hist-pr-recovery-20260909` and opened PR #871 (`fix(belt): recover historical PR task provenance`). No production mutation, restart, or deploy occurred.
+
+## 2026-09-09 ALPHA-000667
+
+- Scope: diagnosis first; code fix only for a proven defect; no deployment or stage-config changes.
+- Required pre-investigation `sk brain search` was attempted with a 30-second bound and returned no results before timeout. Root `CLAUDE.md` was read; the first two orchestrator inbox checks returned no messages.
+- Production cohort matched `2026-09-08 04:00Z <= created_at < 2026-09-09 04:00Z`. Current mutable statuses show 15 completed and 43 failed In Review rows; the caller observed 45 failed. The 43 current failures classify as 31 QC FAIL verdicts, 3 QC-BLOCKED completions, 3 completed tasks without qualifying evidence, and 6 real worker `agent_error.process_failure` failures.
+- Cohort-following the 345 completed In Progress rows by their next relay record gives: 252 re-enter In Progress, 47 go to Human Review, 21 go to In Review, 3 go to Spec, and 22 have no successor record. No immediate successor goes to Queue. Thus the aggregate 345-versus-60 comparison is not a one-to-one funnel.
+- Proven code/config disagreement: `requestRetryEscalation` always requested `Spec` for a completed In Review task without qualifying PASS (`ops/belt/parity/multica-relay-advance-daemon.cjs:1507-1523`; `relay-dead-rows.cjs:259-274`). Policy permits system In Review->Spec, but live gsp-multica In Review config does not; PPP does. Added a regression first and changed this deliberate failed-row path to remain In Review for reconciler redispatch.
+- Pre-fix regression execution was blocked before discovery because this checkout lacked `node_modules` and could not load `pg`; no behavioral pass/fail is claimed from that attempt.
+- Installed frozen workspace dependencies without changing the lockfile. Added both a direct unit regression and the relay integration expectation. Focused post-fix tests passed 1/1 each; `node --check` and `git diff --check` passed.
+- A broader three-file run executed 154 tests: 113 passed, 26 failed, 15 skipped. Failures include the known transition-policy fixture drift, unavailable PostgreSQL endpoints (`127.0.0.1:15436` and host `test`), and existing harness drift around advance claims; the two focused changed-path tests pass.
+- Wrote verified findings to `sk brain` entry `1788928330-3c4d4b6e`. Rebased onto `origin/main`, pushed the atomic fix, and opened PR #869 (`https://github.com/timrecursify/multica/pull/869`). No deployment or production mutation was performed.
