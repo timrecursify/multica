@@ -116,6 +116,12 @@ selected() {
 # root is shared by the GSP and PPP worker units; all other roots are one-to-one.
 service_units_for_target() {
   local target="$1" relative service_root
+  # The credential helper is a shared executable consumed by the relay and
+  # CI/CD workers, and lives outside the per-service runtime roots.
+  if [[ "$target" == "$global_bin_root/gsp-belt-git-credential" ]]; then
+    printf '%s\n' multica-relay-advance multica-cicd-worker
+    return
+  fi
   if [[ "$target" == "$doctrine_root/"* ]]; then
     printf '%s\n' gsp-multica-worker gsp-multica-worker-ppp
     return
