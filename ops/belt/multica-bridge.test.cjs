@@ -2697,6 +2697,7 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     priority: 'medium', metadata: {} };
   const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
   const queries = [];
+  const workProduct = { issue_id: issue.id, status: 'active', consuming_stage: 'CI/CD & Deploy' };
   const client = { async connect() {}, async end() {}, async query(sql, values = []) {
     queries.push({ sql, values });
     if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
@@ -2704,6 +2705,11 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Parked' }] };
     if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Parked', alt_next_stages: [] }] };
     if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Parked' }] };
+    if (sql.includes('UPDATE issue_work_product')) {
+      assert.deepEqual(values, [issue.id, 'In Review', 'CI/CD & Deploy']);
+      workProduct.consuming_stage = values[1];
+      return { rowCount: 1, rows: [workProduct] };
+    }
     if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
       persisted.issue.status = values[0];
       return { rowCount: 1, rows: [{ id: persisted.issue.id, status: persisted.issue.status }] };
@@ -2739,6 +2745,9 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
       intended_stage: null, attempts: 0, task_count: 0 } }]);
   assert.deepEqual(persisted.agent_task_queue, []);
   assert.equal(persisted.issue.status, 'Parked');
+  assert.equal(workProduct.consuming_stage, 'In Review');
+  assert.ok(queries.some(({ sql }) => sql.includes('UPDATE issue_work_product')),
+    'parking did not hand the active CI/CD product back to In Review');
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
   // Parking must retire stale work as part of the same locked transition.
   assert.ok(queries.some(({ sql }) => /UPDATE agent_task_queue/i.test(sql) && /cancel|retir/i.test(sql)),
