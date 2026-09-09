@@ -2530,8 +2530,9 @@ function requeueCandidateSql() {
   return `WITH stranded AS (
     SELECT i.id AS issue_id, i.status AS stage, i.created_at AS issue_created_at,
            i.metadata, NULL::uuid AS agent_id
-      FROM issue i
+     FROM issue i
      WHERE i.status = ANY($2::text[])
+       AND i.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
   ), budgeted AS (
     SELECT stranded.*,
            (SELECT count(*)::int FROM agent_task_queue stage_history
