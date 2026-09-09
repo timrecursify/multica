@@ -120,7 +120,7 @@ function unrecordedCompletionsSql() {
           WHERE l.issue_id = t.issue_id AND l.to_stage = t.context->>'to_stage'
             AND l.from_stage <> l.to_stage), '-infinity')
       ORDER BY t.issue_id, t.context->>'to_stage', t.completed_at DESC)
-    SELECT latest.id, latest.issue_id, latest.stage, latest.output, latest.scope_revision
+    SELECT latest.id, latest.issue_id, latest.stage, latest.output, latest.work_dir, latest.scope_revision
     FROM latest
     WHERE NOT EXISTS (SELECT 1 FROM issue_stage_outcome o WHERE o.task_id = latest.id)
     ORDER BY latest.completed_at ASC LIMIT 200`;
