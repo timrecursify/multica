@@ -48,6 +48,8 @@ deployment_controller_alive() {
 
 deployment_fence_alarm() {
   local stale_invocation="$1" stale_pid="$2" sk="${BELT_DEPLOY_SK:-}" out
+  local alarm_user="${BELT_DEPLOY_ALARM_USER:-newadmin}" runuser_bin="${BELT_DEPLOY_RUNUSER:-/usr/sbin/runuser}"
+  local alarm_home="${BELT_DEPLOY_ALARM_HOME:-/home/$alarm_user}" alarm_path="${BELT_DEPLOY_ALARM_PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
   if [[ -z "$sk" ]]; then
     sk="$(command -v sk 2>/dev/null || true)"
     [[ -n "$sk" ]] || sk=/home/newadmin/.local/bin/sk
@@ -57,7 +59,12 @@ deployment_fence_alarm() {
     printf 'CRITICAL: unable to file stale-fence P0: sk executable unavailable (resolved path: %s)\n' "${sk:-none}" >&2
     return 1
   fi
-  if out=$("$sk" multica create --board gsp \
+  if [[ ! -x "$runuser_bin" ]]; then
+    deployment_fence_alarm_status=failed
+    printf 'CRITICAL: unable to file stale-fence P0: unprivileged launcher unavailable (resolved path: %s)\n' "$runuser_bin" >&2
+    return 1
+  fi
+  if out=$("$runuser_bin" -u "$alarm_user" -- env -i HOME="$alarm_home" PATH="$alarm_path" BELT_DEPLOY_ALARM_USER="$alarm_user" "$sk" multica create --board gsp \
     --title 'P0: belt admission fence has a dead controller' \
     --desc - 2>&1 <<EOF
 Automated by ops/belt/deploy.sh on $(hostname) at $(date -Is).
