@@ -2381,7 +2381,7 @@ test('both daemon accounting paths verify the returned issue stage', () => {
   assert.match(source, /REFUSED:.*requested=.*actual=.*reason=/s);
   assert.match(source, /response\.status === 200 && !confirmation\.ok/);
   assert.match(source, /recordRefusedAdvance\(client, row\)/);
-  assert.match(source, /SET outcome = 'FAILED', blocked_on = 'human'/);
+  assert.doesNotMatch(source, /recordRefusedAdvance[\s\S]{0,500}INSERT INTO issue_stage_outcome/);
 });
 
 test('a no-op disposition reports that no issue transition was applied', async () => {
