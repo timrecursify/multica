@@ -12,6 +12,7 @@ export type IssueStatus =
   | "In Review"
   | "Human Review"
   | "CI/CD & Deploy"
+  | "Parked"
   | "Done"
   | "Archived"
   | "Cancelled"

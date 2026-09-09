@@ -56,7 +56,7 @@ type IssueStatusContract struct {
 func NewIssueStatusContract(profile IssueStatusProfile) (*IssueStatusContract, error) {
 	canonical := []string{
 		"Registered", "Spec", "Queue", "In Progress", "In Review",
-		"Human Review", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
+		"Human Review", "CI/CD & Deploy", "Parked", "Done", "Archived", "Cancelled",
 	}
 	aliases := map[string]string{
 		"todo":        "Spec",

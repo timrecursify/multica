@@ -173,9 +173,7 @@ GROUP BY GROUPING SETS (%s)`, strings.Join(markerCases, " "), strings.Join(value
 		return nil, 0, false
 	}
 	for identity, response := range responses {
-		sort.Slice(response.Values, func(i, j int) bool {
-			return strings.Compare(response.Values[i].Key, response.Values[j].Key) < 0
-		})
+		h.sortIssueTableFacetValues(&response)
 		responses[identity] = response
 	}
 	return responses, total, true
@@ -283,10 +281,36 @@ GROUP BY a.id`, compiled.where)
 		}
 		response.Values = values
 	}
+	h.sortIssueTableFacetValues(&response)
+	return response, true
+}
+
+// sortIssueTableFacetValues orders one facet's values for display. The status
+// facet follows the canonical lifecycle order from the status contract — the
+// same order the board, filters, groups and sorts already use — so the columns
+// read Registered..Cancelled. Sorting it alphabetically (as this did) put
+// Archived first and Cancelled second, which is not the board's progression.
+// Every other facet keeps the stable alphabetical order.
+func (h *Handler) sortIssueTableFacetValues(response *issueTableFacetResponse) {
+	if response.Kind == "status" && h.IssueStatusContract != nil {
+		sort.Slice(response.Values, func(i, j int) bool {
+			ranki, iKnown := h.IssueStatusContract.Order(response.Values[i].Key)
+			rankj, jKnown := h.IssueStatusContract.Order(response.Values[j].Key)
+			if iKnown != jKnown {
+				// A status outside the contract still has to render somewhere;
+				// park it after the canonical lifecycle rather than dropping it.
+				return iKnown
+			}
+			if iKnown && ranki != rankj {
+				return ranki < rankj
+			}
+			return strings.Compare(response.Values[i].Key, response.Values[j].Key) < 0
+		})
+		return
+	}
 	sort.Slice(response.Values, func(i, j int) bool {
 		return strings.Compare(response.Values[i].Key, response.Values[j].Key) < 0
 	})
-	return response, true
 }
 
 // The working-agents facet keys are agent ids, so it discloses agent identity
