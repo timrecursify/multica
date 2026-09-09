@@ -2174,9 +2174,9 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       ($1, 'CI/CD & Deploy', $2, true, NULL)`, [workspaceId, agentId]);
     await admin.query(`INSERT INTO "${schema}".relay_stage_config (workspace_id, stage_name, next_stage, alt_next_stages) VALUES
       ($1, 'Human Review', 'In Progress', NULL), ($1, 'Done', 'CI/CD & Deploy', NULL),
-      ($1, 'CI/CD & Deploy', 'Done', NULL), ($1, 'In Progress', 'In Review', NULL),
+      ($1, 'CI/CD & Deploy', 'Done', NULL), ($1, 'In Progress', 'In Review', ARRAY['Done']),
       ($1, 'Parked', 'Queue', ARRAY['In Review']), ($1, 'Queue', 'In Progress', NULL),
-      ($1, 'In Review', 'CI/CD & Deploy', NULL)`, [workspaceId]);
+      ($1, 'In Review', 'CI/CD & Deploy', ARRAY['Done'])`, [workspaceId]);
 
     await t.test('releases at the cycle limit, enqueues work, persists metadata, and logs', async () => {
       const issueId = '44444444-4444-4444-4444-444444444444';
@@ -2240,6 +2240,43 @@ test('operator Human Review release is authenticated, bounded, and auditable', a
       assert.equal(log.rows[0].parked_audit.cicd_worker.reason, 'no PR referenced');
       assert.deepEqual(log.rows[0].parked_audit.cicd_worker, audit.cicd_worker);
       assert.equal(log.rows[0].parked_audit.trigger, 'relay_advance');
+    });
+    await t.test('admits verified no-PR completion without a QC verdict', async () => {
+      const issueId = '4a4a4a4a-4a4a-4a4a-8a4a-4a4a4a4a4a4a';
+      await insertIssue(issueId, 'In Progress');
+      const res = await invoke({ issue_id: issueId, to_stage: 'Done', evidence: {
+        noDeployRoute: 'no_pr', workProductEvidence: 'OUTCOME: COMPLETE\nNO-SHA: operational change only'
+      } });
+      assert.equal(res.status, 200);
+      assert.equal((await admin.query(`SELECT status FROM "${schema}".issue WHERE id = $1`,
+        [issueId])).rows[0].status, 'Done');
+      assert.equal((await admin.query(`SELECT count(*)::int AS n FROM "${schema}".qc_verdict
+        WHERE issue_id = $1`, [issueId])).rows[0].n, 0);
+    });
+    await t.test('rejects In Progress completion without the no-PR route marker', async () => {
+      const issueId = '4b4b4b4b-4b4b-4b4b-8b4b-4b4b4b4b4b4b';
+      await insertIssue(issueId, 'In Progress');
+      const res = await invoke({ issue_id: issueId, to_stage: 'Done', evidence: {
+        noDeployRoute: 'runtime', workProductEvidence: 'NO-SHA: operational change only'
+      } });
+      assert.equal(res.status, 409);
+      assert.equal(JSON.parse(res.body).error, 'no_deploy_route_evidence_required');
+    });
+    await t.test('rejects no-PR completion without NO-SHA evidence', async () => {
+      const issueId = '4c4c4c4c-4c4c-4c4c-8c4c-4c4c4c4c4c4c';
+      await insertIssue(issueId, 'In Progress');
+      const res = await invoke({ issue_id: issueId, to_stage: 'Done', evidence: {
+        noDeployRoute: 'no_pr', workProductEvidence: 'OUTCOME: COMPLETE'
+      } });
+      assert.equal(res.status, 409);
+      assert.equal(JSON.parse(res.body).error, 'no_deploy_route_evidence_required');
+    });
+    await t.test('keeps In Review completion gated on a PASS verdict', async () => {
+      const issueId = '4d4d4d4d-4d4d-4d4d-8d4d-4d4d4d4d4d4d';
+      await insertIssue(issueId, 'In Review');
+      const res = await invoke({ issue_id: issueId, to_stage: 'Done' });
+      assert.equal(res.status, 409);
+      assert.equal(JSON.parse(res.body).error, 'no_pass_verdict');
     });
     await t.test('rejects a missing operator header without a task', async () => {
       const issueId = '56555555-5555-5555-5555-555555555555'; await insertIssue(issueId);
