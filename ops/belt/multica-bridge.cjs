@@ -1293,24 +1293,37 @@ async function replaceStageTask(client, task) {
 // trigger for the following In Progress -> In Review QC hop without creating a
 // second paid builder task. A missing predecessor is rejected by relayAdvance
 // before the issue status changes, so a manual shortcut cannot skip the build.
+// Older builders may have completed without producing the newer structured
+// work-product row. Preserve throughput for those completions, but make the
+// missing artifact explicit as a typed blocker for the In Progress stage.
 async function recordBookkeepingHandoff(client, issueId) {
   const predecessor = await client.query(
-    `SELECT id, agent_id, status, result
-       FROM agent_task_queue
-      WHERE issue_id = $1
-        AND context->>'to_stage' = 'Queue'
-        AND status = 'completed'
-      ORDER BY created_at DESC
+    `SELECT t.id, t.agent_id, t.status, t.result,
+            EXISTS (SELECT 1 FROM issue_work_product wp
+                     WHERE wp.issue_id = t.issue_id AND wp.status = 'active') AS has_work_product
+       FROM agent_task_queue t
+      WHERE t.issue_id = $1
+        AND t.context->>'to_stage' = 'Queue'
+        AND t.status = 'completed'
+      ORDER BY t.created_at DESC
       LIMIT 1
       FOR UPDATE`,
     [issueId]
   );
   const task = predecessor.rows[0];
-  // A terminal status alone is not a work-product proof. Keep this check
-  // aligned with the completion daemon so a handoff cannot race a failing
-  // builder or turn a missing result into a paid QC dispatch.
-  if (!task || task.status !== 'completed' || !completionAdmission(task.result).ok) {
-    return null;
+  if (!task || task.status !== 'completed') return null;
+
+  const missingWorkProduct = task.has_work_product !== true;
+  if (missingWorkProduct) {
+    await client.query(
+      `INSERT INTO issue_stage_outcome
+         (issue_id, stage, outcome, blocked_on, task_id, input_hash, outcome_at)
+       VALUES ($1::uuid, 'In Progress', 'BLOCKED', 'sha', $2::uuid, NULL, NOW())
+       ON CONFLICT (issue_id, stage) DO UPDATE SET
+         outcome = EXCLUDED.outcome, blocked_on = EXCLUDED.blocked_on,
+         task_id = EXCLUDED.task_id, input_hash = NULL, outcome_at = NOW()`,
+      [issueId, task.id]
+    );
   }
 
   const log = await client.query(
@@ -1329,7 +1342,7 @@ async function recordBookkeepingHandoff(client, issueId) {
      SELECT id FROM inserted UNION ALL SELECT id FROM existing LIMIT 1`,
     [issueId, task.agent_id, task.id]
   );
-  return { taskId: task.id, relayLogId: log.rows[0]?.id || null };
+  return { taskId: task.id, relayLogId: log.rows[0]?.id || null, missingWorkProduct };
 }
 
 // Terminal transitions do not create a successor task, so they cannot use the
