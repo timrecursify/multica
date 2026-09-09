@@ -8,6 +8,22 @@ const SHA_RE = /^[a-f0-9]{40}$/i;
 const MD5_RE = /^[a-f0-9]{32}$/i;
 const FAILURE_CLASSES = new Set(["none", "implementation", "evidence", "tool", "access"]);
 
+// A FAIL must name a defect somebody can act on. Observed on gsp 2026-09-07:
+// every FAIL carried failure_class "implementation" with no reason at all, so
+// no one could tell a real rejection from a hollow one. RUNBOOK_QC_WORKER.md
+// already requires a rework summary; this makes the contract enforceable.
+const GENERIC_REWORK = /^(?:implementation(?:\s+is)?\s+(?:incomplete|failed|wrong)|does\s+not\s+meet\s+acceptance|acceptance\s+not\s+met|see\s+(?:comment|above)|failed\s+qc|n\/?a|none|unknown)\.?$/i;
+const MIN_REWORK_SUMMARY = 12;
+
+function reworkSummaryProblem(evidence) {
+  const summary = typeof evidence.rework_summary === "string" ? evidence.rework_summary.trim() : "";
+  if (!summary) return "rework_summary_required";
+  if (summary.length < MIN_REWORK_SUMMARY || GENERIC_REWORK.test(summary)) {
+    return "rework_summary_not_specific";
+  }
+  return null;
+}
+
 function readTaskEvidence(task) {
   const output = task?.result?.output;
   if (typeof output !== "string") return { ok: false, reason: "qc_task_evidence_required" };
@@ -31,6 +47,12 @@ function validateEvidence(evidence) {
   if (evidence.bound_sha.toLowerCase() !== evidence.observed_sha.toLowerCase()) return "sha_binding_mismatch";
   if (!FAILURE_CLASSES.has(evidence.failure_class)) return "invalid_failure_class";
   if (typeof evidence.qualifying !== "boolean") return "invalid_qualifying";
+  if (evidence.verdict === "FAIL") {
+    // qualifying true is reserved for a PASS (RUNBOOK_QC_WORKER.md).
+    if (evidence.qualifying === true) return "fail_must_not_qualify";
+    const problem = reworkSummaryProblem(evidence);
+    if (problem) return problem;
+  }
   return null;
 }
 
@@ -117,5 +139,5 @@ function validateQcVerdict(input) {
     ? validateExternalVerdict(input) : validateInternalVerdict(input || {});
 }
 
-module.exports = { FAILURE_CLASSES, readTaskEvidence, validateEvidence, taskLane, internalBinding,
+module.exports = { FAILURE_CLASSES, GENERIC_REWORK, reworkSummaryProblem, readTaskEvidence, validateEvidence, taskLane, internalBinding,
   validateInternalVerdict, validateLiveVerdict, validateExternalVerdict, validateQcVerdict };
