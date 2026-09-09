@@ -482,6 +482,13 @@ async function reconcileIssue(client, issueId, options = {}) {
         // Only an explicit human blocker uses Human Review; machine-observable
         // technical blockers return to the agent-owned Spec stage.
         const routed = await routeTerminalBlocker(client, issue, eligibility.prior, options);
+        if (!routed && eligibility.reason === "attempt_budget_exhausted") {
+          const capReason = `${eligibility.reason}:${attempt}/${maxAttempts}`;
+          const deferred = await deferMechanicalRetry(
+            client, issue, capReason, options.mechanicalRetryMinutes);
+          await client.query("COMMIT");
+          return deferred;
+        }
         await client.query("COMMIT");
         return routed || { action: "skipped", reason: eligibility.reason };
       }
