@@ -131,7 +131,7 @@ test('work product handoff advances to CI/CD without creating a second active ro
     status: 'active', consuming_stage: 'In Review' }];
   const client = { async query(sql, values) {
     if (sql.includes('UPDATE issue_work_product')) {
-      const matching = products.filter((row) => row.issue_id === values[0] && row.status === 'active');
+      const matching = products.filter((row) => row.issue_id === values[0] && row.status === 'active' && row.consuming_stage === values[2]);
       for (const row of matching) row.consuming_stage = values[1];
       return { rowCount: matching.length, rows: matching };
     }
@@ -168,7 +168,7 @@ for (const destination of ['In Progress', 'Spec', 'Parked']) {
   });
 }
 
-test('work product handoff rejects when there is no active row', async () => {
+test('work product handoff fails closed when there is no matching active row', async () => {
   const calls = [];
   const client = { async query(sql, values) {
     calls.push({ sql, values });
@@ -179,33 +179,6 @@ test('work product handoff rejects when there is no active row', async () => {
   await assert.rejects(handoffActiveWorkProduct(client, issueId, 'In Review', 'CI/CD & Deploy'), /active_products=0/);
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].values, [issueId, 'CI/CD & Deploy', 'In Review']);
-});
-
-test('work product handoff rejects multiple active rows', async () => {
-  const client = { async query() {
-    return { rowCount: 2, rows: [{}, {}] };
-  } };
-
-  await assert.rejects(
-    handoffActiveWorkProduct(client, '123e4567-e89b-42d3-a456-426614174000',
-      'In Review', 'CI/CD & Deploy'),
-    /work product handoff requires exactly one active row: .*active_products=2/
-  );
-});
-
-test('work product handoff is a no-op when there is no active row', async () => {
-  const calls = [];
-  const client = { async query(sql, values) {
-    calls.push({ sql, values });
-    return { rowCount: 0, rows: [] };
-  } };
-  const issueId = '123e4567-e89b-42d3-a456-426614174000';
-
-  await handoffActiveWorkProduct(client, issueId, 'In Review', 'CI/CD & Deploy');
-  await handoffActiveWorkProduct(client, issueId, 'CI/CD & Deploy', 'In Progress');
-
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls.map(({ values }) => values[1]), ['CI/CD & Deploy', 'In Review']);
 });
 
 test('work product handoff rejects multiple active rows', async () => {

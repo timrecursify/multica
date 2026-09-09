@@ -934,14 +934,14 @@ async function handoffActiveWorkProduct(client, issueId, fromStage, toStage) {
     return;
   }
   const handedOff = await client.query(
-    `UPDATE issue_work_product
+      `UPDATE issue_work_product
         SET consuming_stage = $2::text, updated_at = NOW()
       WHERE issue_id = $1::uuid AND status = 'active'
         AND consuming_stage = $3::text
       RETURNING issue_id`,
     [issueId, consumingStage, fromStage]
   );
-  if (handedOff.rowCount > 1) {
+  if (handedOff.rowCount !== 1) {
     throw new Error(`work product handoff requires exactly one active row: ` +
       `issue=${issueId} active_products=${handedOff.rowCount}`);
   }
