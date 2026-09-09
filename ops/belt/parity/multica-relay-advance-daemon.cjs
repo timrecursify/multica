@@ -1499,7 +1499,7 @@ function postToRelay(payload) {
           const parsed = JSON.parse(data);
           resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
             status: res.statusCode, error: parsed.error, reason: parsed.reason,
-            issue: parsed.issue, disposition: parsed.disposition, body: data });
+            issue: parsed.issue, disposition: parsed.disposition, handled: parsed.handled, body: data });
         } catch { resolve({ ok: res.statusCode === 200, deferred: res.statusCode === 202,
           status: res.statusCode, body: data }); }
       });
@@ -2390,9 +2390,47 @@ function relayAdvanceConfirmation(response, targetStage) {
   let parsed = {};
   try { parsed = JSON.parse(response?.body || '{}') || {}; } catch (_) { parsed = {}; }
   const actualStage = response?.issue?.status || parsed.issue?.status || null;
+  const handled = response?.handled || parsed.handled;
+  if (handled) return { ok: false, reason: `relay_handled:${handled}`, actualStage };
   if (response?.ok && actualStage === targetStage) return { ok: true, actualStage };
   return { ok: false, reason: response?.reason || parsed.reason || response?.error ||
     parsed.error || (response?.ok ? 'relay_stage_mismatch' : 'relay_request_failed'), actualStage };
+}
+
+const TERMINAL_DENIAL_PATTERNS = [
+  /evidence.*required/i, /invalid transition/i, /parked.*(?:hold|release|required)/i,
+  /no pass verdict/i, /work.product.*mismatch/i, /deploy.route.*required/i
+];
+
+function denialRetryPolicy(response, detail, attempts) {
+  const normalized = detail.replace(/[_-]+/g, ' ');
+  const handled = response.ok && typeof response.handled === 'string' && response.handled.length > 0;
+  const terminal = handled ||
+    (response.status === 409 && TERMINAL_DENIAL_PATTERNS.some((rule) => rule.test(normalized)));
+  if (terminal) return { terminal: true, retryAt: null };
+  const delayMs = Math.min(6 * 60 * 60 * 1000, 5 * 60 * 1000 * (2 ** Math.min(attempts, 6)));
+  return { terminal: false, retryAt: new Date(Date.now() + delayMs).toISOString() };
+}
+
+async function persistReadvanceDenial(client, row, response, detail) {
+  const attempts = row.denial_input_hash === row.relevant_input_hash
+    ? Number(row.denial_attempts || 0) + 1 : 1;
+  const policy = denialRetryPolicy(response, detail, attempts - 1);
+  await client.query(
+    `UPDATE issue_stage_outcome SET denial_reason = $3, denial_input_hash = $4,
+       denial_attempts = $5, denial_next_retry_at = $6::timestamptz, denial_terminal = $7
+      WHERE issue_id = $1::uuid AND stage = $2`,
+    [row.issue_id, row.to_stage, detail, row.relevant_input_hash, attempts,
+      policy.retryAt, policy.terminal]);
+  await client.query(
+    `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
+       jsonb_build_object('typed_readvance_denials', $2::int, 'typed_readvance_error', $3::text,
+         'denial_reason', $4::text, 'denial_input_hash', $5::text,
+         'denial_next_retry_at', $6::text, 'denial_terminal', $7::boolean)
+      WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)`,
+    [row.task_id, attempts, `status=${response.status}; error=${detail}`, detail,
+      row.relevant_input_hash, policy.retryAt, policy.terminal]);
+  return policy;
 }
 
 async function recordRefusedAdvance(client, row) {
@@ -2411,7 +2449,9 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
     const evidenceSql = completedTaskEvidenceSql({ taskAlias: 't', issueAlias: 'i', modelParam: 1, effortParam: 2 });
     const result = await client.query(
       `SELECT o.issue_id, o.stage AS to_stage, o.outcome, o.task_id,
-              ${evidenceSql.columns}, rsc.next_stage
+              ${evidenceSql.columns}, rsc.next_stage,
+              fingerprint.relevant_input_hash,
+              o.denial_input_hash, o.denial_attempts
          FROM issue_stage_outcome o
          JOIN issue i ON i.id = o.issue_id AND i.status = o.stage
          JOIN agent_task_queue t ON t.id = o.task_id AND t.status = 'completed'
@@ -2419,7 +2459,26 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
          LEFT JOIN relay_stage_config rsc
            ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
          ${evidenceSql.joins}
+         CROSS JOIN LATERAL (SELECT md5(concat_ws('|', i.status, o.outcome, o.task_id::text,
+           COALESCE(t.result::text, ''), COALESCE(t.error, ''), COALESCE(rsc.next_stage, ''),
+           COALESCE(attempt.verdict, ''), COALESCE(attempt.work_product_md5, ''),
+           COALESCE(attempt.bound_sha, ''), COALESCE(attempt.observed_head, ''),
+           COALESCE(attempt.qualifying::text, ''), COALESCE(attempt.evidence_task_id::text, ''),
+           COALESCE(attempt.evidence_task_status, ''), COALESCE(evidence.tasks::text, ''),
+           COALESCE((SELECT max(updated_at)::text FROM issue_work_product
+             WHERE issue_id = i.id), ''),
+           COALESCE((SELECT string_agg(concat_ws(':', p.id::text, p.updated_at::text,
+               p.html_url), ',' ORDER BY p.id)
+             FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
+             WHERE ipr.issue_id = i.id), ''),
+           COALESCE((SELECT string_agg(concat_ws(':', created_at::text, content), ','
+               ORDER BY created_at DESC) FROM (SELECT created_at, content FROM comment
+               WHERE issue_id = i.id ORDER BY created_at DESC LIMIT 40) recent_comments), ''),
+           COALESCE((SELECT concat_ws(':', seq::text, content) FROM task_message
+             WHERE task_id = o.task_id ORDER BY seq DESC LIMIT 1), ''))) AS relevant_input_hash) fingerprint
         WHERE o.outcome IN ('ADVANCED', 'NO_OP') AND o.blocked_on IS DISTINCT FROM 'human'
+          AND (o.denial_input_hash IS DISTINCT FROM fingerprint.relevant_input_hash
+            OR (o.denial_terminal = false AND o.denial_next_retry_at <= NOW()))
         ORDER BY o.outcome_at ASC LIMIT 100`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
     const advanced = [];
     for (const row of result.rows) {
@@ -2459,13 +2518,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         continue;
       }
       const error = `status=${response.status}; error=${relayDenialDetail(response)}`;
-      await client.query(
-        `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
-             jsonb_build_object('typed_readvance_denials',
-               COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) + 1,
-               'typed_readvance_error', $2::text)
-          WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)
-        RETURNING COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) AS denials`, [row.task_id, error]);
+      await persistReadvanceDenial(client, row, response, relayDenialDetail(response));
       // Keep refusal diagnostics on relay_run_log. The typed task outcome stays
       // authoritative even for a policy 4xx, a mismatched 200, or repeated 5xx.
       logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);

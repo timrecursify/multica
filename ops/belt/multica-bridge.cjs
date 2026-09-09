@@ -1196,6 +1196,9 @@ async function authorizeCicdReturnCapBypass(client, issueId, capBypass) {
 }
 
 async function replaceStageTask(client, task) {
+  if (task.fromStage === task.toStage) {
+    throw new Error(`same-stage relay transition cannot enqueue a task: ${task.fromStage}`);
+  }
   // The issue row lock normally serializes relayAdvance callers. Keep the
   // enqueue primitive safe for recovery/replay callers too: the predicate and
   // insert must share a stage-specific transaction lock or simultaneous

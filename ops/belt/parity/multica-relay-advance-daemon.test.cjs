@@ -31,6 +31,32 @@ test('missing In Review verdict stays in stage for reconciler redispatch', async
   assert.deepEqual(result, { ok: true, status: 200, handled: 'same_stage_redispatch' });
 });
 
+test('HTTP 200 handled response is consumed without repeated readvance', async () => {
+  let suppressed = false;
+  let terminal = false;
+  let posts = 0;
+  const client = { release() {}, query: async (sql, values) => {
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: suppressed ? [] : [{
+      issue_id: 'issue-1', to_stage: 'Spec', outcome: 'NO_OP', task_id: 'task-1',
+      task_result: { output: 'OUTCOME: NO_OP' }, next_stage: 'Queue',
+      relevant_input_hash: 'hash-1', denial_attempts: 0
+    }] };
+    if (sql.startsWith('UPDATE issue_stage_outcome SET denial_reason')) {
+      suppressed = true;
+      terminal = values[6];
+    }
+    return { rows: [] };
+  }};
+  const options = { dbPool: { connect: async () => client }, typedOutcomes: true,
+    logger: { log() {} }, postRelay: async () => { posts += 1; return {
+      ok: true, status: 200, handled: 'already_in_spec', issue: { status: 'Spec' }
+    }; } };
+  await readvanceRecordedOutcomes(options);
+  await readvanceRecordedOutcomes(options);
+  assert.equal(posts, 1);
+  assert.equal(terminal, true);
+});
+
 test('completion evidence satisfies every automatic transition policy row', () => {
   const row = { task_id: 'task-1', task_result: { output: 'completed' }, issue_title: 'normal change' };
   const cases = [
@@ -1677,8 +1703,74 @@ test('a 409 relay refusal preserves the task-declared ADVANCED outcome', async (
       body: '{"error":"parked_release_required","message":"a completed Sol-low diagnosis must authorize one deliberate release"}' }; },
     logger: { log: (line) => logs.push(line) }, typedOutcomes: true });
   assert.equal(posts, 1);
-  assert.equal(calls.some(({ sql }) => /issue_stage_outcome SET|INSERT INTO issue_stage_outcome/.test(sql)), false);
+  assert.equal(calls.some(({ sql }) => /SET denial_reason/.test(sql)), true);
   assert.match(logs.join('\n'), /a completed Sol-low diagnosis must authorize one deliberate release/);
+});
+
+test('deterministic 409 denial persists terminal input-hash suppression', async () => {
+  const calls = [];
+  const client = { release() {}, query: async (sql, values) => {
+    calls.push({ sql, values });
+    if (sql.includes('FROM issue_stage_outcome')) return { rows: [{ issue_id: 'issue-1',
+      to_stage: 'Queue', outcome: 'ADVANCED', task_id: 'task-1', task_result: {},
+      next_stage: 'In Progress', relevant_input_hash: 'hash-1', denial_attempts: 0 }] };
+    return { rows: [] };
+  }};
+  await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
+    postRelay: async () => ({ ok: false, status: 409,
+      error: 'implementation evidence required' }), logger: { log() {} }, typedOutcomes: true });
+  const update = calls.find(({ sql }) => sql.includes("'denial_input_hash'"));
+  const outcomeUpdate = calls.find(({ sql }) => sql.startsWith('UPDATE issue_stage_outcome SET denial_reason'));
+  assert.deepEqual(outcomeUpdate.values.slice(2),
+    ['implementation evidence required', 'hash-1', 1, null, true]);
+  assert.equal(update.values[4], 'hash-1');
+  assert.match(calls[0].sql, /denial_next_retry_at/);
+});
+
+test('unchanged deterministic denial posts once without relay log and changed input re-arms', async () => {
+  let relevantHash = 'hash-1';
+  let storedHash = null;
+  let terminal = false;
+  let posts = 0;
+  const client = { release() {}, query: async (sql, values) => {
+    if (sql.includes('FROM issue_stage_outcome')) {
+      if (terminal && storedHash === relevantHash) return { rows: [] };
+      return { rows: [{ issue_id: 'issue-1', to_stage: 'Queue', outcome: 'ADVANCED',
+        task_id: 'task-1', task_result: {}, next_stage: 'In Progress',
+        relevant_input_hash: relevantHash, denial_input_hash: storedHash, denial_attempts: 1 }] };
+    }
+    if (sql.startsWith('UPDATE issue_stage_outcome SET denial_reason')) {
+      storedHash = values[3];
+      terminal = values[6];
+    }
+    return { rows: [] };
+  }};
+  const options = { dbPool: { connect: async () => client }, typedOutcomes: true,
+    logger: { log() {} }, postRelay: async () => { posts += 1; return {
+      ok: false, status: 409, error: 'invalid_transition'
+    }; } };
+  await readvanceRecordedOutcomes(options);
+  await readvanceRecordedOutcomes(options);
+  assert.equal(posts, 1);
+  relevantHash = 'hash-2';
+  await readvanceRecordedOutcomes(options);
+  assert.equal(posts, 2);
+  assert.equal(storedHash, 'hash-2');
+});
+
+test('readvance suppression fingerprint includes later QC and deploy-route evidence', () => {
+  const source = fs.readFileSync(
+    'ops/belt/parity/multica-relay-advance-daemon.cjs', 'utf8');
+  const query = source.slice(source.indexOf('async function readvanceRecordedOutcomes'),
+    source.indexOf('async function returnFailedQcOutcomes'));
+  assert.match(query, /attempt\.verdict/);
+  assert.match(query, /attempt\.work_product_md5/);
+  assert.match(query, /attempt\.evidence_task_id/);
+  assert.match(query, /evidence\.tasks::text/);
+  assert.match(query, /issue_pull_request/);
+  assert.match(query, /github_pull_request/);
+  assert.match(query, /recent_comments/);
+  assert.match(query, /task_message/);
 });
 
 test('a transient relay denial keeps its three-strike allowance', async () => {
@@ -1710,7 +1802,7 @@ test('retry exhaustion preserves a task-declared NO_OP outcome', async () => {
   await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
     postRelay: async () => ({ ok: false, status: 500, error: 'temporary owner outage' }),
     logger: { log() {} }, typedOutcomes: true });
-  assert.equal(calls.some(({ sql }) => /issue_stage_outcome SET|INSERT INTO issue_stage_outcome/.test(sql)), false);
+  assert.equal(calls.some(({ sql }) => /SET outcome|SET blocked_on|INSERT INTO issue_stage_outcome/.test(sql)), false);
 });
 
 test('a mismatched 200 response preserves the task-declared ADVANCED outcome', async () => {
@@ -1726,7 +1818,7 @@ test('a mismatched 200 response preserves the task-declared ADVANCED outcome', a
   await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
     postRelay: async () => ({ ok: true, status: 200, issue: { status: 'Queue' } }),
     logger: { log() {} }, typedOutcomes: true });
-  assert.equal(calls.some(({ sql }) => /issue_stage_outcome SET|INSERT INTO issue_stage_outcome/.test(sql)), false);
+  assert.equal(calls.some(({ sql }) => /SET outcome|SET blocked_on|INSERT INTO issue_stage_outcome/.test(sql)), false);
 });
 
 test('typed readvance requires task issue and stage ownership', async () => {

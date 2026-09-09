@@ -1969,6 +1969,14 @@ test('stage transition never cancels an active paid predecessor', async () => {
     ['queued', 'dispatched', 'waiting_local_directory', 'deferred']);
 });
 
+test('same-stage transition invariant rejects before database access', async () => {
+  let queries = 0;
+  await assert.rejects(() => replaceStageTask({ query: async () => { queries += 1; } }, {
+    ...transition(), fromStage: 'Spec', toStage: 'Spec'
+  }), /same-stage relay transition cannot enqueue/);
+  assert.equal(queries, 0);
+});
+
 test('relay dispositions preserve already-running paid work', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   const disposition = source.slice(source.indexOf('async function applyDisposition'),
