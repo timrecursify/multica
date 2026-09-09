@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -62,7 +63,8 @@ func TestIssueStatusContractProfilesShareCanonicalStorage(t *testing.T) {
 func TestIssueStatusContractCanonicalStatusesMatchRelayVocabulary(t *testing.T) {
 	want := []string{
 		"Registered", "Spec", "Queue", "In Progress", "In Review",
-		"Human Review", "CI/CD & Deploy", "Done", "Archived", "Cancelled",
+		"Human Review", "Parked", "Rejected", "CI/CD & Deploy", "Done", "Archived",
+		"Cancelled",
 	}
 	for _, profile := range []IssueStatusProfile{IssueStatusProfileLinear, IssueStatusProfilePPP} {
 		if got := mustTestStatusContract(profile).CanonicalStatuses(); !reflect.DeepEqual(got, want) {
@@ -122,7 +124,11 @@ func TestIssueStatusContractOrderCASE(t *testing.T) {
 		if !strings.Contains(expr, "WHEN 'Registered' THEN 0") {
 			t.Errorf("%s orderCASE missing canonical first status: %s", profile, expr)
 		}
-		if !strings.Contains(expr, "WHEN 'Cancelled' THEN 9") {
+		canonical := contract.CanonicalStatuses()
+		if got := canonical[len(canonical)-1]; got != "Cancelled" {
+			t.Errorf("%s: last canonical status = %q, want Cancelled", profile, got)
+		}
+		if !strings.Contains(expr, fmt.Sprintf("WHEN 'Cancelled' THEN %d", len(canonical)-1)) {
 			t.Errorf("%s orderCASE missing canonical last status: %s", profile, expr)
 		}
 	}

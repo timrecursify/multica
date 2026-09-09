@@ -158,6 +158,8 @@ const STATUS_RENDERERS: Record<IssueStatus, () => React.ReactNode> = {
   "In Review": InReviewIcon,
   "Human Review": InReviewIcon,
   "CI/CD & Deploy": InProgressIcon,
+  Parked: BlockedIcon,
+  Rejected: BlockedIcon,
   Done: DoneIcon,
   Archived: CancelledIcon,
   Cancelled: CancelledIcon,
