@@ -8,6 +8,7 @@ const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
   readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, requestRetryEscalation, runBounded,
   parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired } = require('./multica-relay-advance-daemon.cjs');
+const { completionEvidenceWithNoSha } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
 const { recordParkAndQueueDiagnosis } = require('../parked-diagnosis.cjs');
@@ -287,10 +288,11 @@ async function inProgressRoute(pr) {
   }, { githubCommand: () => JSON.stringify(pr) });
 }
 
-test('runtime PR completing In Progress routes through In Review, not straight to deploy', async () => {
+test('ticket with an open runtime PR is not classified no_pr', async () => {
   const route = await inProgressRoute({ state: 'OPEN', files: [{ path: 'ops/belt/multica-bridge.cjs' }],
     headRefOid: 'b'.repeat(40), mergeStateStatus: 'CLEAN', statusCheckRollup: [] });
   assert.equal(route.kind, 'runtime');
+  assert.notEqual(route.kind, 'no_pr');
   assert.equal(route.toStage, 'In Review');
   assert.equal(route.boundSha, 'b'.repeat(40));
   assert.equal(route.repo, 'timrecursify/multica');
@@ -349,31 +351,27 @@ test('409 relay refusals are memoized by issue state and PR head', () => {
   assert.match(source, /response\.status === 409.*relayRefusalMemo\.set/s);
 });
 
-async function noPrDoneEvidence(noShaComment) {
-  const payloads = [];
-  await readvanceRecordedOutcomes({ dbPool: { connect: async () => ({ release() {}, query: async (sql) => {
-    if (sql.includes('FROM issue_stage_outcome')) {
-      return { rows: [{ issue_id: 'issue-1', to_stage: 'In Progress', outcome: 'NO_OP',
-        task_id: 'task-1', task_result: { output: 'doc edit' }, issue_title: 'work',
-        next_stage: 'In Review' }] };
-    }
-    if (sql.includes('NO-SHA')) return { rows: noShaComment ? [{ content: noShaComment }] : [] };
-    if (sql.includes('FROM comment')) return { rows: [] };
-    if (sql.includes('FROM issue_pull_request')) return { rows: [] };
-    return { rows: [] };
-  } }) }, postRelay: async (payload) => { payloads.push(payload); return { ok: true }; },
-  logger: { log() {} }, typedOutcomes: true });
-  return payloads[0];
-}
+test('verified no-PR ticket with clean checkout carries real NO-SHA evidence', async () => {
+  const evidence = await completionEvidenceWithNoSha({}, {
+    issue_id: 'issue-1', task_id: 'task-1', task_result: 'NO-SHA: worker claim', to_stage: 'In Progress'
+  }, 'Done', { kind: 'no_pr', noPrVerified: true }, { ok: false }, {
+    checkoutInspector: async () => ({ checkoutClean: true, changedFiles: [] })
+  });
+  assert.equal(evidence.checkoutClean, true);
+  assert.deepEqual(evidence.changedFiles, []);
+  assert.match(evidence.workProductEvidence, /\bNO-SHA\b/);
+  assert.doesNotMatch(evidence.workProductEvidence, /worker claim/);
+});
 
-test('no-PR Done evidence carries a NO-SHA comment when the task result lacks the token', async () => {
-  const withComment = await noPrDoneEvidence('NO-SHA: runbook edit only');
-  assert.equal(withComment.to_stage, 'Done');
-  assert.deepEqual(withComment.evidence,
-    { noDeployRoute: 'no_pr', workProductEvidence: 'NO-SHA: runbook edit only' });
-  const without = await noPrDoneEvidence(null);
-  assert.deepEqual(without.evidence,
-    { noDeployRoute: 'no_pr', workProductEvidence: 'task:task-1:result' });
+test('dirty no-PR checkout reports changed files without synthesising NO-SHA', async () => {
+  const evidence = await completionEvidenceWithNoSha({}, {
+    issue_id: 'issue-1', task_id: 'task-1', task_result: 'NO-SHA: worker claim', to_stage: 'In Progress'
+  }, 'Done', { kind: 'no_pr', noPrVerified: true }, { ok: false }, {
+    checkoutInspector: async () => ({ checkoutClean: false, changedFiles: ['ops/belt/dirty.cjs'] })
+  });
+  assert.equal(evidence.checkoutClean, false);
+  assert.deepEqual(evidence.changedFiles, ['ops/belt/dirty.cjs']);
+  assert.doesNotMatch(evidence.workProductEvidence, /\bNO-SHA\b/);
 });
 
 test('assignment adoption inserts only the assigned configured QC task once and is workspace-safe', async () => {
