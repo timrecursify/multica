@@ -212,6 +212,28 @@ test('closure stall returns to Spec with system retry-escalation evidence', asyn
   }), relay: async (...args) => calls.push(args) });
 });
 
+test('closure discovery outage returns to configured Spec instead of Human Review', async () => {
+  const calls = [];
+  worker.setTestDependencies({
+    watchdog: {
+      observe: () => ({ stage: 'CI/CD & Deploy', first_seen_at: new Date(0).toISOString(),
+        last_error: 'discovery_auth_failure', correlation_key: 'corr-auth' }),
+      stalled: () => true,
+      markAlerted: row => row
+    },
+    relay: async (...args) => calls.push(args)
+  });
+  const alerted = await worker.closureWatchdog(issue, {
+    status: 'pending', outcome: 'discovery_auth_failure', retryEligible: true,
+    blocker: { type: 'discovery_auth_failure', retry_eligible: true }
+  }, sha);
+  assert.equal(alerted, true);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][1], 'Spec');
+  assert.equal(calls[0][5].retry_escalation, true);
+  assert.doesNotMatch(calls[0][3], /Human Review/);
+});
+
 test('retryable deploy blocker remains observable to the closure watchdog', async () => {
   const calls = [];
   const observations = [];
@@ -642,15 +664,15 @@ test('PPP marker not containing the merge SHA is refused', async () => {
   assert.deepStrictEqual(result.blocker.missing_targets, ['lead-api']);
 });
 
-test('target without a deployment writer routes once to Human Review', async () => {
+test('target without a deployment writer routes once to configured Spec', async () => {
   const calls = dependencies({ receipt: null });
   const result = await worker.routeFinishedPR(issue, 'merged', sha, {
     ...pr, repo: 'timrecursify/sk-cli', changedPaths: ['cmd/sk/main.go']
   });
-  assert.equal(result.status, 'human_review');
+  assert.equal(result.status, 'respec');
   assert.equal(result.retryEligible, false);
   assert.equal(calls.length, 1);
-  assert.equal(calls[0][1], 'Human Review');
+  assert.equal(calls[0][1], 'Spec');
   assert.match(calls[0][3], /deployment_owner_absent target=fleet-sk-cli/);
 });
 
