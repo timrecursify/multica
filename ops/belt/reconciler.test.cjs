@@ -478,6 +478,74 @@ test("typed outcome eligibility runs before creating a retry task", async () => 
   assert.deepEqual(result, { action: "created", taskId: "task-1" });
 });
 
+test("attempt-budget exhaustion gets a timed mechanical retry, not a bare skip", async () => {
+  const budget = { created: 0, humanReview: 0, byAgent: new Map() };
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.includes("COALESCE(max(attempt)")) return { rows: [{ attempt: 2, max_attempts: 2 }] };
+    return original(sql, values);
+  };
+
+  assert.deepEqual(await reconcileIssue(db, issue.id, {
+    evaluate: ok, typedOutcomes: true, mechanicalRetryMinutes: 720, budget
+  }), {
+    action: "deferred", reason: "attempt_budget_exhausted:2/2", retryAfterMinutes: 720
+  });
+  assert.ok(db.calls.some(({ sql }) => /mechanical_retry_after/.test(sql || "")));
+  assert.equal(db.calls.some(({ sql }) => /status = 'Human Review'/.test(sql || "")), false);
+  assert.equal(budget.humanReview, 0);
+});
+
+test("expired attempt-budget deferral releases a fresh stage-entry window", async () => {
+  let deferred = false;
+  let released = false;
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) {
+      return { rows: [{ ...issue, metadata: deferred ? {
+        mechanical_retry_after: "2020-01-01T00:00:00.000Z"
+      } : {} }] };
+    }
+    if (sql.includes("'{mechanical_retry_release_at}'")) released = true;
+    if (sql.includes("COALESCE(max(attempt)")) {
+      db.calls.push({ sql, values });
+      return { rows: [{ attempt: released ? 0 : 2, max_attempts: 2 }] };
+    }
+    if (sql.includes("'mechanical_retry_after', NOW()")) deferred = true;
+    return original(sql, values);
+  };
+
+  assert.equal((await reconcileIssue(db, issue.id, {
+    evaluate: ok, typedOutcomes: true, mechanicalRetryMinutes: 720
+  })).action, "deferred");
+  assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok, typedOutcomes: true }), {
+    action: "created", taskId: "task-1"
+  });
+  assert.equal(released, true, "release must persist mechanical_retry_release_at");
+  const attemptQuery = db.calls.findLast(({ sql }) => sql.includes("COALESCE(max(attempt)"));
+  assert.match(attemptQuery.sql, /mechanical_retry_release_at/);
+});
+
+test("other typed-outcome ineligibility remains a bare skip", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.includes("COALESCE(max(attempt)")) return { rows: [{ attempt: 0, max_attempts: 2 }] };
+    if (sql.includes("FROM issue_stage_outcome")) return { rows: [{
+      outcome: "FAILED", blocked_on: null, input_hash: "h1", outcome_at: new Date().toISOString()
+    }] };
+    if (sql.includes("SELECT md5(concat_ws")) return { rows: [{ input_hash: "h1", issue_status: issue.status }] };
+    return original(sql, values);
+  };
+
+  assert.deepEqual(await reconcileIssue(db, issue.id, {
+    evaluate: ok, typedOutcomes: true, failedTtlMinutes: 15
+  }), { action: "skipped", reason: "outcome_unchanged:FAILED" });
+  assert.equal(db.calls.some(({ sql }) => /mechanical_retry_after/.test(sql || "")), false);
+});
+
 test("two reconciler sessions converge on one task", async () => {
   const shared = { live: [], lock: Promise.resolve(), sequence: 0 };
   const session = () => {
