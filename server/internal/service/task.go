@@ -5232,6 +5232,14 @@ func (s *TaskService) broadcastTaskFailedEvent(ctx context.Context, task db.Agen
 // For autopilot tasks, from the autopilot via its run.
 // Returns "" when none of the links resolve — callers treat that as "not found".
 func (s *TaskService) ResolveTaskWorkspaceID(ctx context.Context, task db.AgentTaskQueue) string {
+	// workspace_id is stamped at enqueue time and is the durable authority for
+	// active work.  Prefer it to source resolution: an issue/chat/autopilot can
+	// be deleted after a task becomes terminal, and falling back to a mutable
+	// source first reintroduced the cross-workspace dispatch hole this column
+	// closes. The following lookups remain only for pre-303 legacy rows.
+	if task.WorkspaceID.Valid {
+		return util.UUIDToString(task.WorkspaceID)
+	}
 	if task.IssueID.Valid {
 		if issue, err := s.Queries.GetIssue(ctx, task.IssueID); err == nil {
 			return util.UUIDToString(issue.WorkspaceID)
