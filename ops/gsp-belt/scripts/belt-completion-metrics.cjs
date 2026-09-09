@@ -4,7 +4,10 @@
 // command (typically a read-only SQL adapter); snapshots remain test-only.
 const {execFileSync}=require('child_process');
 const fs=require('fs');
-const command=process.env.BELT_COMPLETION_AUTHORITATIVE_METRICS_COMMAND;
+// Accept the explicit authoritative name, while retaining compatibility with
+// the belt-status contract used by deployed environments.
+const command=process.env.BELT_COMPLETION_AUTHORITATIVE_METRICS_COMMAND
+  || process.env.BELT_COMPLETION_METRICS_COMMAND;
 try {
   if (!command) throw new Error('authoritative metrics adapter is not configured');
   const out=execFileSync('/bin/sh',['-c',command],{encoding:'utf8'});

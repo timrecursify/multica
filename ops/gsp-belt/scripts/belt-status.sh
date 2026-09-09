@@ -35,8 +35,13 @@ fail=0
 # authoritative adapter; BELT_COMPLETION_LIVENESS_INPUT is retained for tests.
 if [[ -n "${BELT_COMPLETION_STALL_WINDOW:-}" ]]; then
   if [[ -z "${BELT_COMPLETION_LIVENESS_INPUT:-}" ]]; then
-    metrics_cmd="node $(dirname "$0")/belt-completion-metrics.cjs"
-    export BELT_COMPLETION_METRICS_COMMAND="$metrics_cmd"
+    # The adapter consumes the authoritative source command.  In deployed
+    # runs this is supplied by the service environment; mirror it explicitly
+    # so the boundary cannot fail solely due to a variable-name mismatch.
+    if [[ -n "${BELT_COMPLETION_AUTHORITATIVE_METRICS_SOURCE_COMMAND:-}" ]]; then
+      export BELT_COMPLETION_AUTHORITATIVE_METRICS_COMMAND="$BELT_COMPLETION_AUTHORITATIVE_METRICS_SOURCE_COMMAND"
+      export BELT_COMPLETION_METRICS_COMMAND="node $(dirname "$0")/belt-completion-metrics.cjs"
+    fi
   fi
   if ! liveness_result=$(node "$(dirname "$0")/belt-completion-liveness.cjs"); then
     echo "completion_liveness $liveness_result" >&2
