@@ -184,6 +184,56 @@ test("recordStageOutcomes rejects an In Progress ADVANCED result without PR evid
   assert.match(logs[0], /missing review evidence/);
 });
 
+test("a typed no-change completion produces a verified no_change product and records NO_OP", async () => {
+  const sha = "852828aec35bccd3fefd67538a222f18b29b9e24";
+  const c = fakeClient([
+    [{ id: "t-noop", issue_id: "i-noop", stage: "In Progress", scope_revision: 7,
+      work_dir: "/worktrees/noop", output: "Checked current source\nOUTCOME: NO_OP" }],
+    [], [{ issue_id: "i-noop" }], [{ has_review_evidence: true }],
+    [{ input_hash: "noop-hash" }], []
+  ]);
+  const gitCommand = async (args) => {
+    const command = args.slice(2).join(" ");
+    if (command === "config --get remote.origin.url") return "git@github.com:acme/widget.git\n";
+    if (command === "symbolic-ref refs/remotes/origin/HEAD") return "refs/remotes/origin/main\n";
+    if (command === "rev-parse refs/remotes/origin/main^{commit}") return `${sha}\n`;
+    if (command === "rev-parse HEAD^{commit}") return `${sha}\n`;
+    if (command === "status --porcelain") return "";
+    throw new Error(`unexpected git command: ${args.join(" ")}`);
+  };
+
+  await so.recordStageOutcomes(c, { logger: { log() {} }, gitCommand });
+
+  const product = c.calls.find((call) => call.sql.includes("INSERT INTO issue_work_product"));
+  assert.match(product.sql, /'no_change'/);
+  assert.match(product.sql, /'In Review'/);
+  assert.match(product.sql, /'active'/);
+  assert.deepEqual(JSON.parse(product.params[2]), {
+    source: "checked_task_checkout", task_id: "t-noop", repository: "acme/widget",
+    base_ref: "refs/remotes/origin/main", base_sha: sha, verified: true
+  });
+  const outcome = c.calls.find((call) => call.sql.includes("INSERT INTO issue_stage_outcome"));
+  assert.equal(outcome.params[2], "NO_OP");
+});
+
+test("legacy no-op prose cannot create a no_change product", async () => {
+  const c = fakeClient([
+    [{ id: "t-prose", issue_id: "i-prose", stage: "In Progress", scope_revision: 8,
+      work_dir: "/worktrees/prose", output: "nothing to do" }],
+    [{ has_review_evidence: false }], [{ input_hash: "prose-hash" }], []
+  ]);
+  let gitCalled = false;
+
+  await so.recordStageOutcomes(c, {
+    logger: { log() {} }, gitCommand: async () => { gitCalled = true; return ""; }
+  });
+
+  assert.equal(gitCalled, false);
+  assert.equal(c.calls.some((call) => call.sql.includes("INSERT INTO issue_work_product")), false);
+  const outcome = c.calls.find((call) => call.sql.includes("INSERT INTO issue_stage_outcome"));
+  assert.equal(outcome.params[2], "FAILED");
+});
+
 test("recordStageOutcomes never promotes a PR mentioned only in comment prose", async () => {
   const writes = [];
   const ghCalls = [];
