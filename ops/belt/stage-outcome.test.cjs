@@ -38,7 +38,8 @@ function fakeClient(responses) {
   return { calls, query: async (sql, params) => {
     calls.push({ sql, params });
     if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
-    return { rows: responses.shift() || [] };
+    const rows = responses.shift() || [];
+    return { rows, rowCount: rows.length };
   } };
 }
 
@@ -159,8 +160,8 @@ test("recordStageOutcomes never promotes a PR mentioned only in comment prose", 
       if (/^(BEGIN|COMMIT|ROLLBACK)$/.test(sql)) return { rows: [] };
       if (sql.includes("has_review_evidence")) return { rows: [{ has_review_evidence: false }] };
       if (sql.includes("md5")) return { rows: [{ input_hash: "h4" }] };
-      if (sql.includes("SELECT id FROM issue") || sql.includes("FROM issue_work_product") ||
-          sql.includes("FROM issue_pull_request")) return { rows: [] };
+      if (sql.includes("SELECT id, workspace_id FROM issue")) return { rows: [{ id: "i4", workspace_id: "w4" }] };
+      if (sql.includes("FROM issue_work_product") || sql.includes("FROM issue_pull_request")) return { rows: [] };
       if (sql.includes("INSERT INTO issue_stage_outcome")) { writes.push(params); return { rows: [] }; }
       throw new Error(`unexpected query: ${sql.slice(0, 80)}`);
     }
@@ -173,6 +174,97 @@ test("recordStageOutcomes never promotes a PR mentioned only in comment prose", 
   assert.deepEqual(result, { scanned: 1, recorded: 1, failed: 0 });
   assert.equal(ghCalls.length, 0);
   assert.deepEqual(writes[0], ["i4", "In Progress", "FAILED", null, "t4", "h4"]);
+});
+
+test("an authenticated PR URL in the task output repairs its missing issue link", async () => {
+  const sha = "852828aec35bccd3fefd67538a222f18b29b9e24";
+  const url = "https://github.com/acme/widget/pull/7";
+  const view = JSON.stringify({
+    number: 7, title: "fix: widget", state: "OPEN", url, headRefOid: sha,
+    headRefName: "fix/widget", createdAt: "2026-09-08T00:00:00Z",
+    updatedAt: "2026-09-08T01:00:00Z", mergedAt: null, closedAt: null,
+    author: { login: "builder" }, additions: 2, deletions: 1, changedFiles: 1,
+    mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: []
+  });
+  const c = fakeClient([
+    [{ id: "i7", workspace_id: "w7" }], [], [], [{ id: "p7" }], [],
+    [{ repository: "acme/widget", pr_number: 7, branch: "fix/widget", html_url: url }],
+    [{ issue_id: "i7" }]
+  ]);
+  const produced = await so.produceImplementationWorkProduct(c, {
+    id: "t7", issue_id: "i7", scope_revision: 1,
+    output: `Implemented ${url}\nOUTCOME: ADVANCED`
+  }, async () => view);
+
+  assert.equal(produced, true);
+  assert.ok(c.calls.some((call) => call.sql.includes("INSERT INTO github_pull_request")));
+  assert.ok(c.calls.some((call) => call.sql.includes("INSERT INTO issue_pull_request")));
+  assert.ok(c.calls.some((call) => call.sql.includes("INSERT INTO issue_work_product")));
+});
+
+test("the latest completed structured PR URL repairs a missing issue link", async () => {
+  const sha = "852828aec35bccd3fefd67538a222f18b29b9e24";
+  const url = "https://github.com/acme/widget/pull/7";
+  const view = JSON.stringify({
+    number: 7, title: "fix: widget", state: "OPEN", url, headRefOid: sha,
+    headRefName: "fix/widget", createdAt: "2026-09-08T00:00:00Z",
+    updatedAt: "2026-09-08T01:00:00Z", mergedAt: null, closedAt: null,
+    author: { login: "builder" }, additions: 2, deletions: 1, changedFiles: 1,
+    mergeable: "MERGEABLE", mergeStateStatus: "CLEAN", statusCheckRollup: []
+  });
+  const c = fakeClient([
+    [{ id: "i7", workspace_id: "w7" }], [], [{ pr_url: url }], [],
+    [{ id: "p7" }], [],
+    [{ repository: "acme/widget", pr_number: 7, branch: "fix/widget", html_url: url }],
+    [{ issue_id: "i7" }]
+  ]);
+  const produced = await so.produceImplementationWorkProduct(c, {
+    id: "t7-current", issue_id: "i7", scope_revision: 1,
+    output: "Verified PR #7\nOUTCOME: ADVANCED"
+  }, async () => view);
+
+  assert.equal(produced, true);
+  const historical = c.calls.find((call) => call.sql.includes("result->>'pr_url' AS pr_url"));
+  assert.deepEqual(historical.params, ["i7"]);
+  assert.match(historical.sql, /status = 'completed'/);
+  assert.match(historical.sql, /ORDER BY completed_at DESC/);
+  assert.ok(c.calls.some((call) => call.sql.includes("INSERT INTO issue_pull_request")));
+});
+
+test("historical PR recovery rejects prose and non-canonical structured values", async () => {
+  for (const prUrl of ["PR #7", "http://github.com/acme/widget/pull/7",
+    "https://github.com/acme/widget/pull/7/files"]) {
+    const ghCalls = [];
+    const c = fakeClient([
+      [{ id: "i7", workspace_id: "w7" }], [], [{ pr_url: prUrl }], []
+    ]);
+    assert.equal(await so.produceImplementationWorkProduct(c, {
+      id: "t7-current", issue_id: "i7", scope_revision: 1,
+      output: "Verified PR #7\nOUTCOME: ADVANCED"
+    }, async (...args) => { ghCalls.push(args); }), false);
+    assert.equal(ghCalls.length, 0);
+    assert.equal(c.calls.some((call) => call.sql.includes("INSERT INTO github_pull_request")), false);
+  }
+});
+
+test("historical PR recovery mirrors nothing when authenticated verification fails", async () => {
+  const url = "https://github.com/acme/widget/pull/7";
+  for (const view of [
+    { number: 7, state: "OPEN", url, headRefOid: "short", headRefName: "fix/widget" },
+    { number: 7, state: "OPEN", url, headRefOid: "a".repeat(40), headRefName: "wrong/branch" }
+  ]) {
+    const c = fakeClient([
+      [{ id: "i7", workspace_id: "w7" }],
+      [{ kind: "implementation", repository: "acme/widget", branch: "fix/widget", pr_number: 7 }],
+      [{ pr_url: url }], []
+    ]);
+    assert.equal(await so.produceImplementationWorkProduct(c, {
+      id: "t7-current", issue_id: "i7", scope_revision: 1,
+      output: "Verified PR #7\nOUTCOME: ADVANCED"
+    }, async () => JSON.stringify(view)), false);
+    assert.equal(c.calls.some((call) => call.sql.includes("INSERT INTO github_pull_request")), false);
+    assert.equal(c.calls.some((call) => call.sql.includes("INSERT INTO issue_pull_request")), false);
+  }
 });
 test("input hash uses the active product and declared dependency state", () => {
   const sql = so.stageInputHashSql();

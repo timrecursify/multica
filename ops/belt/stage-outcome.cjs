@@ -156,22 +156,92 @@ function uniqueOutputPullRequest(output) {
   return unique.length === 1 ? unique[0] : null;
 }
 
+function canonicalPullRequestUrl(value) {
+  const match = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/([1-9][0-9]*)$/i.exec(
+    String(value || '').trim());
+  return match ? {
+    repository: `${match[1]}/${match[2]}`, prNumber: Number(match[3]), url: match[0]
+  } : null;
+}
+
+async function linkOutputPullRequest(client, issueId, workspaceId, outputPr, githubCommand, expectedBranch) {
+  let pr;
+  try {
+    pr = JSON.parse(await githubCommand(['pr', 'view', outputPr.url, '--json',
+      'number,title,state,url,headRefOid,createdAt,updatedAt,mergedAt,closedAt,' +
+      'author,headRefName,additions,deletions,changedFiles,mergeable,mergeStateStatus,statusCheckRollup'],
+    { fresh: true }));
+  } catch (_) { return false; }
+  const headSha = String(pr?.headRefOid || '').toLowerCase();
+  const branch = String(pr?.headRefName || '');
+  if (Number(pr?.number) !== outputPr.prNumber || !pr?.state ||
+      String(pr?.url || '').toLowerCase() !== outputPr.url.toLowerCase() ||
+      !branch || !/^[0-9a-f]{40}$/.test(headSha) ||
+      (expectedBranch && expectedBranch !== branch)) return false;
+  const rollup = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const conclusions = rollup.map((check) =>
+    String(check.conclusion || check.state || '').toUpperCase()).filter(Boolean);
+  const rollupState = conclusions.length === 0 ? null
+    : conclusions.some((value) => ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(value)) ? 'FAILURE'
+    : conclusions.every((value) => ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(value)) ? 'SUCCESS'
+    : 'PENDING';
+  const [owner, repo] = outputPr.repository.split('/');
+  const inserted = await client.query(
+    `INSERT INTO github_pull_request (workspace_id, installation_id, repo_owner, repo_name,
+        pr_number, title, state, html_url, branch, author_login, merged_at, closed_at,
+        pr_created_at, pr_updated_at, head_sha, additions, deletions, changed_files,
+        api_mergeable, api_merge_state_status, checks_rollup_state, snapshot_head_sha, snapshot_fetched_at)
+      VALUES ($1::uuid, 0, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+        $15, $16, $17, $18, $19, $20, $14, NOW())
+      ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
+        state = EXCLUDED.state, head_sha = EXCLUDED.head_sha, merged_at = EXCLUDED.merged_at,
+        closed_at = EXCLUDED.closed_at, pr_updated_at = EXCLUDED.pr_updated_at,
+        api_mergeable = EXCLUDED.api_mergeable, api_merge_state_status = EXCLUDED.api_merge_state_status,
+        checks_rollup_state = EXCLUDED.checks_rollup_state, snapshot_head_sha = EXCLUDED.snapshot_head_sha,
+        snapshot_fetched_at = NOW(), updated_at = NOW()
+      RETURNING id`,
+    [workspaceId, owner, repo, pr.number, pr.title || outputPr.url,
+      String(pr.state).toLowerCase(), pr.url || outputPr.url, pr.headRefName || null,
+      pr.author?.login || null, pr.mergedAt || null, pr.closedAt || null,
+      pr.createdAt, pr.updatedAt, headSha,
+      pr.additions ?? 0, pr.deletions ?? 0, pr.changedFiles ?? 0,
+      pr.mergeable || null, pr.mergeStateStatus || null, rollupState]);
+  if (inserted.rows.length !== 1) return false;
+  await client.query(
+    `INSERT INTO issue_pull_request (issue_id, pull_request_id, linked_by_type, linked_at)
+      VALUES ($1::uuid, $2::uuid, 'stage_outcome', NOW())
+      ON CONFLICT (issue_id, pull_request_id) DO NOTHING`, [issueId, inserted.rows[0].id]);
+  return true;
+}
+
 async function produceImplementationWorkProduct(client, row, githubCommand) {
   if (typeof githubCommand !== 'function') return false;
-  await client.query("SELECT id FROM issue WHERE id = $1::uuid FOR UPDATE", [row.issue_id]);
+  const issue = (await client.query(
+    "SELECT id, workspace_id FROM issue WHERE id = $1::uuid FOR UPDATE", [row.issue_id])).rows[0];
+  if (!issue) return false;
   const active = (await client.query(
     `SELECT scope_revision, kind, repository, branch, pr_number
        FROM issue_work_product
       WHERE issue_id = $1::uuid AND status = 'active' FOR UPDATE`, [row.issue_id])).rows;
   if (active.length > 1 || (active[0] && active[0].kind !== 'implementation')) return false;
 
-  const outputPr = uniqueOutputPullRequest(row.output);
+  let outputPr = uniqueOutputPullRequest(row.output);
+  if (!outputPr) {
+    const historicalUrl = (await client.query(
+      `SELECT result->>'pr_url' AS pr_url
+         FROM agent_task_queue
+        WHERE issue_id = $1::uuid AND status = 'completed'
+          AND NULLIF(btrim(result->>'pr_url'), '') IS NOT NULL
+        ORDER BY completed_at DESC
+        LIMIT 1`, [row.issue_id])).rows[0]?.pr_url;
+    outputPr = canonicalPullRequestUrl(historicalUrl);
+  }
   if (active[0] && outputPr &&
       (active[0].repository.toLowerCase() !== outputPr.repository.toLowerCase() ||
        Number(active[0].pr_number) !== outputPr.prNumber)) return false;
   const selectedRepository = active[0]?.repository || outputPr?.repository || null;
   const selectedPrNumber = active[0]?.pr_number || outputPr?.prNumber || null;
-  const linked = (await client.query(
+  let linked = (await client.query(
     `SELECT DISTINCT p.repo_owner || '/' || p.repo_name AS repository, p.pr_number,
             p.branch, p.html_url
        FROM issue_pull_request ipr
@@ -181,6 +251,20 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
         AND ($2::text IS NULL OR lower(p.repo_owner || '/' || p.repo_name) = lower($2::text))
         AND ($3::int IS NULL OR p.pr_number = $3::int)
       `, [row.issue_id, selectedRepository, selectedPrNumber])).rows;
+  if (linked.length === 0 && outputPr) {
+    await linkOutputPullRequest(client, row.issue_id, issue.workspace_id, outputPr, githubCommand,
+      active[0]?.branch);
+    linked = (await client.query(
+      `SELECT DISTINCT p.repo_owner || '/' || p.repo_name AS repository, p.pr_number,
+              p.branch, p.html_url
+         FROM issue_pull_request ipr
+         JOIN github_pull_request p ON p.id = ipr.pull_request_id
+         JOIN issue i ON i.id = ipr.issue_id AND i.workspace_id = p.workspace_id
+        WHERE ipr.issue_id = $1::uuid
+          AND lower(p.repo_owner || '/' || p.repo_name) = lower($2::text)
+          AND p.pr_number = $3::int`,
+      [row.issue_id, outputPr.repository, outputPr.prNumber])).rows;
+  }
   if (linked.length !== 1) return false;
   const candidate = linked[0];
   if (active[0] && (active[0].repository.toLowerCase() !== candidate.repository.toLowerCase() ||
@@ -325,4 +409,4 @@ async function stageEligibility(client, issueId, stage, { failedTtlMinutes = Num
 
 module.exports = { OUTCOMES, BLOCKED_ON, parseOutcome, legacyOutcome, stageInputHashSql, outcomeForStageSql,
   upsertOutcomeSql, unrecordedCompletionsSql, recordStageOutcomes, stageEligibility,
-  uniqueOutputPullRequest, produceImplementationWorkProduct };
+  uniqueOutputPullRequest, canonicalPullRequestUrl, produceImplementationWorkProduct };
