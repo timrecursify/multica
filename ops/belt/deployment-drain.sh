@@ -165,7 +165,7 @@ SQL
 deployment_drain_snapshot() {
   deployment_psql -At <<'SQL'
 SELECT concat_ws(' ',
-  'leases=' || count(*) FILTER (WHERE status IN ('dispatched','running') OR prepare_lease_expires_at IS NOT NULL),
+  'leases=' || count(*) FILTER (WHERE status IN ('dispatched','running') OR (prepare_lease_expires_at IS NOT NULL AND prepare_lease_expires_at > now())),
   'children=' || count(*) FILTER (WHERE parent_task_id IS NOT NULL AND status IN ('dispatched','running')),
   -- callbacks counts only pending rows the advancer can still consume.
   --
