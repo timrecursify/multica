@@ -140,3 +140,9 @@ Step 5 — verification:
 - Verified evidence: the established affected population remains 373 In Progress builder completions, including 325 with prose-only PR numbers. `ops/belt/stage-outcome.cjs:159-165` requires an exact canonical HTTPS GitHub pull URL; `ops/belt/stage-outcome.cjs:228-235` selects the most recent non-empty structured URL only from completed tasks on the same issue; `ops/belt/stage-outcome.cjs:167-214` sends that candidate through the existing authenticated GitHub mirror/link helper, now rejecting URL, 40-hex head SHA, or active-branch mismatches before either insert; and `ops/belt/stage-outcome.cjs:243-283` retains the workspace-scoped link read and final authenticated verification.
 - Action taken: extended the existing current-output recovery path with one bounded historical lookup and no fallback guessing. Added regression coverage at `ops/belt/stage-outcome.test.cjs:205-273` for latest-history selection, canonical-only input, and fail-closed verification. `node --test ops/belt/stage-outcome.test.cjs` passes 23/23; `git diff --check` passes. No production writes, restart, deploy, Done-surface change, relay edge, or cap change occurred.
 - Branch basis: prerequisite PR #870 (`fix(belt): recover missing PR links from task output`) remains open, so this work is based on its head branch `belt/builder-pr-gap-20260909` as instructed.
+
+## Batch 9 — publication
+
+- Root cause status: fixed in commit `65bd155f5`; evidence and constraints are unchanged from Batch 8.
+- Verified evidence: focused tests pass 23/23 and `git diff --check` passes. The prerequisite remains open as PR #870, so GitHub records this follow-on against its head branch.
+- Action taken: pushed `belt/hist-pr-recovery-20260909` and opened PR #871 (`fix(belt): recover historical PR task provenance`). No production mutation, restart, or deploy occurred.
