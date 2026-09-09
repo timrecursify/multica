@@ -816,3 +816,12 @@ test("the task budget counts only tasks since the issue entered its stage", asyn
   assert.match(sql, /parked_release_at/);
   assert.match(sql, /human_review_release_at/);
 });
+
+test("a task with no failure_reason still counts toward the stage attempt budget", () => {
+  // failure_reason is NULL on every task that did not fail: 34069 of 42637 rows
+  // live on 2026-09-09. A bare NOT (failure_reason = ANY(...)) evaluates to NULL
+  // for those rows, and WHERE drops them, which silently removes the paid-retry
+  // guard instead of narrowly exempting infrastructure failures.
+  const sql = stageAttemptsSql();
+  assert.match(sql, /failure_reason IS NULL/);
+});

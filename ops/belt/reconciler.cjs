@@ -108,8 +108,9 @@ function stageAttemptsSql() {
            FROM agent_task_queue
            WHERE issue_id = $1::uuid AND context->>'to_stage' = $2
              AND trigger_comment_id IS NULL
-             AND NOT (failure_reason = ANY(ARRAY[${infraReasons}]::text[])
-                      OR failure_reason ~* '${quotaPattern}')
+             AND (failure_reason IS NULL
+                  OR NOT (failure_reason = ANY(ARRAY[${infraReasons}]::text[])
+                          OR failure_reason ~* '${quotaPattern}'))
              AND ${stageEntryWindowSql()}`;
 }
 
