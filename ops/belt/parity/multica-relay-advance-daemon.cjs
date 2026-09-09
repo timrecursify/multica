@@ -46,10 +46,6 @@ const githubTokenCache = createTtlCache({ ttlMs: QC_GATE_PENDING_RECHECK_MS });
 const workProductCache = createTtlCache({ ttlMs: QC_GATE_PENDING_RECHECK_MS });
 const githubClients = new Map();
 const execFileAsync = promisify(execFile);
-// The deployed daemon is copied into a runtime bundle that is not a git tree.
-// Its launcher inherits the source checkout cwd; operators may make that
-// identity explicit with the same source-root variables used by belt tooling.
-const REPOSITORY_ROOT = process.env.MULTICA_CHECKOUT_ROOT || process.env.BELT_SOURCE_ROOT || process.cwd();
 function parseGateCheckConcurrency(value) {
   if (value === undefined) return 1;
   const parsed = Number(value);
@@ -356,8 +352,9 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
       retryEscalationTaskId: row.task_id };
   }
   if (row.to_stage === 'In Progress' && targetStage === 'Done') {
+    const resultText = typeof row.task_result === 'string' ? row.task_result : JSON.stringify(row.task_result || '');
     return { noDeployRoute: route?.kind || 'no_pr',
-      workProductEvidence: pointer };
+      workProductEvidence: /\bNO-SHA\b/i.test(resultText) ? resultText : pointer };
   }
   if (row.to_stage === 'In Review' && targetStage === 'CI/CD & Deploy' && qcAdvance.ok) {
     return { qualifyingPass: true, observedShaMatchesBound: true, completedSolLowTask: qcAdvance.evidenceTaskId };
@@ -365,39 +362,17 @@ function completionEvidence(row, targetStage, route, qcAdvance) {
   return {};
 }
 
-async function inspectCheckout(run = execFileAsync, checkout = REPOSITORY_ROOT) {
-  try {
-    const { stdout } = await run('git', ['-C', checkout, 'status', '--porcelain', '--untracked-files=all'],
-      { encoding: 'utf8', timeout: 30000, maxBuffer: 1e6 });
-    const changedFiles = String(stdout || '').split(/\r?\n/).filter(Boolean)
-      .map((line) => line.slice(3).trim()).filter(Boolean);
-    return { checkoutClean: changedFiles.length === 0, changedFiles };
-  } catch {
-    return null;
-  }
-}
-
 // RUNBOOK_BUILD_WORKER.md tells a builder to record NO-SHA in its comment for
 // no-code work, while the bridge reads NO-SHA from the posted work product.
-// Checkout inspection is an additional refusal guard: a dirty observation
-// overrides the comment, but an unavailable checkout preserves the attestation.
-async function completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance,
-  { checkoutInspector = inspectCheckout } = {}) {
+// Carry the newest NO-SHA comment when the task result itself lacks the token.
+async function completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance) {
   const evidence = completionEvidence(row, targetStage, route, qcAdvance);
-  if (route?.kind !== 'no_pr' || route.noPrVerified !== true || targetStage !== 'Done') return evidence;
+  if (route?.kind !== 'no_pr' || targetStage !== 'Done' ||
+      /\bNO-SHA\b/i.test(String(evidence.workProductEvidence || ''))) return evidence;
   const comment = await client.query(
     `SELECT content FROM comment WHERE issue_id = $1::uuid AND content ~* '\\mNO-SHA\\M'
       ORDER BY created_at DESC LIMIT 1`, [row.issue_id]);
-  const checkout = await checkoutInspector();
-  if (!checkout) {
-    return comment.rows[0] ? { ...evidence, workProductEvidence: comment.rows[0].content } : evidence;
-  }
-  const observed = { ...evidence, checkoutClean: checkout.checkoutClean === true,
-    changedFiles: Array.isArray(checkout.changedFiles) ? checkout.changedFiles : [] };
-  if (!observed.checkoutClean || observed.changedFiles.length > 0) return observed;
-  if (comment.rows[0]) return { ...observed, workProductEvidence: comment.rows[0].content };
-  return { ...observed,
-    workProductEvidence: `NO-SHA: relay verified no pull request and a clean checkout for issue ${row.issue_id}` };
+  return comment.rows[0] ? { ...evidence, workProductEvidence: comment.rows[0].content } : evidence;
 }
 
 // Gate by ticket transition and PR evidence, never by the stage row that
@@ -459,31 +434,32 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
     `SELECT p.html_url, p.repo_owner, p.repo_name
        FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
       WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1`, [row.issue_id]);
-  // A linked PR is authoritative work-product evidence. Otherwise inspect the
-  // completion declaration and comments before choosing a no-deploy route:
-  // typed NO_OP is only no-code when it carries no discoverable PR evidence.
+  // A NO_OP or BLOCKED run has no work product of its own. The merged PR it
+  // cites is prior work, and the comment scan below would adopt that PR as
+  // this ticket's product and send it to QC, which opens an empty branch and
+  // returns failure_class=implementation. Decide these before that scan.
   const declared = linked.rows[0] ? null : await declaredCompletionOutcome(client, row);
-  const commentPr = linked.rows[0] ? null : await client.query(
-    `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`, [row.issue_id]);
-  const commentMatch = commentPr?.rows
-    .map(({ content }) => String(content || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i))
-    .find(Boolean);
   if (declared && declared.outcome === 'BLOCKED' && declared.blockedOn === 'human') {
     return { kind: 'blocked_human', toStage: 'Human Review',
       reason: 'completion_blocked_on_human',
       evidence: `blocked_on=human ${resultPointer(row)}` };
   }
-  if (declared && declared.outcome === 'NO_OP' && row.to_stage === 'In Progress' && !commentMatch) {
-    return { kind: 'no_pr', noPrVerified: true, noopDelivered: true, toStage: 'Done',
+  if (declared && declared.outcome === 'NO_OP' && row.to_stage === 'In Progress') {
+    return { kind: 'no_pr', noopDelivered: true, toStage: 'Done',
       reason: 'completed_noop_already_delivered' };
   }
+  const commentPr = linked.rows[0] ? null : await client.query(
+    `SELECT content FROM comment WHERE issue_id = $1 ORDER BY created_at DESC LIMIT 40`, [row.issue_id]);
+  const commentMatch = commentPr?.rows
+    .map(({ content }) => String(content || '').match(/https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/pull\/(\d+)/i))
+    .find(Boolean);
   // A completed NO_OP has no deployable artifact. Park it instead of asking
   // the bridge to admit an independently checked NO-SHA Done transition.
   if (!linked.rows[0] && !commentMatch) {
     if (declared && declared.outcome === 'NO_OP') {
       return { kind: 'no_pr_noop', toStage: 'Parked', reason: 'completed_spec_noop' };
     }
-    return { kind: 'no_pr', toStage: 'Done', noPrVerified: true };
+    return { kind: 'no_pr', toStage: 'Done' };
   }
   const issuePr = linked.rows[0];
   const repo = issuePr
@@ -682,8 +658,6 @@ const LIFETIME_TASK_LIMIT = Number.parseInt(process.env.RELAY_LIFETIME_TASK_LIMI
 const QUOTA_FAILURE_LIMIT = Number.parseInt(process.env.RELAY_QUOTA_FAILURE_LIMIT || '3', 10);
 
 async function pauseQuotaLane(client, row, consecutiveFailures) {
-  // payment_required_402 is normalized to the same relay-owned quota disposition.
-  // reason: 'payment_required_402'
   const paused = await client.query(
     `UPDATE agent
         SET runtime_config = COALESCE(runtime_config, '{}'::jsonb) || jsonb_build_object(
@@ -869,18 +843,6 @@ async function markRelayLogFailedById(client, logId) {
   } catch (err) {
     console.error(`${LOG_PREFIX} Failed to update relay_run_log ${logId}: ${err.message}`);
   }
-}
-
-async function rejectRefusedEscalation(client, logId, reason, escalation) {
-  return client.query(
-    `UPDATE relay_run_log
-        SET status = 'rejected',
-            parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
-              jsonb_build_object('reason', 'retry_escalation_refused',
-                'completion_reason', $2::text, 'relay_status', $3::int)
-      WHERE id = $1 AND status = 'pending'`,
-    [logId, reason, escalation.status]
-  );
 }
 
 async function failMissingQcVerdict(client, logId) {
@@ -1261,8 +1223,7 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
     if (!completion.ok) {
       const escalation = await requestRetryEscalation(row, completion.reason);
       logger.log(`${LOG_PREFIX} [completion-admission] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', reason=${completion.reason}, relay=${escalation.status}`);
-      if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
-      else await rejectRefusedEscalation(client, row.log_id, completion.reason, escalation);
+      await markRelayLogFailedById(client, row.log_id);
       return false;
     }
     const qcAdvance = qcCompletionAdvance(row);
@@ -1300,7 +1261,6 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
       logger.log(`${LOG_PREFIX} [route] RESPEC: issue=${row.issue_id}, stage='${row.to_stage}', ` +
         `reason=${route.reason}, relay=${escalation.status}`);
       if (escalation.ok) await markRelayLogFailedById(client, row.log_id);
-      else await rejectRefusedEscalation(client, row.log_id, route.reason, escalation);
       return false;
     }
     const targetStage = route?.toStage || row.next_stage;
@@ -1384,10 +1344,6 @@ async function findAndAdvanceTasks({ dbPool = pool, postRelay = postToRelay,
       try { retry = await processAdvanceRow(client, row, { postRelay, logger, gateRunner }); }
       finally { await releaseAdvanceClaim(client, row, retry); }
     });
-    // Manual gated stages close their relay ledger without an automatic transition.
-    // Unbound completed Sol-low QC is failed for reconciler redispatch.
-    // qcAdvance.reason === 'manual_gated_stage' -> markRelayLogCompletedById(client, row.log_id)
-    // completed_sol_low_pass_required', 'qc_attempt_binding_required' -> markRelayLogFailedById(client, row.log_id)
   } catch (err) {
     logger.error(`${LOG_PREFIX} DB error: ${err.message}`);
   } finally {
@@ -1532,15 +1488,11 @@ function postToPath(path, payload) {
 function requestRetryEscalation(row, reason, relay = postToRelay) {
   const taskId = row.task_id || row.dead_task_id;
   const triggerStage = row.to_stage || row.stage;
-  const sameStageQcRedispatch = triggerStage === 'In Review' &&
-    reason === 'qc_verdict_missing_after_task_created';
-  // Spec is already the re-scoping lane. Missing-verdict QC rows are failed
-  // deliberately so the reconciler redispatches them in the same stage;
-  // moving them to Spec is both unnecessary and tenant-dependent because not
-  // every live In Review config admits that edge.
-  if (triggerStage === 'Spec' || sameStageQcRedispatch) {
-    return Promise.resolve({ ok: true, status: 200,
-      handled: triggerStage === 'Spec' ? 'already_in_spec' : 'same_stage_redispatch' });
+  // Spec is already the re-scoping lane.  Do not emit a meaningless
+  // Spec -> Spec request that the relay cannot execute; report an explicit
+  // handled result so the failed source row can be closed by the caller.
+  if (triggerStage === 'Spec') {
+    return Promise.resolve({ ok: true, status: 200, handled: 'already_in_spec' });
   }
   return relay({
     issue_id: row.issue_id,
@@ -1760,13 +1712,9 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
                 -- may not record a verdict, and build stages may not write a
                 -- completed relay row. Wait the existing queue TTL so a
                 -- normal asynchronous completion still has time to land.
-                    OR (
-                      t.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
-                      AND NOT EXISTS (
-                        SELECT 1 FROM agent_task_queue replay
-                         WHERE replay.retry_of_task_id = t.id
-                      )
-                      AND (
+                OR (
+                  t.created_at < NOW() - ($3::bigint * INTERVAL '1 minute')
+                  AND (
                     (i.status = 'In Review' AND NOT EXISTS (
                       SELECT 1 FROM qc_verdict qv
                        WHERE qv.issue_id = i.id
@@ -2081,8 +2029,7 @@ async function requeueStrandedTasks({ dbPool = pool, postRelay = postToRelay } =
           to_stage: row.stage,
           requeue_of_task: row.dead_task_id,
           requeue_of_relay_log: row.requeue_marker_log_id || row.closed_relay_log_id,
-          dead_task_reason: row.failure_reason,
-          replay_reason: coldStart ? 'stage_entry_recovery' : 'same_stage_no_advance'
+          dead_task_reason: row.failure_reason
         });
         const task = await client.query(
           `INSERT INTO agent_task_queue (
@@ -2392,12 +2339,14 @@ function relayAdvanceConfirmation(response, targetStage) {
 
 async function recordRefusedAdvance(client, row) {
   await markRelayLogFailedById(client, row.log_id);
+  // A relay refusal is transport/routing state, not a task outcome.  In
+  // particular, never overwrite a typed ADVANCED/NO_OP with FAILED/human:
+  // Human Review is reserved for an explicit task blocker or policy decision.
 }
 
 // Retry recorded successful work without creating another agent task.  A relay
-// refusal is relay state, not permission to rewrite the task's typed outcome.
-// Denial diagnostics and retry counts live on relay_run_log. Human ownership is
-// reserved for an explicit BLOCKED/human task outcome or an independent policy.
+// refusal (4xx) parks the outcome for a human at once; a denial that can clear
+// by itself is retried at most three times, then the outcome becomes human-owned.
 async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRelay,
   logger = console, typedOutcomes = TYPED_OUTCOMES } = {}) {
   if (!typedOutcomes) return [];
@@ -2425,11 +2374,15 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       // Preserve Spec as the requested stage for typed NO_OP completions so
       // the bridge applies specCompletionDisposition instead of bypassing it
       // with the configured Spec -> Queue target.
-      const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
       const targetStage = row.to_stage === 'Spec' && row.outcome === 'NO_OP'
-        ? 'Spec' : (row.to_stage === 'In Review' && qcAdvance.ok ? row.next_stage : route?.toStage || row.next_stage);
+        ? 'Spec' : route?.toStage || row.next_stage;
       if (!targetStage) continue;
+      const qcAdvance = row.to_stage === 'In Review' ? qcCompletionAdvance(row) : { ok: false };
       if (row.to_stage === 'In Review' && !qcAdvance.ok) {
+        const blockedOn = /sha|md5/i.test(qcAdvance.reason) ? 'sha' : 'human';
+        await client.query(`UPDATE issue_stage_outcome SET blocked_on = $3::text
+          WHERE issue_id = $1::uuid AND stage = $2::text`,
+        [row.issue_id, row.to_stage, blockedOn]);
         logger.log(`${LOG_PREFIX} [typed-readvance] skipped issue=${row.issue_id} reason=${qcAdvance.reason}`);
         continue;
       }
@@ -2445,7 +2398,6 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       const response = await postRelay({ issue_id: row.issue_id, to_stage: targetStage,
         agent_token: RELAY_AGENT_SECRET, relay_source_task_id: row.task_id,
         evidence: await completionEvidenceWithNoSha(client, row, targetStage, route, qcAdvance),
-        ...(qcAdvance.ok ? { current_work_product_md5: qcAdvance.workProductMd5 } : {}),
         ...(route ? { routing_classification: route } : {}) });
       const confirmation = relayAdvanceConfirmation(response, targetStage);
       if (confirmation.ok) {
@@ -2454,15 +2406,28 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
         continue;
       }
       const error = `status=${response.status}; error=${relayDenialDetail(response)}`;
-      await client.query(
+      const denied = await client.query(
         `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
              jsonb_build_object('typed_readvance_denials',
                COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) + 1,
                'typed_readvance_error', $2::text)
           WHERE id = (SELECT id FROM relay_run_log WHERE task_id = $1::uuid ORDER BY created_at DESC LIMIT 1)
         RETURNING COALESCE((parked_audit->>'typed_readvance_denials')::int, 0) AS denials`, [row.task_id, error]);
-      // Keep refusal diagnostics on relay_run_log. The typed task outcome stays
-      // authoritative even for a policy 4xx, a mismatched 200, or repeated 5xx.
+      // A 4xx is the relay refusing on policy, not failing: the identical POST
+      // earns the identical refusal until something outside this loop changes
+      // the ticket, so retrying it is pure waste. The three-strike allowance is
+      // for a denial that can clear by itself (202 deferred, 5xx no-owner).
+      //
+      // The counter alone did not bound the 4xx case: it lives on the task's
+      // newest relay_run_log row, and a completed task that never produced one
+      // makes the UPDATE match nothing, so `denials` reads 0 forever. Issue
+      // cae70ef9 (task ce297efa, zero relay_run_log rows) was refused
+      // `parked_release_required` on every cycle for hours on 2026-09-06 while
+      // issues whose task did have a run log stopped at exactly three.
+      const refused = (response.status >= 400 && response.status < 500) ||
+        (response.status === 200 && !confirmation.ok);
+      // Refusal/retry exhaustion stays in relay_run_log.  It must not mutate
+      // the task-declared outcome into FAILED/human.
       logger.log(`${LOG_PREFIX} [typed-readvance] denied issue=${row.issue_id} ${error}`);
     }
     return advanced;
@@ -2598,6 +2563,5 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   INFRA_FAILURE_REASONS, isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit,
   runReconcileCycle, recordOutcomesPass, readvanceRecordedOutcomes, createGuardedRunner, resolveRelayPoolMax,
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup,
-  inspectCheckout, completionEvidenceWithNoSha,
   advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency,
-  processAdvanceRow, relayAdvanceConfirmation };
+  relayAdvanceConfirmation };
