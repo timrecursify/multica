@@ -38,6 +38,7 @@ const STATUS_COLOR: Record<IssueStatus, string> = {
   "Human Review": "#22c55e",
   "CI/CD & Deploy": "#eab308",
   Parked: "#71717a",
+  Rejected: "#71717a",
   Done: "#3b82f6",
   Archived: "#71717a",
   Cancelled: "#71717a",
