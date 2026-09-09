@@ -14,6 +14,10 @@ const LINE = /^\s*OUTCOME:\s*(ADVANCED|BLOCKED|NO_OP|FAILED)(?:\s+(?:blocked_on=
 // Legacy heuristics keep pre-contract output useful; anything else is FAILED.
 function parseOutcome(output) {
   const text = String(output || "");
+  if (/^\s*OUTCOME:\s*ADVANCED\b/im.test(text) &&
+      /\bno(?: new)? (?:code|implementation|source) change (?:is |was )?(?:needed|required)\b/i.test(text)) {
+    return { outcome: "NO_OP", blockedOn: null, typed: true };
+  }
   const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   for (const line of lines.slice(-5).reverse()) {
     const m = LINE.exec(line);

@@ -81,6 +81,14 @@ test("recordStageOutcomes upserts one row per unrecorded completion", async () =
   assert.deepEqual(c.calls[2].params, ["i1", "In Review", "ADVANCED", null, "t1", "h"]);
 });
 
+test("typed ADVANCED no-change completion is recorded as NO_OP", async () => {
+  const c = fakeClient([[{ id: "t-noop", issue_id: "i-noop", stage: "In Progress",
+    output: "OUTCOME: ADVANCED\nNo code change was needed" }], [{ input_hash: null }], []]);
+  const r = await so.recordStageOutcomes(c, { logger: { log() {} } });
+  assert.deepEqual(r, { scanned: 1, recorded: 1, failed: 0 });
+  assert.equal(c.calls[2].params[2], "NO_OP");
+});
+
 test("recordStageOutcomes persists relay evidence_missing as a non-ADVANCED outcome", async () => {
   const c = fakeClient([[{ id: "t2", issue_id: "i2", stage: "Queue", output: "relay rejected Queue -> In Progress evidence_missing" }], [{ input_hash: "h1" }], []]);
   const r = await so.recordStageOutcomes(c, { logger: { log() {} } });
