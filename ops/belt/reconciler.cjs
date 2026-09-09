@@ -160,10 +160,29 @@ async function moveToHumanReview(client, issue, reason, options) {
   return { action: "human_review", reason };
 }
 
-// RULES allows Spec -> Human Review for the operator actor, which is the actor
-// moveToHumanReview declares. Spec must stay routable: a Spec ticket that has
-// spent its lifetime task budget can no longer be re-dispatched, and without an
-// exit it is re-evaluated every cycle forever instead of reaching a human.
+// Technical exhaustion is a scoping decision, not a human approval gate. Send
+// it to the Sol-low-owned Spec stage with the same durable audit shape used by
+// the Human Review hold. A ticket already in Spec stays there so its existing
+// agent-owned stage can be retried without manufacturing a self-transition.
+async function moveToAgentDecision(client, issue, reason, options) {
+  if (issue.status === "Spec") return null;
+  const verdict = policyFor(options)({
+    from: issue.status, to: "Spec", actor: "system",
+    evidence: { retry_escalation: true, blocker: reason }
+  });
+  if (!verdict?.ok) throw new Error(`reconcile policy rejected Spec: ${reason} (${verdict?.code})`);
+  await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
+  await client.query("UPDATE issue SET status = 'Spec', updated_at = NOW() WHERE id = $1::uuid", [issue.id]);
+  await client.query(
+    `INSERT INTO relay_run_log (issue_id, from_stage, to_stage, status, parked_audit)
+     VALUES ($1::uuid, $2, 'Spec', 'completed', jsonb_build_object('reason', $3::text))`,
+    [issue.id, issue.status, reason]
+  );
+  return { action: "agent_decision", reason, status: "Spec" };
+}
+
+// Human Review remains reachable for a genuine human-only decision from every
+// executing stage. Technical retry exhaustion uses moveToAgentDecision instead.
 const HUMAN_REVIEW_FROM = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LINK_TABLE = { ci: "issue_pull_request", sha: "issue_pull_request", dependency: "issue_dependency" };
 
@@ -299,12 +318,16 @@ async function routeTerminalBlocker(client, issue, prior, options) {
   const reason = await terminalBlocker(client, issue, prior, options);
   if (!reason) return null;
   try {
-    const result = await moveToHumanReview(client, issue, reason, options);
-    options.budget.humanReview += 1;
-    console.log(`[reconcile] ${issue.id} ${issue.status} -> Human Review (${reason})`);
+    const human = reason === "blocked_human";
+    const result = human
+      ? await moveToHumanReview(client, issue, reason, options)
+      : await moveToAgentDecision(client, issue, reason, options);
+    if (!result) return null;
+    if (human) options.budget.humanReview += 1;
+    console.log(`[reconcile] ${issue.id} ${issue.status} -> ${human ? "Human Review" : "Spec"} (${reason})`);
     return result;
   } catch (error) {
-    console.error(`[reconcile] Human Review route failed issue=${issue.id} ${error.message}`);
+    console.error(`[reconcile] blocker route failed issue=${issue.id} ${error.message}`);
     return null;
   }
 }
@@ -412,8 +435,9 @@ async function reconcileIssue(client, issueId, options = {}) {
         console.log(`[reconcile] advanced_stall: issue=${issue.id} stage=${issue.status}`);
       }
       if (!eligibility.eligible) {
-        // Nothing left to observe means nothing will ever re-open this stage, so the
-        // issue leaves the belt for a human instead of resting invisibly in Queue.
+        // Nothing left to observe means the stage needs a durable disposition.
+        // Only an explicit human blocker uses Human Review; machine-observable
+        // technical blockers return to the agent-owned Spec stage.
         const routed = await routeTerminalBlocker(client, issue, eligibility.prior, options);
         await client.query("COMMIT");
         return routed || { action: "skipped", reason: eligibility.reason };
@@ -421,16 +445,13 @@ async function reconcileIssue(client, issueId, options = {}) {
     }
     // Lifetime cap is per issue and includes every reconciler-created task,
     // regardless of terminal status.  Stop the paid loop before selecting an
-    // owner or inserting another task; route the durable blocker to a human.
+    // owner or inserting another task; route the technical decision to Spec.
     const lifetime = await client.query(lifetimeTasksSql(), [issue.id, issue.status]);
     const lifetimeCount = Number(lifetime.rows[0]?.count || 0);
     if (lifetimeCount >= options.lifetimeTaskLimit) {
       const capReason = `lifetime_task_limit:${lifetimeCount}/${options.lifetimeTaskLimit}`;
-      const routed = options.humanReviewRouting && HUMAN_REVIEW_FROM.has(issue.status) &&
-        options.budget.humanReview < options.maxHumanReviewPerCycle
-        ? await moveToHumanReview(client, issue, capReason, options) : null;
+      const routed = await moveToAgentDecision(client, issue, capReason, options);
       if (routed) {
-        options.budget.humanReview += 1;
         await client.query("COMMIT");
         return routed;
       }
@@ -453,10 +474,8 @@ async function reconcileIssue(client, issueId, options = {}) {
           client, issue.id, issue.status, admission.reuseTaskId, options.issueCooldownMinutes);
         if (armed.stalled) {
           const reason = "completed_build_work_product_handoff_stalled";
-          if (options.humanReviewRouting && HUMAN_REVIEW_FROM.has(issue.status) &&
-              options.budget.humanReview < options.maxHumanReviewPerCycle) {
-            const routed = await moveToHumanReview(client, issue, reason, options);
-            options.budget.humanReview += 1;
+          const routed = await moveToAgentDecision(client, issue, reason, options);
+          if (routed) {
             await client.query("COMMIT");
             return routed;
           }
@@ -614,4 +633,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, moveToAgentDecision, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
