@@ -49,6 +49,12 @@ test('controller liveness rejects PID reuse by binding boot id and process start
   assert.match(drain, /identity" == "\$expected_start\|\$expected_boot/);
 });
 
+test('privileged alarm dispatch uses an explicit unprivileged launcher and deterministic environment', () => {
+  assert.match(drain, /runuser_bin=.*BELT_DEPLOY_RUNUSER/);
+  assert.match(drain, /-u \"\$alarm_user\" -- env -i HOME=/);
+  assert.match(drain, /BELT_DEPLOY_ALARM_USER=\"\$alarm_user\"/);
+});
+
 test('stale-fence alarm resolves sk, sends literal newlines, and reports unavailable sk loudly', () => {
   execFileSync('bash', ['-c', `
     set -Eeuo pipefail
@@ -63,8 +69,18 @@ cat >"$ALARM_DESC"
 printf 'GSP-12345\\n'
 STUB
     chmod +x "$fixture/bin/sk"
+    cat >"$fixture/bin/runuser" <<'STUB'
+#!/usr/bin/env bash
+while [[ "$1" != env ]]; do shift; done
+shift
+[[ "$1" == -i ]] && shift
+while [[ "$1" == *=* ]]; do export "$1"; shift; done
+exec "$@"
+STUB
+    chmod +x "$fixture/bin/runuser"
+    sed -i "2i export ALARM_ARGS='$fixture/args' ALARM_DESC='$fixture/desc'" "$fixture/bin/runuser"
     export ALARM_ARGS="$fixture/args" ALARM_DESC="$fixture/desc"
-    PATH="$fixture/bin:/usr/bin:/bin"
+    export PATH="$fixture/bin:/usr/bin:/bin" BELT_DEPLOY_RUNUSER="$fixture/bin/runuser" BELT_DEPLOY_ALARM_USER="$(id -un)"
     source "$root_dir/deployment-drain.sh"
     deployment_fence_alarm old-controller 999 2>"$fixture/stderr"
     [[ "$deployment_fence_alarm_status" == filed ]]
@@ -97,7 +113,16 @@ printf '  code: active_duplicate_issue\\n  existing ticket(s):\\n    #827  P0: b
 exit 9
 STUB
     chmod +x "$fixture/sk"
-    BELT_DEPLOY_SK="$fixture/sk"
+    cat >"$fixture/runuser" <<'STUB'
+#!/usr/bin/env bash
+while [[ "$1" != env ]]; do shift; done
+shift
+[[ "$1" == -i ]] && shift
+while [[ "$1" == *=* ]]; do shift; done
+exec "$@"
+STUB
+    chmod +x "$fixture/runuser"
+    BELT_DEPLOY_SK="$fixture/sk" BELT_DEPLOY_RUNUSER="$fixture/runuser" BELT_DEPLOY_ALARM_USER="$(id -un)"
     source "$root_dir/deployment-drain.sh"
     deployment_fence_alarm old-controller 999 2>"$fixture/stderr"
     [[ "$deployment_fence_alarm_status" == duplicate_suppressed ]]
