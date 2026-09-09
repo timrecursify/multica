@@ -2,6 +2,14 @@
 -- 282 canonicalizes legacy aliases while preserving every canonical status;
 -- this migration repairs the schema contract and keeps older clients
 -- compatible through the write trigger.
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM issue WHERE status IN ('Parked', 'Rejected')) THEN
+        RAISE EXCEPTION 'migration 283 refuses to rewrite Parked or Rejected issue statuses';
+    END IF;
+END;
+$$;
+
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
 UPDATE issue SET status = 'Spec' WHERE status IN ('Parked', 'Rejected');
