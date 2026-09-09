@@ -21,3 +21,9 @@
 - Corrected the stateful release-window test harness so its intercepted stage-attempt query remains available for SQL-boundary assertions.
 - Focused result: 43 tests; 41 passed, 2 failed. The two failures are identical to baseline and require `DATABASE_URL`; all three added regressions pass.
 - `git diff --check`, `node --check ops/belt/reconciler.cjs`, and `node --check ops/belt/reconciler.test.cjs` pass.
+
+## Batch 4 — delivery
+
+- Commit: `7cd86f8d8` (`fix(belt): defer exhausted stage attempts`).
+- Opened PR [#877](https://github.com/timrecursify/multica/pull/877) from `fix/attempt-budget-deferral` to `main`.
+- No deployment, merge, configuration edit, database edit, or credential operation was performed.
