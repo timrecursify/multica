@@ -62,3 +62,23 @@ SELECT count(*) FROM issue WHERE status IN ('Done','Archived') AND updated_at>NO
 - 2026-09-09: Created the atomic commit (`fix(belt): admit completed builds without work products`); its pre-amend identifier was `159c385ce`.
 - 2026-09-09: Initial push failed because an invalid `GH_TOKEN` shadowed the configured GitHub CLI account. Selected the already-configured `timrecursify` account without exposing or rotating credentials; branch push then succeeded.
 - 2026-09-09: Final code commit is `7b15bd284`; pushed branch `belt/work-product-gate-20260909` and opened PR `https://github.com/timrecursify/multica/pull/865`. No deployment, restart, or live-row mutation was performed.
+Step 1 — verified repository guidance and root cause context:
+- Read CLAUDE.md; backend/reconciler change is in scope and tests use node --test.
+- Confirmed stageAttemptsSql() counts stage tasks in the arrival window and cooldown logic separately recognizes completed tasks.
+
+Step 2 — implementation and test:
+- Added `NOT (status = 'completed' AND failure_reason IS NULL)` to stageAttemptsSql().
+- Added an assertion covering the predicate.
+- `node --test ops/belt/reconciler.test.cjs`: 37 tests, 35 pass, 2 fail; both failures are pre-existing real-PostgreSQL regressions requiring DATABASE_URL, with 0 skipped.
+
+Step 3 — live before measurement:
+- Read-only query matched 92 issues with last relay failed and last stage task completed with NULL failure_reason.
+- Breakdown: GSP Multica Cancelled 1, In Progress 74, Spec 11; PPP Production Cancelled 6, In Progress 5, Spec 2.
+
+Step 4 — corrected release measurement:
+- The predicate releases 89 currently-stuck actionable issues: GSP Multica In Progress 73, Spec 9; PPP Production In Progress 5, Spec 2.
+- No live rows were updated.
+
+Step 5 — verification:
+- `git diff --check` passed.
+- Runaway requeue remains bounded by existing `completed_stage_cooldown` and `issue_cooldown` branches in ops/belt/reconciler.cjs:424-430, which skip recent completed or recent same-stage tasks.

@@ -104,6 +104,7 @@ function stageAttemptsSql() {
            FROM agent_task_queue
            WHERE issue_id = $1::uuid AND context->>'to_stage' = $2
              AND trigger_comment_id IS NULL
+             AND NOT (status = 'completed' AND failure_reason IS NULL)
              AND ${stageEntryWindowSql()}`;
 }
 

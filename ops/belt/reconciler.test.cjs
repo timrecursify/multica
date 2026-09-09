@@ -63,6 +63,7 @@ test("query builders hold the live status invariant", () => {
   assert.match(stageAttemptsSql(), /from_stage IS DISTINCT FROM to_stage/);
   assert.match(stageAttemptsSql(), /parked_release_at/);
   assert.match(stageAttemptsSql(), /human_review_release_at/);
+  assert.match(stageAttemptsSql(), /NOT \(status = 'completed' AND failure_reason IS NULL\)/);
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
 });
 
