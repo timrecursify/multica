@@ -30,8 +30,8 @@ hermetic = true
 name = "backend"
 command_argv = ["/usr/bin/bash", ".sk/scripts/check-backend.sh"]
 working_directory = "."
-# The runner supplies fixed loopback service values; caller environment is excluded.
-env_allowlist = []
+# The caller must supply DATABASE_URL and REDIS_TEST_URL for the backend profile.
+env_allowlist = ["DATABASE_URL", "REDIS_TEST_URL"]
 timeout = 600
 hermetic = true
 
