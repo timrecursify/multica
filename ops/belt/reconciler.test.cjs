@@ -63,7 +63,30 @@ test("query builders hold the live status invariant", () => {
   assert.match(stageAttemptsSql(), /from_stage IS DISTINCT FROM to_stage/);
   assert.match(stageAttemptsSql(), /parked_release_at/);
   assert.match(stageAttemptsSql(), /human_review_release_at/);
+  assert.match(stageAttemptsSql(), /failure_reason = ANY/);
+  assert.match(stageAttemptsSql(), /provider_quota_limit/);
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
+});
+
+test("infrastructure failures do not increment the stage attempt aggregate", () => {
+  const sql = stageAttemptsSql();
+  assert.match(sql, /NOT \(failure_reason = ANY/);
+  assert.match(sql, /'runtime_offline'/);
+  assert.match(sql, /'timeout'/);
+  assert.match(sql, /failure_reason ~\* '[^']*402/);
+});
+
+test("genuine failures remain eligible for the stage attempt aggregate", () => {
+  const sql = stageAttemptsSql();
+  assert.doesNotMatch(sql, /failed_implementation/);
+  assert.match(sql, /failure_reason = ANY/);
+  assert.match(sql, /failure_reason ~\*/);
+});
+
+test("infrastructure exclusion remains inside the arrival window", () => {
+  const sql = stageAttemptsSql();
+  assert.ok(sql.indexOf("failure_reason = ANY") < sql.indexOf("created_at >= GREATEST"));
+  assert.match(sql, /from_stage IS DISTINCT FROM/);
 });
 
 test("stage attempt window excludes tasks before arrival and includes tasks after it", () => {

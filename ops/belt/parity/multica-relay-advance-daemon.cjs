@@ -28,6 +28,7 @@ const { strictEvidenceFromRow } = require('../qc-strict-evidence.cjs');
 const { runQcGate, md5ForSha, getHardChecks } = require('../qc-gate.cjs');
 const { QC_LANE_EFFORT, isQcLane, qcLaneModelsSqlArray } = require('../qc-lane.cjs');
 const { reconcileCycle } = require('../reconciler.cjs');
+const { INFRA_FAILURE_REASONS, QUOTA_FAILURE_RE } = require('./infra-failure-reasons.cjs');
 const { recordStageOutcomes } = require('../stage-outcome.cjs');
 const TYPED_OUTCOMES = process.env.RECONCILE_TYPED_OUTCOMES === '1';
 const QUOTA_BREAKER_MINUTES = Number.parseInt(process.env.RECONCILE_QUOTA_BREAKER_MINUTES || '30', 10);
@@ -1605,17 +1606,6 @@ async function findAndAdvanceRegistered() {
 // must not spend the ticket's retry budget (GSP #727). These reasons requeue at
 // the same attempt number; anything else -- a task that actually ran and
 // produced a bad result -- costs an attempt as before.
-const INFRA_FAILURE_REASONS = [
-  'runtime_offline',
-  'timeout',
-  'queued_expired',
-  'cancelled',
-  'stream_disconnected',
-  'agent_error.provider_quota_limit'
-];
-
-const QUOTA_FAILURE_RE = /\b402\b|provider_quota_limit|payment[ _-]?required/i;
-
 function isQuotaFailure(reason) {
   return QUOTA_FAILURE_RE.test(String(reason || ''));
 }

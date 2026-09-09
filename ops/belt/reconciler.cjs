@@ -4,6 +4,7 @@ const { execFileSync } = require("child_process");
 const { resolveBuilderRoute } = require("./guardrails.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
+const { INFRA_FAILURE_REASONS, QUOTA_FAILURE_RE } = require("./parity/infra-failure-reasons.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
@@ -99,11 +100,16 @@ function lifetimeTasksSql() {
 }
 
 function stageAttemptsSql() {
+  // Loaded lazily because the parity daemon imports reconcileCycle from here.
+  const infraReasons = INFRA_FAILURE_REASONS.map((reason) => `'${reason.replaceAll("'", "''")}'`).join(", ");
+  const quotaPattern = QUOTA_FAILURE_RE.source.replaceAll("'", "''");
   return `SELECT COALESCE(max(attempt), 0)::int AS attempt,
                  COALESCE(max(max_attempts), $3::int)::int AS max_attempts
            FROM agent_task_queue
            WHERE issue_id = $1::uuid AND context->>'to_stage' = $2
              AND trigger_comment_id IS NULL
+             AND NOT (failure_reason = ANY(ARRAY[${infraReasons}]::text[])
+                      OR failure_reason ~* '${quotaPattern}')
              AND ${stageEntryWindowSql()}`;
 }
 
