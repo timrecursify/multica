@@ -6,7 +6,7 @@ const { Client } = require('pg');
 const { qcCompletionAdvance, completionEvidence, processParkedDiagnoses,
   adoptUnloggedInReviewTasks, requeueStrandedTasks, requeueTriggerSummary, INFRA_FAILURE_REASONS,
   isQuotaFailure, isInfrastructureFailure, selectReplayAttempt, reconcileCreateLimit, runReconcileCycle,
-  readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, runBounded,
+  readvanceRecordedOutcomes, buildCompletionRoute, requestCapDisposition, requestRetryEscalation, runBounded,
   parseGateCheckConcurrency, claimAdvanceRow, qcGateRequired } = require('./multica-relay-advance-daemon.cjs');
 const { createGuardedRunner, resolveRelayPoolMax } = require('./multica-relay-advance-daemon.cjs');
 const { scheduleEvery } = require('./multica-relay-advance-daemon.cjs');
@@ -17,6 +17,17 @@ test('same-stage no-advance replay is explicitly reasoned and bounded once', () 
   const source = fs.readFileSync('ops/belt/parity/multica-relay-advance-daemon.cjs', 'utf8');
   assert.match(source, /replay\.retry_of_task_id = t\.id/);
   assert.match(source, /replay_reason: coldStart \? 'stage_entry_recovery' : 'same_stage_no_advance'/);
+});
+
+test('missing In Review verdict stays in stage for reconciler redispatch', async () => {
+  const posts = [];
+  const result = await requestRetryEscalation(
+    { issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Review' },
+    'qc_verdict_missing_after_task_created',
+    async (payload) => { posts.push(payload); return { ok: true, status: 200 }; }
+  );
+  assert.deepEqual(posts, []);
+  assert.deepEqual(result, { ok: true, status: 200, handled: 'same_stage_redispatch' });
 });
 
 test('completion evidence satisfies every automatic transition policy row', () => {

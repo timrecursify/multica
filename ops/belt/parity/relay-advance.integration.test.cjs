@@ -583,14 +583,12 @@ test('terminal-source relay logs are completed without requesting a successor', 
   assert.ok(harness.logs.some((line) => line.includes('TERMINAL:')));
 });
 
-test('completed In Review task without a later verdict fails and escalates to Spec', async () => {
+test('completed In Review task without a later verdict fails for same-stage redispatch', async () => {
   const missing = { log_id: 'missing-log', task_id: 'missing-task', issue_id: 'missing-issue',
     to_stage: 'In Review' };
   const harness = advanceHarness(advanceRow(), { verdict: 'PASS', work_product_md5: MD5 }, [missing]);
   await harness.run();
-  assert.ok(harness.payloads.some((payload) => payload.issue_id === 'missing-issue' &&
-    payload.to_stage === 'Spec' &&
-    payload.reason === 'retry_escalation:qc_verdict_missing_after_task_created'));
+  assert.equal(harness.payloads.some((payload) => payload.issue_id === 'missing-issue'), false);
   const failure = harness.queries.find(({ sql }) =>
     sql.includes('qc_verdict_missing_after_task_created'));
   assert.ok(failure);
@@ -606,14 +604,14 @@ test('Cancelled relay row closes before issue-status admission', async () => {
   assert.deepEqual(terminal.values, [['Done', 'Cancelled', 'Archived']]);
 });
 
-test('25 dead In Review rows are excluded before the 20-row advance window', async () => {
+test('25 dead In Review rows redispatch in place before the 20-row advance window', async () => {
   const missing = Array.from({ length: 25 }, (_, index) => ({
     log_id: `missing-${index}`, task_id: `task-${index}`, issue_id: `issue-${index}`,
     to_stage: 'In Review'
   }));
   const harness = advanceHarness(advanceRow(), { verdict: 'PASS', work_product_md5: MD5 }, missing);
   await harness.run();
-  assert.equal(harness.payloads.filter((payload) => payload.to_stage === 'Spec').length, 25);
+  assert.equal(harness.payloads.filter((payload) => payload.issue_id.startsWith('issue-')).length, 0);
   assert.ok(harness.payloads.some((payload) => payload.to_stage === 'CI/CD & Deploy'));
   const advanceQuery = harness.queries.find(({ sql }) => sql.includes('SELECT rrl.id AS log_id') &&
     sql.includes('LIMIT 20'));
