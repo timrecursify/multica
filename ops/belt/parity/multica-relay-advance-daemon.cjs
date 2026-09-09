@@ -1337,7 +1337,7 @@ async function processAdvanceRow(client, row, { postRelay, logger, gateRunner })
       if (response.status === 409 && response.error !== 'builder_work_product_required') {
         relayRefusalMemo.set(row.issue_id, refusalFingerprint);
       }
-      await recordRefusedAdvance(client, row);
+      await recordRefusedAdvance(client, row, response, confirmation, targetStage);
     }
     return false;
   } catch (err) {
@@ -2395,8 +2395,21 @@ function relayAdvanceConfirmation(response, targetStage) {
     parsed.error || (response?.ok ? 'relay_stage_mismatch' : 'relay_request_failed'), actualStage };
 }
 
-async function recordRefusedAdvance(client, row) {
-  await markRelayLogFailedById(client, row.log_id);
+async function recordRefusedAdvance(client, row, response, confirmation, targetStage) {
+  const reason = confirmation?.reason || relayDenialDetail(response || {});
+  await client.query(
+    `UPDATE relay_run_log
+        SET status = 'failed',
+            parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
+              jsonb_build_object('relay_refusal', jsonb_build_object(
+                'status', $2::int,
+                'reason', $3::text,
+                'actual_stage', $4::text,
+                'target_stage', $5::text))
+      WHERE id = $1 AND status = 'pending'`,
+    [row.log_id, response?.status ?? null, reason,
+      confirmation?.actualStage ?? null, targetStage ?? row.to_stage ?? null]
+  );
 }
 
 // Retry recorded successful work without creating another agent task.  A relay
@@ -2605,4 +2618,4 @@ module.exports = { applyQcGate, qcGateRequired, returnFailedQcOutcomes, advanceT
   github, restPrView, restPrViewFields, reconcileGithubCommand, restStatusCheckRollup,
   inspectCheckout, completionEvidenceWithNoSha,
   advanceClaimKey, claimAdvanceRow, releaseAdvanceClaim, runBounded, parseGateCheckConcurrency,
-  processAdvanceRow, relayAdvanceConfirmation };
+  processAdvanceRow, relayAdvanceConfirmation, recordRefusedAdvance };
