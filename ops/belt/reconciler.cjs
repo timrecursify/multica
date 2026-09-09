@@ -478,6 +478,12 @@ async function reconcileIssue(client, issueId, options = {}) {
         console.log(`[reconcile] advanced_stall: issue=${issue.id} stage=${issue.status}`);
       }
       if (!eligibility.eligible) {
+        if (eligibility.reason === "outcome_missing_input_hash") {
+          const deferred = await deferMechanicalRetry(
+            client, issue, eligibility.reason, options.mechanicalRetryMinutes);
+          await client.query("COMMIT");
+          return deferred;
+        }
         // Nothing left to observe means the stage needs a durable disposition.
         // Only an explicit human blocker uses Human Review; machine-observable
         // technical blockers return to the agent-owned Spec stage.
