@@ -156,9 +156,56 @@ function uniqueOutputPullRequest(output) {
   return unique.length === 1 ? unique[0] : null;
 }
 
+async function linkOutputPullRequest(client, issueId, workspaceId, outputPr, githubCommand) {
+  let pr;
+  try {
+    pr = JSON.parse(await githubCommand(['pr', 'view', outputPr.url, '--json',
+      'number,title,state,url,headRefOid,createdAt,updatedAt,mergedAt,closedAt,' +
+      'author,headRefName,additions,deletions,changedFiles,mergeable,mergeStateStatus,statusCheckRollup'],
+    { fresh: true }));
+  } catch (_) { return false; }
+  if (Number(pr?.number) !== outputPr.prNumber || !pr?.state || !pr?.headRefOid) return false;
+  const rollup = Array.isArray(pr.statusCheckRollup) ? pr.statusCheckRollup : [];
+  const conclusions = rollup.map((check) =>
+    String(check.conclusion || check.state || '').toUpperCase()).filter(Boolean);
+  const rollupState = conclusions.length === 0 ? null
+    : conclusions.some((value) => ['FAILURE', 'ERROR', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED'].includes(value)) ? 'FAILURE'
+    : conclusions.every((value) => ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(value)) ? 'SUCCESS'
+    : 'PENDING';
+  const [owner, repo] = outputPr.repository.split('/');
+  const inserted = await client.query(
+    `INSERT INTO github_pull_request (workspace_id, installation_id, repo_owner, repo_name,
+        pr_number, title, state, html_url, branch, author_login, merged_at, closed_at,
+        pr_created_at, pr_updated_at, head_sha, additions, deletions, changed_files,
+        api_mergeable, api_merge_state_status, checks_rollup_state, snapshot_head_sha, snapshot_fetched_at)
+      VALUES ($1::uuid, 0, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+        $15, $16, $17, $18, $19, $20, $14, NOW())
+      ON CONFLICT (workspace_id, repo_owner, repo_name, pr_number) DO UPDATE SET
+        state = EXCLUDED.state, head_sha = EXCLUDED.head_sha, merged_at = EXCLUDED.merged_at,
+        closed_at = EXCLUDED.closed_at, pr_updated_at = EXCLUDED.pr_updated_at,
+        api_mergeable = EXCLUDED.api_mergeable, api_merge_state_status = EXCLUDED.api_merge_state_status,
+        checks_rollup_state = EXCLUDED.checks_rollup_state, snapshot_head_sha = EXCLUDED.snapshot_head_sha,
+        snapshot_fetched_at = NOW(), updated_at = NOW()
+      RETURNING id`,
+    [workspaceId, owner, repo, pr.number, pr.title || outputPr.url,
+      String(pr.state).toLowerCase(), pr.url || outputPr.url, pr.headRefName || null,
+      pr.author?.login || null, pr.mergedAt || null, pr.closedAt || null,
+      pr.createdAt, pr.updatedAt, String(pr.headRefOid).toLowerCase(),
+      pr.additions ?? 0, pr.deletions ?? 0, pr.changedFiles ?? 0,
+      pr.mergeable || null, pr.mergeStateStatus || null, rollupState]);
+  if (inserted.rows.length !== 1) return false;
+  await client.query(
+    `INSERT INTO issue_pull_request (issue_id, pull_request_id, linked_by_type, linked_at)
+      VALUES ($1::uuid, $2::uuid, 'stage_outcome', NOW())
+      ON CONFLICT (issue_id, pull_request_id) DO NOTHING`, [issueId, inserted.rows[0].id]);
+  return true;
+}
+
 async function produceImplementationWorkProduct(client, row, githubCommand) {
   if (typeof githubCommand !== 'function') return false;
-  await client.query("SELECT id FROM issue WHERE id = $1::uuid FOR UPDATE", [row.issue_id]);
+  const issue = (await client.query(
+    "SELECT id, workspace_id FROM issue WHERE id = $1::uuid FOR UPDATE", [row.issue_id])).rows[0];
+  if (!issue) return false;
   const active = (await client.query(
     `SELECT scope_revision, kind, repository, branch, pr_number
        FROM issue_work_product
@@ -171,7 +218,7 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
        Number(active[0].pr_number) !== outputPr.prNumber)) return false;
   const selectedRepository = active[0]?.repository || outputPr?.repository || null;
   const selectedPrNumber = active[0]?.pr_number || outputPr?.prNumber || null;
-  const linked = (await client.query(
+  let linked = (await client.query(
     `SELECT DISTINCT p.repo_owner || '/' || p.repo_name AS repository, p.pr_number,
             p.branch, p.html_url
        FROM issue_pull_request ipr
@@ -181,6 +228,19 @@ async function produceImplementationWorkProduct(client, row, githubCommand) {
         AND ($2::text IS NULL OR lower(p.repo_owner || '/' || p.repo_name) = lower($2::text))
         AND ($3::int IS NULL OR p.pr_number = $3::int)
       `, [row.issue_id, selectedRepository, selectedPrNumber])).rows;
+  if (linked.length === 0 && outputPr) {
+    await linkOutputPullRequest(client, row.issue_id, issue.workspace_id, outputPr, githubCommand);
+    linked = (await client.query(
+      `SELECT DISTINCT p.repo_owner || '/' || p.repo_name AS repository, p.pr_number,
+              p.branch, p.html_url
+         FROM issue_pull_request ipr
+         JOIN github_pull_request p ON p.id = ipr.pull_request_id
+         JOIN issue i ON i.id = ipr.issue_id AND i.workspace_id = p.workspace_id
+        WHERE ipr.issue_id = $1::uuid
+          AND lower(p.repo_owner || '/' || p.repo_name) = lower($2::text)
+          AND p.pr_number = $3::int`,
+      [row.issue_id, outputPr.repository, outputPr.prNumber])).rows;
+  }
   if (linked.length !== 1) return false;
   const candidate = linked[0];
   if (active[0] && (active[0].repository.toLowerCase() !== candidate.repository.toLowerCase() ||
