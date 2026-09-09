@@ -39,8 +39,11 @@ comment with the error and stop.
    test edit merely to create a diff.
 7. Post the human-readable work-product comment below. It is an audit view, not the
    ownership record.
-8. Advance `Queue` to `In Progress`, then `In Progress` to `In Review`, with
-   `sk multica advance "$NUMBER" --to "In Progress" --board "$BOARD"`.
+8. Complete the Queue-stage task and record its work product first. Only after the
+   task status is `completed`, advance `Queue` to `In Progress`, then `In Progress`
+   to `In Review`, with `sk multica advance "$NUMBER" --to "In Progress"
+   --board "$BOARD"`. Requesting `Queue` -> `In Progress` while the task is still
+   running returns 409 `builder_work_product_required` and strands the ticket.
 
 Write the stage names exactly as shown, capitals and space included. They are
 the only values `issue_status_check` accepts. A generic form such as
