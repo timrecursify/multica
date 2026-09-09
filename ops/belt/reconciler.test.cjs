@@ -59,7 +59,23 @@ test("query builders hold the live status invariant", () => {
   assert.match(ownerSql(), /available_capacity/);
   assert.match(ownerSql(), /ORDER BY pool.last_selected_at NULLS FIRST, pool.agent_id LIMIT 1/);
   assert.match(stageAttemptsSql(), /\$3::int/);
+  assert.match(stageAttemptsSql(), /created_at >= GREATEST/);
+  assert.match(stageAttemptsSql(), /from_stage IS DISTINCT FROM to_stage/);
+  assert.match(stageAttemptsSql(), /parked_release_at/);
+  assert.match(stageAttemptsSql(), /human_review_release_at/);
   assert.deepEqual(taskContext("Queue"), { source: "reconcile", kind: "stage_task", to_stage: "Queue" });
+});
+
+test("stage attempt window excludes tasks before arrival and includes tasks after it", () => {
+  const sql = stageAttemptsSql();
+  assert.match(sql, /context->>'to_stage' = \$2/);
+  assert.match(sql, /created_at >= GREATEST/);
+  assert.match(sql, /max\(created_at\) FROM relay_run_log/);
+});
+
+test("stage attempt window uses the later release timestamp", () => {
+  const sql = stageAttemptsSql();
+  assert.match(sql, /GREATEST\([\s\S]*parked_release_at[\s\S]*human_review_release_at/);
 });
 
 test("stage attempt ceiling stays fixed across replays", () => {

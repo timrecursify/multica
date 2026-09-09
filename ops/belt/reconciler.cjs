@@ -78,11 +78,8 @@ function ownerSql() {
 // counts from parked_release_at / human_review_release_at (humanReleaseAt);
 // a release that is followed by a direct Queue -> In Progress hand-off writes
 // no arrival row, and without this the old In Progress arrival still counts.
-function lifetimeTasksSql() {
-  return `SELECT count(*)::int AS count
-            FROM agent_task_queue
-           WHERE issue_id = $1::uuid AND trigger_comment_id IS NULL
-             AND created_at >= GREATEST(
+function stageEntryWindowSql() {
+  return `created_at >= GREATEST(
                    COALESCE(
                      (SELECT max(created_at) FROM relay_run_log
                        WHERE issue_id = $1::uuid AND to_stage = $2
@@ -94,12 +91,20 @@ function lifetimeTasksSql() {
                      FROM issue WHERE id = $1::uuid), '-infinity'::timestamptz))`;
 }
 
+function lifetimeTasksSql() {
+  return `SELECT count(*)::int AS count
+            FROM agent_task_queue
+           WHERE issue_id = $1::uuid AND trigger_comment_id IS NULL
+             AND ${stageEntryWindowSql()}`;
+}
+
 function stageAttemptsSql() {
   return `SELECT COALESCE(max(attempt), 0)::int AS attempt,
                  COALESCE(max(max_attempts), $3::int)::int AS max_attempts
-            FROM agent_task_queue
+           FROM agent_task_queue
            WHERE issue_id = $1::uuid AND context->>'to_stage' = $2
-             AND trigger_comment_id IS NULL`;
+             AND trigger_comment_id IS NULL
+             AND ${stageEntryWindowSql()}`;
 }
 
 function stageAttemptBudget(attempt, configuredMax, fallbackMax) {
