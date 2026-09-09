@@ -255,11 +255,10 @@ function lifetimeTaskAdmission(taskCount, limit = 6) {
     return { ok: false, reason: 'invalid_lifetime_task_limit' };
   }
   // Reaching the ceiling stops another paid run without ending the ticket.
-  // Human Review is non-executing and gives the capped flight an owner instead
-  // of returning it to Spec, where another paid cycle could begin.
+  // Exhaustion is mechanical, so return it to the agent-owned re-scoping lane.
   return count < ceiling
     ? { ok: true, ceiling }
-    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Human Review' };
+    : { ok: false, reason: 'lifetime_task_limit', ceiling, disposition: 'Spec' };
 }
 
 function isExecutionStage(stage) {

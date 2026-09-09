@@ -203,11 +203,31 @@ test('bridge and daemon use the same budget predicate', () => {
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
   assert.deepEqual(lifetimeTaskAdmission(5), { ok: true, ceiling: 6 });
-  // Human Review ends automatic paid retries without throwing the ticket away.
+  // Mechanical exhaustion returns to the agent-owned re-scoping lane.
   assert.deepEqual(lifetimeTaskAdmission(6), {
     ok: false, reason: 'lifetime_task_limit', ceiling: 6,
-    disposition: 'Human Review'
+    disposition: 'Spec'
   });
+});
+
+test('mechanical QC bounce exhaustion re-scopes to Spec, never Human Review', () => {
+  const source = fs.readFileSync(
+    require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8'
+  );
+  const cappedBranch = source.slice(source.indexOf('if (count >= STAGE_CYCLE_LIMIT)'),
+    source.indexOf("const response = await postRelay({ issue_id: row.issue_id, to_stage: 'In Progress'"));
+  assert.match(cappedBranch, /requestRetryEscalation\([\s\S]*'qc_bounce_ceiling'/);
+  assert.doesNotMatch(cappedBranch, /Human Review|blocked_on = 'human'/);
+});
+
+test('mechanical QC gate attempt exhaustion re-scopes to Spec', () => {
+  const source = fs.readFileSync(
+    require.resolve('./parity/multica-relay-advance-daemon.cjs'), 'utf8'
+  );
+  const exhaustedBranch = source.slice(source.indexOf('if (attempt > maxAttempts)'),
+    source.indexOf('if (!selected?.agent_id)'));
+  assert.match(exhaustedBranch, /requestRetryEscalation\([\s\S]*'stage_cycle_limit'/);
+  assert.doesNotMatch(exhaustedBranch, /Human Review/);
 });
 
 test('the lifetime ceiling never disposes a ticket to a terminal stage', () => {

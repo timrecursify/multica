@@ -749,7 +749,10 @@ async function closureWatchdog(issue, result, sha) {
   const elapsed = Date.now() - Date.parse(row.first_seen_at);
   const reason = `retry_escalation:closure_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed} last_error=${row.last_error || 'deploy pending'} correlation_key=${row.correlation_key}`;
   if (result.outcome === 'discovery_auth_failure' || result.outcome === 'discovery_transport_failure') {
-    await humanReview(issue, reason);
+    await retryEscalation(issue, 'Spec', reason, {
+      trigger_reason: 'closure_stalled', stage: row.stage, elapsed_ms: elapsed,
+      last_error: row.last_error || 'deploy pending', correlation_key: row.correlation_key
+    });
     const alerted = watchdog.markAlerted(row, 'closure_stalled');
     return Boolean(alerted);
   }
