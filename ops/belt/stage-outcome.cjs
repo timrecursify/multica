@@ -104,7 +104,7 @@ function unrecordedCompletionsSql() {
   return `WITH latest AS (
       SELECT DISTINCT ON (t.issue_id, t.context->>'from_stage')
              t.id, t.issue_id, t.context->>'from_stage' AS stage,
-             t.context->>'to_stage' AS to_stage,
+             t.context->>'to_stage' AS target_stage,
              t.result->>'output' AS output, t.created_at,
              CASE WHEN (t.context->>'scope_revision') ~ '^[1-9][0-9]*$'
                THEN (t.context->>'scope_revision')::bigint
@@ -120,7 +120,8 @@ function unrecordedCompletionsSql() {
       WHERE t.status = 'completed' AND t.completed_at > NOW() - ($1::int * interval '1 minute')
         AND t.context->>'to_stage' IS NOT NULL AND t.issue_id IS NOT NULL
       ORDER BY t.issue_id, t.context->>'from_stage', t.completed_at DESC)
-    SELECT latest.id, latest.issue_id, latest.stage, latest.output, latest.scope_revision
+    SELECT latest.id, latest.issue_id, latest.stage, latest.target_stage,
+           latest.output, latest.scope_revision
     FROM latest
     WHERE NOT EXISTS (SELECT 1 FROM issue_stage_outcome o WHERE o.task_id = latest.id)
     ORDER BY latest.completed_at ASC LIMIT 200`;

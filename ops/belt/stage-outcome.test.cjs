@@ -66,11 +66,11 @@ test("stageEligibility ignores a stale blocker after an operator release", async
 });
 
 test("recordStageOutcomes upserts one row per unrecorded completion", async () => {
-  const c = fakeClient([[{ id: "t1", issue_id: "i1", stage: "In Progress", output: "OUTCOME: FAILED" }], [{ input_hash: "h" }], []]);
+  const c = fakeClient([[{ id: "t1", issue_id: "i1", stage: "In Review", output: "OUTCOME: ADVANCED" }], [{ input_hash: "h" }], []]);
   const r = await so.recordStageOutcomes(c, { logger: { log() {} } });
   assert.deepEqual(r, { scanned: 1, recorded: 1, failed: 0 });
   assert.match(c.calls[2].sql, /INSERT INTO issue_stage_outcome/);
-  assert.deepEqual(c.calls[2].params, ["i1", "In Progress", "FAILED", null, "t1", "h"]);
+  assert.deepEqual(c.calls[2].params, ["i1", "In Review", "ADVANCED", null, "t1", "h"]);
 });
 
 test("recordStageOutcomes persists relay evidence_missing as a non-ADVANCED outcome", async () => {
@@ -191,6 +191,7 @@ test("unrecorded completions read only the newest completion per issue and stage
   // Without this the pass rewrote one row between two sibling completions forever.
   assert.match(sql, /DISTINCT ON \(t\.issue_id, t\.context->>'from_stage'\)/);
   assert.match(sql, /ORDER BY t\.issue_id, t\.context->>'from_stage', t\.completed_at DESC/);
+  assert.match(sql, /t\.context->>'to_stage' AS target_stage/);
   assert.match(sql, /WHERE NOT EXISTS \(SELECT 1 FROM issue_stage_outcome o WHERE o\.task_id = latest\.id\)/);
 });
 
