@@ -288,14 +288,6 @@ function receiptFor(repo, target, sha, owner) {
   } catch (_) { return null; }
 }
 
-async function humanReview(issue, reason) {
-  const evidence = { blocker: reason, namedBlocker: true };
-  const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Human Review', actor: 'operator', evidence });
-  if (!verdict.ok) throw new Error(`transition policy rejected Human Review: ${verdict.code}`);
-  await relay(issue.id, 'Human Review', null, reason, null, evidence);
-  log(`HUMAN REVIEW #${issue.number} — ${reason}`);
-}
-
 async function retryEscalation(issue, toStage, reason, evidence = {}) {
   const retryEvidence = { retry_escalation: true, blocker: reason, ...evidence };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: toStage, actor: 'system', evidence: retryEvidence });
@@ -709,8 +701,8 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   const deploy = await mergeDeployEvidence(pr.repo, mergedSha, pr);
   if (deploy.blocker?.type === 'deployment_owner_absent') {
     const reason = `${note}; deployment_owner_absent target=${deploy.blocker.target} sha=${mergedSha}`;
-    await humanReview(issue, reason);
-    return { status: 'human_review', outcome: 'failed', blocker: deploy.blocker,
+    await escalateToSpec(issue, reason, mergedSha);
+    return { status: 'respec', outcome: 'failed', blocker: deploy.blocker,
       retryEligible: false, sha: mergedSha };
   }
   if (deploy.outcome === 'failed') {
@@ -749,7 +741,7 @@ async function closureWatchdog(issue, result, sha) {
   const elapsed = Date.now() - Date.parse(row.first_seen_at);
   const reason = `retry_escalation:closure_stalled issue=${issue.id} stage=${row.stage} elapsed_ms=${elapsed} last_error=${row.last_error || 'deploy pending'} correlation_key=${row.correlation_key}`;
   if (result.outcome === 'discovery_auth_failure' || result.outcome === 'discovery_transport_failure') {
-    await humanReview(issue, reason);
+    await escalateToSpec(issue, reason, sha);
     const alerted = watchdog.markAlerted(row, 'closure_stalled');
     return Boolean(alerted);
   }
@@ -1035,19 +1027,15 @@ async function sweep() {
         log(`RATE-LIMIT sweep skipped=${rows.length - issueIndex} reset=${new Date(cooldownUntil).toISOString()}`);
         return;
       }
-      // GSP-1973 / upstream multica#465: watchdogFailure escalates via
-      // humanReview -> relay('Human Review'), which the relay refuses with
-      // 409 actor_denied because this worker holds RELAY_AGENT_SECRET while
-      // that transition is operator-only. Thrown from inside this catch, it
-      // escaped the loop and aborted the whole sweep, so every ticket ordered
-      // after the first escalating one was skipped.
+      // Keep each ticket isolated: one refused escalation must not abort the
+      // sweep and skip every ticket ordered after it.
       let failure = { stalled: false };
       try {
         failure = await watchdogFailure(issue, e.message);
       } catch (escalationError) {
         log(`ESCALATE-FAIL #${issue.number}: ${String(escalationError.message).split('\n')[0].slice(0, 160)}`);
       }
-      log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}${failure.stalled ? ' (Human Review)' : ''}`);
+      log(`ERR #${issue.number}: ${String(e.message).split('\n')[0].slice(0, 160)}${failure.stalled ? ' (escalated)' : ''}`);
     }
   }
 }
@@ -1074,7 +1062,7 @@ function setTestDependencies(dependencies) {
   if (dependencies.watchdog) watchdog = dependencies.watchdog;
 }
 
-module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, humanReview, retryEscalation,
+module.exports = { ciState, countCiFailure, escalateCi, returnToBuild, retryEscalation,
   routeFinishedPR, receiptFor, mergeDeployEvidence, changedPathManifest, deploymentRequirements,
   noDeployRunTriggered, terminalFailedDeployRuns,
   terminalDeployEvaluation, retriggerCancelledDeploys, normalizeReturnReason, parseRelayResponse,
