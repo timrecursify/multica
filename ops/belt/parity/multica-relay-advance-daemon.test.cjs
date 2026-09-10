@@ -1703,7 +1703,8 @@ test('a 409 relay refusal preserves the task-declared ADVANCED outcome', async (
       body: '{"error":"parked_release_required","message":"a completed Sol-low diagnosis must authorize one deliberate release"}' }; },
     logger: { log: (line) => logs.push(line) }, typedOutcomes: true });
   assert.equal(posts, 1);
-  assert.equal(calls.some(({ sql }) => /SET denial_reason/.test(sql)), true);
+  assert.equal(calls.some(({ sql }) => /UPDATE issue_stage_outcome SET denial_reason/.test(sql)), false);
+  assert.equal(calls.some(({ sql }) => /UPDATE relay_run_log SET parked_audit/.test(sql)), true);
   assert.match(logs.join('\n'), /a completed Sol-low diagnosis must authorize one deliberate release/);
 });
 
@@ -1719,12 +1720,13 @@ test('deterministic 409 denial persists terminal input-hash suppression', async 
   await readvanceRecordedOutcomes({ dbPool: { connect: async () => client },
     postRelay: async () => ({ ok: false, status: 409,
       error: 'implementation evidence required' }), logger: { log() {} }, typedOutcomes: true });
-  const update = calls.find(({ sql }) => sql.includes("'denial_input_hash'"));
-  const outcomeUpdate = calls.find(({ sql }) => sql.startsWith('UPDATE issue_stage_outcome SET denial_reason'));
-  assert.deepEqual(outcomeUpdate.values.slice(2),
-    ['implementation evidence required', 'hash-1', 1, null, true]);
+  const update = calls.find(({ sql }) => sql.startsWith('UPDATE relay_run_log SET parked_audit'));
+  assert.equal(calls.some(({ sql }) => sql.startsWith('UPDATE issue_stage_outcome SET denial_reason')), false);
+  assert.deepEqual(update.values.slice(1),
+    [1, 'status=409; error=implementation evidence required',
+      'implementation evidence required', 'hash-1', null, true]);
   assert.equal(update.values[4], 'hash-1');
-  assert.match(calls[0].sql, /denial_next_retry_at/);
+  assert.match(calls[0].sql, /parked_audit->>'denial_next_retry_at'/);
 });
 
 test('unchanged deterministic denial posts once without relay log and changed input re-arms', async () => {
@@ -1739,8 +1741,8 @@ test('unchanged deterministic denial posts once without relay log and changed in
         task_id: 'task-1', task_result: {}, next_stage: 'In Progress',
         relevant_input_hash: relevantHash, denial_input_hash: storedHash, denial_attempts: 1 }] };
     }
-    if (sql.startsWith('UPDATE issue_stage_outcome SET denial_reason')) {
-      storedHash = values[3];
+    if (sql.startsWith('UPDATE relay_run_log SET parked_audit')) {
+      storedHash = values[4];
       terminal = values[6];
     }
     return { rows: [] };
@@ -1771,6 +1773,8 @@ test('readvance suppression fingerprint includes later QC and deploy-route evide
   assert.match(query, /github_pull_request/);
   assert.match(query, /recent_comments/);
   assert.match(query, /task_message/);
+  assert.match(query, /LEFT JOIN LATERAL \([\s\S]*FROM relay_run_log log/);
+  assert.doesNotMatch(query, /o\.denial_input_hash|o\.denial_attempts/);
 });
 
 test('a transient relay denial keeps its three-strike allowance', async () => {
