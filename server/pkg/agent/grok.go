@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -145,6 +146,10 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 
 	cmd := exec.CommandContext(runCtx, execPath, grokArgs...)
 	hideAgentWindow(cmd)
+	configureProcessGroup(cmd)
+	// Drive cancellation explicitly so descendants are terminated too.
+	cmd.Cancel = func() error { return nil }
+	cmd.WaitDelay = 10 * time.Second
 	b.cfg.Logger.Info("agent command", "exec", execPath, "args", grokArgs)
 	if opts.Cwd != "" {
 		cmd.Dir = opts.Cwd
@@ -176,6 +181,19 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		cancel()
 		return nil, fmt.Errorf("start grok: %w", err)
 	}
+	procDone := make(chan struct{})
+	go func() {
+		select {
+		case <-procDone:
+		case <-runCtx.Done():
+			if cmd.Process != nil {
+				signalProcessGroup(cmd.Process, syscall.SIGTERM)
+				if !waitProcessGroupGone(cmd.Process, 2*time.Second) {
+					signalProcessGroup(cmd.Process, syscall.SIGKILL)
+				}
+			}
+		}
+	}()
 
 	stderrSink := io.MultiWriter(newLogWriter(b.cfg.Logger, "[grok:stderr] "), providerErr)
 	stderrDone := make(chan struct{})
@@ -256,6 +274,7 @@ func (b *grokBackend) Execute(ctx context.Context, prompt string, opts ExecOptio
 		defer func() {
 			stdin.Close()
 			_ = cmd.Wait()
+			close(procDone)
 		}()
 
 		startTime := time.Now()
