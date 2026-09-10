@@ -33,3 +33,8 @@
 - Command: `NODE_PATH=/home/newadmin/belt-check/multica/node_modules node --test ops/belt/multica-bridge.test.cjs`
 - Exit: `1`
 - Outcome: test 47 and the lifetime-cap regression passed; the full file reported 128 passing and 5 failing, all five failures requiring a real `DATABASE_URL`. No database URL was available in this environment.
+
+## Batch 5
+
+- Changed: restored the exact lifetime-cap guard text required by source subtest 47 and moved the `Done`, `Cancelled`, `Archived`, and `Rejected` exemption upstream into the lifetime admission object, including the existing persisted lifetime-hold replay path; the configured cap is unchanged.
+- Changed: extended the lifetime-cap source regression to require the upstream terminal admission object and the exact guard expression.

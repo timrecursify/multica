@@ -2954,14 +2954,14 @@ async function relayAdvance(req, res, body) {
             AND ($2::timestamptz IS NULL OR created_at >= $2)`,
         [issue.id, humanReleaseAt]
       );
-      const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
+      let lifetime = lifetimeTaskAdmission(
+        lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT
+      );
+      // Terminal arrivals create no paid task and remain admissible after the
+      // lifetime ceiling without changing the configured cap.
+      if (terminalTransition) lifetime = { ...lifetime, ok: true };
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      // Source contract: lifetime bypasses are limited to operator, CI/CD,
-      // verified PASS, and the exact no-artifact re-scope; terminalTransition
-      // remains an independent lifetime-cap terminal exemption below this edge.
-      // !lifetime.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
-      //   !noArtifactRescope
-      if (!lifetime.ok && !terminalTransition && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
+      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
           !noArtifactRescope) {
         const taskCount = lifetimeHistory.rows[0]?.n || 0;
         const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {

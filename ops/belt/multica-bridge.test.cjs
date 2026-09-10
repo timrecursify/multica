@@ -2533,7 +2533,8 @@ test('lifetime ceiling applies an auditable terminal rejection instead of a re-s
   assert.match(source, /disposition: lifetime\.disposition, disposition_applied: applied/);
   assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
   assert.match(source, /const terminalTransition = isTerminalStage\(to_stage\);/);
-  assert.match(source, /!lifetime\.ok && !terminalTransition && !operatorCapBypass/);
+  assert.match(source, /let lifetime = lifetimeTaskAdmission\([\s\S]*?if \(terminalTransition\) lifetime = \{ \.\.\.lifetime, ok: true \}/);
+  assert.match(source, /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&\n\s*!noArtifactRescope/);
   assert.match(source, /lifetime_exhaustion.*!terminalTransition/);
 });
 
@@ -2935,7 +2936,7 @@ test('terminal exits preserve the configured archiver path and require an authen
   assert.match(source, /parked_audit/);
   assert.match(source, /terminalExit: explicitTerminalExit/);
   assert.match(source, /!cycle\.ok && !operatorCapBypass/);
-  assert.match(source, /!lifetime\.ok && !terminalTransition && !operatorCapBypass/);
+  assert.match(source, /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&\n\s*!noArtifactRescope/);
 });
 
 test('identical relay and operator secrets disable explicit terminal exits', () => {
