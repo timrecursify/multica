@@ -6,6 +6,8 @@ RELAY_ENV=/etc/gsp/multica/multica-relay-advance.env
 OAUTH_ENV=/etc/gsp/multica/claude-oauth.env
 CLAUDE_BIN=${MULTICA_CLAUDE_PATH:-/opt/gsp/multica-workers/claude}
 POLL_SECONDS=${SCOPING_DRIVER_POLL_SECONDS:-5}
+HEARTBEAT_SECONDS=${SCOPING_DRIVER_HEARTBEAT_SECONDS:-300}
+last_empty_heartbeat=0
 
 set -a
 . "$RELAY_ENV"
@@ -40,6 +42,39 @@ RETURNING c.id, c.issue_id, c.agent_id, c.title, c.description;
 SQL
 }
 
+claim_starvation_reason() {
+  psql -q "$DATABASE_URL" -At <<SQL
+SELECT CASE
+  WHEN NOT EXISTS (
+    SELECT 1 FROM agent_task_queue t
+    WHERE t.workspace_id = '$MULTICA_WORKSPACE_ID'::uuid AND t.status = 'queued'
+  ) THEN 'agent_task_queue.status=queued'
+  WHEN NOT EXISTS (
+    SELECT 1 FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id
+    WHERE t.workspace_id = '$MULTICA_WORKSPACE_ID'::uuid AND t.status = 'queued' AND i.status = 'Spec'
+  ) THEN 'issue.status=Spec'
+  WHEN NOT EXISTS (
+    SELECT 1 FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id JOIN agent a ON a.id = t.agent_id
+    WHERE t.workspace_id = '$MULTICA_WORKSPACE_ID'::uuid AND t.status = 'queued'
+      AND i.status = 'Spec' AND a.model LIKE 'claude%'
+  ) THEN 'agent.model LIKE claude%'
+  WHEN NOT EXISTS (
+    SELECT 1 FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id JOIN agent a ON a.id = t.agent_id
+    JOIN agent_runtime ar ON ar.id = t.runtime_id
+    WHERE t.workspace_id = '$MULTICA_WORKSPACE_ID'::uuid AND t.status = 'queued'
+      AND i.status = 'Spec' AND a.model LIKE 'claude%' AND ar.provider = 'claude'
+  ) THEN 'agent_runtime.provider=claude'
+  WHEN NOT EXISTS (
+    SELECT 1 FROM agent_task_queue t JOIN issue i ON i.id = t.issue_id JOIN agent a ON a.id = t.agent_id
+    JOIN agent_runtime ar ON ar.id = t.runtime_id
+    WHERE t.workspace_id = '$MULTICA_WORKSPACE_ID'::uuid AND t.status = 'queued'
+      AND i.status = 'Spec' AND a.model LIKE 'claude%' AND ar.provider = 'claude' AND ar.status = 'online'
+  ) THEN 'agent_runtime.status=online'
+  ELSE 'claim race or lock contention'
+END;
+SQL
+}
+
 finish_task() {
   local task_id=$1 issue_id=$2 agent_id=$3 body=$4
   psql -q "$DATABASE_URL" --set=task_id="$task_id" --set=issue_id="$issue_id" \
@@ -65,6 +100,12 @@ SQL
 while :; do
   row=$(claim_task || true)
   if [[ -z "$row" ]]; then
+    now=$(date +%s)
+    if (( now - last_empty_heartbeat >= HEARTBEAT_SECONDS )); then
+      reason=$(claim_starvation_reason 2>/dev/null || printf 'diagnosis failed')
+      printf '%s scoping claim empty: predicate=%s\n' "$(date -u +%FT%TZ)" "$reason"
+      last_empty_heartbeat=$now
+    fi
     sleep "$POLL_SECONDS"
     continue
   fi

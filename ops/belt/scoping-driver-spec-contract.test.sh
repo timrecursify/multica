@@ -32,6 +32,10 @@ check "driver passes the ticket description to the model" \
   'grep -q "Description: \${description}" "$driver"'
 check "driver flattens newlines so the tab-separated row stays parsable" \
   'grep -q "regexp_replace(COALESCE(i.description" "$driver"'
+check "driver rate-limits empty-claim heartbeats" \
+  'grep -q "now - last_empty_heartbeat >= HEARTBEAT_SECONDS" "$driver"'
+check "empty-claim heartbeat reports the eliminating predicate" \
+  'grep -q "scoping claim empty: predicate=%s" "$driver" && grep -q "agent.model LIKE claude%" "$driver"'
 check "driver is valid bash" 'bash -n "$driver"'
 
 [ "$fail" -eq 0 ] && echo "PASS: scoping driver satisfies the bridge spec gate"
