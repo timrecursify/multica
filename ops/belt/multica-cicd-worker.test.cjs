@@ -147,17 +147,15 @@ test('FAIL verdict returns the issue to build', async () => {
   assert.match(calls[0][3], /latest QC PASS evidence is absent/);
 });
 
-test('no verdict accepts merged green work with no-verdict evidence', async () => {
+test('merged green work with no PASS schedules the belt QC step', async () => {
   const receipt = { source_sha: sha, release: `/releases/${sha}`, health: 'ok' };
   const calls = dependencies({ receipt, verdict: null });
-  await worker.routeFinishedPR(issue, 'merged', sha, pr);
-  assert.equal(calls[0][1], 'Done');
-  assert.equal(calls[0][2], null);
-  assert.equal(calls[0][5].ciSuccess, true);
-  assert.equal(calls[0][5].mergeDeployReceipt.kind, 'activation_receipts');
-  assert.equal(calls[0][5].reviewedSha, sha);
-  assert.equal(calls[0][5].qualifyingPass, false);
-  assert.equal(calls[0][5].noVerdict, true);
+  const result = await worker.routeFinishedPR(issue, 'merged', sha, pr);
+  assert.equal(result.status, 'pending');
+  assert.equal(result.outcome, 'merged_without_pass');
+  assert.equal(calls[0][1], 'In Review');
+  assert.equal(calls[0][3], 'merged_without_pass');
+  assert.deepEqual(calls[0][5], { mergedWithoutPass: true, mergedSha: sha, qcScheduled: true });
 });
 
 test('merged CI absent is accepted only when the repo has no workflows or suites', async () => {

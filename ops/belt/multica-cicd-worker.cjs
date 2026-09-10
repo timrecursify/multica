@@ -717,17 +717,32 @@ async function routeFinishedPR(issue, note, mergedSha, pr = {}) {
   if (!['deployed', 'verified_not_applicable'].includes(deploy.outcome)) {
     throw new Error(`unhandled deployment outcome: ${deploy.outcome}`);
   }
-  const noVerdict = !latest;
-  const reviewedSha = noVerdict ? mergedSha : latest.bound_sha || mergedSha;
+  if (!latest) {
+    const evidence = { mergedWithoutPass: true, mergedSha, qcScheduled: true };
+    try {
+      // A merged carrier can arrive here without the QC relay row that normally
+      // follows the build handoff. Re-enter In Review so the bridge schedules
+      // the belt's QC owner; never treat the absence of PASS as a PASS.
+      await relay(issue.id, 'In Review', null, 'merged_without_pass', null, evidence);
+      log(`QC-SCHEDULED #${issue.number} merged ${mergedSha} reason=merged_without_pass`);
+      return { status: 'pending', outcome: 'merged_without_pass',
+        blocker: { type: 'merged_without_pass', retry_eligible: true },
+        retryEligible: true, sha: mergedSha };
+    } catch (error) {
+      log(`QC-SCHEDULE-FAIL #${issue.number} reason=merged_without_pass error=${String(error.message).split('\n')[0].slice(0, 160)}`);
+      return { status: 'pending', outcome: 'merged_without_pass',
+        blocker: { type: 'merged_without_pass', retry_eligible: true },
+        retryEligible: true, sha: mergedSha };
+    }
+  }
+  const reviewedSha = latest.bound_sha || mergedSha;
   const evidence = { ciSuccess: retroactiveMerge ? 'retroactive' : true,
     ...(retroactiveMerge ? { retroactiveMerge: true } : {}),
-    mergeDeployReceipt: deploy.evidence, reviewedSha,
-    qualifyingPass: !noVerdict, ...(noVerdict ? { noVerdict: true } : {}) };
+    mergeDeployReceipt: deploy.evidence, reviewedSha, qualifyingPass: true };
   const verdict = evaluate({ from: 'CI/CD & Deploy', to: 'Done', actor: 'system', evidence });
   if (!verdict.ok) throw new Error(`transition policy rejected Done: ${verdict.code}`);
   await relay(issue.id, 'Done', latest?.work_product_md5 || null, null, null, evidence);
-  log(noVerdict ? `NO-VERDICT #${issue.number} accepted merged+green sha=${mergedSha}` :
-    `DONE #${issue.number} — ${note}`);
+  log(`DONE #${issue.number} — ${note}`);
   return { status: 'done', sha: mergedSha };
 }
 
