@@ -1,0 +1,7 @@
+# GSP-2454 workbook
+
+- Terminal transition: `server/internal/handler/daemon.go:3038-3112` accepts the daemon completion callback and commits `TaskService.CompleteTask`; `server/pkg/db/queries/agent.sql:777-801` stamps `status='completed'` and `completed_at=now()`. Failure uses the adjacent `FailAgentTask` terminal update.
+- Workdir creation/ownership: `server/internal/daemon/daemon.go:4817-4835` predicts `<root>/<workspace>/<task-prefix>` and holds the active-root guard; `server/internal/daemon/daemon.go:4931-4945` writes GC metadata after terminal reporting.
+- Existing cleaner gap: `.gc_meta.json` already identifies task ownership, but `server/internal/daemon/gc.go:420-428` treated the managed `workdir/` container itself as a Git checkout. Real repositories are children such as `workdir/ppp`, so every terminal directory failed the publication gate and was quarantined.
+- Change: terminal cleanup re-reads the task descriptor from the server and requires terminal status, matching workdir, publication/no-PR state, zero non-terminal references, managed provenance, and a clean pushed checkout. `KEEP_WORKDIR=1` disables cleanup.
+- Historical cleanup: `ops/belt/workspace-gc.sh` now cross-checks `.gc_meta.json` against the DB terminal row and issue ownership, rejects a directory referenced by a non-terminal task, validates pushed nested checkouts when present, and caps each run at 200 descriptors.
