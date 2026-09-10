@@ -455,7 +455,21 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
   const buildHandoff = row.to_stage === 'In Progress' && row.next_stage === 'In Review';
   const qcHandoff = row.to_stage === 'In Review' && row.next_stage === 'CI/CD & Deploy';
   if (!buildHandoff && !qcHandoff) return null;
-  const linked = await client.query(
+  // The active implementation work product is the canonical code-bearing
+  // route. Linked PR rows are only a legacy/reconciliation fallback.
+  const activeProduct = await client.query(
+    `SELECT repository, branch, pr_number, head_sha,
+            'https://github.com/' || repository || '/pull/' || pr_number AS html_url
+       FROM issue_work_product
+      WHERE issue_id = $1::uuid AND status = 'active' AND kind = 'implementation'
+      ORDER BY updated_at DESC NULLS LAST LIMIT 1`, [row.issue_id]);
+  const linked = activeProduct.rows[0] ? { rows: [{
+    html_url: activeProduct.rows[0].html_url,
+    repo_owner: String(activeProduct.rows[0].repository).split('/')[0],
+    repo_name: String(activeProduct.rows[0].repository).split('/')[1],
+    branch: activeProduct.rows[0].branch,
+    head_sha: activeProduct.rows[0].head_sha
+  }] } : await client.query(
     `SELECT p.html_url, p.repo_owner, p.repo_name
        FROM issue_pull_request ipr JOIN github_pull_request p ON p.id = ipr.pull_request_id
       WHERE ipr.issue_id = $1::uuid ORDER BY p.updated_at DESC NULLS LAST LIMIT 1`, [row.issue_id]);
