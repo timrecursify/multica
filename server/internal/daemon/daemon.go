@@ -4626,6 +4626,20 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			}
 			continue
 		}
+		// A successful authenticated claim acts as the recovery probe for
+		// matching runtime identities.
+		d.mu.Lock()
+		for wsid, ws := range d.workspaces {
+			for _, rid := range ws.runtimeIDs {
+				for _, asked := range runtimeIDs {
+					if rid == asked {
+						owner, gen := d.admissionIdentityForRuntime(rid)
+						d.closeAdmissionCircuit(wsid, owner, gen)
+					}
+				}
+			}
+		}
+		d.mu.Unlock()
 		d.recordTick("success")
 
 		// Dispatch each claimed task into a slot. activeTasks is incremented for
