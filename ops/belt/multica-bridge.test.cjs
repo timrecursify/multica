@@ -131,7 +131,7 @@ test('work product handoff advances to CI/CD without creating a second active ro
     status: 'active', consuming_stage: 'In Review' }];
   const client = { async query(sql, values) {
     if (sql.includes('UPDATE issue_work_product')) {
-      const matching = products.filter((row) => row.issue_id === values[0] && row.status === 'active');
+      const matching = products.filter((row) => row.issue_id === values[0] && row.status === 'active' && row.consuming_stage === values[2]);
       for (const row of matching) row.consuming_stage = values[1];
       return { rowCount: matching.length, rows: matching };
     }
@@ -158,6 +158,7 @@ for (const destination of ['In Progress', 'Spec', 'Parked']) {
     const client = { async query(sql, values) {
       assert.match(sql, /UPDATE issue_work_product/);
       assert.equal(values[0], product.issue_id);
+      assert.equal(values[2], 'CI/CD & Deploy');
       product.consuming_stage = values[1];
       return { rowCount: 1, rows: [product] };
     } };
@@ -167,7 +168,7 @@ for (const destination of ['In Progress', 'Spec', 'Parked']) {
   });
 }
 
-test('work product handoff is a no-op when there is no active row', async () => {
+test('work product handoff fails closed when there is no matching active row', async () => {
   const calls = [];
   const client = { async query(sql, values) {
     calls.push({ sql, values });
@@ -175,11 +176,9 @@ test('work product handoff is a no-op when there is no active row', async () => 
   } };
   const issueId = '123e4567-e89b-42d3-a456-426614174000';
 
-  await handoffActiveWorkProduct(client, issueId, 'In Review', 'CI/CD & Deploy');
-  await handoffActiveWorkProduct(client, issueId, 'CI/CD & Deploy', 'In Progress');
-
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls.map(({ values }) => values[1]), ['CI/CD & Deploy', 'In Review']);
+  await assert.rejects(handoffActiveWorkProduct(client, issueId, 'In Review', 'CI/CD & Deploy'), /active_products=0/);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].values, [issueId, 'CI/CD & Deploy', 'In Review']);
 });
 
 test('work product handoff rejects multiple active rows', async () => {
@@ -2705,11 +2704,21 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     status: 'CI/CD & Deploy', description: '', parent_issue_id: null, title: 'park me',
     priority: 'medium', metadata: {} };
   const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
+  const workProduct = { issue_id: issue.id, scope_revision: 'scope-1', kind: 'implementation',
+    repository: 'timrecursify/multica', branch: 'feature/park-me', pr_number: 872,
+    head_sha: '5627f7973b98c0cf7a43da24f04ce4eb9ac9afe0', consuming_stage: 'CI/CD & Deploy',
+    status: 'active' };
   const queries = [];
   const client = { async connect() {}, async end() {}, async query(sql, values = []) {
     queries.push({ sql, values });
     if (sql.includes('FROM "issue"') && sql.includes('FOR UPDATE')) return { rows: [{ ...persisted.issue }] };
     if (sql.includes('FROM agent_task_queue t') && sql.includes("t.context->>'to_stage' = 'In Review'")) return { rows: [] };
+    if (sql.includes('UPDATE issue_work_product')) {
+      assert.deepEqual(values, [issue.id, 'In Review', 'CI/CD & Deploy']);
+      assert.equal(workProduct.consuming_stage, values[2]);
+      workProduct.consuming_stage = values[1];
+      return { rowCount: 1, rows: [{ issue_id: issue.id }] };
+    }
     if (sql.startsWith('SELECT stage_name FROM relay_stage_config')) return { rows: [{ stage_name: 'Parked' }] };
     if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Parked', alt_next_stages: [] }] };
     if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Parked' }] };
@@ -2748,6 +2757,7 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
       intended_stage: null, attempts: 0, task_count: 0 } }]);
   assert.deepEqual(persisted.agent_task_queue, []);
   assert.equal(persisted.issue.status, 'Parked');
+  assert.equal(workProduct.consuming_stage, 'In Review');
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
   // Parking must retire stale work as part of the same locked transition.
   assert.ok(queries.some(({ sql }) => /UPDATE agent_task_queue/i.test(sql) && /cancel|retir/i.test(sql)),
