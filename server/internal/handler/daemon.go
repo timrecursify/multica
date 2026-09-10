@@ -1630,6 +1630,10 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 			WorkspaceID: parseUUID(resp.WorkspaceID),
 			UserID:      rt.OwnerID,
 			ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+			// Bind the task token to the authenticated daemon credential
+			// generation. A token minted during one daemon-token generation
+			// must not remain usable after credential rotation.
+			CredentialGeneration: parseUUID(middleware.DaemonCredentialGenerationFromContext(r.Context())),
 		}, deliveredCommentIDs, commentBackedTask)
 		if ferr != nil {
 			slog.Error("batch claim: finalize task claim failed; requeueing claim",
@@ -2758,6 +2762,7 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 		WorkspaceID: parseUUID(resp.WorkspaceID),
 		UserID:      runtime.OwnerID,
 		ExpiresAt:   pgtype.Timestamptz{Time: time.Now().Add(24 * time.Hour), Valid: true},
+		CredentialGeneration: parseUUID(middleware.DaemonCredentialGenerationFromContext(r.Context())),
 	}, deliveredCommentIDs, commentBackedTask)
 	if ferr != nil {
 		outcome = "error_claim_finalize"
