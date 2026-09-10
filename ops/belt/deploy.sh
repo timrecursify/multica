@@ -52,6 +52,12 @@ fi
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 runtime_root="${BELT_DEPLOY_RUNTIME_ROOT:-/opt/gsp/multica-workers}"
 receipt_root="${MULTICA_RECEIPT_ROOT:-/var/lib/gsp-multica/runtime/receipts}"
+service_user="${BELT_DEPLOY_SERVICE_USER:-gsp-multica}"
+service_user_available=1
+if ! id -u "$service_user" >/dev/null 2>&1 || ! id -g "$service_user" >/dev/null 2>&1; then
+  service_user_available=0
+  printf 'Skipping runtime ownership/readability checks: service user %s is unavailable on this host\n' "$service_user" >&2
+fi
 receipt_repository="timrecursify/multica"
 receipt_target="gsp-belt"
 receipt_owner="ops/belt/deploy.sh"
@@ -507,7 +513,9 @@ for index in "${!sources[@]}"; do
       *) chmod 0640 -- "$target_file" ;;
     esac
   else
-    chown gsp-multica:gsp-multica -- "$target_file"
+    if (( service_user_available )); then
+      chown "$service_user:$service_user" -- "$target_file"
+    fi
     case "$target_file" in
       *.sh) chmod 0755 -- "$target_file" ;;
       *) chmod 0644 -- "$target_file" ;;
@@ -528,11 +536,11 @@ if [[ "$mode" == apply ]]; then
   done
 fi
 
-if [[ "$mode" == apply ]]; then
+if [[ "$mode" == apply && service_user_available -eq 1 ]]; then
   for index in "${!sources[@]}"; do
     selected "$index" || continue
-    if ! sudo -n /bin/su -s /bin/sh gsp-multica -c 'test -r "$1"' belt-deploy "${targets[$index]}"; then
-      printf 'Pre-restart readability check failed: gsp-multica cannot read %s\n' "${targets[$index]}" >&2
+    if ! sudo -n /bin/su -s /bin/sh "$service_user" -c 'test -r "$1"' belt-deploy "${targets[$index]}"; then
+      printf 'Pre-restart readability check failed: %s cannot read %s\n' "$service_user" "${targets[$index]}" >&2
       false
     fi
   done

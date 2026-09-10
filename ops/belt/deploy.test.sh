@@ -93,6 +93,9 @@ printf '%s\n' \
   'printf "%s|%s|%s\n" "$$" "$kind" "$*" >> "${BELT_DEPLOY_TEST_PSQL_LOG:?}"' > "$fake_bin/psql"
 chmod +x -- "$fake_bin/psql"
 export PATH="$fake_bin:$PATH"
+# The hermetic fixture has no permission to exercise a real account through
+# sudo; force the runner-like absent-account branch for deployment exercises.
+export BELT_DEPLOY_SERVICE_USER=__missing_service_user__
 export BELT_DEPLOY_SYSTEMCTL_STATE="$fake_state"
 export BELT_DEPLOY_PROC_ROOT="$fake_proc"
 export BELT_DEPLOY_STATE_ROOT="$tmp_dir/deploy-state"
@@ -163,6 +166,18 @@ for index in "${!targets[@]}"; do
   is_new_target "${targets[$index]}" && continue
   cp -- "${sources[$index]}" "${targets[$index]}"
 done
+
+# CI runners do not have the production service account. Deployment must state
+# that ownership/readability checks are skipped there, while production keeps
+# both checks when the account exists.
+unavailable_user_log="$tmp_dir/unavailable-service-user.log"
+if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" BELT_DEPLOY_SERVICE_USER=__missing_service_user__ \
+  "$root_dir/deploy.sh" --dry-run >"$unavailable_user_log" 2>&1; then
+  grep -q 'Skipping runtime ownership/readability checks: service user __missing_service_user__ is unavailable' "$unavailable_user_log"
+else
+  echo 'dry-run unexpectedly failed without the production service user' >&2
+  exit 1
+fi
 
 bridge_dir="$tmp_dir/gsp-multica-bridge"
 relay_dir="$tmp_dir/multica-relay-advance/app"
