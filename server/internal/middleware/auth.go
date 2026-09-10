@@ -82,6 +82,17 @@ func Auth(queries *db.Queries, patCache *auth.PATCache, cloudPAT *auth.CloudPATV
 					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
 					return
 				}
+				// Task tokens are bound to the daemon credential generation that
+				// admitted them.  A revoked/rotated daemon token must therefore
+				// invalidate its descendants even while their task-token TTL remains.
+				if !tt.CredentialGeneration.Valid {
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
+				if _, err := queries.GetDaemonTokenByID(r.Context(), tt.CredentialGeneration); err != nil {
+					http.Error(w, `{"error":"invalid token"}`, http.StatusUnauthorized)
+					return
+				}
 				r.Header.Set("X-User-ID", uuidToString(tt.UserID))
 				r.Header.Set("X-Agent-ID", uuidToString(tt.AgentID))
 				r.Header.Set("X-Task-ID", uuidToString(tt.TaskID))
