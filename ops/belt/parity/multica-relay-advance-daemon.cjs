@@ -2418,12 +2418,6 @@ async function persistReadvanceDenial(client, row, response, detail) {
     ? Number(row.denial_attempts || 0) + 1 : 1;
   const policy = denialRetryPolicy(response, detail, attempts - 1);
   await client.query(
-    `UPDATE issue_stage_outcome SET denial_reason = $3, denial_input_hash = $4,
-       denial_attempts = $5, denial_next_retry_at = $6::timestamptz, denial_terminal = $7
-      WHERE issue_id = $1::uuid AND stage = $2`,
-    [row.issue_id, row.to_stage, detail, row.relevant_input_hash, attempts,
-      policy.retryAt, policy.terminal]);
-  await client.query(
     `UPDATE relay_run_log SET parked_audit = COALESCE(parked_audit, '{}'::jsonb) ||
        jsonb_build_object('typed_readvance_denials', $2::int, 'typed_readvance_error', $3::text,
          'denial_reason', $4::text, 'denial_input_hash', $5::text,
@@ -2452,7 +2446,7 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
       `SELECT o.issue_id, o.stage AS to_stage, o.outcome, o.task_id,
               ${evidenceSql.columns}, rsc.next_stage,
               fingerprint.relevant_input_hash,
-              o.denial_input_hash, o.denial_attempts
+              denial.denial_input_hash, denial.denial_attempts
          FROM issue_stage_outcome o
          JOIN issue i ON i.id = o.issue_id AND i.status = o.stage
          JOIN agent_task_queue t ON t.id = o.task_id AND t.status = 'completed'
@@ -2460,6 +2454,18 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
          LEFT JOIN relay_stage_config rsc
            ON rsc.workspace_id = i.workspace_id AND rsc.stage_name = i.status
          ${evidenceSql.joins}
+         LEFT JOIN LATERAL (
+           SELECT log.parked_audit->>'denial_input_hash' AS denial_input_hash,
+                  COALESCE(NULLIF(log.parked_audit->>'typed_readvance_denials', '')::int, 0)
+                    AS denial_attempts,
+                  COALESCE((log.parked_audit->>'denial_terminal')::boolean, false)
+                    AS denial_terminal,
+                  NULLIF(log.parked_audit->>'denial_next_retry_at', '')::timestamptz
+                    AS denial_next_retry_at
+             FROM relay_run_log log
+            WHERE log.task_id = o.task_id
+            ORDER BY log.created_at DESC, log.id DESC LIMIT 1
+         ) denial ON true
          CROSS JOIN LATERAL (SELECT md5(concat_ws('|', i.status, o.outcome, o.task_id::text,
            COALESCE(t.result::text, ''), COALESCE(t.error, ''), COALESCE(rsc.next_stage, ''),
            COALESCE(attempt.verdict, ''), COALESCE(attempt.work_product_md5, ''),
@@ -2478,8 +2484,8 @@ async function readvanceRecordedOutcomes({ dbPool = pool, postRelay = postToRela
            COALESCE((SELECT concat_ws(':', seq::text, content) FROM task_message
              WHERE task_id = o.task_id ORDER BY seq DESC LIMIT 1), ''))) AS relevant_input_hash) fingerprint
         WHERE o.outcome IN ('ADVANCED', 'NO_OP') AND o.blocked_on IS DISTINCT FROM 'human'
-          AND (o.denial_input_hash IS DISTINCT FROM fingerprint.relevant_input_hash
-            OR (o.denial_terminal = false AND o.denial_next_retry_at <= NOW()))
+          AND (denial.denial_input_hash IS DISTINCT FROM fingerprint.relevant_input_hash
+            OR (denial.denial_terminal = false AND denial.denial_next_retry_at <= NOW()))
         ORDER BY o.outcome_at ASC LIMIT 100`, [qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
     const advanced = [];
     for (const row of result.rows) {
