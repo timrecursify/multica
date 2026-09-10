@@ -82,15 +82,11 @@ func TestIssueStatusMigrationsPreserveCanonicalData(t *testing.T) {
 		"00000000-0000-0000-0000-000000000012": "Cancelled",
 	}
 
-	for _, migration := range []string{
-		"282_drop_issue_status_check_constraint.up.sql",
-		"283_restore_canonical_issue_status_check.up.sql",
-		"284_add_parked_rejected_issue_statuses.up.sql",
-		"285_reconcile_parked_rejected_statuses.up.sql",
-	} {
-		applyMigrationFile(t, ctx, conn.Conn(), migration)
-		assertIssueStatuses(t, ctx, conn.Conn(), want)
+	applyMigrationFile(t, ctx, conn.Conn(), "282_drop_issue_status_check_constraint.up.sql")
+	if _, err := conn.Exec(ctx, readMigrationFile(t, "283_restore_canonical_issue_status_check.up.sql")); !isCheckViolation(err) {
+		t.Fatalf("migration 283 should fail closed with Parked/Rejected data, got %v", err)
 	}
+	assertIssueStatuses(t, ctx, conn.Conn(), want)
 
 	if _, err := conn.Exec(ctx, `
 		INSERT INTO issue (id, status)
