@@ -2533,7 +2533,10 @@ test('lifetime ceiling applies an auditable terminal rejection instead of a re-s
   assert.match(source, /disposition: lifetime\.disposition, disposition_applied: applied/);
   assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
   assert.match(source, /const terminalTransition = isTerminalStage\(to_stage\);/);
-  assert.match(source, /let lifetime = lifetimeTaskAdmission\([\s\S]*?if \(terminalTransition\) lifetime = \{ \.\.\.lifetime, ok: true \}/);
+  const lifetimeGuard = source.slice(source.indexOf('const lifetime = lifetimeTaskAdmission'),
+    source.indexOf('const taskCount = lifetimeHistory'));
+  assert.match(lifetimeGuard, /const lifetime = lifetimeTaskAdmission/);
+  assert.match(lifetimeGuard, /if \(terminalTransition\) \{\s+lifetime\.ok = true;\s+lifetime\.reason = "terminal_transition";\s+\}/);
   assert.match(source, /!lifetime\.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&\n\s*!noArtifactRescope/);
   assert.match(source, /lifetime_exhaustion.*!terminalTransition/);
 });
@@ -2735,8 +2738,10 @@ test('terminal relay transitions are logged and Parked Done remains relay-only a
   assert.match(source, /ensureCompletedRelayLog\(\s*client, issue_id, issue\.status, to_stage/s);
 });
 
-test('Parked disposition bypasses an incompatible pool and commits its audit without a successor task', async () => {
-  const issue = { id: '123e4567-e89b-42d3-a456-426614174000', workspace_id: 'workspace-1',
+test('decimal-ticket Parked disposition canonicalizes UUID writes and commits no successor task', async () => {
+  const issueNumber = '24052';
+  const issue = { id: '123e4567-e89b-42d3-a456-426614174000',
+    workspace_id: '11111111-1111-4111-8111-111111111111',
     status: 'CI/CD & Deploy', description: '', parent_issue_id: null, title: 'park me',
     priority: 'medium', metadata: {} };
   const persisted = { relay_run_log: [], agent_task_queue: [], issue: { ...issue } };
@@ -2749,6 +2754,7 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     if (sql.includes('SELECT next_stage, alt_next_stages')) return { rows: [{ next_stage: 'Parked', alt_next_stages: [] }] };
     if (sql.startsWith('SELECT next_stage FROM relay_stage_config')) return { rows: [{ next_stage: 'Parked' }] };
     if (sql.includes('UPDATE "issue"') && sql.includes('SET status = $1')) {
+      assert.equal(values[1], issue.id, 'status mutation must use the resolved UUID');
       persisted.issue.status = values[0];
       return { rowCount: 1, rows: [{ id: persisted.issue.id, status: persisted.issue.status }] };
     }
@@ -2770,7 +2776,8 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
   const res = { status: 0, body: '', writeHead(status) { this.status = status; }, end(body = '') { this.body = body; } };
   setTestClientFactory(() => client);
   try {
-    await relayAdvance({ headers: {} }, res, { issue_id: issue.id, to_stage: 'Parked',
+    await relayAdvance({ headers: {} }, res, { issue_id: issueNumber,
+      workspace_id: issue.workspace_id, to_stage: 'Parked',
       parked_audit: { cicd_worker: { reason: 'no compatible owner' } }, agent_token: 'test-relay-secret' });
   } finally {
     setTestClientFactory(null);
@@ -2783,6 +2790,8 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
       intended_stage: null, attempts: 0, task_count: 0 } }]);
   assert.deepEqual(persisted.agent_task_queue, []);
   assert.equal(persisted.issue.status, 'Parked');
+  const lookup = queries.find(({ sql }) => sql.includes('WHERE number = $1::bigint'));
+  assert.deepEqual(lookup?.values, [issueNumber, issue.workspace_id]);
   assert.equal(queries.some(({ sql }) => sql.includes('relay_stage_agent_pool')), false);
   // Parking must retire stale work as part of the same locked transition.
   assert.ok(queries.some(({ sql }) => /UPDATE agent_task_queue/i.test(sql) && /cancel|retir/i.test(sql)),

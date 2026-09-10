@@ -1936,6 +1936,10 @@ async function relayAdvance(req, res, body) {
     }
 
     const issue = issueResult.rows[0];
+    // From this point onward every database write, audit, and task handoff is
+    // UUID-keyed. Canonicalize a decimal ticket lookup exactly once so the
+    // caller's human-facing number cannot reach a uuid parameter downstream.
+    issue_id = issue.id;
     to_stage = normalizeRelayStage(issue.workspace_id, to_stage);
     // Terminal transitions retire the ticket and create no paid task. They
     // must remain available after the lifetime budget is exhausted so shipped
@@ -2895,8 +2899,8 @@ async function relayAdvance(req, res, body) {
       const verifiedPassAdvance = issue.status === "In Review" &&
         to_stage === "CI/CD & Deploy" &&
         await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
-      if (!cycle.ok && !terminalTransition && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
-          !verifiedPassAdvance && !noArtifactRescope && !retryEscalation) {
+      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
+          !verifiedPassAdvance && !noArtifactRescope && !retryEscalation && !terminalTransition) {
         if (escalationLoop) {
           const taskCount = history.rows[0]?.n || 0;
           const applied = await applyDisposition(client, issue, "Parked", "escalation_loop", {
@@ -2962,8 +2966,8 @@ async function relayAdvance(req, res, body) {
         lifetime.reason = "terminal_transition";
       }
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !terminalTransition && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
-          !noArtifactRescope) {
+      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
+          !noArtifactRescope && !retryEscalation) {
         const taskCount = lifetimeHistory.rows[0]?.n || 0;
         const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
           ceiling: lifetime.ceiling, task_count: taskCount, target_stage: to_stage,
