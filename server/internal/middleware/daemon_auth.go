@@ -17,6 +17,7 @@ type daemonContextKey int
 const (
 	ctxKeyDaemonWorkspaceID daemonContextKey = iota
 	ctxKeyDaemonID
+	ctxKeyDaemonCredentialGeneration
 	ctxKeyDaemonAuthPath
 )
 
@@ -37,6 +38,12 @@ func DaemonIDFromContext(ctx context.Context) string {
 	return id
 }
 
+// DaemonCredentialGenerationFromContext returns the authenticated token row ID.
+func DaemonCredentialGenerationFromContext(ctx context.Context) string {
+	id, _ := ctx.Value(ctxKeyDaemonCredentialGeneration).(string)
+	return id
+}
+
 // DaemonAuthPathFromContext returns which token kind authenticated this
 // request — currently always "daemon_token" — for telemetry.
 // Empty when the request did not pass through DaemonAuth.
@@ -49,7 +56,7 @@ func DaemonAuthPathFromContext(ctx context.Context) string {
 // This is used by tests to simulate daemon token authentication.
 func WithDaemonContext(ctx context.Context, workspaceID, daemonID string) context.Context {
 	ctx = context.WithValue(ctx, ctxKeyDaemonWorkspaceID, workspaceID)
-	ctx = context.WithValue(ctx, ctxKeyDaemonID, daemonID)
+		ctx = context.WithValue(ctx, ctxKeyDaemonID, daemonID)
 	ctx = context.WithValue(ctx, ctxKeyDaemonAuthPath, DaemonAuthPathDaemonToken)
 	return ctx
 }
@@ -91,6 +98,7 @@ func DaemonAuth(queries *db.Queries, daemonCache *auth.DaemonTokenCache) func(ht
 					if id, ok := daemonCache.Get(r.Context(), hash); ok {
 						ctx := context.WithValue(r.Context(), ctxKeyDaemonWorkspaceID, id.WorkspaceID)
 						ctx = context.WithValue(ctx, ctxKeyDaemonID, id.DaemonID)
+						ctx = context.WithValue(ctx, ctxKeyDaemonCredentialGeneration, id.CredentialGeneration)
 						ctx = context.WithValue(ctx, ctxKeyDaemonAuthPath, DaemonAuthPathDaemonToken)
 						next.ServeHTTP(w, r.WithContext(ctx))
 						return
@@ -111,6 +119,7 @@ func DaemonAuth(queries *db.Queries, daemonCache *auth.DaemonTokenCache) func(ht
 				identity := auth.DaemonTokenIdentity{
 					WorkspaceID: uuidToString(dt.WorkspaceID),
 					DaemonID:    dt.DaemonID,
+					CredentialGeneration: uuidToString(dt.ID),
 				}
 				// daemon_token.expires_at is NOT NULL; pgtype Valid is true
 				// in normal operation, but defend against zero just in case.
@@ -122,6 +131,7 @@ func DaemonAuth(queries *db.Queries, daemonCache *auth.DaemonTokenCache) func(ht
 
 				ctx := context.WithValue(r.Context(), ctxKeyDaemonWorkspaceID, identity.WorkspaceID)
 				ctx = context.WithValue(ctx, ctxKeyDaemonID, identity.DaemonID)
+				ctx = context.WithValue(ctx, ctxKeyDaemonCredentialGeneration, identity.CredentialGeneration)
 				ctx = context.WithValue(ctx, ctxKeyDaemonAuthPath, DaemonAuthPathDaemonToken)
 				next.ServeHTTP(w, r.WithContext(ctx))
 				return

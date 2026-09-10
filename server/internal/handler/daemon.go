@@ -165,6 +165,17 @@ func (h *Handler) verifyDaemonWorkspaceAccess(r *http.Request, workspaceID strin
 	return true
 }
 
+// verifyRuntimeAdmission performs the owner/membership preflight before a
+// queue claim.  Keeping this check ahead of ClaimTask* ensures authorization
+// drift cannot consume an attempt or mint a task token.
+func (h *Handler) verifyRuntimeAdmission(ctx context.Context, rt db.AgentRuntime) bool {
+	if !rt.OwnerID.Valid || !rt.WorkspaceID.Valid {
+		return false
+	}
+	_, err := h.getWorkspaceMember(ctx, uuidToString(rt.OwnerID), uuidToString(rt.WorkspaceID))
+	return err == nil
+}
+
 // ---------------------------------------------------------------------------
 // Daemon Registration & Heartbeat
 // ---------------------------------------------------------------------------
@@ -1535,6 +1546,11 @@ func (h *Handler) ClaimTasksByRuntime(w http.ResponseWriter, r *http.Request) {
 		if !h.verifyDaemonWorkspaceAccess(r, uuidToString(rt.WorkspaceID)) {
 			continue
 		}
+		if !h.verifyRuntimeAdmission(r.Context(), rt) {
+			// Owner membership drift is a non-disclosing authorization miss;
+			// importantly, do not claim the task before this check succeeds.
+			continue
+		}
 		// Group-ownership check (mirrors the WS path, daemon_ws.go): a runtime
 		// bound to a different daemon must not be claimed by this one. Runtimes
 		// with a NULL daemon_id (e.g. cloud runtimes) are not machine-pinned, so
@@ -2647,6 +2663,11 @@ func (h *Handler) ClaimTaskByRuntime(w http.ResponseWriter, r *http.Request) {
 	}
 	runtimeWorkspaceID := uuidToString(runtime.WorkspaceID)
 	authMs = time.Since(start).Milliseconds()
+	if !h.verifyRuntimeAdmission(r.Context(), runtime) {
+		outcome = "unauth"
+		writeError(w, http.StatusNotFound, "workspace not found")
+		return
+	}
 
 	claimStart := time.Now()
 	task, err := h.TaskService.ClaimTaskForRuntime(r.Context(), parseUUID(runtimeID))
