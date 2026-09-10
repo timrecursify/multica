@@ -1933,13 +1933,17 @@ async function relayAdvance(req, res, body) {
 
     const issue = issueResult.rows[0];
     to_stage = normalizeRelayStage(issue.workspace_id, to_stage);
+    // Terminal transitions retire the ticket and create no paid task. They
+    // must remain available after the lifetime budget is exhausted so shipped
+    // work cannot be stranded in a non-terminal stage.
+    const terminalTransition = isTerminalStage(to_stage);
     const requestedHumanReview = to_stage === "Human Review";
     let noArtifactHumanReviewRescope = false;
     let astraLifetimeHumanApproval = false;
     let astraLifetimeOperatorRelease = false;
 
     const lifetimeHold = activeAdjudicationHold(issue);
-    if (lifetimeHold?.purpose === "lifetime_exhaustion" && to_stage !== "Parked") {
+    if (lifetimeHold?.purpose === "lifetime_exhaustion" && to_stage !== "Parked" && !terminalTransition) {
       const currentLifetimeRevision = decisionRevision({
         ...issue, pending_decision: lifetimeHold.decision
       });
@@ -2948,7 +2952,7 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
+      if (!lifetime.ok && !terminalTransition && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
           !noArtifactRescope && !retryEscalation) {
         const taskCount = lifetimeHistory.rows[0]?.n || 0;
         const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {

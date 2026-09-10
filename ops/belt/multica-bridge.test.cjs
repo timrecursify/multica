@@ -2532,6 +2532,9 @@ test('lifetime ceiling applies an auditable terminal rejection instead of a re-s
   assert.match(source, /task_count: taskCount, target_stage: to_stage/);
   assert.match(source, /disposition: lifetime\.disposition, disposition_applied: applied/);
   assert.doesNotMatch(source, /to_stage = lifetime\.disposition/);
+  assert.match(source, /const terminalTransition = isTerminalStage\(to_stage\);/);
+  assert.match(source, /!lifetime\.ok && !terminalTransition && !operatorCapBypass/);
+  assert.match(source, /lifetime_exhaustion.*!terminalTransition/);
 });
 
 test('relay success requires proof that the requested stage was reached', () => {
@@ -2932,7 +2935,7 @@ test('terminal exits preserve the configured archiver path and require an authen
   assert.match(source, /parked_audit/);
   assert.match(source, /terminalExit: explicitTerminalExit/);
   assert.match(source, /!cycle\.ok && !operatorCapBypass/);
-  assert.match(source, /!lifetime\.ok && !operatorCapBypass/);
+  assert.match(source, /!lifetime\.ok && !terminalTransition && !operatorCapBypass/);
 });
 
 test('identical relay and operator secrets disable explicit terminal exits', () => {
