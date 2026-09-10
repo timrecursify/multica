@@ -506,6 +506,12 @@ for index in "${!sources[@]}"; do
       *.py) chmod 0750 -- "$target_file" ;;
       *) chmod 0640 -- "$target_file" ;;
     esac
+  else
+    chown gsp-multica:gsp-multica -- "$target_file"
+    case "$target_file" in
+      *.sh) chmod 0755 -- "$target_file" ;;
+      *) chmod 0644 -- "$target_file" ;;
+    esac
   fi
   printf 'Copied %s to %s\n' "$source_file" "$target_file"
 done
@@ -517,6 +523,16 @@ if [[ "$mode" == apply ]]; then
     selected "$index" || continue
     if ! cmp -s -- "${sources[$index]}" "${targets[$index]}"; then
       printf 'Post-deploy parity mismatch: %s != %s\n' "${sources[$index]}" "${targets[$index]}" >&2
+      false
+    fi
+  done
+fi
+
+if [[ "$mode" == apply ]]; then
+  for index in "${!sources[@]}"; do
+    selected "$index" || continue
+    if ! sudo -n /bin/su -s /bin/sh gsp-multica -c 'test -r "$1"' belt-deploy "${targets[$index]}"; then
+      printf 'Pre-restart readability check failed: gsp-multica cannot read %s\n' "${targets[$index]}" >&2
       false
     fi
   done
