@@ -12,6 +12,17 @@ module.exports = {
     { name: 'multica-relay-advance', script: relayWrapper, ...guardrails,
       env: { GSP_BELT_ENV_FILE: process.env.GSP_BELT_ENV_FILE } },
     { name: 'gsp-multica-worker', script: process.env.BELT_WORKER_SCRIPT ?? path.join(runtimeRoot, 'gsp-multica/fleet/multica-daemon-wrapper.sh'), ...guardrails, kill_timeout: 30000,
-      env: { MULTICA_DAEMON_MAX_CONCURRENT_TASKS: process.env.MULTICA_DAEMON_MAX_CONCURRENT_TASKS, MULTICA_DAEMON_WORKSPACES_ROOT: process.env.MULTICA_DAEMON_WORKSPACES_ROOT ?? process.env.GSP_WORKSPACES_ROOT ?? path.join(runtimeRoot, 'multica/workspaces'), BELT_SOURCE_ROOT: beltRoot } },
+      env: {
+        MULTICA_DAEMON_MAX_CONCURRENT_TASKS: process.env.MULTICA_DAEMON_MAX_CONCURRENT_TASKS,
+        MULTICA_DAEMON_WORKSPACES_ROOT: process.env.MULTICA_DAEMON_WORKSPACES_ROOT ?? process.env.GSP_WORKSPACES_ROOT ?? path.join(runtimeRoot, 'multica/workspaces'),
+        // Keep regenerable task output bounded on the deployment-owned worker.
+        // Every value remains overridable for staging and incident response.
+        MULTICA_GC_TTL: process.env.MULTICA_GC_TTL ?? '6h',
+        MULTICA_GC_ORPHAN_TTL: process.env.MULTICA_GC_ORPHAN_TTL ?? '72h',
+        MULTICA_GC_ARTIFACT_TTL: process.env.MULTICA_GC_ARTIFACT_TTL ?? '12h',
+        MULTICA_GC_FREE_SPACE_FLOOR: process.env.MULTICA_GC_FREE_SPACE_FLOOR ?? '20G',
+        MULTICA_GC_FREE_SPACE_TARGET: process.env.MULTICA_GC_FREE_SPACE_TARGET ?? '40G',
+        BELT_SOURCE_ROOT: beltRoot,
+      } },
   ],
 };
