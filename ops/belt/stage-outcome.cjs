@@ -260,6 +260,13 @@ async function recordOneOutcome(client, row, logger, githubCommand) {
 }
 
 async function persistOutcome(client, row, parsed, logger) {
+  // A task owns only the stage declared in its context. Fail closed rather
+  // than allowing a stale/cross-stage task id to overwrite another outcome.
+  if (row.id && (row.context?.to_stage || row.to_stage) &&
+      (row.context?.to_stage || row.to_stage) !== row.stage) {
+    logger.log(`[stage-outcome] rejected task=${row.id}: task stage ${row.context?.to_stage || row.to_stage} != row stage ${row.stage}`);
+    return 0;
+  }
   const hash = (await client.query(stageInputHashSql(), [row.issue_id])).rows[0]?.input_hash || null;
   try {
     await client.query(upsertOutcomeSql(), [row.issue_id, row.stage, parsed.outcome, parsed.blockedOn, row.id, hash]);
