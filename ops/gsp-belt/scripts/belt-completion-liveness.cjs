@@ -6,7 +6,10 @@ const window=duration(process.env.BELT_COMPLETION_STALL_WINDOW);
 if(window===null){console.log(JSON.stringify({code:'no_opinion',healthy:true,reason:'BELT_COMPLETION_STALL_WINDOW absent'}));process.exit(0)}
 if(!Number.isFinite(window)||window<=0){console.error(JSON.stringify({code:'belt_completion_configuration_invalid',healthy:false}));process.exit(2)}
 const input=process.env.BELT_COMPLETION_LIVENESS_INPUT||'-'; let data;
-try{data=JSON.parse(input==='-'?fs.readFileSync(0,'utf8'):fs.readFileSync(input,'utf8'))}catch(e){console.error(JSON.stringify({code:'belt_completion_metrics_unavailable',healthy:false,error:e.message}));process.exit(2)}
+try{data=process.env.BELT_COMPLETION_METRICS_COMMAND
+  ? JSON.parse(require('child_process').execFileSync('/bin/sh',['-c',process.env.BELT_COMPLETION_METRICS_COMMAND],{encoding:'utf8'}))
+  : JSON.parse(input==='-'?fs.readFileSync(0,'utf8'):fs.readFileSync(input,'utf8'))
+}catch(e){console.error(JSON.stringify({code:'belt_completion_metrics_unavailable',healthy:false,error:e.message}));process.exit(2)}
 const now=Date.parse(data.now||new Date().toISOString()); const ws=data.workspace||data.workspace_id||'unknown';
 if(!ws||ws==='unknown'){console.error(JSON.stringify({code:'belt_completion_metrics_unavailable',healthy:false,error:'workspace missing'}));process.exit(2)}
 const admitted=Number(data.unresolved_admitted_work||0)>0, consumed=Number(data.task_consumption||0)>0, due=Number(data.due_handoff_obligations||0)>0;
@@ -14,7 +17,15 @@ const last=data.last_done_at?Date.parse(data.last_done_at):null; const age=last=
 const active=admitted&&(consumed||due), stalled=active&&age>=window;
 const statePath=process.env.BELT_COMPLETION_LIVENESS_STATE||'/var/lib/gsp/.local/state/belt-completion-liveness.json'; let state={};
 try{state=JSON.parse(fs.readFileSync(statePath,'utf8'))}catch{}
-state[ws]={last_done_at:data.last_done_at||null,oldest_pending_obligation:data.oldest_pending_obligation||null,updated_at:new Date(now).toISOString(),incident:stalled};
+const previous=state[ws]||{};
+const observedDone=data.last_done_at||null;
+const recovered=previous.incident===true && observedDone && observedDone!==previous.last_done_at;
+const effectiveIncident=stalled || (previous.incident===true && !recovered);
+if(effectiveIncident && process.env.BELT_COMPLETION_INCIDENT_COMMAND){
+  try{require('child_process').execFileSync('/bin/sh',['-c',process.env.BELT_COMPLETION_INCIDENT_COMMAND],{input:JSON.stringify({code:'belt_completion_stalled',workspace:ws,oldest_pending_obligation:data.oldest_pending_obligation||null,last_done_at:data.last_done_at||null,task_consumption:Number(data.task_consumption||0),rejected_handoffs:Number(data.rejected_handoffs||0),blocker_reasons:data.blocker_reasons||{}}),stdio:['pipe','ignore','pipe']})}
+  catch(e){console.error(JSON.stringify({code:'belt_completion_incident_delivery_failed',healthy:false,error:e.message}));process.exit(2)}
+}
+state[ws]={last_done_at:observedDone,oldest_pending_obligation:data.oldest_pending_obligation||null,updated_at:new Date(now).toISOString(),incident:effectiveIncident,acknowledged:effectiveIncident&&Boolean(process.env.BELT_COMPLETION_INCIDENT_COMMAND)};
 try{fs.mkdirSync(require('path').dirname(statePath),{recursive:true}); const t=statePath+'.tmp'; fs.writeFileSync(t,JSON.stringify(state)); fs.renameSync(t,statePath)}catch(e){console.error(JSON.stringify({code:'belt_completion_incident_persist_failed',healthy:false,error:e.message}));process.exit(2)}
 const out={code:stalled?'belt_completion_stalled':'ok',healthy:!stalled,workspace:ws,last_done_at:data.last_done_at||null,oldest_pending_obligation:data.oldest_pending_obligation||null,task_consumption:Number(data.task_consumption||0),rejected_handoffs:Number(data.rejected_handoffs||0),blocker_reasons:data.blocker_reasons||{}};
 console.log(JSON.stringify(out)); process.exit(stalled?1:0);

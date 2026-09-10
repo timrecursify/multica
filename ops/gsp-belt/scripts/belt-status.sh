@@ -31,11 +31,19 @@ done
 [[ "$burst_threshold" =~ ^[0-9]+$ && "$burst_window" =~ ^[0-9]+$ ]] || { echo "status: invalid restart burst configuration" >&2; exit 2; }
 fail=0
 
-# Optional workspace-scoped completion liveness contract.  The caller supplies
-# a JSON metrics snapshot; absent configuration is explicitly no-opinion.
-if [[ -n "${BELT_COMPLETION_LIVENESS_INPUT:-}" || -n "${BELT_COMPLETION_STALL_WINDOW:-}" ]]; then
-  liveness_input="${BELT_COMPLETION_LIVENESS_INPUT:--}"
-  if ! liveness_result=$(BELT_COMPLETION_LIVENESS_INPUT="$liveness_input" node "$(dirname "$0")/belt-completion-liveness.cjs"); then
+# Workspace-scoped completion liveness. Deployed runs always use the
+# authoritative adapter; BELT_COMPLETION_LIVENESS_INPUT is retained for tests.
+if [[ -n "${BELT_COMPLETION_STALL_WINDOW:-}" ]]; then
+  if [[ -z "${BELT_COMPLETION_LIVENESS_INPUT:-}" ]]; then
+    # The adapter consumes the authoritative source command.  In deployed
+    # runs this is supplied by the service environment; mirror it explicitly
+    # so the boundary cannot fail solely due to a variable-name mismatch.
+    if [[ -n "${BELT_COMPLETION_AUTHORITATIVE_METRICS_SOURCE_COMMAND:-}" ]]; then
+      export BELT_COMPLETION_AUTHORITATIVE_METRICS_COMMAND="$BELT_COMPLETION_AUTHORITATIVE_METRICS_SOURCE_COMMAND"
+      export BELT_COMPLETION_METRICS_COMMAND="node $(dirname "$0")/belt-completion-metrics.cjs"
+    fi
+  fi
+  if ! liveness_result=$(node "$(dirname "$0")/belt-completion-liveness.cjs"); then
     echo "completion_liveness $liveness_result" >&2
     fail=1
   else
