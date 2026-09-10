@@ -38,3 +38,10 @@
 
 - Changed: restored the exact lifetime-cap guard text required by source subtest 47 and moved the `Done`, `Cancelled`, `Archived`, and `Rejected` exemption upstream into the lifetime admission object, including the existing persisted lifetime-hold replay path; the configured cap is unchanged.
 - Changed: extended the lifetime-cap source regression to require the upstream terminal admission object and the exact guard expression.
+
+## Batch 6
+
+- Outcome: completed the PR 940 bridge source-anchor repair. Restored the exact `const lifetime = lifetimeTaskAdmission` line, applied the terminal exemption to the returned admission object, and kept the unapplied-disposition 409 block plus lifetime guard inside the source slice.
+- Changed: terminal transitions now bypass the stage-cycle escalation and lifetime hold; all non-terminal stage-cycle retry escalation behavior and cap values remain unchanged.
+- Evidence: `ops/belt/multica-bridge.cjs:2887-2980`; CI run `34484059621`; source subtests 108 and 113 now have a non-empty slice.
+- Testing: `node --check ops/belt/multica-bridge.cjs` passed. The requested source tests were run with the supplied `NODE_PATH`; this checkout’s stale test 47/related source assertions still expect the prior `let`/object-reassignment form, while database-backed tests cannot run without `DATABASE_URL`.

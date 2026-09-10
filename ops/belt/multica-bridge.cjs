@@ -2895,7 +2895,7 @@ async function relayAdvance(req, res, body) {
       const verifiedPassAdvance = issue.status === "In Review" &&
         to_stage === "CI/CD & Deploy" &&
         await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
-      if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
+      if (!cycle.ok && !terminalTransition && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
           !verifiedPassAdvance && !noArtifactRescope && !retryEscalation) {
         if (escalationLoop) {
           const taskCount = history.rows[0]?.n || 0;
@@ -2954,14 +2954,15 @@ async function relayAdvance(req, res, body) {
             AND ($2::timestamptz IS NULL OR created_at >= $2)`,
         [issue.id, humanReleaseAt]
       );
-      let lifetime = lifetimeTaskAdmission(
-        lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT
-      );
+      const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       // Terminal arrivals create no paid task and remain admissible after the
       // lifetime ceiling without changing the configured cap.
-      if (terminalTransition) lifetime = { ...lifetime, ok: true };
+      if (terminalTransition) {
+        lifetime.ok = true;
+        lifetime.reason = "terminal_transition";
+      }
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
-      if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
+      if (!lifetime.ok && !terminalTransition && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
           !noArtifactRescope) {
         const taskCount = lifetimeHistory.rows[0]?.n || 0;
         const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
