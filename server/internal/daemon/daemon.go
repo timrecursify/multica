@@ -669,7 +669,11 @@ func (d *Daemon) admissionCircuitOpen(workspaceID, ownerID, credentialGen string
 }
 
 func (d *Daemon) openAdmissionCircuit(workspaceID, ownerID, credentialGen string) {
-	if workspaceID == "" { return }
+	// An incomplete identity is never safe to quarantine: it would collapse
+	// unrelated runtimes into an "empty" bucket and hide server auth bugs.
+	if workspaceID == "" || ownerID == "" || credentialGen == "" {
+		return
+	}
 	key := admissionCircuitKey{workspaceID, ownerID, credentialGen}
 	d.claimMu.Lock()
 	if _, exists := d.authCircuits[key]; !exists {
@@ -683,11 +687,17 @@ func (d *Daemon) closeAdmissionCircuit(workspaceID, ownerID, credentialGen strin
 	d.claimMu.Lock(); delete(d.authCircuits, admissionCircuitKey{workspaceID, ownerID, credentialGen}); d.claimMu.Unlock()
 }
 
-// admissionIdentityForRuntime provides a stable, non-empty identity for
-// poller admission bookkeeping. Runtime IDs are daemon-owned identities; the
-// daemon credential generation is scoped to the daemon credential itself.
+// admissionIdentityForRuntime returns the server-attested identity carried by
+// runtime registration/sync. Never substitute runtime or daemon IDs: doing so
+// would allow stale credentials to share quarantine state with a new owner.
 func (d *Daemon) admissionIdentityForRuntime(runtimeID string) (string, string) {
-	return runtimeID, d.cfg.DaemonID
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	rt, ok := d.runtimeIndex[runtimeID]
+	if !ok {
+		return "", ""
+	}
+	return rt.OwnerID, rt.CredentialGeneration
 }
 
 // setAgentVersion records the detected CLI version for an agent provider so
