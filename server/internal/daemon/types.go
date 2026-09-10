@@ -23,6 +23,10 @@ type AgentEntry struct {
 // Runtime represents a registered daemon runtime.
 type Runtime struct {
 	ID       string `json:"id"`
+	// OwnerID and CredentialGeneration are server-attested admission identity
+	// fields. They must never be synthesized from daemon-local identifiers.
+	OwnerID               string `json:"owner_id,omitempty"`
+	CredentialGeneration string `json:"credential_generation,omitempty"`
 	Name     string `json:"name"`
 	Provider string `json:"provider"`
 	Status   string `json:"status"`

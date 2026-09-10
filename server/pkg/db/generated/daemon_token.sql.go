@@ -110,3 +110,15 @@ func (q *Queries) GetDaemonTokenByHash(ctx context.Context, tokenHash string) (D
 	)
 	return i, err
 }
+
+const getDaemonTokenByID = `-- name: GetDaemonTokenByID :one
+SELECT id, token_hash, workspace_id, daemon_id, expires_at, created_at FROM daemon_token
+WHERE id = $1 AND expires_at > now()
+`
+
+func (q *Queries) GetDaemonTokenByID(ctx context.Context, id pgtype.UUID) (DaemonToken, error) {
+	row := q.db.QueryRow(ctx, getDaemonTokenByID, id)
+	var i DaemonToken
+	err := row.Scan(&i.ID, &i.TokenHash, &i.WorkspaceID, &i.DaemonID, &i.ExpiresAt, &i.CreatedAt)
+	return i, err
+}
