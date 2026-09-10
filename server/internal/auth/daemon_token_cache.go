@@ -22,6 +22,9 @@ const daemonTokenCachePrefix = "mul:auth:daemon:"
 type DaemonTokenIdentity struct {
 	WorkspaceID string `json:"w"`
 	DaemonID    string `json:"d"`
+	// CredentialGeneration is the immutable daemon_token row ID. It changes
+	// on token rotation and must never be inferred from daemon identity.
+	CredentialGeneration string `json:"g"`
 }
 
 // DaemonTokenCache caches resolved daemon-token (mdt_) lookups in Redis.

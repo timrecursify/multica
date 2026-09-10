@@ -316,6 +316,16 @@ type workspaceState struct {
 	builtinVersions map[string]string
 }
 
+// admissionCircuitKey scopes authorization quarantine to the exact identity
+// that failed.  Keeping owner and credential generation in the key prevents a
+// recovered credential (or a different owner on the same board) from being
+// blocked by stale state.
+type admissionCircuitKey struct {
+	workspaceID  string
+	ownerID      string
+	credentialGen string
+}
+
 type repoCacheBackend interface {
 	Lookup(workspaceID, url string) string
 	BarePath(workspaceID, url string) string
@@ -542,6 +552,7 @@ type Daemon struct {
 	claimMu        sync.Mutex
 	pauseClaims    bool // when true, the batch poller skips claiming
 	claimsInFlight int  // pollers that have decided to claim but haven't yet handed the task off to handleTask
+	authCircuits   map[admissionCircuitKey]time.Time // workspace/owner/credential-generation quarantine
 
 	activeEnvRootsMu   sync.Mutex
 	activeEnvRootsCond *sync.Cond      // signalled when an in-flight env-root GC mutation finishes
@@ -613,6 +624,7 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 		agentVersions:             make(map[string]string),
 		skippedAgents:             make(map[string]string),
 		resolvedPaths:             make(map[string]healedAgent),
+		authCircuits:              make(map[admissionCircuitKey]time.Time),
 		wsHBLastAck:               make(map[string]time.Time),
 		activeEnvRoots:            make(map[string]int),
 		taskTempDirs:              make(map[string]struct{}),
@@ -645,6 +657,50 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	d.runner = taskRunnerFunc(d.runTask)
 	d.runUpdateFn = d.runUpdate
 	return d
+}
+
+// admissionCircuitOpen suppresses claims for a workspace while its board
+// authorization is unavailable. A successful workspace sync is the recovery
+// probe and closes the circuit.
+func (d *Daemon) admissionCircuitOpen(workspaceID, ownerID, credentialGen string) bool {
+	// An incomplete identity is not admissible. Treat it as quarantined until
+	// the server supplies both attested values; never collapse identities into
+	// a shared empty key.
+	if workspaceID == "" || ownerID == "" || credentialGen == "" {
+		return true
+	}
+	d.claimMu.Lock(); defer d.claimMu.Unlock()
+	_, ok := d.authCircuits[admissionCircuitKey{workspaceID, ownerID, credentialGen}]
+	return ok
+}
+
+func (d *Daemon) openAdmissionCircuit(workspaceID, ownerID, credentialGen string) {
+	if workspaceID == "" || ownerID == "" || credentialGen == "" {
+		return
+	}
+	key := admissionCircuitKey{workspaceID, ownerID, credentialGen}
+	d.claimMu.Lock()
+	if _, exists := d.authCircuits[key]; !exists {
+		d.authCircuits[key] = time.Now()
+		d.logger.Warn("admission circuit opened", "workspace", workspaceID, "owner", ownerID, "credential_generation", credentialGen)
+	}
+	d.claimMu.Unlock()
+}
+
+func (d *Daemon) closeAdmissionCircuit(workspaceID, ownerID, credentialGen string) {
+	d.claimMu.Lock(); delete(d.authCircuits, admissionCircuitKey{workspaceID, ownerID, credentialGen}); d.claimMu.Unlock()
+}
+
+// admissionIdentityForRuntime returns only server-attested identity fields.
+// Missing values intentionally remain empty and therefore fail closed.
+func (d *Daemon) admissionIdentityForRuntime(runtimeID string) (string, string) {
+	d.mu.RLock()
+	rt, ok := d.runtimeIndex[runtimeID]
+	d.mu.RUnlock()
+	if !ok {
+		return "", ""
+	}
+	return rt.OwnerID, rt.CredentialGeneration
 }
 
 // setAgentVersion records the detected CLI version for an agent provider so
@@ -4499,6 +4555,19 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		}
 
 		runtimeIDs := d.allRuntimeIDs()
+		// Do not issue claim traffic for runtimes belonging to quarantined
+		// workspaces; this guarantees no attempts are consumed while open.
+		d.mu.Lock()
+		filtered := runtimeIDs[:0]
+		for _, rid := range runtimeIDs {
+			blocked := false
+			for wsid, ws := range d.workspaces {
+				for _, wrid := range ws.runtimeIDs { if wrid == rid { owner, gen := d.admissionIdentityForRuntime(rid); if d.admissionCircuitOpen(wsid, owner, gen) { blocked = true } } }
+			}
+			if !blocked { filtered = append(filtered, rid) }
+		}
+		d.mu.Unlock()
+		runtimeIDs = filtered
 		if len(runtimeIDs) == 0 {
 			d.recordTick("idle")
 			if err := sleepWithContextOrWakeup(pollerCtx, d.cfg.PollInterval, wakeup); err != nil {
@@ -4552,6 +4621,13 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 
 		tasks, err := d.ClaimTasksWSFirst(pollerCtx, d.cfg.DaemonID, runtimeIDs, len(slots))
 		if err != nil {
+			if isWorkspaceNotFoundError(err) {
+				d.mu.Lock()
+				for wsid, ws := range d.workspaces {
+					for _, rid := range ws.runtimeIDs { for _, asked := range runtimeIDs { if rid == asked { owner, gen := d.admissionIdentityForRuntime(rid); d.openAdmissionCircuit(wsid, owner, gen) } } }
+				}
+				d.mu.Unlock()
+			}
 			d.recordTick("error")
 			d.exitClaim()
 			releaseSlots(slots)
@@ -4563,6 +4639,20 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			}
 			continue
 		}
+		// A successful authenticated claim acts as the recovery probe for
+		// matching runtime identities.
+		d.mu.Lock()
+		for wsid, ws := range d.workspaces {
+			for _, rid := range ws.runtimeIDs {
+				for _, asked := range runtimeIDs {
+					if rid == asked {
+						owner, gen := d.admissionIdentityForRuntime(rid)
+						d.closeAdmissionCircuit(wsid, owner, gen)
+					}
+				}
+			}
+		}
+		d.mu.Unlock()
 		d.recordTick("success")
 
 		// Dispatch each claimed task into a slot. activeTasks is incremented for
