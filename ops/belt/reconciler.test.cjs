@@ -46,6 +46,7 @@ function harness({ live = [], isLeaf = true, owner = {
 
 test("query builders hold the live status invariant", () => {
   assert.match(issueCandidatesSql(), /status = ANY/);
+  assert.match(issueCandidatesSql(), /i\.status = 'Parked' AND i\.metadata \? 'lifetime_budget_hold'/);
   assert.match(issueCandidatesSql(), /NOT EXISTS \(SELECT 1 FROM issue c/);
   assert.doesNotMatch(issueCandidatesSql(), /parent_issue_id IS NULL/);
   assert.match(isLeafSql(), /AS is_leaf/);
@@ -96,6 +97,24 @@ test("zero-task issue creates exactly one reconcile task and pending log", async
   assert.equal(JSON.parse(insert.values[5]).source, "reconcile");
   assert.ok(db.calls.some((call) => call.sql.includes("UPDATE relay_stage_agent_pool SET last_selected_at = NOW()")));
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO relay_run_log")));
+});
+
+test("reconciler holds an unclassified Human Review decision before ordinary dispatch", async () => {
+  const db = harness();
+  const original = db.query;
+  db.query = async (sql, values = []) => {
+    if (sql.startsWith("SELECT id, workspace_id, status")) return { rows: [{ ...issue, metadata: {
+      human_review_hold: { purpose: "classification", decision: "choose the actual owner",
+        decision_revision: "prior-revision", reason: "human_review_classification_required" }
+    } }] };
+    return original(sql, values);
+  };
+  const result = await reconcileIssue(db, issue.id, { evaluate: ok });
+  assert.equal(result.action, "held");
+  assert.equal(result.reason, "human_review_classification_required");
+  assert.equal(result.blocker, "astra_adjudication_owner_absent");
+  assert.equal(db.calls.some(({ sql }) => /FROM relay_stage_agent_pool/.test(sql || "")), false);
+  assert.equal(db.calls.some(({ sql }) => /trigger_summary, originator_source/.test(sql || "")), false);
 });
 
 test("completed task with failed outcome is repaired instead of cooling down the stage", async () => {
@@ -776,7 +795,7 @@ test("moveToAgentDecision routes technical blockers to Spec, never Human Review"
   assert.equal(logged.values[1], "Queue");
 });
 
-test("a capped Spec ticket gets a timed retry and durable audit instead of a silent skip", async () => {
+test("a capped Spec ticket enters one durable Parked hold without a mechanical retry", async () => {
   const db = harness();
   const original = db.query;
   db.query = async (sql, values = []) => {
@@ -789,13 +808,18 @@ test("a capped Spec ticket gets a timed retry and durable audit instead of a sil
   };
 
   assert.deepEqual(await reconcileIssue(db, issue.id, { evaluate: ok }), {
-    action: "deferred", reason: "lifetime_task_limit:6/6", retryAfterMinutes: 720
+    action: "held", reason: "lifetime_task_limit", status: "Parked", taskId: null,
+    blocker: "astra_adjudication_owner_absent", relayLogId: null
   });
-  assert.ok(db.calls.some(({ sql }) => /mechanical_retry_after/.test(sql || "")),
-    "cap exhaustion must persist its automatic release timer");
+  assert.equal(db.calls.some(({ sql }) => /mechanical_retry_after/.test(sql || "")), false,
+    "lifetime exhaustion must not persist an automatic release timer");
+  assert.ok(db.calls.some(({ sql }) => /UPDATE issue SET status = 'Parked'/.test(sql || "")));
+  assert.ok(db.calls.some(({ values }) => values.includes("astra_adjudication_owner_absent")));
   const audit = db.calls.find(({ sql }) => /INSERT INTO relay_run_log/.test(sql || ""));
   assert.ok(audit, "cap exhaustion must write a durable relay audit row");
   assert.equal(audit.values[1], "Spec");
+  assert.equal(db.calls.some(({ sql }) => /context->>'to_stage'/.test(sql || "") &&
+    /INSERT INTO agent_task_queue/.test(sql || "")), false);
   assert.equal(db.calls.some(({ sql }) => /status = 'Human Review'/.test(sql || "")), false);
 });
 

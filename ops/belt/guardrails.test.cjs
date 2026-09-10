@@ -203,10 +203,10 @@ test('bridge and daemon use the same budget predicate', () => {
 
 test('lifetime ceiling bounds paid work across stage changes', () => {
   assert.deepEqual(lifetimeTaskAdmission(5), { ok: true, ceiling: 6 });
-  // Astra decides after the automatic paid retry budget is exhausted.
+  // Astra decides while a durable Parked hold prevents further paid work.
   assert.deepEqual(lifetimeTaskAdmission(6), {
     ok: false, reason: 'lifetime_task_limit', ceiling: 6,
-    disposition: 'Spec'
+    disposition: 'Parked'
   });
 });
 

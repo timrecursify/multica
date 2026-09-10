@@ -4,7 +4,11 @@ const { execFileSync } = require("child_process");
 const { resolveBuilderRoute } = require("./guardrails.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
-const { isHumanReviewEligible } = require("./human-review-routing.cjs");
+const { classifyHumanReviewRequest, decisionRevision, humanReviewRoutingDecision,
+  latestQcBlockerEvidence } = require("./human-review-routing.cjs");
+const { activeAdjudicationHold, persistTrustedAstraAssessment, recordAstraAdjudication,
+  trustedAstraAssessment } = require("./astra-adjudication.cjs");
+const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
@@ -19,7 +23,9 @@ const OPEN_CHILD_SQL = `NOT EXISTS (SELECT 1 FROM issue c
 
 function issueCandidatesSql() {
   return `SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata, i.qc_fail_count
-            FROM issue i WHERE i.status = ANY($1::text[]) AND ${OPEN_CHILD_SQL} ORDER BY i.id`;
+            FROM issue i WHERE (i.status = ANY($1::text[])
+              OR (i.status = 'Parked' AND i.metadata ? 'lifetime_budget_hold'))
+              AND ${OPEN_CHILD_SQL} ORDER BY i.id`;
 }
 
 function isLeafSql() {
@@ -169,10 +175,9 @@ async function moveToHumanReview(client, issue, reason, options) {
   return { action: "human_review", reason };
 }
 
-// Technical exhaustion is a scoping decision, not a human approval gate. Send
-// it to the Sol-low-owned Spec stage with the same durable audit shape used by
-// the Human Review hold. A ticket already in Spec stays there so its existing
-// agent-owned stage can be retried without manufacturing a self-transition.
+// A machine-resolvable blocker returns to the agent-owned Spec stage with the
+// same durable audit shape used by the Human Review hold. A ticket already in
+// Spec stays there rather than manufacturing a self-transition.
 async function moveToAgentDecision(client, issue, reason, options) {
   if (issue.status === "Spec") return null;
   const verdict = policyFor(options)({
@@ -188,6 +193,129 @@ async function moveToAgentDecision(client, issue, reason, options) {
     [issue.id, issue.status, reason]
   );
   return { action: "agent_decision", reason, status: "Spec" };
+}
+
+async function moveToLifetimeHold(client, issue, taskCount, ceiling) {
+  const reason = "lifetime_task_limit";
+  const decision = "resolve exhausted lifetime task budget";
+  const revision = decisionRevision({ ...issue, pending_decision: decision });
+  await client.query("SELECT set_config('multica.relay_authorized', 'on', true)");
+  const changed = await client.query(
+    "UPDATE issue SET status = 'Parked', updated_at = NOW() WHERE id = $1::uuid AND status <> 'Parked' RETURNING id",
+    [issue.id]);
+  const relayLogId = changed.rowCount !== 0 ? await recordParkedEntry(client, { issueId: issue.id,
+    fromStage: issue.status, trigger: reason, intendedStage: issue.status,
+    attempts: taskCount, taskCount }) : null;
+  const adjudication = await recordAstraAdjudication(client, issue, {
+    purpose: "lifetime_exhaustion", reason, decision, decision_revision: revision,
+    attempts: taskCount, ceiling, provenance: { source: "reconciler_lifetime_counter" }
+  });
+  await client.query(
+    `UPDATE agent_task_queue SET status = 'cancelled', completed_at = NOW(),
+          failure_reason = 'lifetime_task_limit', prepare_lease_expires_at = NULL
+      WHERE issue_id = $1::uuid
+        AND status IN ('queued','dispatched','waiting_local_directory','deferred')
+        AND COALESCE(context->>'kind','') NOT IN ('parked_diagnosis','astra_adjudication')`,
+    [issue.id]);
+  return { action: "held", reason, status: "Parked", taskId: adjudication.task_id,
+    blocker: adjudication.reason, relayLogId };
+}
+
+async function enforceLifetimeHold(client, issue, hold) {
+  if (issue.status !== "Parked") {
+    return moveToLifetimeHold(client, issue, Number(hold.attempts || 0), Number(hold.ceiling || 0));
+  }
+  const currentRevision = decisionRevision({ ...issue, pending_decision: hold.decision });
+  if (currentRevision !== hold.decision_revision) {
+    const refreshed = await recordAstraAdjudication(client, issue, {
+      ...hold, purpose: "lifetime_exhaustion", reason: "lifetime_task_limit",
+      decision_revision: currentRevision,
+      provenance: { source: "reconciler_lifetime_hold_scope_change" }
+    });
+    return { action: "held", reason: "lifetime_ruling_revision_required", status: "Parked",
+      decisionRevision: currentRevision, taskId: refreshed.task_id, blocker: refreshed.reason };
+  }
+  const ruling = await trustedAstraAssessment(
+    client, issue, hold.decision_revision, "lifetime_exhaustion");
+  if (ruling) {
+    await persistTrustedAstraAssessment(client, issue, "lifetime_exhaustion", ruling);
+    return { action: "held", reason: ruling.outcome === "human_approval"
+      ? "astra_human_approval_recorded" : "lifetime_budget_extension_required",
+    status: "Parked", ruling: ruling.outcome };
+  }
+  const selection = await recordAstraAdjudication(client, issue, {
+    ...hold, purpose: "lifetime_exhaustion", reason: "lifetime_task_limit"
+  });
+  return { action: "held", reason: "lifetime_task_limit", status: "Parked",
+    taskId: selection.task_id, blocker: selection.reason };
+}
+
+function taskDecisionText(row) {
+  if (!row) return null;
+  const result = row.result;
+  if (typeof result === "string" && result.trim()) return result.trim();
+  if (result && typeof result === "object") {
+    const text = [result.output, result.comment, result.text, result.error]
+      .find((value) => typeof value === "string" && value.trim());
+    if (text) return text.trim();
+  }
+  return typeof row.error === "string" && row.error.trim() ? row.error.trim() : null;
+}
+
+async function pendingBlockerDecision(client, prior) {
+  if (!prior?.task_id) return "BLOCKED outcome requires a human classification";
+  const task = await client.query(
+    "SELECT result, error FROM agent_task_queue WHERE id = $1::uuid LIMIT 1", [prior.task_id]);
+  return taskDecisionText(task.rows[0]) || "BLOCKED outcome requires a human classification";
+}
+
+async function routeClassifiedDecision(client, issue, decision, options) {
+  const ticket = { ...issue, pending_decision: decision };
+  const pending = classifyHumanReviewRequest(ticket);
+  const latestQc = issue.status === "In Review" ? await latestQcBlockerEvidence(client, issue) : null;
+  const assessment = await trustedAstraAssessment(
+    client, issue, pending.decision_revision, "classification");
+  const classification = classifyHumanReviewRequest(ticket, assessment);
+  const routing = humanReviewRoutingDecision(classification, {
+    latestQc, outcome: assessment?.outcome
+  });
+  if (routing.action === "no_artifact_rescope") {
+    await client.query(
+      `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+           jsonb_build_object('human_review_hold', $2::jsonb), updated_at = NOW()
+        WHERE id = $1::uuid`, [issue.id, JSON.stringify({
+        reason: "no_artifact_rescope_relay_required", purpose: "classification",
+        decision, decision_revision: pending.decision_revision,
+        provenance: { source: latestQc.provenance, task_id: latestQc.task_id }
+      })]);
+    return { action: "held", reason: "no_artifact_rescope_relay_required",
+      classification: "technical", qcTaskId: latestQc.task_id };
+  }
+  if (routing.action === "hold") {
+    const selection = await recordAstraAdjudication(client, issue, {
+      purpose: "classification", reason: "human_review_classification_required",
+      decision: pending.decision, decision_revision: pending.decision_revision,
+      suggestion: pending.suggestion, provenance: pending.provenance
+    });
+    return { action: "held", reason: "human_review_classification_required",
+      decisionRevision: pending.decision_revision, blocker: selection.reason,
+      taskId: selection.task_id };
+  }
+  if (routing.destination === "Human Review" &&
+      options.budget.humanReview >= options.maxHumanReviewPerCycle) {
+    return { action: "held", reason: "human_review_cycle_budget",
+      decisionRevision: pending.decision_revision, taskId: assessment.assessor_task_id };
+  }
+  await persistTrustedAstraAssessment(client, issue, "classification", assessment);
+  if (routing.action === "no_op") {
+    return { action: "no_op", reason: "astra_adjudication_noop", evidence: assessment.evidence };
+  }
+  if (routing.destination === "Human Review") return moveToHumanReview(client, issue, decision, options);
+  if (routing.destination === "Spec") {
+    const moved = await moveToAgentDecision(client, issue, decision, options);
+    return moved || { action: "adjudicated", reason: "technical_scope_recorded", status: issue.status };
+  }
+  return { action: "held", reason: "human_review_classification_required" };
 }
 
 async function deferMechanicalRetry(client, issue, reason, minutes) {
@@ -342,17 +470,17 @@ async function terminalBlocker(client, issue, prior, options = {}) {
 // Returns a human_review result, or null to leave the issue skipped as before.
 async function routeTerminalBlocker(client, issue, prior, options) {
   if (!options.humanReviewRouting || !HUMAN_REVIEW_FROM.has(issue.status)) return null;
-  if (options.budget.humanReview >= options.maxHumanReviewPerCycle) return null;
   const reason = await terminalBlocker(client, issue, prior, options);
   if (!reason) return null;
   try {
-    const human = reason === "blocked_human" && isHumanReviewEligible(issue);
+    const human = reason === "blocked_human";
     const result = human
-      ? await moveToHumanReview(client, issue, reason, options)
+      ? await routeClassifiedDecision(client, issue,
+        await pendingBlockerDecision(client, prior), options)
       : await moveToAgentDecision(client, issue, reason, options);
     if (!result) return null;
-    if (human) options.budget.humanReview += 1;
-    console.log(`[reconcile] ${issue.id} ${issue.status} -> ${human ? "Human Review" : "Spec"} (${reason})`);
+    if (result.action === "human_review") options.budget.humanReview += 1;
+    console.log(`[reconcile] ${issue.id} ${issue.status} ${result.action} (${result.reason || reason})`);
     return result;
   } catch (error) {
     console.error(`[reconcile] blocker route failed issue=${issue.id} ${error.message}`);
@@ -370,9 +498,24 @@ async function reconcileIssue(client, issueId, options = {}) {
       [issueId]
     );
     const issue = locked.rows[0];
-    if (!issue || !DISPATCHABLE.has(issue.status)) {
+    if (!issue) {
       await client.query("COMMIT");
       return { action: "skipped" };
+    }
+    const activeHold = activeAdjudicationHold(issue);
+    if (!DISPATCHABLE.has(issue.status) && !activeHold) {
+      await client.query("COMMIT");
+      return { action: "skipped" };
+    }
+    if (activeHold?.purpose === "classification") {
+      const routed = await routeClassifiedDecision(client, issue, activeHold.decision, options);
+      await client.query("COMMIT");
+      return routed;
+    }
+    if (activeHold?.purpose === "lifetime_exhaustion") {
+      const held = await enforceLifetimeHold(client, issue, activeHold);
+      await client.query("COMMIT");
+      return held;
     }
     const mechanicalRetryAfter = issue.metadata?.mechanical_retry_after;
     if (mechanicalRetryAfter) {
@@ -500,17 +643,15 @@ async function reconcileIssue(client, issueId, options = {}) {
         return routed || { action: "skipped", reason: eligibility.reason };
       }
     }
-    // This cap is per stage-entry window. Stop the paid loop before selecting
-    // an owner, record the exhaustion, and automatically open a fresh window
-    // after a bounded delay. The issue stays on its agent-owned belt stage.
+    // Exhaustion is a durable Parked hold. It never opens a mechanical retry
+    // window and never selects an ordinary stage owner.
     const lifetime = await client.query(lifetimeTasksSql(), [issue.id, issue.status]);
     const lifetimeCount = Number(lifetime.rows[0]?.count || 0);
     if (lifetimeCount >= options.lifetimeTaskLimit) {
-      const capReason = `lifetime_task_limit:${lifetimeCount}/${options.lifetimeTaskLimit}`;
-      const deferred = await deferMechanicalRetry(
-        client, issue, capReason, options.mechanicalRetryMinutes);
+      const held = await moveToLifetimeHold(
+        client, issue, lifetimeCount, options.lifetimeTaskLimit);
       await client.query("COMMIT");
-      return deferred;
+      return held;
     }
     if (issue.status === "CI/CD & Deploy") {
       // The CI/CD worker owns this stage's exit; a desk task here buys nothing.
@@ -687,4 +828,4 @@ async function reconcileCycle(client, options = {}) {
   return results;
 }
 
-module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, moveToAgentDecision, deferMechanicalRetry, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };
+module.exports = { ADVISORY_LOCK_SQL, DISPATCHABLE, LIVE, issueCandidatesSql, isLeafSql, liveTasksSql, ownerSql, lifetimeTasksSql, stageAttemptsSql, stageAttemptBudget, taskContext, moveToHumanReview, moveToAgentDecision, moveToLifetimeHold, enforceLifetimeHold, routeClassifiedDecision, deferMechanicalRetry, terminalBlocker, commentPullRequestUrl, linkObservedPullRequest, mergedPullRequestNoop, armCompletedBuildWorkProduct, reconcileIssue, reconcileCycle };

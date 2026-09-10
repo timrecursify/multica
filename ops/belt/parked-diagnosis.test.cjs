@@ -64,6 +64,16 @@ test('validated Parked outcomes map to bounded state actions', () => {
     { action: 'release', status: 'Parked', nextStage: 'Spec' });
 });
 
+test('lifetime exhaustion never auto-releases from an ordinary diagnosis', () => {
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'fixable', reason: 'lifetime_task_limit' }), {
+    action: 'hold', status: 'Parked', blocker: 'lifetime_budget_astra_ruling_required'
+  });
+  assert.deepEqual(diagnosisOutcomeAction({ outcome: 'already_fixed', evidenceVerified: true,
+    reason: 'lifetime_task_limit' }), {
+    action: 'hold', status: 'Parked', blocker: 'lifetime_budget_astra_ruling_required'
+  });
+});
+
 test('invalid already-fixed diagnosis preserves its named blocker', () => {
   assert.deepEqual(diagnosisOutcomeAction({ outcome: 'already_fixed', blocker: 'missing durable task evidence',
     invalidAlreadyFixed: true }), {

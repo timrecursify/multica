@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const { qcCompletionAdvance, relayAdvanceConfirmation } =
   require('./parity/multica-relay-advance-daemon.cjs');
 const { classifyStageRoute } = require('./stage-routing.cjs');
+const { reconcileIssue } = require('./reconciler.cjs');
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || 'test-secret';
 // Capture the operator-supplied database before the placeholder default below.
@@ -104,6 +105,7 @@ const {
   operatorRescopeIssueId,
   issueImplementationArtifact,
   implementationEvidence,
+  noArtifactRescopeDecision,
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,
@@ -873,6 +875,30 @@ test('operator re-scope rejects consumed, artifact-bearing, and PASS/FAIL flight
     taskClient('QC-BLOCKED: no implementation SHA exists.', true), issue, 'Spec', id), false);
 });
 
+test('NO-SHA rescope reports the exact missing-evidence reason', async () => {
+  const id = '123e4567-e89b-42d3-a456-426614174000';
+  const issue = { id, workspace_id: 'workspace-1', status: 'In Review', metadata: {} };
+  const latest = (output, artifact = false) => ({ query: async (sql) =>
+    sql.includes('FROM agent_task_queue t')
+      ? { rows: [{ status: 'completed', result: { output } }] }
+      : { rows: [{ has_qc_verdict: artifact, has_builder_artifact: false,
+          has_comment_artifact: false }] } });
+  assert.deepEqual(await noArtifactRescopeDecision(
+    latest('QC VERDICT: PASS'), issue, 'In Progress', null), {
+    ok: false, reason: 'completed_sol_low_no_artifact_qc_required'
+  });
+  assert.deepEqual(await noArtifactRescopeDecision(
+    latest('QC-BLOCKED: NO-SHA; no implementation commit exists', true), issue,
+    'In Progress', null), {
+    ok: false, reason: 'implementation_artifact_absence_required'
+  });
+  assert.deepEqual(await noArtifactRescopeDecision(
+    latest('QC-BLOCKED: NO-SHA; no implementation commit exists'), issue,
+    'In Progress', null, 'newer-running-qc'), {
+    ok: false, reason: 'completed_latest_qc_no_artifact_required'
+  });
+});
+
 test('operator re-scope authorization is consumed once in issue metadata', async () => {
   let calls = 0;
   const issue = { id: '123e4567-e89b-42d3-a456-426614174000' };
@@ -903,9 +929,13 @@ test('Human Review guard reads only the latest active-or-completed Sol-low QC fl
   assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1', ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
 });
 
-test('all Human Review requests use the canonical classifier and exact re-scope bypasses configured edge and caps', () => {
+test('all Human Review requests use trusted classification and exact re-scope bypasses configured edge and caps', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /to_stage = humanReviewDestination\(\{ \.\.\.issue, reason \}\)/);
+  assert.match(source, /classifyHumanReviewRequest\(requestTicket, assessment\)/);
+  assert.match(source, /humanReviewRoutingDecision\(classification/);
+  assert.match(source, /human_review_classification_required/);
+  assert.match(source, /latestQcBlockerEvidence\(client, issue\)/);
+  assert.match(source, /const specCompletion = !requestedHumanReview/);
   assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
   assert.match(source,
     /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&\n\s*!verifiedPassAdvance && !noArtifactRescope/);
@@ -2597,7 +2627,8 @@ test('parking records a reason and hands off one Sol-low diagnosis', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
   assert.match(source, /recordParkAndQueueDiagnosis/);
   assert.match(source, /disposition === 'Parked'/);
-  assert.match(source, /context->>'kind', ''\) <> 'parked_diagnosis'/);
+  assert.match(source,
+    /COALESCE\(context->>'kind', ''\) NOT IN \('parked_diagnosis','astra_adjudication'\)/);
 });
 
 test('Parked dispositions create a dedicated relay audit row before diagnosis', async () => {
@@ -2754,6 +2785,126 @@ test('Parked disposition bypasses an incompatible pool and commits its audit wit
     'parking did not retire in-flight tasks');
   assert.ok(queries.some(({ sql }) => /UPDATE relay_run_log/i.test(sql) && /pending|retir/i.test(sql)),
     'parking did not retire pending relay rows');
+});
+
+test('lifetime exhaustion is held across reconciliation and advance replay', async () => {
+  const workspaceId = 'f47e92d1-8c9e-4f2a-9b3c-7e2a4d1b5c6f';
+  const issueId = '123e4567-e89b-42d3-a456-426614174000';
+  const state = { issue: { id: issueId, workspace_id: workspaceId, status: 'Spec',
+    description: '', parent_issue_id: null, title: 'bounded lifetime fixture',
+    priority: 'medium', metadata: {} }, historicalTasks: 6, astraTasks: [],
+    ordinaryTasks: [], holds: 0, relayLogs: [] };
+  const ordinaryOwner = { agent_id: '223e4567-e89b-42d3-a456-426614174000',
+    agent_name: 'ppp-build-terra-low-01', owner_id: '223e4567-e89b-42d3-a456-426614174000',
+    runtime_id: '323e4567-e89b-42d3-a456-426614174000', selected_runtime_id: '323e4567-e89b-42d3-a456-426614174000',
+    selected_runtime_provider: 'codex', archived_at: null, agent_status: 'idle',
+    instructions: 'Build Queue tasks.', model: 'gpt-5.6-terra', thinking_level: 'low',
+    runtime_config: { model: 'gpt-5.6-terra', reasoning_effort: 'low' },
+    max_concurrent_tasks: 1, active_task_count: 0, last_selected_at: null };
+  const astraOwner = { id: '423e4567-e89b-42d3-a456-426614174000',
+    name: 'ppp-astra-adjudicator-1', model: 'gpt-6-astra',
+    runtime_id: '523e4567-e89b-42d3-a456-426614174000',
+    instructions: 'Human Review adjudication: technical_scope bounded_repair duplicate_noop human_approval',
+    runtime_config: { model: 'gpt-6-astra', role: 'human-review-adjudication',
+      astra_adjudication: true }, max_concurrent_tasks: 1, active_task_count: 0 };
+  const client = { async connect() {}, async end() {}, async query(sql, values = []) {
+    if (/FROM "issue"[\s\S]*FOR UPDATE/.test(sql) ||
+        /^SELECT id, workspace_id, status, title, description/.test(sql)) {
+      return { rows: [{ ...state.issue, metadata: structuredClone(state.issue.metadata) }] };
+    }
+    if (/SELECT stage_name FROM relay_stage_config/.test(sql)) return { rows: [{ stage_name: values[1] }] };
+    if (/^SELECT next_stage FROM relay_stage_config/.test(sql)) return { rows: [{ next_stage: 'Queue' }] };
+    if (/SELECT next_stage, alt_next_stages/.test(sql)) return { rows: [{ next_stage: 'Queue', alt_next_stages: [] }] };
+    if (/FROM comment[\s\S]*content LIKE '%## Spec%'/.test(sql)) {
+      return { rows: [{ content: '## Evidence\nfixture\n## Spec\nkeep the hold bounded' }] };
+    }
+    if (/SELECT p\.agent_id/.test(sql)) return { rows: [ordinaryOwner] };
+    if (/SELECT a\.id, a\.name, a\.model/.test(sql)) return { rows: [astraOwner] };
+    if (/SELECT id, status FROM agent_task_queue/.test(sql) && /context->>'kind' = \$2::text/.test(sql)) {
+      const existing = state.astraTasks.find((task) => task.revision === values[3]);
+      return { rows: existing ? [{ id: existing.id, status: existing.status }] : [] };
+    }
+    if (/SELECT count\(\*\)::int AS n FROM agent_task_queue/.test(sql) &&
+        /context->>'to_stage' = \$2/.test(sql)) return { rows: [{ n: 0 }] };
+    if (/SELECT count\(\*\)::int AS n FROM agent_task_queue/.test(sql)) {
+      return { rows: [{ n: state.historicalTasks }] };
+    }
+    if (/UPDATE issue SET status = \$1/.test(sql)) {
+      if (state.issue.status === values[0]) return { rowCount: 0, rows: [] };
+      state.issue.status = values[0];
+      state.holds += values[0] === 'Parked' ? 1 : 0;
+      return { rowCount: 1, rows: [{ id: issueId }] };
+    }
+    if (/UPDATE "issue" SET description = \$1/.test(sql)) {
+      state.issue.description = values[0];
+      return { rowCount: 1, rows: [{ id: issueId }] };
+    }
+    if (/jsonb_build_object\('human_review_hold'/.test(sql)) {
+      state.issue.metadata.human_review_hold = JSON.parse(values[1]);
+      if (values[2] === 'lifetime_exhaustion') state.issue.metadata.lifetime_budget_hold = {
+        reason: 'lifetime_task_limit', decision_revision: values[3], attempts: values[4], ceiling: values[5]
+      };
+      return { rowCount: 1, rows: [] };
+    }
+    if (/INSERT INTO agent_task_queue/.test(sql) && values.includes('astra_adjudication')) {
+      const revision = values[9];
+      const existing = state.astraTasks.find((task) => task.revision === revision);
+      if (existing) return { rowCount: 0, rows: [] };
+      const task = { id: 'astra-task-1', revision, status: 'queued', context: JSON.parse(values[5]) };
+      state.astraTasks.push(task);
+      return { rowCount: 1, rows: [{ id: task.id }] };
+    }
+    if (/t\.context->>'kind' = \$2::text/.test(sql) && /t\.status = 'completed'/.test(sql)) {
+      return { rows: [] };
+    }
+    if (/INSERT INTO relay_run_log/.test(sql) && /parked_audit/.test(sql)) {
+      state.relayLogs.push({ from: values[1], to: 'Parked', reason: 'lifetime_task_limit' });
+      return { rowCount: 1, rows: [{ id: 'park-log-1' }] };
+    }
+    if (/INSERT INTO agent_task_queue/.test(sql)) {
+      state.ordinaryTasks.push({ sql, values });
+      return { rowCount: 1, rows: [{ id: 'ordinary-task' }] };
+    }
+    return { rowCount: 0, rows: [] };
+  } };
+  const advance = async () => {
+    const res = { status: 0, body: '', writeHead(status) { this.status = status; },
+      end(body = '') { this.body = body; } };
+    setTestClientFactory(() => client);
+    try {
+      await relayAdvance({ headers: {} }, res, { issue_id: issueId, to_stage: 'Queue',
+        agent_token: 'test-relay-secret' });
+    } finally { setTestClientFactory(null); }
+    return { status: res.status, body: JSON.parse(res.body) };
+  };
+  const originalNow = Date.now;
+  try {
+    const first = await advance();
+    assert.equal(first.status, 200);
+    assert.equal(first.body.issue.status, 'Parked');
+    assert.equal(state.historicalTasks, 6, 'spend baseline must not reset');
+    assert.deepEqual(await reconcileIssue(client, issueId, { evaluate: () => ({ ok: true }) }),
+      { action: 'held', reason: 'lifetime_task_limit', status: 'Parked', taskId: 'astra-task-1',
+        blocker: null });
+    Date.now = () => originalNow() + 48 * 60 * 60 * 1000;
+    const replayOne = await advance();
+    const replayTwo = await advance();
+    await reconcileIssue(client, issueId, { evaluate: () => ({ ok: true }),
+      failedTtlMinutes: 1, mechanicalRetryMinutes: 1 });
+    await reconcileIssue(client, issueId, { evaluate: () => ({ ok: true }),
+      failedTtlMinutes: 1, mechanicalRetryMinutes: 1 });
+    assert.deepEqual([replayOne.status, replayTwo.status], [409, 409]);
+    assert.equal(state.holds, 1);
+    assert.equal(state.astraTasks.length, 1);
+    assert.equal(state.astraTasks[0].context.no_builder, true);
+    assert.equal(state.ordinaryTasks.length, 0);
+    assert.equal(state.historicalTasks, 6);
+    assert.equal(state.issue.metadata.mechanical_retry_release_at, undefined);
+    assert.equal(state.relayLogs.length, 1);
+  } finally {
+    Date.now = originalNow;
+    setTestClientFactory(null);
+  }
 });
 
 test('parked admission skips stale system exits while retaining operator release', () => {

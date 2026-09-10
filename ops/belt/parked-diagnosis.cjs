@@ -127,7 +127,10 @@ function selectDiagnosisOwner(rows) {
 // ordinary QC result (or from falling through to a builder dispatch).
 function diagnosisOutcomeAction({ outcome, evidenceVerified = false, duplicateIssueId = null,
   blocker = null, missingOutcome = false, invalidAlreadyFixed = false,
-  invalidDuplicate = false, hasBindingSpec = true, needsQC = false }) {
+  invalidDuplicate = false, hasBindingSpec = true, needsQC = false, reason = null }) {
+  if (reason === 'lifetime_task_limit') {
+    return { action: 'hold', status: 'Parked', blocker: 'lifetime_budget_astra_ruling_required' };
+  }
   if (outcome === 'fixable') {
     return { action: 'release', status: 'Parked', nextStage: hasBindingSpec ? 'Queue' : 'Spec' };
   }

@@ -153,7 +153,7 @@ done
 # rather than restore a backup.
 is_new_target() {
   case "${1##*/}" in
-    guardrails.cjs|human-review-routing.cjs|parked-diagnosis.cjs|parked-entry-audit.cjs|relay-dead-rows.cjs|relay-completion-admission.cjs) return 0 ;;
+    guardrails.cjs|human-review-routing.cjs|astra-adjudication.cjs|parked-diagnosis.cjs|parked-entry-audit.cjs|relay-dead-rows.cjs|relay-completion-admission.cjs|RUNBOOK_ASTRA_ADJUDICATOR.md) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -174,14 +174,19 @@ dry_log="$tmp_dir/dry-run.log"
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --dry-run >"$dry_log"
 grep -q "Would copy .*/parked-diagnosis.cjs to $bridge_dir/parked-diagnosis.cjs" "$dry_log"
 grep -q "Would copy .*/parked-diagnosis.cjs to $relay_dir/parked-diagnosis.cjs" "$dry_log"
+grep -q "Would copy .*/astra-adjudication.cjs to $bridge_dir/astra-adjudication.cjs" "$dry_log"
+grep -q "Would copy .*/astra-adjudication.cjs to $relay_dir/astra-adjudication.cjs" "$dry_log"
 grep -q "Would copy .*/parity/relay-dead-rows.cjs to .*/parity/relay-dead-rows.cjs" "$dry_log"
 grep -q "Would copy .*/multica-bundle.py to $doctrine_dir/multica-bundle.py" "$dry_log"
 grep -q "Would copy .*/RUNBOOK_SPEC_WORKER.md to $doctrine_dir/RUNBOOK_SPEC_WORKER.md" "$dry_log"
+grep -q "Would copy .*/RUNBOOK_ASTRA_ADJUDICATOR.md to $doctrine_dir/RUNBOOK_ASTRA_ADJUDICATOR.md" "$dry_log"
 # transition-policy.cjs ships to three service directories from one source row.
 [[ "$(grep -c 'Would copy .*/transition-policy.cjs' "$dry_log")" -eq 3 ]]
 grep -q '^Would restart gsp-multica-bridge$' "$dry_log"
 grep -q '^Would restart multica-relay-advance$' "$dry_log"
-[[ "$(grep -c '^Would restart ' "$dry_log")" -eq 2 ]]
+grep -q '^Would restart gsp-multica-worker$' "$dry_log"
+grep -q '^Would restart gsp-multica-worker-ppp$' "$dry_log"
+[[ "$(grep -c '^Would restart ' "$dry_log")" -eq 4 ]]
 
 # An unscoped apply rewrites every managed target, so it must be requested by name.
 if BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --apply >"$tmp_dir/unscoped.log" 2>&1; then
@@ -304,13 +309,15 @@ BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/verify.sh" "$(git -C "$root_dir/.
 grep -q "Match: $cicd_dir/multica-cicd-worker.cjs" "$tmp_dir/verify.log"
 [[ "$(stat -c '%a:%g' "$doctrine_dir/multica-bundle.py")" == "750:$(stat -c '%g' "$doctrine_dir")" ]]
 [[ "$(stat -c '%a:%g' "$doctrine_dir/RUNBOOK_SPEC_WORKER.md")" == "640:$(stat -c '%g' "$doctrine_dir")" ]]
+[[ "$(stat -c '%a:%g' "$doctrine_dir/RUNBOOK_ASTRA_ADJUDICATOR.md")" == "640:$(stat -c '%g' "$doctrine_dir")" ]]
 receipt="$(sed -n 's/^Rollback receipt: .* --rollback \([0-9T]*Z\)$/\1/p' "$apply_log")"
 [[ "$receipt" =~ ^[0-9]{8}T[0-9]{6}Z$ ]] || { echo 'missing rollback receipt' >&2; exit 1; }
 BELT_DEPLOY_RUNTIME_ROOT="$tmp_dir" "$root_dir/deploy.sh" --rollback "$receipt" >/dev/null
-for suffix in guardrails.cjs parked-diagnosis.cjs parked-entry-audit.cjs relay-completion-admission.cjs; do
+for suffix in guardrails.cjs astra-adjudication.cjs parked-diagnosis.cjs parked-entry-audit.cjs relay-completion-admission.cjs; do
   [[ ! -e "$bridge_dir/$suffix" ]] || { echo "rollback did not remove $suffix" >&2; exit 1; }
   [[ ! -e "$relay_dir/$suffix" ]] || { echo "rollback did not remove relay copy of $suffix" >&2; exit 1; }
 done
+[[ ! -e "$doctrine_dir/RUNBOOK_ASTRA_ADJUDICATOR.md" ]] || { echo 'rollback did not remove Astra adjudicator runbook' >&2; exit 1; }
 [[ ! -e "$relay_dir/parity/relay-dead-rows.cjs" ]] || { echo 'rollback did not remove relay dead rows target' >&2; exit 1; }
 
 # A selective deploy touches only what it names.
