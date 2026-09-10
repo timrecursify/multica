@@ -169,6 +169,10 @@ async function consumeParkedQcRecovery(client, issue, toStage, reason, evidenceR
   return consumed.rowCount === 1;
 }
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Callers and fixtures are not required to use RFC 4122 version/variant bits.
+// The extra hex digit preserves the legacy zero-padded ticket form used by
+// bridge callers; PostgreSQL UUID resolution remains on the canonical branch.
+const UUID_TEXT_SHAPE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12,13}$/i;
 const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
@@ -1841,7 +1845,7 @@ async function relayVerdict(req, res, payload) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
+    let { issue_id, workspace_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
       operator_rescope_issue_id, operator_terminal_exit, operator_release,
       operator_cap_release, operator_recovery } = body;
     
@@ -1866,6 +1870,23 @@ async function relayAdvance(req, res, body) {
       return;
     }
 
+    // issue_id is a compatibility boundary: callers may send the durable UUID
+    // or the human ticket number. Never let a number reach a uuid parameter,
+    // and never resolve a number outside its explicitly supplied workspace.
+    const identifier = String(issue_id ?? "");
+    const issueIdIsUuid = UUID_TEXT_SHAPE_RE.test(identifier);
+    const issueIdIsNumber = /^\d+$/.test(identifier);
+    if (!issueIdIsUuid && !issueIdIsNumber) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_issue_identifier", identifier_shape: "expected_uuid_or_decimal_ticket_number" }));
+      return;
+    }
+    if (issueIdIsNumber && (!UUID_RE.test(String(workspace_id || "")))) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_issue_identifier", identifier_shape: "decimal_ticket_number_requires_workspace_id" }));
+      return;
+    }
+
     client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
     await client.connect();
     await client.query("BEGIN");
@@ -1874,18 +1895,31 @@ async function relayAdvance(req, res, body) {
     // including the recovery daemon. A partial unique index would either miss
     // waiting/deferred tasks or incorrectly constrain manual tasks; this lock
     // serializes precisely the belt-owned execution transition.
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [issue_id]);
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [identifier]);
 
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
+    const partialWorkExit = body.partial_work_exit === true;
+    if (partialWorkExit && (to_stage !== "Parked" || issue_id == null ||
+        typeof reason !== "string" || !reason.trim())) {
+      // This is a preserving disposition, not a terminal override: it still
+      // requires a human-readable account of the partial work and uses the
+      // normal Parked retirement/audit path below.
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "partial_work_exit_requires_parked_reason" }));
+      return;
+    }
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
+    if (partialWorkExit) parkedAudit = { ...(parkedAudit || {}), trigger: "partial_work_exit", reason: reason.trim() };
     let escalationLoop = false;
     let verifiedNoPrCompletion = false;
     const issueResult = await client.query(
-      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
-       FROM "issue"
-       WHERE id = $1
-       FOR UPDATE`,
-      [issue_id]
+      issueIdIsUuid
+        ? `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
+             FROM "issue" WHERE id = $1 FOR UPDATE`
+        : `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
+             FROM "issue" WHERE number = $1::bigint AND workspace_id = $2::uuid
+             FOR UPDATE`,
+      issueIdIsUuid ? [identifier] : [identifier, workspace_id]
     );
 
     if (issueResult.rows.length === 0) {
@@ -1894,16 +1928,30 @@ async function relayAdvance(req, res, body) {
       res.end(JSON.stringify({ error: "Issue not found" }));
       return;
     }
+    if (issueIdIsNumber && issueResult.rows.length > 1) {
+      await client.query("ROLLBACK");
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_issue_identifier", identifier_shape: "ambiguous_decimal_ticket_number" }));
+      return;
+    }
 
     const issue = issueResult.rows[0];
+    // From this point onward every database write, audit, and task handoff is
+    // UUID-keyed. Canonicalize a decimal ticket lookup exactly once so the
+    // caller's human-facing number cannot reach a uuid parameter downstream.
+    issue_id = issue.id;
     to_stage = normalizeRelayStage(issue.workspace_id, to_stage);
+    // Terminal transitions retire the ticket and create no paid task. They
+    // must remain available after the lifetime budget is exhausted so shipped
+    // work cannot be stranded in a non-terminal stage.
+    const terminalTransition = isTerminalStage(to_stage);
     const requestedHumanReview = to_stage === "Human Review";
     let noArtifactHumanReviewRescope = false;
     let astraLifetimeHumanApproval = false;
     let astraLifetimeOperatorRelease = false;
 
     const lifetimeHold = activeAdjudicationHold(issue);
-    if (lifetimeHold?.purpose === "lifetime_exhaustion" && to_stage !== "Parked") {
+    if (lifetimeHold?.purpose === "lifetime_exhaustion" && to_stage !== "Parked" && !terminalTransition) {
       const currentLifetimeRevision = decisionRevision({
         ...issue, pending_decision: lifetimeHold.decision
       });
@@ -2515,7 +2563,8 @@ async function relayAdvance(req, res, body) {
       } : {}),
       ...(issue.status === 'CI/CD & Deploy' && to_stage === 'Parked' ? {
         retry_escalation: parkedAudit?.trigger || parkedAudit?.cicd_worker?.reason || reason
-      } : {})
+      } : {}),
+      ...(partialWorkExit ? { partial_work_exit: true } : {})
     };
     const transitionAdmission = admitConfiguredTransition({
       fromStage: issue.status,
@@ -2851,7 +2900,7 @@ async function relayAdvance(req, res, body) {
         to_stage === "CI/CD & Deploy" &&
         await hasCurrentPassWorkProduct(client, issue.id, current_work_product_md5);
       if (!cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&
-          !verifiedPassAdvance && !noArtifactRescope && !retryEscalation) {
+          !verifiedPassAdvance && !noArtifactRescope && !retryEscalation && !terminalTransition) {
         if (escalationLoop) {
           const taskCount = history.rows[0]?.n || 0;
           const applied = await applyDisposition(client, issue, "Parked", "escalation_loop", {
@@ -2910,6 +2959,12 @@ async function relayAdvance(req, res, body) {
         [issue.id, humanReleaseAt]
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
+      // Terminal arrivals create no paid task and remain admissible after the
+      // lifetime ceiling without changing the configured cap.
+      if (terminalTransition) {
+        lifetime.ok = true;
+        lifetime.reason = "terminal_transition";
+      }
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
       if (!lifetime.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
           !noArtifactRescope && !retryEscalation) {
