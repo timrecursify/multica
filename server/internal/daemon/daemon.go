@@ -683,6 +683,13 @@ func (d *Daemon) closeAdmissionCircuit(workspaceID, ownerID, credentialGen strin
 	d.claimMu.Lock(); delete(d.authCircuits, admissionCircuitKey{workspaceID, ownerID, credentialGen}); d.claimMu.Unlock()
 }
 
+// admissionIdentityForRuntime provides a stable, non-empty identity for
+// poller admission bookkeeping. Runtime IDs are daemon-owned identities; the
+// daemon credential generation is scoped to the daemon credential itself.
+func (d *Daemon) admissionIdentityForRuntime(runtimeID string) (string, string) {
+	return runtimeID, d.cfg.DaemonID
+}
+
 // setAgentVersion records the detected CLI version for an agent provider so
 // later task-dispatch code (e.g. Codex sandbox policy) can read it.
 //
@@ -4542,7 +4549,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 		for _, rid := range runtimeIDs {
 			blocked := false
 			for wsid, ws := range d.workspaces {
-				for _, wrid := range ws.runtimeIDs { if wrid == rid && d.admissionCircuitOpen(wsid, "", "") { blocked = true } }
+				for _, wrid := range ws.runtimeIDs { if wrid == rid { owner, gen := d.admissionIdentityForRuntime(rid); if d.admissionCircuitOpen(wsid, owner, gen) { blocked = true } } }
 			}
 			if !blocked { filtered = append(filtered, rid) }
 		}
@@ -4604,7 +4611,7 @@ func (d *Daemon) runBatchPoller(pollerCtx, parentCtx context.Context, sem chan i
 			if isWorkspaceNotFoundError(err) {
 				d.mu.Lock()
 				for wsid, ws := range d.workspaces {
-					for _, rid := range ws.runtimeIDs { for _, asked := range runtimeIDs { if rid == asked { d.openAdmissionCircuit(wsid, "", "") } } }
+					for _, rid := range ws.runtimeIDs { for _, asked := range runtimeIDs { if rid == asked { owner, gen := d.admissionIdentityForRuntime(rid); d.openAdmissionCircuit(wsid, owner, gen) } } }
 				}
 				d.mu.Unlock()
 			}
