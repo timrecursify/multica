@@ -1841,7 +1841,7 @@ async function relayVerdict(req, res, payload) {
 async function relayAdvance(req, res, body) {
   let client;
   try {
-    let { issue_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
+    let { issue_id, workspace_id, to_stage, agent_token, current_work_product_md5, reason, parked_audit,
       operator_rescope_issue_id, operator_terminal_exit, operator_release,
       operator_cap_release, operator_recovery } = body;
     
@@ -1866,6 +1866,23 @@ async function relayAdvance(req, res, body) {
       return;
     }
 
+    // issue_id is a compatibility boundary: callers may send the durable UUID
+    // or the human ticket number. Never let a number reach a uuid parameter,
+    // and never resolve a number outside its explicitly supplied workspace.
+    const identifier = String(issue_id ?? "");
+    const issueIdIsUuid = UUID_RE.test(identifier);
+    const issueIdIsNumber = /^\d+$/.test(identifier);
+    if (!issueIdIsUuid && !issueIdIsNumber) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_issue_identifier", identifier_shape: "expected_uuid_or_decimal_ticket_number" }));
+      return;
+    }
+    if (issueIdIsNumber && (!UUID_RE.test(String(workspace_id || "")))) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_issue_identifier", identifier_shape: "decimal_ticket_number_requires_workspace_id" }));
+      return;
+    }
+
     client = testClientFactory ? testClientFactory() : new Client({ connectionString: MULTICA_DB });
     await client.connect();
     await client.query("BEGIN");
@@ -1874,24 +1891,43 @@ async function relayAdvance(req, res, body) {
     // including the recovery daemon. A partial unique index would either miss
     // waiting/deferred tasks or incorrectly constrain manual tasks; this lock
     // serializes precisely the belt-owned execution transition.
-    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [issue_id]);
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 804))", [identifier]);
 
     const dispositionStages = new Set(["Parked", "Rejected", "Cancelled"]);
+    const partialWorkExit = body.partial_work_exit === true;
+    if (partialWorkExit && (to_stage !== "Parked" || issue_id == null ||
+        typeof reason !== "string" || !reason.trim())) {
+      // This is a preserving disposition, not a terminal override: it still
+      // requires a human-readable account of the partial work and uses the
+      // normal Parked retirement/audit path below.
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "partial_work_exit_requires_parked_reason" }));
+      return;
+    }
     let parkedAudit = to_stage === "Parked" ? parked_audit : null;
+    if (partialWorkExit) parkedAudit = { ...(parkedAudit || {}), trigger: "partial_work_exit", reason: reason.trim() };
     let escalationLoop = false;
     let verifiedNoPrCompletion = false;
     const issueResult = await client.query(
-      `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
-       FROM "issue"
-       WHERE id = $1
-       FOR UPDATE`,
-      [issue_id]
+      issueIdIsUuid
+        ? `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
+             FROM "issue" WHERE id = $1::uuid FOR UPDATE`
+        : `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
+             FROM "issue" WHERE number = $1::bigint AND workspace_id = $2::uuid
+             FOR UPDATE`,
+      issueIdIsUuid ? [identifier] : [identifier, workspace_id]
     );
 
     if (issueResult.rows.length === 0) {
       await client.query("ROLLBACK");
       res.writeHead(404, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Issue not found" }));
+      return;
+    }
+    if (issueIdIsNumber && issueResult.rows.length > 1) {
+      await client.query("ROLLBACK");
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "invalid_issue_identifier", identifier_shape: "ambiguous_decimal_ticket_number" }));
       return;
     }
 
@@ -2515,7 +2551,8 @@ async function relayAdvance(req, res, body) {
       } : {}),
       ...(issue.status === 'CI/CD & Deploy' && to_stage === 'Parked' ? {
         retry_escalation: parkedAudit?.trigger || parkedAudit?.cicd_worker?.reason || reason
-      } : {})
+      } : {}),
+      ...(partialWorkExit ? { partial_work_exit: true } : {})
     };
     const transitionAdmission = admitConfiguredTransition({
       fromStage: issue.status,
