@@ -32,6 +32,11 @@ type Runtime struct {
 	// command_name to the executable to launch. Built-in (provider-detected)
 	// runtimes leave this empty.
 	ProfileID string `json:"profile_id,omitempty"`
+	// OwnerID and CredentialGeneration are server-attested admission identity
+	// fields returned during runtime registration/sync. They must never be
+	// synthesized from the runtime or daemon IDs.
+	OwnerID              string `json:"owner_id,omitempty"`
+	CredentialGeneration string `json:"credential_generation,omitempty"`
 }
 
 // RepoData holds repository information from the workspace.
