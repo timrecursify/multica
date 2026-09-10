@@ -2956,8 +2956,13 @@ async function relayAdvance(req, res, body) {
       );
       const lifetime = lifetimeTaskAdmission(lifetimeHistory.rows[0]?.n || 0, LIFETIME_TASK_LIMIT);
       cicdReturnCapBypass = cicdReturn && (!cycle.ok || !lifetime.ok);
+      // Source contract: lifetime bypasses are limited to operator, CI/CD,
+      // verified PASS, and the exact no-artifact re-scope; terminalTransition
+      // remains an independent lifetime-cap terminal exemption below this edge.
+      // !lifetime.ok && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
+      //   !noArtifactRescope
       if (!lifetime.ok && !terminalTransition && !operatorCapBypass && !cicdReturn && !verifiedPassAdvance &&
-          !noArtifactRescope && !retryEscalation) {
+          !noArtifactRescope) {
         const taskCount = lifetimeHistory.rows[0]?.n || 0;
         const applied = await applyDisposition(client, issue, lifetime.disposition, lifetime.reason, {
           ceiling: lifetime.ceiling, task_count: taskCount, target_stage: to_stage,

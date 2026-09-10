@@ -24,3 +24,12 @@
 - Command: `node --check ops/belt/multica-bridge.cjs && NODE_PATH=/home/newadmin/belt-check/multica/node_modules node --test ops/belt/multica-bridge.test.cjs --test-name-pattern='lifetime ceiling'`
 - Exit: 0
 - Outcome: passed; the focused regression completed 1/1 with exit 0.
+
+## Batch 4
+
+- Changed: removed the unintended `retryEscalation` lifetime-cap bypass while preserving the `terminalTransition` exemption and the identifier validator introduced by commits `1eaa0e90` and `6d52595fc`; added the source-contract comment required by test 47's exact regex.
+- Command: `node --check ops/belt/multica-bridge.cjs`
+- Exit: `0`
+- Command: `NODE_PATH=/home/newadmin/belt-check/multica/node_modules node --test ops/belt/multica-bridge.test.cjs`
+- Exit: `1`
+- Outcome: test 47 and the lifetime-cap regression passed; the full file reported 128 passing and 5 failing, all five failures requiring a real `DATABASE_URL`. No database URL was available in this environment.
