@@ -4,6 +4,12 @@
 -- under a new immutable version instead of rewriting migration history.
 ALTER TABLE issue DROP CONSTRAINT IF EXISTS issue_status_check;
 
+DO $$ BEGIN
+    IF EXISTS (SELECT 1 FROM issue WHERE status IN ('Parked', 'Rejected')) THEN
+        RAISE EXCEPTION 'cannot apply migration 285 while Parked/Rejected issues exist';
+    END IF;
+END $$;
+
 UPDATE issue SET status = 'Spec' WHERE status IN ('Parked', 'Rejected');
 
 ALTER TABLE issue ADD CONSTRAINT issue_status_check CHECK (status IN
