@@ -1882,6 +1882,25 @@ test('NO_OP build outcome with comment PR enters In Review and inspects that PR'
   assert.equal(seen.some((sql) => sql.includes('FROM comment')), true);
 });
 
+test('NO_OP with an open carrier PR waits for the carrier instead of completing', async () => {
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: NO_OP'), {
+    issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: () => JSON.stringify({ state: 'OPEN', files: [], headRefOid: 'a'.repeat(40),
+    mergeStateStatus: 'CLEAN', statusCheckRollup: [] }) });
+  assert.equal(route.kind, 'waiting_carrier');
+  assert.equal(route.toStage, 'Human Review');
+  assert.equal(route.reason, 'open_carrier_pr');
+});
+
+test('NO_OP with a merged carrier PR proceeds through the normal merged route', async () => {
+  const route = await buildCompletionRoute(noPrClient('OUTCOME: NO_OP'), {
+    issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'
+  }, { githubCommand: () => JSON.stringify({ state: 'MERGED', files: [], headRefOid: 'a'.repeat(40),
+    mergeStateStatus: 'CLEAN', statusCheckRollup: [] }) });
+  assert.equal(route.toStage, 'Done');
+  assert.equal(route.kind, 'merge_only');
+});
+
 test('genuine no-code NO_OP still reaches Done without QC', async () => {
   const route = await buildCompletionRoute(noPrClient('OUTCOME: NO_OP', null, null), {
     issue_id: 'issue-1', task_id: 'task-1', to_stage: 'In Progress', next_stage: 'In Review'

@@ -278,6 +278,7 @@ async function restPrViewFields(repo, num, fields, run = ghExec, { fresh = false
   if (want.has('createdAt')) out.createdAt = pr.created_at;
   if (want.has('updatedAt')) out.updatedAt = pr.updated_at;
   if (want.has('mergedAt')) out.mergedAt = pr.merged_at;
+  if (want.has('mergeCommitSha')) out.mergeCommitSha = pr.merge_commit_sha;
   if (want.has('closedAt')) out.closedAt = pr.closed_at;
   if (want.has('additions')) out.additions = pr.additions;
   if (want.has('deletions')) out.deletions = pr.deletions;
@@ -317,7 +318,8 @@ async function github(args, run = ghExec) {
   const target = args[0] === 'pr' ? PR_URL_RE.exec(String(args[2] || '')) : null;
   if (target) {
     const repo = `${target[1]}/${target[2]}`;
-    if (args[1] === 'view') return restPrView(repo, target[3], run);
+    if (args[1] === 'view') return restPrViewFields(repo, target[3], GATE_PR_FIELDS,
+      run, { fresh: args.includes('--fresh') });
     if (args[1] === 'merge') {
       return run(['api', '-X', 'PUT', `repos/${repo}/pulls/${target[3]}/merge`, '-f', 'merge_method=squash']);
     }
@@ -491,7 +493,12 @@ async function buildCompletionRoute(client, row, { githubCommand = github } = {}
     : `${commentMatch[1]}/${commentMatch[2]}`;
   const prUrl = issuePr?.html_url || commentMatch[0];
   const pr = JSON.parse(await githubCommand(['pr', 'view', prUrl, '--json',
-    'state,files,headRefOid,mergeStateStatus,statusCheckRollup']));
+    'state,files,headRefOid,mergeStateStatus,statusCheckRollup', '--fresh']));
+  if (declared?.outcome === 'NO_OP' && commentMatch && pr.state !== 'MERGED') {
+    return { kind: 'waiting_carrier', toStage: 'Human Review', pr_url: prUrl,
+      pr_state: pr.state, reason: 'open_carrier_pr',
+      evidence: `carrier=${prUrl} state=${pr.state || 'UNKNOWN'} next_check=after_merge` };
+  }
   const route = classifyStageRoute({ repo, state: pr.state, files: pr.files.map(({ path }) => path) });
   // The bridge (#528) refuses In Progress -> CI/CD & Deploy unless a qualifying
   // Sol-low QC pass exists, and only In Review produces one, so a runtime
