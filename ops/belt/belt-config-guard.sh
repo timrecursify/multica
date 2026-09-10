@@ -30,7 +30,8 @@ readonly ECOSYSTEM="$RUNTIME_ROOT/gsp-multica/fleet/ecosystem.gsp-belt.config.js
 # metadata digest is meaningful only when it covers the complete runtime
 # manifest, including both members of the parity pair.
 readonly RELEASE_MANIFEST=(
-  ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs
+  ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs ops/belt/human-review-routing.cjs
+  ops/belt/astra-adjudication.cjs
   ops/belt/parked-diagnosis.cjs ops/belt/parked-entry-audit.cjs
   ops/belt/parity/multica-relay-advance-daemon.cjs
   ops/belt/parity/relay-dead-rows.cjs ops/belt/multica-cicd-worker.cjs
@@ -41,7 +42,7 @@ readonly RELEASE_MANIFEST=(
   ops/belt/qc-verdict-policy.cjs ops/belt/belt-config-guard.sh
   ops/belt/multica-daemon-wrapper.sh ops/belt/ecosystem.gsp-belt.config.js
   ops/belt/workspace-root.sh
-  ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md
+  ops/belt/multica-bundle.py ops/belt/RUNBOOK_SPEC_WORKER.md ops/belt/RUNBOOK_ASTRA_ADJUDICATOR.md
   ops/belt/RUNBOOK_BUILD_WORKER.md ops/belt/RUNBOOK_QC_WORKER.md
   ops/belt/WORKER_COMMON.md ops/belt/relay-completion-admission.cjs
   ops/belt/build-admission.cjs

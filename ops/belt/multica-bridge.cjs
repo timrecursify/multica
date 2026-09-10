@@ -23,6 +23,10 @@ const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
 const { evaluate: evaluateTransitionPolicy } = require("./transition-policy.cjs");
+const { classifyHumanReviewRequest, decisionRevision, humanReviewRoutingDecision,
+  latestQcBlockerEvidence } = require("./human-review-routing.cjs");
+const { activeAdjudicationHold, persistTrustedAstraAssessment, recordAstraAdjudication,
+  trustedAstraAssessment } = require("./astra-adjudication.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -624,17 +628,35 @@ function passVerdictRescopeForbidden(redirect, verdict) {
 // Admission invariants: !noArtifactRescope && !allowedStages.includes(to_stage)
 // Cap bypass requires !cycle.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery && !noArtifactRescope
 
-async function noArtifactRescopeAdmission(client, issue, toStage, operatorIssueId) {
-  if (!["In Review", "Human Review"].includes(issue.status)) return false;
+async function noArtifactRescopeDecision(client, issue, toStage, operatorIssueId, expectedQcTaskId = null) {
+  if (!["In Review", "Human Review"].includes(issue.status)) {
+    return { ok: false, reason: "no_artifact_rescope_source_stage_required" };
+  }
   const qcReturn = issue.status === "In Review" && toStage === "In Progress" &&
     operatorIssueId == null;
   const operatorReturn = toStage === "Spec" && UUID_RE.test(String(operatorIssueId || "")) &&
     String(operatorIssueId).toLowerCase() === String(issue.id).toLowerCase();
-  if (!qcReturn && !operatorReturn) return false;
-  if (issue.metadata?.no_artifact_rescope_consumed_at) return false;
+  if (!qcReturn && !operatorReturn) {
+    return { ok: false, reason: "no_artifact_rescope_request_required" };
+  }
+  if (issue.metadata?.no_artifact_rescope_consumed_at) {
+    return { ok: false, reason: "no_artifact_rescope_already_consumed" };
+  }
   const task = await latestCompletedSolLowQcTask(client, issue.id, issue.workspace_id);
-  if (!task || task.status !== "completed" || !isNoArtifactQcBlock(taskResultText(task.result))) return false;
-  return !await issueImplementationArtifact(client, issue.id);
+  if (!task || task.status !== "completed" || !isNoArtifactQcBlock(taskResultText(task.result))) {
+    return { ok: false, reason: "completed_sol_low_no_artifact_qc_required" };
+  }
+  if (expectedQcTaskId && task.id !== expectedQcTaskId) {
+    return { ok: false, reason: "completed_latest_qc_no_artifact_required" };
+  }
+  if (await issueImplementationArtifact(client, issue.id)) {
+    return { ok: false, reason: "implementation_artifact_absence_required" };
+  }
+  return { ok: true, reason: "verified_no_artifact_rescope" };
+}
+
+async function noArtifactRescopeAdmission(client, issue, toStage, operatorIssueId) {
+  return (await noArtifactRescopeDecision(client, issue, toStage, operatorIssueId)).ok;
 }
 
 async function consumeNoArtifactRescope(client, issue) {
@@ -650,25 +672,7 @@ async function consumeNoArtifactRescope(client, issue) {
 }
 
 async function latestQcNoArtifactSignal(client, issue) {
-  const latest = await client.query(
-    `SELECT t.result, c.content
-       FROM agent_task_queue t
-       JOIN agent a ON a.id = t.agent_id AND a.workspace_id = t.workspace_id
-       LEFT JOIN LATERAL (
-         SELECT content FROM comment
-          WHERE issue_id = t.issue_id AND author_type = 'agent' AND author_id = t.agent_id
-            AND created_at >= t.created_at
-          ORDER BY created_at DESC, id DESC LIMIT 1
-       ) c ON true
-      WHERE t.issue_id = $1 AND t.workspace_id = $2
-        AND t.context->>'to_stage' = 'In Review'
-        AND t.status IN ('queued','dispatched','running','waiting_local_directory','deferred','completed')
-        AND COALESCE(a.model, a.runtime_config->>'model') = ANY($3::text[])
-        AND COALESCE(a.thinking_level, a.runtime_config->>'reasoning_effort') = $4::text
-      ORDER BY t.created_at DESC, t.id DESC LIMIT 1`, [issue.id, issue.workspace_id, qcLaneModelsSqlArray(), QC_LANE_EFFORT]);
-  const row = latest.rows[0];
-  return Boolean(row && (isNoArtifactQcBlock(taskResultText(row.result)) ||
-    isNoArtifactQcBlock(row.content)));
+  return (await latestQcBlockerEvidence(client, issue))?.kind === "no_artifact";
 }
 
 function qcTaskEvidence(task) {
@@ -876,9 +880,22 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
       attempts: evidence.historical_tasks || 0,
       taskCount: evidence.task_count || evidence.historical_tasks || 0
     });
-    const diagnosisTaskId = await recordParkAndQueueDiagnosis(client, issue,
-      { ...evidence, reason });
-    if (diagnosisTaskId) evidence = { ...evidence, diagnosis_task_id: diagnosisTaskId };
+    if (reason === 'lifetime_task_limit') {
+      const decision = 'resolve exhausted lifetime task budget';
+      const revision = decisionRevision({ ...issue, pending_decision: decision });
+      const adjudication = await recordAstraAdjudication(client, issue, {
+        purpose: 'lifetime_exhaustion', reason, decision, decision_revision: revision,
+        attempts: evidence.task_count ?? evidence.historical_tasks,
+        ceiling: evidence.ceiling,
+        provenance: { source: 'bridge_lifetime_counter' }
+      });
+      evidence = { ...evidence, astra_adjudication_task_id: adjudication.task_id,
+        astra_adjudication_blocker: adjudication.reason };
+    } else {
+      const diagnosis = await recordParkAndQueueDiagnosis(client, issue,
+        { ...evidence, reason });
+      if (diagnosis.task_id) evidence = { ...evidence, diagnosis_task_id: diagnosis.task_id };
+    }
     // Parked is a durable hold: retire every other live task and relay row
     // while the issue lock is held, so reconciliation cannot observe stale
     // work and advance it later. The dedicated diagnosis task is preserved.
@@ -886,7 +903,7 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
       `UPDATE agent_task_queue SET status = 'cancelled', completed_at = NOW(),
               prepare_lease_expires_at = NULL, failure_reason = 'parked_hold'
          WHERE issue_id = $1 AND status::text NOT IN ('completed','failed','cancelled')
-           AND COALESCE(context->>'kind','') <> 'parked_diagnosis' RETURNING id`, [issue.id]);
+           AND COALESCE(context->>'kind','') NOT IN ('parked_diagnosis','astra_adjudication') RETURNING id`, [issue.id]);
     const retiredRelay = await client.query(
       `UPDATE relay_run_log SET status = 'failed', parked_audit =
               COALESCE(parked_audit,'{}'::jsonb) || jsonb_build_object('retired_by_park', true)
@@ -904,7 +921,7 @@ async function applyDisposition(client, issue, disposition, reason, evidence = {
         -- Running predecessors are handled by cross-stage admission and are
         -- allowed to reach a terminal state before any successor is created.
         AND status IN ('queued','dispatched','waiting_local_directory','deferred')
-        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'`,
+        AND COALESCE(context->>'kind', '') NOT IN ('parked_diagnosis','astra_adjudication')`,
     [issue.id, reason]
   );
   if (changed.rowCount > 0) {
@@ -970,7 +987,7 @@ async function retireParkedWork(client, issue, reason) {
             prepare_lease_expires_at = NULL, failure_reason = $2
       WHERE issue_id = $1
         AND status IN ('queued','dispatched','running','waiting_local_directory','deferred')
-        AND COALESCE(context->>'kind', '') <> 'parked_diagnosis'
+        AND COALESCE(context->>'kind', '') NOT IN ('parked_diagnosis','astra_adjudication')
       RETURNING id`, [issue.id, reason]);
   const relays = await client.query(
     `UPDATE relay_run_log
@@ -1880,7 +1897,131 @@ async function relayAdvance(req, res, body) {
 
     const issue = issueResult.rows[0];
     to_stage = normalizeRelayStage(issue.workspace_id, to_stage);
-    const specCompletion = issue.status === "Spec" && to_stage === "Spec"
+    const requestedHumanReview = to_stage === "Human Review";
+    let noArtifactHumanReviewRescope = false;
+    let astraLifetimeHumanApproval = false;
+    let astraLifetimeOperatorRelease = false;
+
+    const lifetimeHold = activeAdjudicationHold(issue);
+    if (lifetimeHold?.purpose === "lifetime_exhaustion" && to_stage !== "Parked") {
+      const currentLifetimeRevision = decisionRevision({
+        ...issue, pending_decision: lifetimeHold.decision
+      });
+      if (currentLifetimeRevision !== lifetimeHold.decision_revision) {
+        const refreshed = await recordAstraAdjudication(client, issue, {
+          ...lifetimeHold, purpose: "lifetime_exhaustion", reason: "lifetime_task_limit",
+          decision_revision: currentLifetimeRevision,
+          provenance: { source: "bridge_lifetime_hold_scope_change" }
+        });
+        await client.query("COMMIT");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "lifetime_ruling_revision_required",
+          reason: "lifetime_task_limit", decision_revision: currentLifetimeRevision,
+          astra_blocker: refreshed.reason }));
+        return;
+      }
+      const ruling = await trustedAstraAssessment(
+        client, issue, lifetimeHold.decision_revision, "lifetime_exhaustion");
+      if (ruling) await persistTrustedAstraAssessment(client, issue, "lifetime_exhaustion", ruling);
+      astraLifetimeHumanApproval = ruling?.outcome === "human_approval" &&
+        to_stage === "Human Review";
+      astraLifetimeOperatorRelease = Boolean(ruling && issue.status === "Human Review" &&
+        operator_release === true && typeof reason === "string" && reason.trim() &&
+        !OPERATOR_SECRET_DISABLED && req.headers["x-relay-operator-secret"] === RELAY_OPERATOR_SECRET);
+      if (!astraLifetimeHumanApproval && !astraLifetimeOperatorRelease) {
+        let selection = null;
+        if (!ruling) selection = await recordAstraAdjudication(client, issue, {
+          ...lifetimeHold, purpose: "lifetime_exhaustion", reason: "lifetime_task_limit"
+        });
+        await client.query("COMMIT");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          error: ruling ? "lifetime_budget_extension_required" : "lifetime_budget_hold",
+          reason: "lifetime_task_limit",
+          decision_revision: lifetimeHold.decision_revision,
+          astra_blocker: selection?.reason || null
+        }));
+        return;
+      }
+    }
+
+    // Parked is already a durable terminal hold. Its exits are governed by the
+    // Parked release/diagnosis gate below; do not turn an invalid Parked exit
+    // into a new Human Review classification task. The lifetime adjudication
+    // path above is the sole exception and carries its own revision-bound
+    // human-approval evidence.
+    if (requestedHumanReview && issue.status !== "Parked" && !astraLifetimeHumanApproval) {
+      const requestTicket = { ...issue, pending_decision: reason };
+      const pending = classifyHumanReviewRequest(requestTicket);
+      const assessment = await trustedAstraAssessment(
+        client, issue, pending.decision_revision, "classification");
+      const classification = classifyHumanReviewRequest(requestTicket, assessment);
+      const latestNoArtifact = issue.status === "In Review" &&
+        await latestQcBlockerEvidence(client, issue);
+      const routing = humanReviewRoutingDecision(classification, {
+        latestQc: latestNoArtifact, outcome: assessment?.outcome
+      });
+      if (routing.action === "no_artifact_rescope") {
+        const rescope = await noArtifactRescopeDecision(
+          client, issue, "In Progress", null, routing.qc_task_id);
+        if (!rescope.ok) {
+          await client.query(
+            `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) ||
+                 jsonb_build_object('human_review_hold', $2::jsonb), updated_at = NOW()
+              WHERE id = $1::uuid`, [issue.id, JSON.stringify({
+              reason: rescope.reason, purpose: "classification",
+              decision: classification.decision,
+              decision_revision: classification.decision_revision,
+              provenance: { source: "latest_eligible_qc_task", task_id: routing.qc_task_id }
+            })]);
+          await client.query("COMMIT");
+          res.writeHead(409, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: rescope.reason,
+            classification: "technical", provenance: "latest_qc_no_artifact" }));
+          return;
+        }
+        await client.query(
+          `UPDATE issue SET metadata = (COALESCE(metadata, '{}'::jsonb) -
+               'human_review_hold' - 'astra_adjudication_blocker') ||
+               jsonb_build_object('human_review_assessment', $2::jsonb), updated_at = NOW()
+            WHERE id = $1::uuid`, [issue.id, JSON.stringify({
+            category: "technical", decision_revision: classification.decision_revision,
+            source: "latest_eligible_qc_task", task_id: routing.qc_task_id,
+            evidence: rescope.reason
+          })]);
+        noArtifactHumanReviewRescope = true;
+        to_stage = "Spec";
+      } else if (routing.action === "hold") {
+        const selection = await recordAstraAdjudication(client, issue, {
+          purpose: "classification",
+          reason: "human_review_classification_required",
+          decision: classification.decision,
+          decision_revision: classification.decision_revision,
+          suggestion: classification.suggestion,
+          provenance: classification.provenance
+        });
+        await client.query("COMMIT");
+        res.writeHead(409, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: "human_review_classification_required",
+          decision: classification.decision,
+          decision_revision: classification.decision_revision,
+          provenance: classification.provenance,
+          suggestion: classification.suggestion,
+          astra_blocker: selection.reason }));
+        return;
+      } else if (routing.action === "no_op") {
+        await persistTrustedAstraAssessment(client, issue, "classification", assessment);
+        await client.query("COMMIT");
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ success: true, issue: { id: issue.id, status: issue.status },
+          transition: "astra_adjudication_noop", evidence: assessment.evidence }));
+        return;
+      } else {
+        await persistTrustedAstraAssessment(client, issue, "classification", assessment);
+        to_stage = routing.destination;
+      }
+    }
+    const specCompletion = !requestedHumanReview && issue.status === "Spec" && to_stage === "Spec"
       ? await specCompletionDisposition(client, issue.id, body.relay_source_task_id)
       : null;
     if (specCompletion) {
@@ -1986,7 +2127,7 @@ async function relayAdvance(req, res, body) {
         verified_sha: verified.pr.sha, merged_at: verified.pr.merged_at,
         verified_at: verified.pr.verified_at } };
     }
-    const noArtifactRescope = await noArtifactRescopeAdmission(
+    const noArtifactRescope = noArtifactHumanReviewRescope || await noArtifactRescopeAdmission(
       client, issue, to_stage, operatorRescopeIssueId(operator_rescope_issue_id, reason)
     );
     if (issue.status === 'In Progress' && to_stage === 'In Review') {
@@ -2014,23 +2155,6 @@ async function relayAdvance(req, res, body) {
     }
     if (noArtifactRescope && to_stage === "In Progress") {
       to_stage = "Spec";
-    }
-    if (issue.status === "In Review" && to_stage === "Human Review" &&
-        await latestQcNoArtifactSignal(client, issue)) {
-      await client.query("ROLLBACK");
-      console.warn(JSON.stringify({
-        event: "relay_advance_rejected",
-        reason: "technical_human_review_forbidden",
-        issue_id: issue.id,
-        from_stage: issue.status,
-        to_stage
-      }));
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        error: "technical_human_review_forbidden",
-        message: "QC-BLOCKED NO-SHA work must be re-scoped by Sol-low; Human Review is money-only"
-      }));
-      return;
     }
     let retryEscalation = (noArtifactRescope || specCompletion) ? null :
       await verifiedRetryEscalation(client, issue, body);
@@ -2221,7 +2345,7 @@ async function relayAdvance(req, res, body) {
     const parkedOperatorRelease = issue.status === 'Parked' && explicitOperatorRelease &&
       parkedAllowedStages.includes(to_stage);
     const parkedSystemExit = issue.status === 'Parked' &&
-      (parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone);
+      (parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone || astraLifetimeHumanApproval);
     if (issue.status === 'Parked' && to_stage !== 'Parked' &&
         !parkedOperatorRelease && !parkedSystemExit) {
       await client.query("INSERT INTO activity_log (workspace_id, issue_id, actor_type, action, details) VALUES ($1,$2,'system','relay_parked_skipped',$3::jsonb)",
@@ -2401,7 +2525,7 @@ async function relayAdvance(req, res, body) {
       actor: policyActor,
       evidence: policyEvidence,
       exceptional: retryEscalation || parkedRelease || parkedEvidenceQcRelease ||
-        parkedDiagnosisDone || noArtifactRescope || evidenceTransition ||
+        parkedDiagnosisDone || astraLifetimeHumanApproval || noArtifactRescope || evidenceTransition ||
         rejectedPassTerminalExit || operatorTerminalExitAdmission ||
         explicitOperatorRelease || explicitOperatorRecovery ||
         dispositionStages.has(to_stage)
@@ -2412,8 +2536,8 @@ async function relayAdvance(req, res, body) {
       return;
     }
     if (issue.status === "Parked" && to_stage !== "Parked" &&
-        !(parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone ||
-          explicitOperatorRelease || explicitTerminalExit)) {
+      !(parkedRelease || parkedEvidenceQcRelease || parkedDiagnosisDone ||
+          astraLifetimeHumanApproval || explicitOperatorRelease || explicitTerminalExit)) {
       await client.query("ROLLBACK");
       console.warn(JSON.stringify({
         event: "relay_parked_skipped", reason: "parked_hold",
@@ -2571,10 +2695,12 @@ async function relayAdvance(req, res, body) {
         }));
         return;
       }
+      const boundDescription = descriptionWithSpec(issue.description, bindingSpec);
       await client.query(
         `UPDATE "issue" SET description = $1, updated_at = NOW() WHERE id = $2`,
-        [descriptionWithSpec(issue.description, bindingSpec), issue.id]
+        [boundDescription, issue.id]
       );
+      issue.description = boundDescription;
     }
 
     const ownerStage = retryEscalation ? "Registered" :
@@ -2912,6 +3038,13 @@ async function relayAdvance(req, res, body) {
             AND outcome_at < $3::timestamptz`,
         [issue.id, to_stage, issue.metadata.human_review_release_at]
       );
+      if (astraLifetimeOperatorRelease) {
+        await client.query(
+          `UPDATE issue SET metadata = COALESCE(metadata, '{}'::jsonb) -
+                'lifetime_budget_hold' - 'lifetime_budget_ruling' - 'human_review_hold' -
+                'astra_adjudication_blocker', updated_at = NOW()
+            WHERE id = $1::uuid`, [issue.id]);
+      }
     }
     if (parkedRelease || parkedEvidenceQcRelease) {
       console.warn(JSON.stringify({ event: "parked_release_consumed",
@@ -3358,6 +3491,7 @@ module.exports = {
   isNoArtifactQcBlock,
   operatorRescopeIssueId,
   issueImplementationArtifact,
+  noArtifactRescopeDecision,
   noArtifactRescopeAdmission,
   consumeNoArtifactRescope,
   latestQcNoArtifactSignal,

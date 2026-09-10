@@ -32,6 +32,7 @@ environment variable is unset, those exceptional exits are refused.
 | --- | --- | --- |
 | `multica-bridge.cjs` | `/var/lib/gsp/gsp-multica/multica-bridge.cjs` | PM2 app `gsp-multica-bridge` |
 | `guardrails.cjs` | `/var/lib/gsp/gsp-multica/guardrails.cjs` | Required by bridge and relay daemon |
+| `astra-adjudication.cjs` | `/var/lib/gsp/gsp-multica/astra-adjudication.cjs` | Dedicated fail-closed Astra decision contract |
 | `parity/multica-relay-advance-daemon.cjs` | `/var/lib/gsp/gsp-multica/parity/multica-relay-advance-daemon.cjs` | PM2 app `multica-relay-advance`, through its wrapper and launcher |
 | `multica-cicd-worker.cjs` | `/var/lib/gsp/multica-cicd-worker.cjs` | PM2 app `multica-cicd-worker` |
 | `belt-config-guard.sh` | `/var/lib/gsp/tools/belt-config-guard.sh` | `belt-config-guard.timer`, which activates `belt-config-guard.service` |
@@ -42,6 +43,7 @@ skips only `gsp-multica-worker`; bridge, CI/CD, archiver, and relay liveness
 checks continue. Remove the marker only after the worker may safely resume.
 | `multica-bundle.py` | `/opt/gsp/multica-doctrine/multica-bundle.py` | Spec helper |
 | `RUNBOOK_SPEC_WORKER.md` | `/opt/gsp/multica-doctrine/RUNBOOK_SPEC_WORKER.md` | Spec doctrine |
+| `RUNBOOK_ASTRA_ADJUDICATOR.md` | `/opt/gsp/multica-doctrine/RUNBOOK_ASTRA_ADJUDICATOR.md` | Astra adjudication doctrine |
 
 ## Guard parity repair
 
