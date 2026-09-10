@@ -114,7 +114,7 @@ Editing a profile only affects tasks claimed afterwards. Before deleting a profi
 
 Check in this order:
 
-1. Run `multica daemon status` to confirm the daemon is running.
+1. Run `multica daemon status` to confirm the selected daemon is running. The result is scoped to the user profile or current managed task, not externally supervised daemons; check the supervisor-specific health surface for those deployments.
 2. Run `multica daemon logs -f` to look for login, network, or tool-detection errors.
 3. Run `command -v <tool-command>` in the same environment to confirm the daemon can find it.
 4. Open Multica's **Runtimes** page and check whether the target computer and the matching AI coding tool show as online.

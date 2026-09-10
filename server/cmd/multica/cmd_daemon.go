@@ -1092,6 +1092,7 @@ func requestDaemonShutdown(healthPort int) error {
 
 func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 	profile := resolveProfile(cmd)
+	scope := daemonStatusScope()
 	healthPort, err := daemonStatusHealthPort(cmd)
 	if err != nil {
 		return err
@@ -1105,7 +1106,7 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {
-		return cli.PrintJSON(cmd.OutOrStdout(), daemonStatusJSON(profile, logPath, health))
+		return cli.PrintJSON(cmd.OutOrStdout(), daemonStatusJSON(profile, logPath, scope, health))
 	}
 
 	label := "Daemon"
@@ -1117,13 +1118,16 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 
 	switch health["status"] {
 	case "running":
-		printDaemonStatusReport(cmd.OutOrStdout(), label, health, logPath)
+		printDaemonStatusReport(cmd.OutOrStdout(), label, scope, health, logPath)
 	case "starting":
 		fmt.Fprintf(cmd.OutOrStdout(), "%s: starting (pid %v)\n", label, health["pid"])
+		fmt.Fprintf(cmd.OutOrStdout(), "Scope: %s\n", scope)
 		fmt.Fprintf(cmd.OutOrStdout(), "Log path: %s\n", logPath)
 	default:
 		fmt.Fprintf(cmd.OutOrStdout(), "%s: stopped\n", label)
+		fmt.Fprintf(cmd.OutOrStdout(), "Scope: %s\n", scope)
 		fmt.Fprintf(cmd.OutOrStdout(), "Log path: %s\n", logPath)
+		if scope == "user_profile" { fmt.Fprintln(cmd.OutOrStdout(), "Notice: externally supervised daemons are outside this result.") }
 	}
 	return nil
 }
@@ -1132,11 +1136,15 @@ func runDaemonStatus(cmd *cobra.Command, _ []string) error {
 // daemon health fields, plus the selected profile (empty string remains the
 // default profile identifier) and the resolved daemon log path for that
 // profile. Preserves every existing health field verbatim.
-func daemonStatusJSON(profile, logPath string, health map[string]any) map[string]any {
+func daemonStatusJSON(profile, logPath string, args ...any) map[string]any {
+	scope := "user_profile"
+	var health map[string]any
+	if len(args) == 1 { health, _ = args[0].(map[string]any) } else if len(args) >= 2 { scope, _ = args[0].(string); health, _ = args[1].(map[string]any) }
 	status := map[string]any{
 		"status":   health["status"],
 		"profile":  profile,
 		"log_path": logPath,
+		"scope":    scope,
 	}
 	for k, v := range health {
 		if _, seen := status[k]; !seen {
@@ -1144,6 +1152,11 @@ func daemonStatusJSON(profile, logPath string, health map[string]any) map[string
 		}
 	}
 	return status
+}
+
+func daemonStatusScope() string {
+	if inDaemonManagedExecutionContext() { return "managed_task" }
+	return "user_profile"
 }
 
 // daemonStatusHealthPort resolves which daemon `status` should probe. Outside a
@@ -1175,10 +1188,15 @@ func daemonStatusHealthPort(cmd *cobra.Command) (int, error) {
 // printDaemonStatusReport renders a key/value summary of the daemon health
 // response. The value column is aligned to the widest label so the dynamic
 // "Daemon [profile]" row stays in step with the static rows below it.
-func printDaemonStatusReport(w io.Writer, label string, health map[string]any, logPath string) {
+func printDaemonStatusReport(w io.Writer, label string, args ...any) {
+	scope := "user_profile"
+	var health map[string]any
+	var logPath string
+	if len(args) == 2 { health, _ = args[0].(map[string]any); logPath, _ = args[1].(string) } else if len(args) >= 3 { scope, _ = args[0].(string); health, _ = args[1].(map[string]any); logPath, _ = args[2].(string) }
 	type row struct{ key, value string }
 	rows := []row{
 		{label, fmt.Sprintf("running (pid %v, uptime %v)", health["pid"], health["uptime"])},
+		{"Scope", scope},
 	}
 	rows = append(rows, row{"Log path", logPath})
 	if version, ok := health["cli_version"].(string); ok && version != "" {

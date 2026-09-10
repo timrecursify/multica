@@ -5,6 +5,8 @@ description: Diagnose common problems with connections, execution, realtime upda
 
 import { Callout } from "fumadocs-ui/components/callout";
 
+`daemon status` reports only the selected user-profile daemon (`scope: user_profile`), or the daemon hosting the current managed task (`scope: managed_task`). It is not a host-wide or supervisor-wide health check; supervised deployments should also use their supervisor-specific health surface.
+
 First work out which layer the problem lives in: the Multica service, the daemon, the runtime, or the AI coding tool. These commands are usually enough to surface the first meaningful error:
 
 ```bash
