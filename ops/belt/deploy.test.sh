@@ -153,7 +153,7 @@ done
 # rather than restore a backup.
 is_new_target() {
   case "${1##*/}" in
-    guardrails.cjs|parked-diagnosis.cjs|parked-entry-audit.cjs|relay-dead-rows.cjs|relay-completion-admission.cjs) return 0 ;;
+    guardrails.cjs|human-review-routing.cjs|parked-diagnosis.cjs|parked-entry-audit.cjs|relay-dead-rows.cjs|relay-completion-admission.cjs) return 0 ;;
     *) return 1 ;;
   esac
 }

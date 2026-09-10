@@ -30,7 +30,7 @@ readonly ECOSYSTEM="$RUNTIME_ROOT/gsp-multica/fleet/ecosystem.gsp-belt.config.js
 # metadata digest is meaningful only when it covers the complete runtime
 # manifest, including both members of the parity pair.
 readonly RELEASE_MANIFEST=(
-  ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs
+  ops/belt/multica-bridge.cjs ops/belt/guardrails.cjs ops/belt/human-review-routing.cjs
   ops/belt/parked-diagnosis.cjs ops/belt/parked-entry-audit.cjs
   ops/belt/parity/multica-relay-advance-daemon.cjs
   ops/belt/parity/relay-dead-rows.cjs ops/belt/multica-cicd-worker.cjs
