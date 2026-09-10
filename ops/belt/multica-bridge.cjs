@@ -23,6 +23,7 @@ const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { recordParkedEntry } = require("./parked-entry-audit.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
 const { evaluate: evaluateTransitionPolicy } = require("./transition-policy.cjs");
+const { humanReviewDestination } = require("./human-review-routing.cjs");
 
 // Relay configuration is supplied by the host environment.
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -1880,6 +1881,7 @@ async function relayAdvance(req, res, body) {
 
     const issue = issueResult.rows[0];
     to_stage = normalizeRelayStage(issue.workspace_id, to_stage);
+    if (to_stage === "Human Review") to_stage = humanReviewDestination({ ...issue, reason });
     const specCompletion = issue.status === "Spec" && to_stage === "Spec"
       ? await specCompletionDisposition(client, issue.id, body.relay_source_task_id)
       : null;
@@ -2014,23 +2016,6 @@ async function relayAdvance(req, res, body) {
     }
     if (noArtifactRescope && to_stage === "In Progress") {
       to_stage = "Spec";
-    }
-    if (issue.status === "In Review" && to_stage === "Human Review" &&
-        await latestQcNoArtifactSignal(client, issue)) {
-      await client.query("ROLLBACK");
-      console.warn(JSON.stringify({
-        event: "relay_advance_rejected",
-        reason: "technical_human_review_forbidden",
-        issue_id: issue.id,
-        from_stage: issue.status,
-        to_stage
-      }));
-      res.writeHead(409, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({
-        error: "technical_human_review_forbidden",
-        message: "QC-BLOCKED NO-SHA work must be re-scoped by Sol-low; Human Review is money-only"
-      }));
-      return;
     }
     let retryEscalation = (noArtifactRescope || specCompletion) ? null :
       await verifiedRetryEscalation(client, issue, body);

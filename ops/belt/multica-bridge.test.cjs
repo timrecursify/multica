@@ -903,9 +903,9 @@ test('Human Review guard reads only the latest active-or-completed Sol-low QC fl
   assert.deepEqual(calls[0].values, ['issue-1', 'workspace-1', ['gpt-5.6-sol', 'gpt-5.6-luna'], 'low']);
 });
 
-test('technical QC block cannot route to Human Review and exact re-scope bypasses configured edge and caps', () => {
+test('all Human Review requests use the canonical classifier and exact re-scope bypasses configured edge and caps', () => {
   const source = fs.readFileSync(require.resolve('./multica-bridge.cjs'), 'utf8');
-  assert.match(source, /technical_human_review_forbidden/);
+  assert.match(source, /to_stage = humanReviewDestination\(\{ \.\.\.issue, reason \}\)/);
   assert.match(source, /!noArtifactRescope && !allowedStages\.includes\(to_stage\)/);
   assert.match(source,
     /!cycle\.ok && !operatorCapBypass && !cicdReturn && !parkedQcRecovery &&\n\s*!verifiedPassAdvance && !noArtifactRescope/);

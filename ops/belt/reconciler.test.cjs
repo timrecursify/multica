@@ -388,7 +388,7 @@ test("rollups with open children and running old-stage tasks are skipped", async
   const leafChild = harness();
   const childOriginal = leafChild.query;
   leafChild.query = async (sql, values = []) =>
-    sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count, parent_issue_id")
+    sql.startsWith("SELECT id, workspace_id, status, title, description, priority, metadata, qc_fail_count, parent_issue_id")
       ? { rows: [{ ...issue, parent_issue_id: "parent" }] } : childOriginal(sql, values);
   assert.deepEqual(await reconcileIssue(leafChild, issue.id, { evaluate: ok }), { action: "created", taskId: "task-1" });
   const stale = harness({ live: [{ id: "old", status: "running", context: taskContext("Spec") }] });
@@ -434,7 +434,7 @@ test("cycle rolls back a throwing issue and reconciles the next issue", async ()
     if (sql.startsWith("SELECT i.id, i.workspace_id, i.status, i.priority, i.metadata, i.qc_fail_count\n            FROM issue i WHERE")) {
       return { rows: [issue, second] };
     }
-    if (sql.startsWith("SELECT id, workspace_id, status, priority, metadata, qc_fail_count, parent_issue_id") &&
+    if (sql.startsWith("SELECT id, workspace_id, status, title, description, priority, metadata, qc_fail_count, parent_issue_id") &&
         values[0] === issue.id) throw new Error("first issue fails");
     return original(sql, values);
   };

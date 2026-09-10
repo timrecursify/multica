@@ -4,6 +4,7 @@ const { execFileSync } = require("child_process");
 const { resolveBuilderRoute } = require("./guardrails.cjs");
 const { completionAdmission } = require("./relay-completion-admission.cjs");
 const { buildTaskAdmission } = require("./build-admission.cjs");
+const { isHumanReviewEligible } = require("./human-review-routing.cjs");
 
 const DISPATCHABLE = new Set(["Spec", "Queue", "In Progress", "In Review", "CI/CD & Deploy"]);
 const LIVE = ["queued", "dispatched", "running", "waiting_local_directory", "deferred"];
@@ -345,7 +346,7 @@ async function routeTerminalBlocker(client, issue, prior, options) {
   const reason = await terminalBlocker(client, issue, prior, options);
   if (!reason) return null;
   try {
-    const human = reason === "blocked_human";
+    const human = reason === "blocked_human" && isHumanReviewEligible(issue);
     const result = human
       ? await moveToHumanReview(client, issue, reason, options)
       : await moveToAgentDecision(client, issue, reason, options);
@@ -365,7 +366,7 @@ async function reconcileIssue(client, issueId, options = {}) {
   try {
     await client.query(ADVISORY_LOCK_SQL, [issueId]);
     const locked = await client.query(
-      "SELECT id, workspace_id, status, priority, metadata, qc_fail_count, parent_issue_id FROM issue WHERE id = $1::uuid FOR UPDATE",
+      "SELECT id, workspace_id, status, title, description, priority, metadata, qc_fail_count, parent_issue_id FROM issue WHERE id = $1::uuid FOR UPDATE",
       [issueId]
     );
     const issue = locked.rows[0];
