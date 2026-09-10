@@ -663,13 +663,21 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 // authorization is unavailable. A successful workspace sync is the recovery
 // probe and closes the circuit.
 func (d *Daemon) admissionCircuitOpen(workspaceID, ownerID, credentialGen string) bool {
+	// An incomplete identity is not admissible. Treat it as quarantined until
+	// the server supplies both attested values; never collapse identities into
+	// a shared empty key.
+	if workspaceID == "" || ownerID == "" || credentialGen == "" {
+		return true
+	}
 	d.claimMu.Lock(); defer d.claimMu.Unlock()
 	_, ok := d.authCircuits[admissionCircuitKey{workspaceID, ownerID, credentialGen}]
 	return ok
 }
 
 func (d *Daemon) openAdmissionCircuit(workspaceID, ownerID, credentialGen string) {
-	if workspaceID == "" { return }
+	if workspaceID == "" || ownerID == "" || credentialGen == "" {
+		return
+	}
 	key := admissionCircuitKey{workspaceID, ownerID, credentialGen}
 	d.claimMu.Lock()
 	if _, exists := d.authCircuits[key]; !exists {
@@ -683,11 +691,16 @@ func (d *Daemon) closeAdmissionCircuit(workspaceID, ownerID, credentialGen strin
 	d.claimMu.Lock(); delete(d.authCircuits, admissionCircuitKey{workspaceID, ownerID, credentialGen}); d.claimMu.Unlock()
 }
 
-// admissionIdentityForRuntime provides a stable, non-empty identity for
-// poller admission bookkeeping. Runtime IDs are daemon-owned identities; the
-// daemon credential generation is scoped to the daemon credential itself.
+// admissionIdentityForRuntime returns only server-attested identity fields.
+// Missing values intentionally remain empty and therefore fail closed.
 func (d *Daemon) admissionIdentityForRuntime(runtimeID string) (string, string) {
-	return runtimeID, d.cfg.DaemonID
+	d.mu.RLock()
+	rt, ok := d.runtimeIndex[runtimeID]
+	d.mu.RUnlock()
+	if !ok {
+		return "", ""
+	}
+	return rt.OwnerID, rt.CredentialGeneration
 }
 
 // setAgentVersion records the detected CLI version for an agent provider so
