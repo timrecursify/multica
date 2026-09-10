@@ -23,7 +23,7 @@ if [[ "$input" == *concat_ws* ]]; then
   fi
 fi
 if [[ "$input" == *'admission_held = true'* ]]; then : > "$FENCE_FILE"; fi
-if [[ "$input" == *'admission_held = false'* ]]; then rm -f -- "$FENCE_FILE"; fi
+if [[ "$input" == *'admission_held = false'* ]]; then echo 1; rm -f -- "$FENCE_FILE"; fi
 SH
 chmod +x "$fixture/bin/psql"
 export PATH="$fixture/bin:$PATH" BELT_DEPLOY_DATABASE_URL=fixture

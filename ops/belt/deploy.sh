@@ -62,14 +62,6 @@ receipt_repository="timrecursify/multica"
 receipt_target="gsp-belt"
 receipt_owner="ops/belt/deploy.sh"
 receipt_probe="systemd-active-mainpid-runtime-parity-v1"
-# The managed units report TimeoutStartUSec=1min 30s. Use that systemd
-# start-time bound as the default settle window; tests/operators may shorten it
-# explicitly without changing the production authority.
-health_settle_seconds="${BELT_DEPLOY_HEALTH_SETTLE_SECONDS:-90}"
-[[ "$health_settle_seconds" =~ ^[1-9][0-9]*$ ]] || {
-  printf 'BELT_DEPLOY_HEALTH_SETTLE_SECONDS must be a positive integer\n' >&2
-  exit 2
-}
 deployment_fence_closed=0
 deployment_drain_timed_out=0
 deployment_cleanup_running=0
@@ -130,8 +122,10 @@ selected() {
 # root is shared by the GSP and PPP worker units; all other roots are one-to-one.
 service_units_for_target() {
   local target="$1" relative service_root
+  # The credential helper is a shared executable consumed by the relay and
+  # CI/CD workers, and lives outside the per-service runtime roots.
   if [[ "$target" == "$global_bin_root/gsp-belt-git-credential" ]]; then
-    printf '%s\n' multica-cicd-worker multica-relay-advance
+    printf '%s\n' multica-relay-advance multica-cicd-worker
     return
   fi
   if [[ "$target" == "$doctrine_root/"* ]]; then
@@ -223,37 +217,22 @@ process_reports_entrypoint() {
 }
 
 health_probe_unit() {
-  local unit="$1" initial_pid="$2" state_output key value target_unit index
+  local unit="$1" expected_pid="$2" state_output key value target_unit index
   local main_pid="" active_state="" substate="" belongs
-  local deadline=$(( $(date +%s) + health_settle_seconds ))
-  while :; do
-    if ! state_output="$(systemctl show -p MainPID -p ActiveState -p SubState "$unit")"; then
-      printf 'Health probe %s failed: %s systemctl show failed\n' "$receipt_probe" "$unit" >&2
-      return 1
-    fi
-    main_pid=""
-    active_state=""
-    substate=""
-    while IFS='=' read -r key value; do
-      case "$key" in
-        MainPID) main_pid="$value" ;;
-        ActiveState) active_state="$value" ;;
-        SubState) substate="$value" ;;
-      esac
-    done <<< "$state_output"
-    if [[ "$active_state" == active && "$substate" == running && "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
-      break
-    fi
-    if (( $(date +%s) >= deadline )); then
-      printf 'Health probe %s failed: %s initial_pid=%s observed_pid=%s active=%s substate=%s settle_window_seconds=%s\n' \
-        "$receipt_probe" "$unit" "$initial_pid" "${main_pid:-unknown}" "${active_state:-unknown}" "${substate:-unknown}" "$health_settle_seconds" >&2
-      return 1
-    fi
-    sleep 0.05
-  done
-  if [[ "$active_state" != active || "$substate" != running || ! "$main_pid" =~ ^[1-9][0-9]*$ ]]; then
-    printf 'Health probe %s failed: %s initial_pid=%s observed_pid=%s active=%s substate=%s\n' \
-      "$receipt_probe" "$unit" "$initial_pid" "${main_pid:-unknown}" "${active_state:-unknown}" "${substate:-unknown}" >&2
+  if ! state_output="$(systemctl show -p MainPID -p ActiveState -p SubState "$unit")"; then
+    printf 'Health probe %s failed: %s systemctl show failed\n' "$receipt_probe" "$unit" >&2
+    return 1
+  fi
+  while IFS='=' read -r key value; do
+    case "$key" in
+      MainPID) main_pid="$value" ;;
+      ActiveState) active_state="$value" ;;
+      SubState) substate="$value" ;;
+    esac
+  done <<< "$state_output"
+  if [[ "$main_pid" != "$expected_pid" || "$active_state" != active || "$substate" != running ]]; then
+    printf 'Health probe %s failed: %s expected_pid=%s main_pid=%s active=%s substate=%s\n' \
+      "$receipt_probe" "$unit" "$expected_pid" "${main_pid:-unknown}" "${active_state:-unknown}" "${substate:-unknown}" >&2
     return 1
   fi
   if ! process_reports_entrypoint "$unit" "$main_pid"; then
@@ -370,9 +349,7 @@ for index in "${!sources[@]}"; do
   # per-file allowlist this replaces had to be edited for every added file and
   # silently encoded the old layout.
   new_targets[$index]=0
-  if [[ "${targets[$index]}" == "$global_bin_root/gsp-belt-git-credential" ]]; then
-    service_root="$(dirname -- "${targets[$index]}")"
-  elif [[ "${targets[$index]}" == "$doctrine_root/"* ]]; then
+  if [[ "${targets[$index]}" == "$doctrine_root/"* ]]; then
     service_root="$doctrine_root"
   else
     relative_target="${targets[$index]#"$runtime_root"/}"
@@ -501,12 +478,7 @@ for index in "${!sources[@]}"; do
     false
   fi
   cp --preserve=mode -- "$source_file" "$target_file"
-  if [[ "$target_file" == "$global_bin_root/gsp-belt-git-credential" ]]; then
-    chmod 0755 -- "$target_file"
-    if [[ "${BELT_DEPLOY_SKIP_OWNERSHIP:-0}" != 1 ]]; then
-      chown root:root -- "$target_file"
-    fi
-  elif [[ "$target_file" == "$doctrine_root/"* ]]; then
+  if [[ "$target_file" == "$doctrine_root/"* ]]; then
     chgrp --reference="$doctrine_root" -- "$target_file"
     case "$target_file" in
       *.py) chmod 0750 -- "$target_file" ;;
