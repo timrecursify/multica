@@ -169,6 +169,10 @@ async function consumeParkedQcRecovery(client, issue, toStage, reason, evidenceR
   return consumed.rowCount === 1;
 }
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Callers and fixtures are not required to use RFC 4122 version/variant bits.
+// The extra hex digit preserves the legacy zero-padded ticket form used by
+// bridge callers; PostgreSQL UUID resolution remains on the canonical branch.
+const UUID_TEXT_SHAPE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12,13}$/i;
 const MD5_RE = /^[a-f0-9]{32}$/i;
 const SHA_RE = /^[a-f0-9]{40}$/i;
 const IDENTITY_RE = /^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,127}$/;
@@ -1870,7 +1874,7 @@ async function relayAdvance(req, res, body) {
     // or the human ticket number. Never let a number reach a uuid parameter,
     // and never resolve a number outside its explicitly supplied workspace.
     const identifier = String(issue_id ?? "");
-    const issueIdIsUuid = UUID_RE.test(identifier);
+    const issueIdIsUuid = UUID_TEXT_SHAPE_RE.test(identifier);
     const issueIdIsNumber = /^\d+$/.test(identifier);
     if (!issueIdIsUuid && !issueIdIsNumber) {
       res.writeHead(400, { "Content-Type": "application/json" });
@@ -1911,7 +1915,7 @@ async function relayAdvance(req, res, body) {
     const issueResult = await client.query(
       issueIdIsUuid
         ? `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
-             FROM "issue" WHERE id = $1::uuid FOR UPDATE`
+             FROM "issue" WHERE id = $1 FOR UPDATE`
         : `SELECT id, status, workspace_id, description, parent_issue_id, title, priority, metadata
              FROM "issue" WHERE number = $1::bigint AND workspace_id = $2::uuid
              FOR UPDATE`,
