@@ -1020,18 +1020,20 @@ func TestCreateIssueAllowsDuplicateAfterCancelled(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	req := newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
-		"title":  title,
-		"status": "cancelled",
+		"title": title,
 	})
 	testHandler.CreateIssue(w, req)
 	if w.Code != http.StatusCreated {
-		t.Fatalf("CreateIssue cancelled: expected 201, got %d: %s", w.Code, w.Body.String())
+		t.Fatalf("CreateIssue fixture: expected 201, got %d: %s", w.Code, w.Body.String())
 	}
 	var first IssueResponse
 	if err := json.NewDecoder(w.Body).Decode(&first); err != nil {
-		t.Fatalf("decode cancelled: %v", err)
+		t.Fatalf("decode fixture: %v", err)
 	}
 	firstID = first.ID
+	if _, err := testPool.Exec(ctx, `UPDATE issue SET status = 'Cancelled' WHERE id = $1`, firstID); err != nil {
+		t.Fatalf("set cancelled fixture status: %v", err)
+	}
 
 	w = httptest.NewRecorder()
 	req = newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, map[string]any{
