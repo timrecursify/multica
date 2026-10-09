@@ -160,7 +160,8 @@
   "trigger_kind": {
     "schedule": "时间表",
     "webhook": "Webhook",
-    "api": "API"
+    "api": "API",
+    "event": "事件"
   },
   "trigger_row": {
     "disabled_badge": "已禁用",

@@ -160,7 +160,8 @@
   "trigger_kind": {
     "schedule": "Schedule",
     "webhook": "Webhook",
-    "api": "API"
+    "api": "API",
+    "event": "Event"
   },
   "trigger_row": {
     "disabled_badge": "Disabled",

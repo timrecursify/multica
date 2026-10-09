@@ -160,7 +160,8 @@
   "trigger_kind": {
     "schedule": "スケジュール",
     "webhook": "Webhook",
-    "api": "API"
+    "api": "API",
+    "event": "イベント"
   },
   "trigger_row": {
     "disabled_badge": "無効",
