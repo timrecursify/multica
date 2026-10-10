@@ -18,7 +18,7 @@ jobs:
   # nothing from a full web build. This job emits a single `frontend`
   # output consumed by the frontend job below.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     permissions:
       contents: read
       pull-requests: read
@@ -98,7 +98,7 @@ jobs:
   # runner to itself and everything else shares the other one.
   frontend-build:
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     env:
       # Pin turbo's filesystem cache somewhere actions/cache can address.
       TURBO_CACHE_DIR: .turbo/cache
@@ -176,7 +176,7 @@ jobs:
 
   frontend-test:
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     env:
       TURBO_CACHE_DIR: .turbo/cache
     steps:
@@ -237,7 +237,7 @@ jobs:
     # is cancelled by the concurrency group above, and there is no reason to
     # spend a runner reporting a verdict nobody will read.
     if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     steps:
       - name: Check frontend job results
         env:
@@ -255,7 +255,7 @@ jobs:
     # Hermetic shell regressions for the daemon launch contract. Keep these
     # independent of the backend services so every push and pull request
     # validates the restart-critical wrapper and guard directly.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -399,7 +399,7 @@ jobs:
   unattended-lifecycle:
     # Release acceptance binds the production manifest, relay policy, CI/CD
     # evidence, activation, terminal accounting, and clock-controlled archive.
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -423,7 +423,7 @@ jobs:
         run: node --test --test-name-pattern 'a restarted relay preserves the persisted QC handoff decision' ops/belt/parity/relay-advance.integration.test.cjs
 
   backend:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     services:
       postgres:
         image: pgvector/pgvector:pg17
@@ -492,7 +492,9 @@ jobs:
     # The environment-preparation deadline owns a process tree, not just a Go
     # process. This Windows runtime test verifies Job Object cancellation kills
     # a delayed descendant before an immediate retry can reuse the same root.
-    runs-on: windows-latest
+    # disabled DELTA-001354: no self-hosted windows runner (Tim 2026-10-10 no hosted minutes)
+    if: false
+    runs-on: [self-hosted, fedci]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -606,8 +608,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        # DELTA-001354: macOS and Windows entries removed, no self-hosted runner for them (Tim 2026-10-10 no hosted minutes)
+        os: [linux]
+    runs-on: [self-hosted, fedci]
     steps:
       - name: Checkout
         uses: actions/checkout@v6
