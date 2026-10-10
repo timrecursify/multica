@@ -9,7 +9,7 @@ on:
 permissions: { contents: read, packages: write }
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     steps:
       - name: Validate requested SHA
         env: { SHA: "${{ inputs.commit_sha }}" }
