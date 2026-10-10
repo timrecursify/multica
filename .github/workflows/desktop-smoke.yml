@@ -57,3 +57,4 @@ jobs:
           name: desktop-${{ matrix.target }}
           path: apps/desktop/dist
           if-no-files-found: error
+          retention-days: 3
