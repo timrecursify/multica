@@ -7,7 +7,7 @@ on:
 
 jobs:
   audit:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     # `secrets` is not available in a step-level `if`, so the presence of the
     # deployed-database secret is resolved once here into a plain env flag.
     env:
