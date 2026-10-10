@@ -1,0 +1,19 @@
+name: no-hosted-runners
+on:
+  pull_request:
+    paths: ['.github/workflows/**']
+  push:
+    paths: ['.github/workflows/**']
+jobs:
+  guard:
+    runs-on: [self-hosted, fedci]
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fail on GitHub-hosted runs-on
+        shell: bash
+        run: |
+          bad=$(grep -nE '^\s*runs-on:' .github/workflows/*.y*ml | grep -vE 'self-hosted|\$\{\{' | grep -iE 'ubuntu|windows|macos|-arm' || true)
+          expr=$(grep -nE '(ubuntu|windows|macos)-(latest|[0-9])' .github/workflows/*.y*ml | grep -v 'no-hosted-runners.yml' || true)
+          if [ -n "$bad$expr" ]; then echo "GitHub-hosted runner labels found (Tim 2026-10-10: self-hosted only):"; echo "$bad"; echo "$expr"; exit 1; fi
+          echo ok
