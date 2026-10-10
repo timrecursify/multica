@@ -12,11 +12,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: linux
             target: linux
-          - os: windows-latest
-            target: win
-    runs-on: ${{ matrix.os }}
+          # disabled DELTA-001354: no self-hosted Windows runner (Tim 2026-10-10 no hosted minutes): win entry removed
+    runs-on: [self-hosted, fedci]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
