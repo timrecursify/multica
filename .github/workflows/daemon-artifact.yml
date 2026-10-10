@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   linux-amd64:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, fedci]
     steps:
       - uses: actions/checkout@v6
       - name: Enforce release-tag grammar
