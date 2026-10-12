@@ -88,6 +88,15 @@ func TestIssueStatusMigrationsPreserveCanonicalData(t *testing.T) {
 		"284_add_parked_rejected_issue_statuses.up.sql",
 		"285_reconcile_parked_rejected_statuses.up.sql",
 	} {
+		if migration == "283_restore_canonical_issue_status_check.up.sql" {
+			if err := applyMigrationFileReturningError(ctx, conn.Conn(), migration); err == nil {
+				t.Fatal("migration 283 should fail closed for existing Parked/Rejected rows")
+			}
+			want["00000000-0000-0000-0000-000000000007"] = "Parked"
+			want["00000000-0000-0000-0000-000000000008"] = "Rejected"
+			assertIssueStatuses(t, ctx, conn.Conn(), want)
+			break
+		}
 		applyMigrationFile(t, ctx, conn.Conn(), migration)
 		assertIssueStatuses(t, ctx, conn.Conn(), want)
 	}
