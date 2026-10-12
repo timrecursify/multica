@@ -74,8 +74,8 @@ func TestIssueStatusMigrationsPreserveCanonicalData(t *testing.T) {
 		"00000000-0000-0000-0000-000000000004": "In Progress",
 		"00000000-0000-0000-0000-000000000005": "In Review",
 		"00000000-0000-0000-0000-000000000006": "Human Review",
-		"00000000-0000-0000-0000-000000000007": "Spec",
-		"00000000-0000-0000-0000-000000000008": "Spec",
+		"00000000-0000-0000-0000-000000000007": "Parked",
+		"00000000-0000-0000-0000-000000000008": "Rejected",
 		"00000000-0000-0000-0000-000000000009": "CI/CD & Deploy",
 		"00000000-0000-0000-0000-000000000010": "Done",
 		"00000000-0000-0000-0000-000000000011": "Archived",
@@ -88,7 +88,13 @@ func TestIssueStatusMigrationsPreserveCanonicalData(t *testing.T) {
 		"284_add_parked_rejected_issue_statuses.up.sql",
 		"285_reconcile_parked_rejected_statuses.up.sql",
 	} {
-		applyMigrationFile(t, ctx, conn.Conn(), migration)
+		if migration == "283_restore_canonical_issue_status_check.up.sql" || migration == "285_reconcile_parked_rejected_statuses.up.sql" {
+			if err := applyMigrationFileErr(t, ctx, conn.Conn(), migration); err == nil {
+				t.Fatalf("%s must refuse to rewrite Parked/Rejected", migration)
+			}
+		} else {
+			applyMigrationFile(t, ctx, conn.Conn(), migration)
+		}
 		assertIssueStatuses(t, ctx, conn.Conn(), want)
 	}
 
