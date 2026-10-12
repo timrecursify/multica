@@ -132,6 +132,18 @@ func applyMigrationFile(t *testing.T, ctx context.Context, conn interface {
 	}
 }
 
+func applyMigrationFileErr(ctx context.Context, conn interface {
+	Exec(context.Context, string, ...interface{}) (pgconn.CommandTag, error)
+}, name string) error {
+	path := filepath.Join("..", "..", "migrations", name)
+	sql, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, string(sql))
+	return err
+}
+
 func readMigrationFile(t *testing.T, name string) string {
 	t.Helper()
 	contents, err := os.ReadFile(filepath.Join(realMigrationsDir(t), name))

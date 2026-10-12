@@ -61,7 +61,9 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 		t.Fatalf("seed canonical issue state: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "283_restore_canonical_issue_status_check.up.sql")
+	if err := applyMigrationFileErr(ctx, conn.Conn(), "283_restore_canonical_issue_status_check.up.sql"); err == nil {
+		t.Fatal("migration 283 rewrote Parked/Rejected instead of failing closed")
+	}
 	assertIssueStatusDefault(t, ctx, conn.Conn(), "'Spec'::text")
 	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
 		"00000000-0000-0000-0000-000000000001": "Registered",
@@ -74,8 +76,8 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 		"00000000-0000-0000-0000-000000000008": "Done",
 		"00000000-0000-0000-0000-000000000009": "Archived",
 		"00000000-0000-0000-0000-000000000010": "Cancelled",
-		"00000000-0000-0000-0000-000000000011": "Spec",
-		"00000000-0000-0000-0000-000000000012": "Spec",
+		"00000000-0000-0000-0000-000000000011": "Parked",
+		"00000000-0000-0000-0000-000000000012": "Rejected",
 	})
 
 	if _, err := conn.Exec(ctx, `INSERT INTO issue (id, status) VALUES ('00000000-0000-0000-0000-000000000013', 'in_progress')`); err != nil {
