@@ -11,8 +11,7 @@ import (
 )
 
 // TestIssueStatusMigrationsPreserveCanonicalData guards the live-board path:
-// a board that missed 282 can still contain every canonical status before the
-// 282/283/284/285 repair sequence runs.
+// migration 312 accepts every canonical status without rewriting data.
 func TestIssueStatusMigrationsPreserveCanonicalData(t *testing.T) {
 	dbURL := os.Getenv("DATABASE_URL")
 	if dbURL == "" {
@@ -74,8 +73,8 @@ func TestIssueStatusMigrationsPreserveCanonicalData(t *testing.T) {
 		"00000000-0000-0000-0000-000000000004": "In Progress",
 		"00000000-0000-0000-0000-000000000005": "In Review",
 		"00000000-0000-0000-0000-000000000006": "Human Review",
-		"00000000-0000-0000-0000-000000000007": "Spec",
-		"00000000-0000-0000-0000-000000000008": "Spec",
+		"00000000-0000-0000-0000-000000000007": "Parked",
+		"00000000-0000-0000-0000-000000000008": "Rejected",
 		"00000000-0000-0000-0000-000000000009": "CI/CD & Deploy",
 		"00000000-0000-0000-0000-000000000010": "Done",
 		"00000000-0000-0000-0000-000000000011": "Archived",
@@ -83,10 +82,7 @@ func TestIssueStatusMigrationsPreserveCanonicalData(t *testing.T) {
 	}
 
 	for _, migration := range []string{
-		"282_drop_issue_status_check_constraint.up.sql",
-		"283_restore_canonical_issue_status_check.up.sql",
-		"284_add_parked_rejected_issue_statuses.up.sql",
-		"285_reconcile_parked_rejected_statuses.up.sql",
+		"312_restore_parked_issue_status_contract.up.sql",
 	} {
 		applyMigrationFile(t, ctx, conn.Conn(), migration)
 		assertIssueStatuses(t, ctx, conn.Conn(), want)
