@@ -61,8 +61,10 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 		t.Fatalf("seed canonical issue state: %v", err)
 	}
 
-	applyMigrationFile(t, ctx, conn.Conn(), "283_restore_canonical_issue_status_check.up.sql")
-	assertIssueStatusDefault(t, ctx, conn.Conn(), "'Spec'::text")
+	if _, err := conn.Exec(ctx, readMigrationFile(t, "283_restore_canonical_issue_status_check.up.sql")); !isCheckViolation(err) {
+		t.Fatalf("migration 283 should fail closed with Parked/Rejected data, got %v", err)
+	}
+	// The guard runs before any DDL or UPDATE, so canonical dispositions remain intact.
 	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
 		"00000000-0000-0000-0000-000000000001": "Registered",
 		"00000000-0000-0000-0000-000000000002": "Spec",
@@ -74,17 +76,7 @@ func TestRestoreCanonicalIssueStatusCheckMigrationPreservesData(t *testing.T) {
 		"00000000-0000-0000-0000-000000000008": "Done",
 		"00000000-0000-0000-0000-000000000009": "Archived",
 		"00000000-0000-0000-0000-000000000010": "Cancelled",
-		"00000000-0000-0000-0000-000000000011": "Spec",
-		"00000000-0000-0000-0000-000000000012": "Spec",
+		"00000000-0000-0000-0000-000000000011": "Parked",
+		"00000000-0000-0000-0000-000000000012": "Rejected",
 	})
-
-	if _, err := conn.Exec(ctx, `INSERT INTO issue (id, status) VALUES ('00000000-0000-0000-0000-000000000013', 'in_progress')`); err != nil {
-		t.Fatalf("insert legacy status through compatibility trigger: %v", err)
-	}
-	assertIssueStatuses(t, ctx, conn.Conn(), map[string]string{
-		"00000000-0000-0000-0000-000000000013": "In Progress",
-	})
-	if _, err := conn.Exec(ctx, `INSERT INTO issue (id, status) VALUES ('00000000-0000-0000-0000-000000000014', 'unknown')`); !isCheckViolation(err) {
-		t.Fatalf("canonical constraint accepted unknown status: %v", err)
-	}
 }
